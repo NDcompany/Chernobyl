@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.expo/
+web-build/
+*.tsbuildinfo
+
+# Native build artifacts
+android/
+ios/
+*.apk
+*.aab
+*.hbc
+
+# Env — never commit secrets or host tokens
+.env
+.env.*
+!.env.example
+
+# Logs & OS
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Tests / coverage
+coverage/

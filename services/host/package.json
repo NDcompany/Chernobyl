@@ -1,0 +1,23 @@
+{
+  "name": "@chernobyl/host",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CHERNOBYL host service — WebSocket API, mock agent execution, permission enforcement.",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "npm run build && node --watch dist/server.js",
+    "start": "node dist/server.js",
+    "test": "npm run build && node --test \"dist/*.test.js\""
+  },
+  "dependencies": {
+    "@chernobyl/protocol": "*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "~6.0.3"
+  }
+}

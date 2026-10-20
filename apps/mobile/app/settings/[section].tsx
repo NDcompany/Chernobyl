@@ -1,0 +1,401 @@
+/**
+ * Settings detail — one route, six sections: hosts, integrations,
+ * notifications, appearance, security and the local audit trail.
+ */
+import { useEffect, useState, type ReactNode } from 'react';
+import { Platform, StyleSheet, Switch, View } from 'react-native';
+import type { StyleProp, ViewStyle } from 'react-native';
+import { Redirect, useLocalSearchParams, useRouter } from 'expo-router';
+import type { AgentKind } from '@chernobyl/protocol';
+import { colors, spacing } from '@/theme/tokens';
+import { useAppStore } from '@/store/appStore';
+import { useSnapshot } from '@/data/state';
+import { readAudit } from '@/platform/storage';
+import { clearHostToken, readHostToken } from '@/platform/secure';
+import { agentKindLabel, hostStatusLabel, hostTone, relativeTime } from '@/utils/format';
+import { useNow } from '@/hooks/useReducedMotion';
+import { Button, StatusDot, Text } from '@/ui/primitives';
+import { Screen, PageHeader, Card, ConfirmModal, EmptyState } from '@/ui/surface';
+import { DetailRow } from '@/ui/lists';
+import { Icon } from '@/ui/icons';
+
+const TITLES: Record<string, string> = {
+  hosts: 'Connected hosts',
+  integrations: 'Agent integrations',
+  notifications: 'Notification settings',
+  appearance: 'Appearance',
+  security: 'Security & device',
+  audit: 'Audit history',
+};
+
+function ToggleRow({
+  label,
+  caption,
+  value,
+  onValueChange,
+  disabled = false,
+}: {
+  label: string;
+  caption?: string;
+  value: boolean;
+  onValueChange: (v: boolean) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <View style={styles.toggleRow}>
+      <View style={{ flex: 1, gap: 2 }}>
+        <Text variant="bodyStrong" color={disabled ? colors.text3 : colors.text}>
+          {label}
+        </Text>
+        {caption ? (
+          <Text variant="xs" color={colors.text3}>
+            {caption}
+          </Text>
+        ) : null}
+      </View>
+      <Switch
+        value={value}
+        onValueChange={onValueChange}
+        disabled={disabled}
+        trackColor={{ false: colors.border, true: colors.black }}
+        thumbColor={colors.white}
+        ios_backgroundColor={colors.border}
+        accessibilityLabel={label}
+      />
+    </View>
+  );
+}
+
+function SectionCard({ children, style }: { children: ReactNode; style?: StyleProp<ViewStyle> }) {
+  return (
+    <Card style={[{ gap: 0, paddingVertical: spacing.xs }, style]}>{children}</Card>
+  );
+}
+
+export default function SettingsSectionScreen() {
+  const authed = useAppStore((s) => s.authed);
+  const { section } = useLocalSearchParams<{ section: string }>();
+  const key = String(section);
+  const router = useRouter();
+  const snapshot = useSnapshot();
+  const now = useNow(30_000);
+
+  const settings = useAppStore((s) => s.settings);
+  const updateSettings = useAppStore((s) => s.updateSettings);
+  const toggleIntegration = useAppStore((s) => s.toggleIntegration);
+  const signOut = useAppStore((s) => s.signOut);
+
+  const [hasToken, setHasToken] = useState<boolean | null>(null);
+  const [audit] = useState(() => readAudit(50));
+  const [confirmAll, setConfirmAll] = useState(false);
+
+  useEffect(() => {
+    void readHostToken().then((t) => setHasToken(!!t));
+  }, []);
+
+  if (!authed) return <Redirect href="/sign-in" />;
+
+  const title = TITLES[key] ?? 'Settings';
+  const known = key in TITLES;
+
+  const signOutEverywhere = () => {
+    setConfirmAll(false);
+    signOut();
+    router.replace('/sign-in');
+  };
+
+  let body: ReactNode = null;
+
+  if (key === 'hosts') {
+    body = (
+      <>
+        <Text variant="sm" color={colors.text2}>
+          Hosts run your agents and enforce every decision made in this app.
+        </Text>
+        {snapshot.hosts.length === 0 ? (
+          <EmptyState
+            icon="link"
+            title="No hosts yet"
+            caption="Add a host to discover the agents running on it."
+            actionLabel="Connect a host"
+            onAction={() => router.push('/connect-host')}
+          />
+        ) : (
+          <SectionCard>
+            {snapshot.hosts.map((h, i) => (
+              <View key={h.id} style={i < snapshot.hosts.length - 1 ? styles.divider : undefined}>
+                <View style={styles.hostRow}>
+                  <View style={{ flex: 1, gap: 2 }}>
+                    <Text variant="bodyStrong">{h.name}</Text>
+                    <Text variant="mono" color={colors.text3} numberOfLines={1}>
+                      {h.address}
+                    </Text>
+                    <Text variant="xs" color={colors.text3}>
+                      {h.platform} · seen {relativeTime(h.lastSeenAt, now)}
+                    </Text>
+                  </View>
+                  <StatusDot tone={hostTone(h.status)} label={hostStatusLabel(h.status)} />
+                </View>
+              </View>
+            ))}
+          </SectionCard>
+        )}
+        <Button label="Connect a host" icon="plus" variant="secondary" onPress={() => router.push('/connect-host')} />
+        <Text variant="xs" color={colors.text3} center>
+          Prototype: hosts are simulated locally and no WebSocket handshake is performed.
+        </Text>
+      </>
+    );
+  }
+
+  if (key === 'integrations') {
+    const kinds = Object.keys(settings.integrations) as AgentKind[];
+    body = (
+      <>
+        <Text variant="sm" color={colors.text2}>
+          Enabled integrations can be picked when you start a new task.
+        </Text>
+        <SectionCard>
+          {kinds.map((kind, i) => (
+            <View key={kind} style={i < kinds.length - 1 ? styles.divider : undefined}>
+              <ToggleRow
+                label={agentKindLabel(kind)}
+                caption={`kind: ${kind}`}
+                value={settings.integrations[kind]}
+                onValueChange={() => toggleIntegration(kind)}
+              />
+            </View>
+          ))}
+        </SectionCard>
+      </>
+    );
+  }
+
+  if (key === 'notifications') {
+    body = (
+      <>
+        <Text variant="sm" color={colors.text2}>
+          Local notifications for approvals and finished sessions.
+        </Text>
+        <SectionCard>
+          <ToggleRow
+            label="Push notifications"
+            caption={Platform.OS === 'web' ? 'Unavailable in the browser preview' : 'Device-level alerts'}
+            value={settings.push}
+            onValueChange={(v) => updateSettings({ push: v })}
+            disabled={Platform.OS === 'web'}
+          />
+          <View style={styles.divider} />
+          <ToggleRow
+            label="Approval alerts"
+            caption="When an agent requests permission"
+            value={settings.approvalAlerts}
+            onValueChange={(v) => updateSettings({ approvalAlerts: v })}
+            disabled={!settings.push}
+          />
+          <View style={styles.divider} />
+          <ToggleRow
+            label="Session finished"
+            caption="When a task completes"
+            value={settings.sessionAlerts}
+            onValueChange={(v) => updateSettings({ sessionAlerts: v })}
+            disabled={!settings.push}
+          />
+        </SectionCard>
+        <Text variant="xs" color={colors.text3} center>
+          This build shows notifications while the app is open. Silent push while backgrounded
+          requires FCM/APNs configuration on the host.
+        </Text>
+      </>
+    );
+  }
+
+  if (key === 'appearance') {
+    body = (
+      <>
+        <Text variant="sm" color={colors.text2}>
+          CHERNOBYL is monochrome by design — the only theme option is motion.
+        </Text>
+        <SectionCard>
+          <View style={styles.appearRow}>
+            <View style={{ flex: 1, gap: 2 }}>
+              <Text variant="bodyStrong">Theme</Text>
+              <Text variant="xs" color={colors.text3}>
+                Monochrome (light) — fixed
+              </Text>
+            </View>
+            <Icon name="check" size={18} color={colors.black} />
+          </View>
+          <View style={styles.divider} />
+          <ToggleRow
+            label="Reduce motion"
+            caption={
+              settings.reduceMotion === 'on'
+                ? 'Animations are off'
+                : 'Follows the system accessibility setting'
+            }
+            value={settings.reduceMotion === 'on'}
+            onValueChange={(v) => updateSettings({ reduceMotion: v ? 'on' : 'system' })}
+          />
+        </SectionCard>
+      </>
+    );
+  }
+
+  if (key === 'security') {
+    body = (
+      <>
+        <Text variant="sm" color={colors.text2}>
+          Secrets live in the OS keystore. Nothing sensitive is stored in the app database.
+        </Text>
+        <SectionCard>
+          <View style={styles.hostRow}>
+            <Icon name="phone" size={18} color={colors.text2} />
+            <View style={{ flex: 1, gap: 2 }}>
+              <Text variant="bodyStrong">This device</Text>
+              <Text variant="xs" color={colors.text3}>
+                Active now · {Platform.OS}
+              </Text>
+            </View>
+            <StatusDot tone="success" label="Active" />
+          </View>
+          <View style={styles.divider} />
+          <View style={{ paddingHorizontal: spacing.md, paddingVertical: spacing.md }}>
+            <DetailRow
+              label="Host token"
+              value={hasToken === null ? 'Checking…' : hasToken ? 'Stored in keystore' : 'Not stored'}
+              mono={false}
+            />
+          </View>
+        </SectionCard>
+        <Button
+          label="Remove stored token"
+          variant="secondary"
+          onPress={() => {
+            void clearHostToken().then(() => {
+              setHasToken(false);
+              useAppStore.getState().addToast('Stored token removed', 'success');
+            });
+          }}
+        />
+        <Button
+          label="Sign out on all devices"
+          variant="secondary"
+          icon="logout"
+          onPress={() => setConfirmAll(true)}
+        />
+        <Text variant="xs" color={colors.text3} center>
+          Prototype note: session revocation on other devices needs a real account backend.
+        </Text>
+      </>
+    );
+  }
+
+  if (key === 'audit') {
+    body = (
+      <>
+        <Text variant="sm" color={colors.text2}>
+          Every approval decision recorded on this device, newest first.
+        </Text>
+        {audit.length === 0 ? (
+          <EmptyState
+            icon="clock"
+            title="No decisions yet"
+            caption="Approve or reject a request and the entry appears here."
+            contour={false}
+          />
+        ) : (
+          <SectionCard>
+            {audit.map((row, i) => (
+              <View key={row.id} style={i < audit.length - 1 ? styles.divider : undefined}>
+                <View style={styles.auditRow}>
+                  <View style={{ flex: 1, gap: 3 }}>
+                    <View style={styles.auditHead}>
+                      <Text variant="smStrong" color={row.decision === 'reject' ? colors.error : colors.success}>
+                        {row.decision === 'reject' ? 'Rejected' : 'Approved'}
+                      </Text>
+                      <Text variant="xs" color={colors.text3}>
+                        {row.agent} · {row.risk} risk
+                      </Text>
+                    </View>
+                    <Text variant="mono" color={colors.text2} numberOfLines={2}>
+                      {row.command}
+                    </Text>
+                  </View>
+                  <Text variant="xs" color={colors.text3}>
+                    {relativeTime(row.ts, now)}
+                  </Text>
+                </View>
+              </View>
+            ))}
+          </SectionCard>
+        )}
+        <Text variant="xs" color={colors.text3} center>
+          Stored in local SQLite on this device only.
+        </Text>
+      </>
+    );
+  }
+
+  return (
+    <Screen header={<PageHeader title={title} />}>
+      {!known ? (
+        <EmptyState
+          icon="sliders"
+          title="Unknown section"
+          caption="That settings section does not exist."
+          actionLabel="Back"
+          onAction={() => router.back()}
+        />
+      ) : (
+        body
+      )}
+
+      <ConfirmModal
+        visible={confirmAll}
+        title="Sign out everywhere?"
+        message="This device and any other session will need to sign in again."
+        note="Hosts keep enforcing permissions regardless — agents are never left unattended."
+        confirmLabel="Sign out"
+        onConfirm={signOutEverywhere}
+        onCancel={() => setConfirmAll(false)}
+      />
+    </Screen>
+  );
+}
+
+const styles = StyleSheet.create({
+  toggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.md,
+  },
+  appearRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.md,
+  },
+  hostRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.md,
+  },
+  auditRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: spacing.md,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.md,
+  },
+  auditHead: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, flexWrap: 'wrap' },
+  divider: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+  },
+});
