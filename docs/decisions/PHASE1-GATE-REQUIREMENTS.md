@@ -80,4 +80,4 @@
 
 **Phase 1 result:** 43/43 tests (13 domain + 21 host + 9 adapter-sdk), verify green.
 
-**Carried forward to Phase 2 (not gaps in this gate):** envelope `seq` persistence for replay/resync (C2 remainder) — needs the companion's durable storage; command lifecycle surfacing in UI (state layer tracks it now; screens render it in the production-integration phase).
+**Carried forward to Phase 2 (not gaps in this gate):** envelope `seq` persistence for replay/resync (C2 remainder) — ~~needed the companion's durable storage~~ **landed in Phase 2** (`event_cursors` + transactional append, see `PHASE2-COMPANION-FOUNDATION.md`); command lifecycle surfacing in UI (state layer tracks it now; screens render it in the production-integration phase).

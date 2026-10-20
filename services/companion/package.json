@@ -1,0 +1,29 @@
+{
+  "name": "@chernobyl/companion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CHERNOBYL desktop companion foundation: config, SQLite persistence, adapter lifecycle, loopback diagnostics, graceful shutdown",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "chernobyl-companion": "dist/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test \"dist/*.test.js\"",
+    "start": "npm run build && node dist/main.js"
+  },
+  "dependencies": {
+    "@chernobyl/adapter-sdk": "*",
+    "@chernobyl/domain": "*",
+    "@chernobyl/protocol": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "~6.0.3"
+  }
+}
