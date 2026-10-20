@@ -188,3 +188,96 @@ test('replaying a commandId over the socket never runs it twice', async (t) => {
   assert.equal(acks[0].sessionId, acks[1].sessionId);
   assert.equal(acks.filter((a) => a.duplicate).length, 1);
 });
+
+/* ------------------------------------------------------------------ */
+/* Phase 1 gate requirements (docs/decisions/PHASE1-GATE-REQUIREMENTS) */
+/* ------------------------------------------------------------------ */
+
+test('G1: the ack and the terminal outcome are separate frames', async (t) => {
+  const host = await createHost({ port: 0 });
+  t.after(() => host.close());
+
+  const c = await connect(host.url);
+  const helloAck = await hello(c);
+
+  c.send({
+    type: 'create_session',
+    commandId: 'itest-life',
+    agentId: 'a4',
+    title: 'Lifecycle task',
+    prompt: 'over a real socket',
+  });
+
+  // acceptance: persisted + routed — nothing about execution
+  const ack = await waitFor<Ack>(c.messages, (m) => m.type === 'ack' && m.commandId === 'itest-life');
+  assert.equal(ack.ok, true);
+
+  // outcome: exactly one terminal, correlated by commandId
+  const result = await waitFor<Extract<ServerMessage, { type: 'command_result' }>>(
+    c.messages,
+    (m) => m.type === 'command_result' && m.commandId === 'itest-life',
+  );
+  assert.equal(result.status, 'completed');
+  assert.equal(result.sessionId, ack.sessionId);
+
+  // envelope: strictly increasing seqs, all newer than the snapshot's lastSeq
+  const enveloped = c.messages.filter((m): m is ServerMessage & { seq: number } => 'seq' in m);
+  assert.ok(enveloped.length > 0);
+  for (let i = 1; i < enveloped.length; i++) {
+    assert.ok(enveloped[i].seq > enveloped[i - 1].seq, `seq went backwards at ${i}`);
+  }
+  assert.ok(enveloped.every((m) => m.seq > helloAck.lastSeq));
+});
+
+test('G1/G2: a permission decision over the wire is revision-checked', async (t) => {
+  const host = await createHost({ port: 0 });
+  t.after(() => host.close());
+
+  const c = await connect(host.url);
+  const { snapshot } = await hello(c);
+  const permission = snapshot.permissions.find((p) => p.status === 'pending');
+  assert.ok(permission);
+
+  // native fields ride the wire (G2)
+  assert.equal(permission.nativeRequestId, permission.id);
+  assert.ok(permission.supportedDecisions.includes('reject'));
+  assert.equal(permission.revision, 1);
+
+  // stale revision → refused fail-closed, and NO resolution event is emitted
+  c.send({
+    type: 'permission_decision',
+    commandId: 'itest-stale-rev',
+    permissionId: permission.id,
+    decision: 'reject',
+    revision: permission.revision + 1,
+  });
+  const stale = await waitFor<Ack>(
+    c.messages,
+    (m) => m.type === 'ack' && m.commandId === 'itest-stale-rev',
+  );
+  assert.equal(stale.ok, false);
+  assert.equal(
+    c.messages.some((m) => m.type === 'permission_resolved'),
+    false,
+  );
+
+  // fresh revision → resolved, and the bumped revision rides back on the wire
+  c.send({
+    type: 'permission_decision',
+    commandId: 'itest-fresh-rev',
+    permissionId: permission.id,
+    decision: 'reject',
+    revision: permission.revision,
+  });
+  const ack = await waitFor<Ack>(
+    c.messages,
+    (m) => m.type === 'ack' && m.commandId === 'itest-fresh-rev',
+  );
+  assert.equal(ack.ok, true);
+  const resolved = await waitFor<Extract<ServerMessage, { type: 'permission_resolved' }>>(
+    c.messages,
+    (m) => m.type === 'permission_resolved' && m.permission.id === permission.id,
+  );
+  assert.equal(resolved.permission.status, 'rejected');
+  assert.equal(resolved.permission.revision, 2);
+});

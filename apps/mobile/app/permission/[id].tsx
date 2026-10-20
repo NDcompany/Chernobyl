@@ -61,7 +61,7 @@ export default function PermissionScreen() {
     setBusy(key);
     void (async () => {
       const ack = await send(
-        commands.approve(permission.id, decision),
+        commands.approve(permission.id, decision, permission.revision),
         decision === 'reject' ? 'Request rejected' : 'Approved for this run',
       );
       setBusy(null);

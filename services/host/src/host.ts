@@ -3,7 +3,7 @@
  * production wiring is covered by integration tests.
  *
  * HTTP  /health   — liveness + counters
- * WS    /         — protocol v1 (see @chernobyl/protocol)
+ * WS    /         — protocol v2 (see @chernobyl/protocol)
  *
  * Hardening:
  * - optional shared-secret auth (HOST_TOKEN): `?token=` query or
@@ -101,6 +101,7 @@ function handleFrame(
         protocol: PROTOCOL_VERSION,
         serverTime: Date.now(),
         snapshot: engine.snapshot(),
+        lastSeq: engine.lastSeq(),
       } satisfies ServerMessage),
     );
     return;

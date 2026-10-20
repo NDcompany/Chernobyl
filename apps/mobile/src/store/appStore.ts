@@ -5,7 +5,8 @@
  */
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
-import { nextId, type AgentKind } from '@chernobyl/protocol';
+import { applyCommandLifecycle, type CommandTracker } from '@chernobyl/domain';
+import { nextId, type AgentKind, type ServerMessage } from '@chernobyl/protocol';
 import { sqliteStorage } from '@/platform/storage';
 
 export type SessionFilter = 'all' | 'running' | 'waiting' | 'completed';
@@ -66,6 +67,12 @@ export interface AppState {
   sessionFilter: SessionFilter;
   /** identical concurrent commands share a key and are sent only once */
   inFlight: Record<string, true>;
+  /**
+   * Command lifecycle per commandId (G1): acceptance and outcome are
+   * distinct, and a terminal state is final. Server messages merge here
+   * through the domain FSM — NOT through the ack.
+   */
+  commandStates: CommandTracker;
 
   completeOnboarding: () => void;
   signIn: () => void;
@@ -78,6 +85,8 @@ export interface AppState {
   /** returns false when an identical command is already in flight */
   markInFlight: (key: string) => boolean;
   clearInFlight: (key: string) => void;
+  /** feeds command_progress / command_result through the domain FSM */
+  trackCommand: (msg: ServerMessage) => void;
   updateSettings: (patch: Partial<Settings>) => void;
   toggleIntegration: (kind: AgentKind) => void;
 }
@@ -98,6 +107,7 @@ export const useAppStore = create<AppState>()(
       sessionsQuery: '',
       sessionFilter: 'all',
       inFlight: {},
+      commandStates: {},
 
       completeOnboarding: () => set({ onboarded: true }),
       signIn: () => set({ authed: true }),
@@ -127,6 +137,16 @@ export const useAppStore = create<AppState>()(
           delete next[key];
           return { inFlight: next };
         }),
+
+      trackCommand: (msg) => {
+        if (msg.type !== 'command_progress' && msg.type !== 'command_result') return;
+        set((s) => {
+          const commandStates = applyCommandLifecycle(s.commandStates, msg);
+          // applyCommandLifecycle returns the same reference when it ignored
+          // the event (terminal lock / illegal transition) — skip the update
+          return commandStates === s.commandStates ? {} : { commandStates };
+        });
+      },
 
       updateSettings: (patch) => set((s) => ({ settings: { ...s.settings, ...patch } })),
       toggleIntegration: (kind) =>

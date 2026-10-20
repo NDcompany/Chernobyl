@@ -2,7 +2,8 @@
  * Protocol constants and small shared helpers (dependency-free, platform-neutral).
  */
 
-export const PROTOCOL_VERSION = 1 as const;
+/** Protocol version. Bumped to 2 for the command lifecycle + native permissions. */
+export const PROTOCOL_VERSION = 2 as const;
 
 /** Permission requests older than this are stale and must not be decided on. */
 export const PERMISSION_TTL_MS = 2 * 60_000;

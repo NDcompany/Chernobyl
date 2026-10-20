@@ -69,7 +69,15 @@
 
 ## Gate checklist (Phase 1 exit, additive to PRD §25 Phase 1)
 
-- [ ] G1: three-phase command lifecycle in protocol + domain + MockEngine + reducer; FSM tests green.
-- [ ] G2: native-ID/supportedDecisions/revision on approvals; fail-closed + no-synthesis tests green.
-- [ ] G3: v2 through existing version gate; 14 baseline tests pass unchanged in assertion; no UI/behavior change; verify green.
-- [ ] G4: adapter-sdk safety contract + MockAdapter conformance suite green.
+- [x] G1: three-phase command lifecycle in protocol + domain + MockEngine + reducer; FSM tests green.
+      (`command_progress accepted|running` + exactly one `command_result` per command, `commandId`-correlated; domain FSM + tracker; appStore `trackCommand` via domain tracker; host wire tests + engine tests green)
+- [x] G2: native-ID/supportedDecisions/revision on approvals; fail-closed + no-synthesis tests green.
+      (`PermissionRequest.nativeRequestId/supportedDecisions/revision/fingerprint`; `permission_decision` requires revision; engine delegates to domain `evaluatePermissionDecision`; resolution/expiry bumps revision; conformance + engine + wire tests green)
+- [x] G3: v2 through existing version gate; 14 baseline tests pass unchanged in assertion; no UI/behavior change; verify green.
+      (`PROTOCOL_VERSION=2`, 4002 behavior preserved; 14 baseline tests migrated with identical assertions; reducer/messages unchanged in behavior — envelope + lifecycle fields are additive; `npm run verify` green end-to-end)
+- [x] G4: adapter-sdk safety contract + MockAdapter conformance suite green.
+      (`packages/adapter-sdk`: Adapter contract + `validateJsonResponse` + MockAdapter fault knobs; `runAdapterConformance` + `runSafetyConformance` 9/9 green)
+
+**Phase 1 result:** 43/43 tests (13 domain + 21 host + 9 adapter-sdk), verify green.
+
+**Carried forward to Phase 2 (not gaps in this gate):** envelope `seq` persistence for replay/resync (C2 remainder) — needs the companion's durable storage; command lifecycle surfacing in UI (state layer tracks it now; screens render it in the production-integration phase).

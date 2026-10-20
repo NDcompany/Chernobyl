@@ -7,7 +7,7 @@ import { StyleSheet, View } from 'react-native';
 import { Redirect, useRouter } from 'expo-router';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
-import { nextId, type Host } from '@chernobyl/protocol';
+import { nextId, type EventEnvelope, type Host } from '@chernobyl/protocol';
 import { colors, spacing } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { applyMessage } from '@/data/state';
@@ -16,6 +16,13 @@ import { saveHostToken } from '@/platform/secure';
 import { Button, Chip, Text, TextField } from '@/ui/primitives';
 import { Screen, PageHeader, Card } from '@/ui/surface';
 import { Icon } from '@/ui/icons';
+
+/** This screen's local mock events still need an envelope (protocol v2). */
+let localSeq = 0;
+function localEvent<T extends { type: string }>(msg: T): T & EventEnvelope {
+  localSeq += 1;
+  return { ...msg, seq: localSeq, eventId: nextId('evt'), occurredAt: Date.now() };
+}
 
 const hostSchema = z.object({
   name: z.string().trim().min(2, 'Give the host a name (2+ characters)'),
@@ -56,23 +63,27 @@ export default function ConnectHostScreen() {
       lastSeenAt: Date.now(),
     };
     if (data.token) void saveHostToken(data.token);
-    applyMessage({ type: 'host_updated', host });
+    applyMessage(localEvent({ type: 'host_updated', host }));
     // simulated handshake — a real build waits for the host's hello_ack
     setTimeout(() => {
-      applyMessage({
-        type: 'host_updated',
-        host: { ...host, status: 'connected', lastSeenAt: Date.now() },
-      });
-      applyMessage({
-        type: 'activity',
-        event: {
-          id: nextId('ev'),
-          ts: Date.now(),
-          kind: 'host',
-          text: `${host.name} connected`,
-          refId: host.id,
-        },
-      });
+      applyMessage(
+        localEvent({
+          type: 'host_updated',
+          host: { ...host, status: 'connected', lastSeenAt: Date.now() },
+        }),
+      );
+      applyMessage(
+        localEvent({
+          type: 'activity',
+          event: {
+            id: nextId('ev'),
+            ts: Date.now(),
+            kind: 'host',
+            text: `${host.name} connected`,
+            refId: host.id,
+          },
+        }),
+      );
       useAppStore.getState().addToast(`${host.name} connected`, 'success');
       setBusy(false);
       router.back();

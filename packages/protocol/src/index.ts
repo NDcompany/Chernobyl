@@ -1,13 +1,27 @@
 /**
- * CHERNOBYL shared protocol (v1).
+ * CHERNOBYL shared protocol (v2).
  *
  * Single source of truth for hosts, agents, sessions, activity events and
  * permission requests, plus the WebSocket client/server message envelope.
- * Dependency-free on purpose: the host service and the Expo app both consume
- * it, and it must stay payload-light.
+ * The only dependency is @chernobyl/domain (the lifecycle FSM authority);
+ * otherwise payload-light on purpose — the host service and the Expo app
+ * both consume it.
+ *
+ * v2 changes (see docs/decisions/PHASE1-GATE-REQUIREMENTS.md):
+ *  - G1: every mutating command has a three-phase lifecycle — acceptance
+ *    (`ack`), execution (`command_progress`), exactly one terminal outcome
+ *    (`command_result`). An ack is NEVER an execution outcome.
+ *  - G2: PermissionRequest carries the native request id, the decisions the
+ *    runtime actually supports, and a revision that invalidates stale
+ *    decisions. Decisions are never synthesized or translated.
+ *  - Every event message carries an EventEnvelope (per-host monotonic
+ *    `seq`, `eventId`, `occurredAt`); snapshot replies carry `lastSeq` so
+ *    clients can detect gaps.
  *
  * All timestamps are epoch milliseconds (UTC). All ids are opaque strings.
  */
+
+import type { CommandState } from '@chernobyl/domain';
 
 /* Constants and helpers live in ./util and are re-exported at the bottom. */
 
@@ -64,6 +78,26 @@ export type PermissionDecision =
 export type ActivityKind = 'session' | 'permission' | 'host' | 'agent';
 
 export type OutputStream = 'stdout' | 'stderr' | 'system';
+
+/** Terminal command outcome; `unknown` = safe reconciliation impossible (PRD §12.4). */
+export type CommandOutcome = Extract<
+  CommandState,
+  'completed' | 'failed' | 'cancelled' | 'expired' | 'unknown'
+>;
+
+/** Execution phase reported before an outcome; never terminal by itself. */
+export type CommandProgressState = 'accepted' | 'running';
+
+/**
+ * Envelope stamped on every event message by the event authority (host).
+ * `seq` is monotonic per host; a restart without persisted sequences is
+ * detectable because it resets (persistence lands with the companion DB).
+ */
+export interface EventEnvelope {
+  seq: number;
+  eventId: string;
+  occurredAt: number;
+}
 
 /* ------------------------------------------------------------------ */
 /* Entities                                                            */
@@ -132,6 +166,11 @@ export interface Session {
 
 export interface PermissionRequest {
   id: string;
+  /**
+   * Opaque id the native runtime uses for this request (G2). Decisions are
+   * addressed by this id — never by a synthesized one.
+   */
+  nativeRequestId: string;
   sessionId: string;
   agentId: string;
   hostId: string;
@@ -144,6 +183,12 @@ export interface PermissionRequest {
   directory?: string;
   risk: PermissionRisk;
   status: PermissionStatus;
+  /** Decisions the native runtime actually offers; never assumed (G2). */
+  supportedDecisions: PermissionDecision[];
+  /** Bumps on every resolution/expiry; a decision must match to apply (G2). */
+  revision: number;
+  /** Content fingerprint for display/audit; optional, never authoritative. */
+  fingerprint?: string;
   requestedAt: number;
   expiresAt: number;
   /** Free-form context from the host (what the agent is doing and why). */
@@ -193,6 +238,8 @@ export type ClientMessage =
       commandId: string;
       permissionId: string;
       decision: PermissionDecision;
+      /** Revision the user decided against; mismatch fails closed (G2). */
+      revision: number;
     }
   | { type: 'list_state'; commandId: string };
 
@@ -208,9 +255,15 @@ export type ServerMessage =
       protocol: number;
       serverTime: number;
       snapshot: Snapshot;
+      /** Highest envelope seq at reply time; clients use it to detect gaps. */
+      lastSeq: number;
     }
   | { type: 'pong'; commandId: string }
-  /** Generic reply to a ClientMessage; `commandId` correlates the request. */
+  /**
+   * ACCEPTANCE ONLY: the command was persisted and routed (duplicate flag
+   * marks replays). Never an execution outcome — outcomes arrive as
+   * exactly one `command_result` per command (G1).
+   */
   | {
       type: 'ack';
       commandId: string;
@@ -221,24 +274,46 @@ export type ServerMessage =
       sessionId?: string;
       permissionId?: string;
     }
-  | { type: 'state'; snapshot: Snapshot }
-  | { type: 'host_updated'; host: Host }
-  | { type: 'agent_updated'; agent: Agent }
-  | { type: 'session_created'; session: Session }
-  | {
+  | { type: 'state'; snapshot: Snapshot; lastSeq: number }
+  | ({ type: 'host_updated'; host: Host } & EventEnvelope)
+  | ({ type: 'agent_updated'; agent: Agent } & EventEnvelope)
+  | ({ type: 'session_created'; session: Session } & EventEnvelope)
+  | ({
       type: 'session_updated';
       session: Session;
-    }
-  | {
+    } & EventEnvelope)
+  | ({
       type: 'session_output';
       sessionId: string;
       lines: OutputLine[];
       progress: number;
       status: SessionStatus;
-    }
-  | { type: 'permission_requested'; permission: PermissionRequest }
-  | { type: 'permission_resolved'; permission: PermissionRequest }
-  | { type: 'activity'; event: ActivityEvent };
+    } & EventEnvelope)
+  | ({
+      type: 'permission_requested';
+      permission: PermissionRequest;
+    } & EventEnvelope)
+  | ({
+      type: 'permission_resolved';
+      permission: PermissionRequest;
+    } & EventEnvelope)
+  | ({ type: 'activity'; event: ActivityEvent } & EventEnvelope)
+  /** Execution phase of a mutating command (accepted → running). */
+  | ({
+      type: 'command_progress';
+      commandId: string;
+      state: CommandProgressState;
+      sessionId?: string;
+    } & EventEnvelope)
+  /** Exactly one terminal outcome per mutating command (G1). */
+  | ({
+      type: 'command_result';
+      commandId: string;
+      status: CommandOutcome;
+      error?: string;
+      sessionId?: string;
+      permissionId?: string;
+    } & EventEnvelope);
 
 export type ServerMessageType = ServerMessage['type'];
 
@@ -281,10 +356,17 @@ const SERVER_TYPES: ReadonlySet<string> = new Set([
   'permission_requested',
   'permission_resolved',
   'activity',
+  'command_progress',
+  'command_result',
 ]);
 
 function hasCommandId(v: Record<string, unknown>): boolean {
   return isStr(v.commandId);
+}
+
+/** Every event message must carry a well-formed envelope. */
+function hasEnvelope(v: Record<string, unknown>): boolean {
+  return isNum(v.seq) && isStr(v.eventId) && isNum(v.occurredAt);
 }
 
 /** Validates an untrusted payload as a ClientMessage. */
@@ -303,6 +385,7 @@ export function isClientMessage(v: unknown): v is ClientMessage {
       return (
         hasCommandId(v) &&
         isStr(v.permissionId) &&
+        isNum(v.revision) &&
         (v.decision === 'approve-once' ||
           v.decision === 'approve-session' ||
           v.decision === 'reject')
@@ -332,32 +415,51 @@ export function isServerMessage(v: unknown): v is ServerMessage {
   if (!isRecord(v) || !isStr(v.type) || !SERVER_TYPES.has(v.type)) return false;
   switch (v.type) {
     case 'hello_ack':
-      return isNum(v.protocol) && isNum(v.serverTime) && hasSnapshot(v);
+      return (
+        isNum(v.protocol) && isNum(v.serverTime) && isNum(v.lastSeq) && hasSnapshot(v)
+      );
     case 'pong':
       return isStr(v.commandId);
     case 'ack':
       return isStr(v.commandId) && typeof v.ok === 'boolean';
     case 'state':
-      return hasSnapshot(v);
+      return isNum(v.lastSeq) && hasSnapshot(v);
     case 'host_updated':
-      return isRecord(v.host) && isStr(v.host.id);
+      return isRecord(v.host) && isStr(v.host.id) && hasEnvelope(v);
     case 'agent_updated':
-      return isRecord(v.agent) && isStr(v.agent.id);
+      return isRecord(v.agent) && isStr(v.agent.id) && hasEnvelope(v);
     case 'session_created':
     case 'session_updated':
-      return isRecord(v.session) && isStr(v.session.id);
+      return isRecord(v.session) && isStr(v.session.id) && hasEnvelope(v);
     case 'session_output':
       return (
         isStr(v.sessionId) &&
         Array.isArray(v.lines) &&
         isNum(v.progress) &&
-        isStr(v.status)
+        isStr(v.status) &&
+        hasEnvelope(v)
       );
     case 'permission_requested':
     case 'permission_resolved':
-      return isRecord(v.permission) && isStr(v.permission.id);
+      return isRecord(v.permission) && isStr(v.permission.id) && hasEnvelope(v);
     case 'activity':
-      return isRecord(v.event) && isStr(v.event.id);
+      return isRecord(v.event) && isStr(v.event.id) && hasEnvelope(v);
+    case 'command_progress':
+      return (
+        hasCommandId(v) &&
+        (v.state === 'accepted' || v.state === 'running') &&
+        hasEnvelope(v)
+      );
+    case 'command_result':
+      return (
+        hasCommandId(v) &&
+        (v.status === 'completed' ||
+          v.status === 'failed' ||
+          v.status === 'cancelled' ||
+          v.status === 'expired' ||
+          v.status === 'unknown') &&
+        hasEnvelope(v)
+      );
     default:
       return false;
   }

@@ -17,11 +17,20 @@ function dedupeKey(msg: ClientMessage): string {
 }
 
 export const commands = {
-  approve: (permissionId: string, decision: PermissionDecision): ClientMessage => ({
+  /**
+   * G2: the decision carries the revision it was made against — a record
+   * that changed since rendering is refused fail-closed by the host.
+   */
+  approve: (
+    permissionId: string,
+    decision: PermissionDecision,
+    revision: number,
+  ): ClientMessage => ({
     type: 'permission_decision',
     commandId: nextId('cmd'),
     permissionId,
     decision,
+    revision,
   }),
   submitPrompt: (sessionId: string, text: string): ClientMessage => ({
     type: 'submit_prompt',

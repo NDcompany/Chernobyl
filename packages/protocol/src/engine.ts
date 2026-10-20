@@ -10,6 +10,7 @@
  *  - suppress duplicate commands by commandId
  */
 
+import { evaluatePermissionDecision, PERMISSION_DECISION_ERRORS } from '@chernobyl/domain';
 import { createSeedSnapshot } from './seed';
 import { PERMISSION_TTL_MS, isStalePermission, nextId, unrefTimer } from './util';
 import type {
@@ -17,6 +18,9 @@ import type {
   Agent,
   AgentState,
   ClientMessage,
+  CommandOutcome,
+  CommandProgressState,
+  EventEnvelope,
   FileChange,
   OutputStream,
   PermissionAction,
@@ -45,7 +49,17 @@ interface RunState {
   cursor: number;
   timer?: ReturnType<typeof setTimeout>;
   awaiting?: string;
+  /**
+   * Command that started this run, for the exactly-once terminal outcome
+   * (G1). Absent for runs not started by a client command (session created
+   * by create_session completes that command immediately; seeded sessions
+   * resume with no client command to report to).
+   */
+  commandId?: string;
 }
+
+/** An event message with its envelope fields removed (stamped by broadcast). */
+type Unenveloped<T> = T extends EventEnvelope ? Omit<T, keyof EventEnvelope> : T;
 
 /** Mutations that must be idempotent across reconnect retries. */
 const MUTATING: ReadonlySet<ClientMessage['type']> = new Set([
@@ -68,6 +82,8 @@ export class MockEngine {
   /** `${sessionId}::${command}` grants created by "approve for this session". */
   private grants = new Set<string>();
   private ticker: ReturnType<typeof setInterval>;
+  /** Per-host monotonic event sequence (persisted later with the companion DB). */
+  private seq = 0;
 
   constructor(private emit: (msg: ServerMessage) => void) {
     this.ticker = setInterval(() => this.tick(), TICK_MS);
@@ -76,6 +92,36 @@ export class MockEngine {
 
   snapshot(): Snapshot {
     return this.state;
+  }
+
+  /** Highest envelope seq issued so far (goes into hello_ack/state as lastSeq). */
+  lastSeq(): number {
+    return this.seq;
+  }
+
+  /** Stamps the event envelope; the engine is the event authority. */
+  private broadcast(msg: Unenveloped<Extract<ServerMessage, EventEnvelope>>): void {
+    this.seq += 1;
+    this.emit({
+      ...msg,
+      seq: this.seq,
+      eventId: nextId('evt'),
+      occurredAt: Date.now(),
+    } as ServerMessage);
+  }
+
+  /** G1: acceptance phase event for a mutating command. */
+  private progress(commandId: string, state: CommandProgressState, sessionId?: string): void {
+    this.broadcast({ type: 'command_progress', commandId, state, sessionId });
+  }
+
+  /** G1: the single terminal outcome for a mutating command. */
+  private result(
+    commandId: string,
+    status: CommandOutcome,
+    extra?: { error?: string; sessionId?: string; permissionId?: string },
+  ): void {
+    this.broadcast({ type: 'command_result', commandId, status, ...extra });
   }
 
   dispose(): void {
@@ -103,7 +149,7 @@ export class MockEngine {
         reply = { type: 'pong', commandId: msg.commandId };
         break;
       case 'list_state':
-        reply = { type: 'state', snapshot: this.state };
+        reply = { type: 'state', snapshot: this.state, lastSeq: this.seq };
         break;
       case 'create_session':
         reply = this.createSession(msg);
@@ -123,6 +169,7 @@ export class MockEngine {
           protocol: msg.protocol,
           serverTime: Date.now(),
           snapshot: this.state,
+          lastSeq: this.seq,
         };
         break;
       default:
@@ -171,11 +218,15 @@ export class MockEngine {
       files: [],
     };
     this.state.sessions.unshift(session);
-    this.emit({ type: 'session_created', session });
+    this.broadcast({ type: 'session_created', session });
     this.pushActivity('session', `${agent.name} started “${session.title}”`, session.id);
     this.refreshAgent(agent.id);
-    // no run state exists yet, so schedule() alone would no-op — start the plan
+    // no run state exists yet, so schedule() alone would no-op — start the plan.
+    // The create command's outcome is the session's existence: accepted and
+    // completed immediately; the run itself is session-level (no commandId).
     this.startRun(session);
+    this.progress(msg.commandId, 'accepted', session.id);
+    this.result(msg.commandId, 'completed', { sessionId: session.id });
     return { type: 'ack', commandId: msg.commandId, ok: true, sessionId: session.id };
   }
 
@@ -191,20 +242,25 @@ export class MockEngine {
     session.status = 'running';
     session.lastActivityAt = Date.now();
     this.pushOutput(session, `» ${msg.text}`, 'stdout');
-    this.emit({ type: 'session_updated', session });
-    this.startRun(session);
+    this.broadcast({ type: 'session_updated', session });
+    this.startRun(session, msg.commandId);
+    this.progress(msg.commandId, 'accepted', session.id);
+    this.progress(msg.commandId, 'running', session.id);
     return { type: 'ack', commandId: msg.commandId, ok: true, sessionId: session.id };
   }
 
   private interrupt(msg: Extract<ClientMessage, { type: 'interrupt' }>): ServerMessage {
     const session = this.findSession(msg.sessionId);
     if (!session) return ackErr(msg.commandId, 'unknown session');
+    this.progress(msg.commandId, 'accepted', session.id);
     const active = session.status === 'running' || session.status === 'waiting';
     if (!active) {
       // idempotent: interrupting an idle session is not an error
+      this.result(msg.commandId, 'completed', { sessionId: session.id });
       return { type: 'ack', commandId: msg.commandId, ok: true };
     }
-    this.stopRun(session.id);
+    // cancels the run and emits the interrupted prompt's own terminal (G1)
+    this.stopRun(session.id, 'cancelled');
     session.status = 'interrupted';
     session.lastActivityAt = Date.now();
     // an unanswered ask is moot once the user interrupts the session
@@ -213,41 +269,49 @@ export class MockEngine {
     );
     if (pending) this.expire(pending);
     this.pushOutput(session, 'Interrupted by user', 'system');
-    this.emit({ type: 'session_updated', session });
+    this.broadcast({ type: 'session_updated', session });
     this.pushActivity('session', `Interrupted “${session.title}”`, session.id);
     this.refreshAgent(session.agentId);
+    this.result(msg.commandId, 'completed', { sessionId: session.id });
     return { type: 'ack', commandId: msg.commandId, ok: true };
   }
 
   private decide(msg: Extract<ClientMessage, { type: 'permission_decision' }>): ServerMessage {
     const p = this.findPermission(msg.permissionId);
     if (!p) return ackErr(msg.commandId, 'unknown permission request');
-    if (p.status !== 'pending') return ackErr(msg.commandId, 'request is no longer pending');
-    if (isStalePermission(p)) {
-      this.expire(p);
-      return ackErr(msg.commandId, 'request expired before a decision was made');
+    // Fail-closed authority: native metadata, pending status, expiry,
+    // revision match and supported-decision checks (G2). Never translated.
+    const verdict = evaluatePermissionDecision(p, {
+      decision: msg.decision,
+      revision: msg.revision,
+    });
+    if (!verdict.ok) {
+      if (verdict.code === 'expired') this.expire(p);
+      return ackErr(msg.commandId, PERMISSION_DECISION_ERRORS[verdict.code]);
     }
 
     const now = Date.now();
     const session = this.findSession(p.sessionId);
     const agent = this.findAgent(p.agentId);
+    this.progress(msg.commandId, 'accepted', p.sessionId);
+    p.revision += 1; // resolution invalidates any older decision (G2)
 
     if (msg.decision === 'reject') {
       p.status = 'rejected';
       p.decidedAt = now;
       p.decision = 'reject';
-      this.emit({ type: 'permission_resolved', permission: p });
+      this.broadcast({ type: 'permission_resolved', permission: p });
       this.pushActivity(
         'permission',
         `${agent?.name ?? 'Agent'}: rejected “${p.command}”`,
         p.id,
       );
       if (session) {
-        this.stopRun(session.id);
+        this.stopRun(session.id, 'cancelled');
         session.status = 'interrupted';
         session.lastActivityAt = now;
         this.pushOutput(session, `Rejected: ${p.title} — ${p.command} was not executed`, 'system');
-        this.emit({ type: 'session_updated', session });
+        this.broadcast({ type: 'session_updated', session });
         this.refreshAgent(session.agentId);
       }
     } else {
@@ -257,7 +321,7 @@ export class MockEngine {
       if (msg.decision === 'approve-session') {
         this.grants.add(`${p.sessionId}::${p.command}`);
       }
-      this.emit({ type: 'permission_resolved', permission: p });
+      this.broadcast({ type: 'permission_resolved', permission: p });
       this.pushActivity(
         'permission',
         msg.decision === 'approve-once'
@@ -269,10 +333,11 @@ export class MockEngine {
         session.status = 'running';
         session.lastActivityAt = now;
         this.pushOutput(session, `Approved (${msg.decision}): ${p.command}`, 'system');
-        this.emit({ type: 'session_updated', session });
+        this.broadcast({ type: 'session_updated', session });
         this.resume(session.id);
       }
     }
+    this.result(msg.commandId, 'completed', { sessionId: p.sessionId, permissionId: p.id });
     return { type: 'ack', commandId: msg.commandId, ok: true, permissionId: p.id };
   }
 
@@ -280,11 +345,12 @@ export class MockEngine {
   /* Run loop                                                          */
   /* ---------------------------------------------------------------- */
 
-  private startRun(session: Session): void {
+  private startRun(session: Session, commandId?: string): void {
     const run: RunState = {
       sessionId: session.id,
       plan: this.buildPlan(session),
       cursor: 0,
+      commandId,
     };
     this.runs.set(session.id, run);
     this.schedule(session.id, STEP_MS);
@@ -362,8 +428,8 @@ export class MockEngine {
       run.awaiting = permission.id;
       session.status = 'waiting';
       session.lastActivityAt = permission.requestedAt;
-      this.emit({ type: 'session_updated', session });
-      this.emit({ type: 'permission_requested', permission });
+      this.broadcast({ type: 'session_updated', session });
+      this.broadcast({ type: 'permission_requested', permission });
       this.pushActivity('permission', `${this.findAgent(session.agentId)?.name ?? 'Agent'} requested to run “${step.ask.command}”`, permission.id);
       this.refreshAgent(session.agentId);
       return;
@@ -371,31 +437,43 @@ export class MockEngine {
 
     const line = this.pushOutput(session, step.line, step.stream ?? 'stdout');
     const progress = planProgress(run);
-    this.emit({ type: 'session_output', sessionId: session.id, lines: [line], progress, status: session.status });
+    this.broadcast({ type: 'session_output', sessionId: session.id, lines: [line], progress, status: session.status });
     if (step.files) {
       session.files = [...session.files, ...step.files];
-      this.emit({ type: 'session_updated', session });
+      this.broadcast({ type: 'session_updated', session });
     }
     this.schedule(sessionId, STEP_MS);
   }
 
   private finish(session: Session): void {
+    const run = this.runs.get(session.id);
     this.runs.delete(session.id);
     session.status = 'completed';
     session.progress = 100;
     session.lastActivityAt = Date.now();
     session.timeline = session.timeline.map((s) => ({ ...s, status: 'done' as const }));
     this.pushOutput(session, 'Session finished', 'system');
-    this.emit({ type: 'session_updated', session });
+    this.broadcast({ type: 'session_updated', session });
     this.pushActivity('session', `Finished “${session.title}”`, session.id);
     this.refreshAgent(session.agentId);
+    // the prompt command that started this run is done (G1: one terminal)
+    if (run?.commandId) {
+      this.result(run.commandId, 'completed', { sessionId: session.id });
+    }
   }
 
-  private stopRun(sessionId: string): void {
+  /**
+   * Stops a run and emits the terminal outcome of the client command that
+   * started it (G1). `expired` covers decisions that lapsed mid-run.
+   */
+  private stopRun(sessionId: string, terminal: 'cancelled' | 'expired'): void {
     const run = this.runs.get(sessionId);
     if (!run) return;
     if (run.timer) clearTimeout(run.timer);
     this.runs.delete(sessionId);
+    if (run.commandId) {
+      this.result(run.commandId, terminal, { sessionId });
+    }
   }
 
   /* ---------------------------------------------------------------- */
@@ -404,8 +482,12 @@ export class MockEngine {
 
   private issuePermission(session: Session, spec: AskSpec): PermissionRequest {
     const now = Date.now();
+    const id = nextId('p');
     const permission: PermissionRequest = {
-      id: nextId('p'),
+      id,
+      // the mock runtime is its own native authority: its internal id IS the
+      // native request id; supported decisions are the ones it actually offers
+      nativeRequestId: id,
       sessionId: session.id,
       agentId: session.agentId,
       hostId: session.hostId,
@@ -416,6 +498,9 @@ export class MockEngine {
       directory: spec.directory,
       risk: spec.risk,
       status: 'pending',
+      supportedDecisions: ['approve-once', 'approve-session', 'reject'],
+      revision: 1,
+      fingerprint: `mock:${spec.action}:${spec.command}`,
       requestedAt: now,
       expiresAt: now + PERMISSION_TTL_MS,
       context: spec.context,
@@ -436,16 +521,18 @@ export class MockEngine {
     if (p.status !== 'pending') return;
     p.status = 'stale';
     p.decidedAt = Date.now();
-    this.emit({ type: 'permission_resolved', permission: p });
+    p.revision += 1; // expiry is a resolution: older decisions die with it (G2)
+    this.broadcast({ type: 'permission_resolved', permission: p });
     this.pushActivity('permission', `“${p.command}” expired without a decision`, p.id);
 
     const session = this.findSession(p.sessionId);
     if (session && session.status === 'waiting') {
-      this.stopRun(session.id);
+      // the blocked prompt's command gets its `expired` terminal (G1)
+      this.stopRun(session.id, 'expired');
       session.status = 'idle';
       session.lastActivityAt = p.decidedAt;
       this.pushOutput(session, 'Permission request expired — task paused', 'system');
-      this.emit({ type: 'session_updated', session });
+      this.broadcast({ type: 'session_updated', session });
       this.refreshAgent(session.agentId);
     }
   }
@@ -475,7 +562,7 @@ export class MockEngine {
     const next: AgentState = active ? 'busy' : agent.acceptsNewSession ? 'online' : 'idle';
     if (next !== agent.state) {
       agent.state = next;
-      this.emit({ type: 'agent_updated', agent });
+      this.broadcast({ type: 'agent_updated', agent });
     }
   }
 
@@ -491,7 +578,7 @@ export class MockEngine {
     const event: ActivityEvent = { id: nextId('ev'), ts: Date.now(), kind, text, refId };
     this.state.activity.unshift(event);
     if (this.state.activity.length > MAX_ACTIVITY) this.state.activity.pop();
-    this.emit({ type: 'activity', event });
+    this.broadcast({ type: 'activity', event });
   }
 }
 

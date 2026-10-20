@@ -64,6 +64,8 @@ const DEMO_HOST: Host = {
 
 const DEMO_PERMISSION: PermissionRequest = {
   id: 'demo-permission',
+  // the demo mock runtime is its own native authority (G2 fields included)
+  nativeRequestId: 'demo-permission',
   sessionId: 'demo-session',
   agentId: 'demo-1',
   hostId: 'demo-host',
@@ -74,6 +76,9 @@ const DEMO_PERMISSION: PermissionRequest = {
   directory: '~/projects/atlas',
   risk: 'high',
   status: 'pending',
+  supportedDecisions: ['approve-once', 'approve-session', 'reject'],
+  revision: 1,
+  fingerprint: 'demo:shell:rm -rf .cache/build',
   requestedAt: Date.now(),
   expiresAt: Date.now() + 110_000,
   context: 'Clearing the stale build cache before rebuilding.',

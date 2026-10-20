@@ -81,6 +81,7 @@ export function TransportProvider({ children }: { children: ReactNode }) {
       cleanupTransport = active;
       unsubMessages = active.subscribe((msg) => {
         applyMessage(msg);
+        useAppStore.getState().trackCommand(msg);
         void handleSideEffect(msg);
       });
       unsubStatus = active.subscribeStatus((s) =>

@@ -1,0 +1,24 @@
+{
+  "name": "@chernobyl/adapter-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Adapter contract (G4 safety rules), MockAdapter and conformance suites for agent runtime adapters",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test \"dist/*.test.js\""
+  },
+  "dependencies": {
+    "@chernobyl/domain": "*",
+    "@chernobyl/protocol": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "~6.0.3"
+  }
+}

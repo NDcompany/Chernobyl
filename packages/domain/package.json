@@ -1,0 +1,20 @@
+{
+  "name": "@chernobyl/domain",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CHERNOBYL domain: command lifecycle FSM, fail-closed permission evaluation, capability model, command tracker.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test \"dist/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "~6.0.3"
+  }
+}
