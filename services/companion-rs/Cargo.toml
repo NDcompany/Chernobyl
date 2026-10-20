@@ -1,0 +1,24 @@
+[package]
+name = "chernobyl-companion"
+version = "0.1.0"
+edition = "2024"
+description = "CHERNOBYL local backend: protocol v2 WS server + companion foundation. Zero external crates."
+
+[lib]
+name = "chernobyl_companion"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chernobyl-companion"
+path = "src/main.rs"
+
+[dependencies]
+# Intentionally empty: zero external modules. JSON, SHA-1, base64, WS framing
+# and storage are implemented in-repo (see docs/decisions/ADR-010).
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "z"

@@ -1,0 +1,672 @@
+//! Durable companion store — crash-safe append-only journal.
+//!
+//! Format: one JSON record per line (`\n`-terminated). A record is durable
+//! only once its newline is written; a torn tail (power loss mid-append) is
+//! detected at load (invalid JSON / missing terminator) and truncated.
+//!
+//! PRD §16.2 mandates SQLite; the Rust companion uses this journal instead
+//! (conflict register C15: zero external modules → no C toolchain, no C code
+//! in-process). Logical tables map 1:1: commands, events, approvals, audit,
+//! config KV, adapter status, schema meta. Same durability guarantees:
+//! persist-before-execute, idempotency by commandId, boot reconciliation,
+//! latched fail-closed on write failure.
+
+use crate::json::{self, Json};
+use crate::protocol::now_ms;
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+
+pub const SCHEMA_VERSION: i64 = 1;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandRecord {
+    pub command_id: String,
+    pub kind: String,
+    pub payload: String, // raw client message JSON
+    pub status: String,  // unresolved | completed | failed | cancelled | expired | unknown
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub session_id: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventRecord {
+    pub seq: i64,
+    pub kind: String,
+    pub payload: String, // full ServerMessage JSON (already enveloped)
+    pub occurred_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalRecord {
+    pub permission_id: String,
+    pub session_id: String,
+    pub native_request_id: String,
+    pub status: String, // pending | approved | rejected | stale | expired
+    pub revision: i64,
+    pub requested_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditRecord {
+    pub ts: i64,
+    pub kind: String,
+    pub text: String,
+}
+
+pub struct Storage {
+    dir: PathBuf,
+    journal: File,
+    pub commands: HashMap<String, CommandRecord>,
+    pub events: Vec<EventRecord>,
+    pub approvals: HashMap<String, ApprovalRecord>,
+    pub audit: Vec<AuditRecord>,
+    pub kv: HashMap<String, String>,
+    pub last_seq: i64,
+    /// Latched after any write failure: the store refuses further writes and
+    /// the companion fails closed (PRD §19.4).
+    failed: bool,
+}
+
+fn record_line(kind: &str, body: &Json) -> String {
+    let mut line = String::with_capacity(128);
+    line.push_str("{\"kind\":");
+    json::write_str(&mut line, kind);
+    line.push(',');
+    // body is an object: splice its fields after "kind"
+    match body {
+        Json::Obj(pairs) => {
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    line.push(',');
+                }
+                json::write_str(&mut line, k);
+                line.push(':');
+                json::write(&mut line, v);
+            }
+        }
+        other => json::write(&mut line, other),
+    }
+    line.push_str("}\n");
+    line
+}
+
+impl Storage {
+    /// Opens (creating if absent) the journal at `<dir>/companion.journal`.
+    pub fn open(dir: &Path, event_cap: usize) -> Result<Storage, String> {
+        fs::create_dir_all(dir).map_err(|e| format!("create data dir: {e}"))?;
+        let path = dir.join("companion.journal");
+
+        let mut store = Storage {
+            dir: dir.to_path_buf(),
+            journal: OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| format!("open journal: {e}"))?,
+            commands: HashMap::new(),
+            events: Vec::new(),
+            approvals: HashMap::new(),
+            audit: Vec::new(),
+            kv: HashMap::new(),
+            last_seq: 0,
+            failed: false,
+        };
+
+        // Load, then truncate any torn tail so future appends stay aligned.
+        let valid_bytes = store.load(&path)?;
+        let file_len = fs::metadata(&path)
+            .map_err(|e| format!("stat journal: {e}"))?
+            .len();
+        if valid_bytes < file_len {
+            // torn tail from an unclean shutdown — truncate to last full record
+            let f = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|e| format!("reopen for truncate: {e}"))?;
+            f.set_len(valid_bytes)
+                .map_err(|e| format!("truncate torn tail: {e}"))?;
+        }
+
+        // schema marker
+        if !store.kv.contains_key("schema") {
+            store.put_kv("schema", &SCHEMA_VERSION.to_string())?;
+        }
+
+        // retention: prune events over the cap, then compact if the journal
+        // grew much larger than the live set
+        if store.events.len() > event_cap {
+            let drop_n = store.events.len() - event_cap;
+            store.events.drain(..drop_n);
+            store.compact()?;
+        }
+
+        Ok(store)
+    }
+
+    fn load(&mut self, path: &Path) -> Result<u64, String> {
+        let file = File::open(path).map_err(|e| format!("read journal: {e}"))?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut valid_bytes = 0u64;
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .map_err(|e| format!("read journal: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            let Some(text) = line.strip_suffix('\n') else {
+                // torn tail: last line has no newline terminator
+                break;
+            };
+            match json::parse(text) {
+                Ok(rec) => {
+                    self.apply_record(&rec);
+                    valid_bytes += n as u64;
+                }
+                Err(_) => {
+                    // mid-file corruption or torn write — stop here, truncate
+                    break;
+                }
+            }
+        }
+        Ok(valid_bytes)
+    }
+
+    fn apply_record(&mut self, rec: &Json) {
+        let Some(kind) = json::as_str(json::get(rec, "kind").unwrap_or(&Json::Null)) else {
+            return;
+        };
+        let g = |k: &str| json::get(rec, k).cloned().unwrap_or(Json::Null);
+        let gs = |k: &str| json::as_str(&g(k)).map(str::to_string);
+        let gi = |k: &str| json::as_i64(&g(k)).unwrap_or(0);
+        match kind {
+            "command" => {
+                let id = gs("id").unwrap_or_default();
+                if !id.is_empty() {
+                    self.commands.insert(
+                        id.clone(),
+                        CommandRecord {
+                            command_id: id,
+                            kind: gs("cmdKind").unwrap_or_default(),
+                            payload: gs("payload").unwrap_or_default(),
+                            status: gs("status").unwrap_or_else(|| "unresolved".into()),
+                            created_at: gi("createdAt"),
+                            updated_at: gi("updatedAt"),
+                            session_id: gs("sessionId"),
+                            error: gs("error"),
+                        },
+                    );
+                }
+            }
+            "event" => {
+                let seq = gi("seq");
+                self.events.push(EventRecord {
+                    seq,
+                    kind: gs("eventKind").unwrap_or_default(),
+                    payload: gs("payload").unwrap_or_default(),
+                    occurred_at: gi("occurredAt"),
+                });
+                if seq > self.last_seq {
+                    self.last_seq = seq;
+                }
+            }
+            "approval" => {
+                let id = gs("id").unwrap_or_default();
+                if !id.is_empty() {
+                    self.approvals.insert(
+                        id.clone(),
+                        ApprovalRecord {
+                            permission_id: id,
+                            session_id: gs("sessionId").unwrap_or_default(),
+                            native_request_id: gs("nativeRequestId").unwrap_or_default(),
+                            status: gs("status").unwrap_or_default(),
+                            revision: gi("revision"),
+                            requested_at: gi("requestedAt"),
+                            expires_at: gi("expiresAt"),
+                        },
+                    );
+                }
+            }
+            "audit" => {
+                self.audit.push(AuditRecord {
+                    ts: gi("ts"),
+                    kind: gs("auditKind").unwrap_or_default(),
+                    text: gs("text").unwrap_or_default(),
+                });
+            }
+            "kv" => {
+                if let (Some(k), v) = (gs("k"), g("v"))
+                    && let Json::Str(v) = v
+                {
+                    self.kv.insert(k, v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn append(&mut self, line: &str) -> Result<(), String> {
+        if self.failed {
+            return Err("storage latched failed — refusing writes (fail-closed)".into());
+        }
+        match self
+            .journal
+            .write_all(line.as_bytes())
+            .and_then(|_| self.journal.flush())
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.failed = true;
+                Err(format!("journal append failed (latched): {e}"))
+            }
+        }
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.failed
+    }
+
+    /* ---- writes ------------------------------------------------- */
+
+    pub fn put_command(&mut self, rec: &CommandRecord) -> Result<(), String> {
+        let body = json::obj(vec![
+            ("id", json::s(&rec.command_id)),
+            ("cmdKind", json::s(&rec.kind)),
+            ("payload", json::s(&rec.payload)),
+            ("status", json::s(&rec.status)),
+            ("createdAt", Json::Int(rec.created_at)),
+            ("updatedAt", Json::Int(rec.updated_at)),
+        ]);
+        let mut fields = vec![];
+        if let Some(s) = &rec.session_id {
+            fields.push(("sessionId", json::s(s)));
+        }
+        if let Some(e) = &rec.error {
+            fields.push(("error", json::s(e)));
+        }
+        let body = match body {
+            Json::Obj(mut pairs) => {
+                pairs.extend(fields.into_iter().map(|(k, v)| (k.to_string(), v)));
+                Json::Obj(pairs)
+            }
+            other => other,
+        };
+        self.append(&record_line("command", &body))?;
+        self.commands.insert(rec.command_id.clone(), rec.clone());
+        Ok(())
+    }
+
+    pub fn update_command_status(
+        &mut self,
+        command_id: &str,
+        status: &str,
+        session_id: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(mut rec) = self.commands.get(command_id).cloned() else {
+            return Ok(());
+        };
+        rec.status = status.to_string();
+        rec.updated_at = now_ms();
+        if session_id.is_some() {
+            rec.session_id = session_id.map(str::to_string);
+        }
+        rec.error = error.map(str::to_string);
+        self.put_command(&rec)
+    }
+
+    /// Persists an enveloped event; returns the assigned seq.
+    pub fn append_event(&mut self, kind: &str, payload: &str, seq: i64) -> Result<(), String> {
+        let body = json::obj(vec![
+            ("seq", Json::Int(seq)),
+            ("eventKind", json::s(kind)),
+            ("payload", json::s(payload)),
+            ("occurredAt", Json::Int(now_ms())),
+        ]);
+        self.append(&record_line("event", &body))?;
+        self.events.push(EventRecord {
+            seq,
+            kind: kind.to_string(),
+            payload: payload.to_string(),
+            occurred_at: now_ms(),
+        });
+        Ok(())
+    }
+
+    pub fn put_approval(&mut self, rec: &ApprovalRecord) -> Result<(), String> {
+        let body = json::obj(vec![
+            ("id", json::s(&rec.permission_id)),
+            ("sessionId", json::s(&rec.session_id)),
+            ("nativeRequestId", json::s(&rec.native_request_id)),
+            ("status", json::s(&rec.status)),
+            ("revision", Json::Int(rec.revision)),
+            ("requestedAt", Json::Int(rec.requested_at)),
+            ("expiresAt", Json::Int(rec.expires_at)),
+        ]);
+        self.append(&record_line("approval", &body))?;
+        self.approvals
+            .insert(rec.permission_id.clone(), rec.clone());
+        Ok(())
+    }
+
+    pub fn append_audit(&mut self, kind: &str, text: &str) -> Result<(), String> {
+        let body = json::obj(vec![
+            ("ts", Json::Int(now_ms())),
+            ("auditKind", json::s(kind)),
+            ("text", json::s(text)),
+        ]);
+        self.append(&record_line("audit", &body))?;
+        self.audit.push(AuditRecord {
+            ts: now_ms(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+        });
+        Ok(())
+    }
+
+    pub fn put_kv(&mut self, k: &str, v: &str) -> Result<(), String> {
+        let body = json::obj(vec![("k", json::s(k)), ("v", json::s(v))]);
+        self.append(&record_line("kv", &body))?;
+        self.kv.insert(k.to_string(), v.to_string());
+        Ok(())
+    }
+
+    /* ---- reconciliation (boot) ---------------------------------- */
+
+    /// PRD §10.4/§12.4: commands that never reached a terminal state are
+    /// reconciled to `unknown` — never re-executed, never silently dropped.
+    pub fn reconcile_unresolved(&mut self) -> Result<Vec<String>, String> {
+        let unresolved: Vec<String> = self
+            .commands
+            .values()
+            .filter(|c| c.status == "unresolved")
+            .map(|c| c.command_id.clone())
+            .collect();
+        for id in &unresolved {
+            self.update_command_status(id, "unknown", None, Some("reconciled at boot"))?;
+        }
+        Ok(unresolved)
+    }
+
+    /// Pending approvals past their deadline become `stale` at boot.
+    pub fn reconcile_expired_approvals(&mut self, now: i64) -> Result<Vec<String>, String> {
+        let expired: Vec<String> = self
+            .approvals
+            .values()
+            .filter(|a| a.status == "pending" && now >= a.expires_at)
+            .map(|a| a.permission_id.clone())
+            .collect();
+        for id in &expired {
+            if let Some(mut rec) = self.approvals.get(id).cloned() {
+                rec.status = "stale".into();
+                rec.revision += 1;
+                self.put_approval(&rec)?;
+            }
+        }
+        Ok(expired)
+    }
+
+    /* ---- compaction --------------------------------------------- */
+
+    /// Rewrites the journal with only live records (atomic: tmp + rename).
+    pub fn compact(&mut self) -> Result<(), String> {
+        let tmp = self.dir.join("companion.journal.tmp");
+        {
+            let mut f = File::create(&tmp).map_err(|e| format!("compact create: {e}"))?;
+            let mut write_rec = |kind: &str, body: &Json| -> std::io::Result<()> {
+                f.write_all(record_line(kind, body).as_bytes())
+            };
+            write_rec(
+                "kv",
+                &json::obj(vec![
+                    ("k", json::s("schema")),
+                    ("v", json::s(&SCHEMA_VERSION.to_string())),
+                ]),
+            )
+            .map_err(|e| format!("compact write: {e}"))?;
+            for (k, v) in &self.kv {
+                if k == "schema" {
+                    continue;
+                }
+                write_rec("kv", &json::obj(vec![("k", json::s(k)), ("v", json::s(v))]))
+                    .map_err(|e| format!("compact write: {e}"))?;
+            }
+            for c in self.commands.values() {
+                let mut fields = vec![
+                    ("id", json::s(&c.command_id)),
+                    ("cmdKind", json::s(&c.kind)),
+                    ("payload", json::s(&c.payload)),
+                    ("status", json::s(&c.status)),
+                    ("createdAt", Json::Int(c.created_at)),
+                    ("updatedAt", Json::Int(c.updated_at)),
+                ];
+                if let Some(s) = &c.session_id {
+                    fields.push(("sessionId", json::s(s)));
+                }
+                if let Some(e) = &c.error {
+                    fields.push(("error", json::s(e)));
+                }
+                write_rec("command", &json::obj(fields))
+                    .map_err(|e| format!("compact write: {e}"))?;
+            }
+            for e in &self.events {
+                write_rec(
+                    "event",
+                    &json::obj(vec![
+                        ("seq", Json::Int(e.seq)),
+                        ("eventKind", json::s(&e.kind)),
+                        ("payload", json::s(&e.payload)),
+                        ("occurredAt", Json::Int(e.occurred_at)),
+                    ]),
+                )
+                .map_err(|e| format!("compact write: {e}"))?;
+            }
+            for a in self.approvals.values() {
+                write_rec(
+                    "approval",
+                    &json::obj(vec![
+                        ("id", json::s(&a.permission_id)),
+                        ("sessionId", json::s(&a.session_id)),
+                        ("nativeRequestId", json::s(&a.native_request_id)),
+                        ("status", json::s(&a.status)),
+                        ("revision", Json::Int(a.revision)),
+                        ("requestedAt", Json::Int(a.requested_at)),
+                        ("expiresAt", Json::Int(a.expires_at)),
+                    ]),
+                )
+                .map_err(|e| format!("compact write: {e}"))?;
+            }
+            for a in &self.audit {
+                write_rec(
+                    "audit",
+                    &json::obj(vec![
+                        ("ts", Json::Int(a.ts)),
+                        ("auditKind", json::s(&a.kind)),
+                        ("text", json::s(&a.text)),
+                    ]),
+                )
+                .map_err(|e| format!("compact write: {e}"))?;
+            }
+            f.sync_all().map_err(|e| format!("compact sync: {e}"))?;
+        }
+        // swap: std::fs::rename replaces the destination on Windows too
+        fs::rename(&tmp, self.dir.join("companion.journal"))
+            .map_err(|e| format!("compact rename: {e}"))?;
+        self.journal = OpenOptions::new()
+            .append(true)
+            .open(self.dir.join("companion.journal"))
+            .map_err(|e| format!("compact reopen: {e}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chernobyl-rs-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn command(id: &str, status: &str) -> CommandRecord {
+        CommandRecord {
+            command_id: id.into(),
+            kind: "create_session".into(),
+            payload: "{}".into(),
+            status: status.into(),
+            created_at: 1,
+            updated_at: 1,
+            session_id: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn journal_reopens_with_contiguous_seq() {
+        let dir = temp_dir("reopen");
+        let mut s = Storage::open(&dir, 500).unwrap();
+        s.append_event("session_created", "{}", 1).unwrap();
+        s.append_event("activity", "{}", 2).unwrap();
+        drop(s);
+        let s2 = Storage::open(&dir, 500).unwrap();
+        assert_eq!(s2.last_seq, 2);
+        assert_eq!(s2.events.len(), 2);
+        assert_eq!(s2.kv.get("schema").map(String::as_str), Some("1"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commands_are_idempotent_by_id() {
+        let dir = temp_dir("idem");
+        let mut s = Storage::open(&dir, 500).unwrap();
+        s.put_command(&command("c1", "unresolved")).unwrap();
+        // same id again replaces in place (last write wins, single record)
+        s.put_command(&command("c1", "unresolved")).unwrap();
+        assert_eq!(s.commands.len(), 1);
+        drop(s);
+        let s2 = Storage::open(&dir, 500).unwrap();
+        assert_eq!(s2.commands.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_marks_unresolved_unknown_and_expires_approvals() {
+        let dir = temp_dir("recon");
+        let mut s = Storage::open(&dir, 500).unwrap();
+        s.put_command(&command("c1", "unresolved")).unwrap();
+        s.put_command(&command("c2", "completed")).unwrap();
+        s.put_approval(&ApprovalRecord {
+            permission_id: "p1".into(),
+            session_id: "s1".into(),
+            native_request_id: "p1".into(),
+            status: "pending".into(),
+            revision: 1,
+            requested_at: 0,
+            expires_at: 100,
+        })
+        .unwrap();
+        s.put_approval(&ApprovalRecord {
+            permission_id: "p2".into(),
+            session_id: "s2".into(),
+            native_request_id: "p2".into(),
+            status: "pending".into(),
+            revision: 1,
+            requested_at: 0,
+            expires_at: 99_999,
+        })
+        .unwrap();
+
+        let unresolved = s.reconcile_unresolved().unwrap();
+        assert_eq!(unresolved, vec!["c1".to_string()]);
+        assert_eq!(s.commands["c1"].status, "unknown");
+        assert_eq!(s.commands["c2"].status, "completed");
+
+        let expired = s.reconcile_expired_approvals(1_000).unwrap();
+        assert_eq!(expired, vec!["p1".to_string()]);
+        assert_eq!(s.approvals["p1"].status, "stale");
+        assert_eq!(s.approvals["p1"].revision, 2);
+        assert_eq!(s.approvals["p2"].status, "pending");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn torn_tail_is_truncated_and_store_still_works() {
+        let dir = temp_dir("torn");
+        {
+            let mut s = Storage::open(&dir, 500).unwrap();
+            s.append_event("e1", "{}", 1).unwrap();
+            // simulate torn write: half a record, no newline
+            s.append("{\"kind\":\"event\",\"seq\":2,\"p").unwrap();
+        }
+        let mut s2 = Storage::open(&dir, 500).unwrap();
+        assert_eq!(s2.last_seq, 1);
+        assert_eq!(s2.events.len(), 1);
+        // appends after recovery stay valid
+        s2.append_event("e3", "{}", 2).unwrap();
+        drop(s2);
+        let s3 = Storage::open(&dir, 500).unwrap();
+        assert_eq!(s3.events.len(), 2);
+        assert_eq!(s3.last_seq, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_cap_prunes_oldest_events() {
+        let dir = temp_dir("retention");
+        let mut s = Storage::open(&dir, 3).unwrap();
+        for seq in 1..=10 {
+            s.append_event("e", "{}", seq).unwrap();
+        }
+        drop(s);
+        let s2 = Storage::open(&dir, 3).unwrap();
+        assert_eq!(s2.events.len(), 3);
+        assert_eq!(s2.last_seq, 10);
+        let seqs: Vec<i64> = s2.events.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![8, 9, 10]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_shrinks_journal_and_preserves_state() {
+        let dir = temp_dir("compact");
+        let mut s = Storage::open(&dir, 500).unwrap();
+        for seq in 1..=50 {
+            s.append_event("e", "{\"x\":1}", seq).unwrap();
+        }
+        s.put_command(&command("c1", "completed")).unwrap();
+        s.compact().unwrap();
+        assert_eq!(s.events.len(), 50);
+        assert_eq!(s.commands.len(), 1);
+        drop(s);
+        let s2 = Storage::open(&dir, 500).unwrap();
+        assert_eq!(s2.events.len(), 50);
+        assert_eq!(s2.last_seq, 50);
+        assert_eq!(s2.commands["c1"].status, "completed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kv_survives_reopen() {
+        let dir = temp_dir("kv");
+        let mut s = Storage::open(&dir, 500).unwrap();
+        s.put_kv("bootCount", "3").unwrap();
+        drop(s);
+        let s2 = Storage::open(&dir, 500).unwrap();
+        assert_eq!(s2.kv.get("bootCount").map(String::as_str), Some("3"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

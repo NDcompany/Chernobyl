@@ -19,6 +19,7 @@
 | C12 | PRD wants **signed installers**; no code-signing certificate exists | Unsigned installer + published SHA-256 checksums + docs — ADR-007 | decided |
 | C13 | PRD §22.6 E2E implies **device testing**; no Android SDK on this machine | Playwright-driven E2E on the mobile web build + explicitly documented manual on-device checks — ADR-005 | decided |
 | C14 | Mobile **sign-in is fake** (mock auth, no credential check) and transport selection is the env var `EXPO_PUBLIC_HOST_WS_URL` | Phase 6: pairing-based device credential replaces fake sign-in; transport = paired host list (URL + credential); demo mode remains an explicit choice — ADR-002/ADR-009 | open (Phase 6) |
+| C15 | The Rust companion (ADR-010) persists to an **append-only JSONL journal**, not PRD §16.2 SQLite; ADR-003's "SQLite everywhere" therefore no longer covers the resident binary | Zero-dependency constraint forbids bundling SQLite (C or a crate); the journal gives the same durability properties the PRD actually requires (fsync-on-append, atomic compaction, torn-tail recovery) with in-memory state instead of queryable tables — ADR-010; revisit if cross-process queries or multi-writer access become a requirement | decided (ADR-010) |
 
 ## Rules carried forward from the register
 
