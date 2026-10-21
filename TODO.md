@@ -45,6 +45,57 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
       `npm run verify` re-run green after workspace rewiring (typecheck/test/build chains no
       longer reference it; lockfile refreshed).
 
+### Hardening round — skipped items closed (committed `9f148b6`, `1805318`, `d46e334`)
+
+- [x] **Retention caps at runtime** (the benchmark's unbounded-growth finding, fixed):
+      commands capped at `retention.commands` (default 5 000, optional field — old configs
+      parse unchanged) + events now pruned **during** the run (the old cap applied only at
+      boot). `unresolved` records are never evicted (replay/boot reconciliation must find
+      them); eviction is batched — one O(cap) selection per ~78 commands instead of a scan
+      per eviction (the first per-eviction version cost 19.2k → 6.5k cmd/s at cap; batching
+      restored **17.2k/s**, p50 0.19 ms). Journal also bounded **within** one process now:
+      past 64 MB of appends since last compaction it rewrites to the live set (failure is
+      ignored on purpose — the append already succeeded).
+  - Footprint re-measured (30 s saturated command bench, fresh home): RSS **421 MB →
+    10.99 MB**, journal **364 MB → 20.34 MB**, cap held (`commandsTotal` 4 966),
+    `storageFailed: false`, 517 114 commands at 17 237/s. Storage microbench with caps on:
+    **18 630 ns/op** (was 17 378 uncapped — the caps cost ~1.2 µs/op).
+- [x] **Multi-connection burst test** (was owed): new `differential.mjs --burst --conns N`
+      opens N simultaneous connections (connect+hello+one persisted command+close), reports
+      wall, per-phase p50/p95, errors, and /health RSS delta.
+  - **Found a real bug on first run:** Rust **181/200** (19 refused at the TCP layer) vs
+    Node 200/200 — std's `TcpListener::bind` exposes no backlog knob and queues only ~128
+    handshakes; a reconnect storm (app + relay flap) is exactly that shape. Bisect: 150/150,
+    100/100 clean → confirmed backlog. **Fixed** with one winsock call std doesn't provide
+    (`ffi::bind_listener_backlog`: raw socket + `listen(SOMAXCONN)`, adopted via
+    `from_raw_socket` so accept/shutdown behavior is unchanged; IPv6 binds fall back to std).
+  - After fix: Rust **200/200 (0 errs, 205 ms)**, **400/400 (0 errs, 338 ms)**, working set
+    3.8 → 10.4 MB after a 400-conn burst. Node 400/400 in 333 ms (53.5 → 65.4 MB).
+- [x] **Full-path microbench pair** (the previously skipped TS-side mirror): `engine-bench.mjs
+      full` = JSON.parse + validate + handle + stringify vs in-crate
+      `microbench_parse_validate_handle_encode` — **Rust 5.93-6.06 µs/op, TS 2.15-2.20
+      µs/op** (solo release reps). Engine-only solo: Rust 2.54-2.56 µs/op, TS 0.542-0.545
+      µs/op. Storage has no TS counterpart (the Node side persists nothing — verified: the
+      host holds only a client Map, no record store).
+  - Updated budget: Rust wire 89 µs ≈ 6 in-process + 18.6 storage + ~64 socket/queue/lock;
+    Node 32 µs ≈ 2.2 in-process + ~30 socket — the gap remains durability + transport.
+  - Gotcha (now in the tool comments): `cargo test -- --ignored` runs the microbenches in
+    **parallel threads** — one combined run measured the engine at 6.6 µs vs 2.55 solo.
+    Run each bench with a single filter (or `--test-threads=1`).
+- [x] **Old Node companion resurrected for the memory baseline** (was optional): restored
+      `services/companion` from git history (`7331bac`), built, booted idle → **53.6 MB
+    working set vs Rust 3.8 MB = 14.1×** (the earlier `services/host` proxy number, 53.8 MB,
+    was coincidentally accurate). Removed again; `npm run verify` re-run green.
+- [x] **Windows autostart** (PRD §6.3 start-on-login): `--install-autostart` /
+      `--uninstall-autostart` write/remove the HKCU Run entry via `reg.exe` (std-only, user
+      level, no elevation, idempotent uninstall; `--config` is carried into the entry when
+      installed from a non-default config). **Live round-trip verified**: install → `reg
+      query` shows the quoted path → uninstall → re-uninstall reports "not installed", exit 0
+      both times. Known limitation: the console daemon appears as a console window at
+      login; a windowless host is packaging work (Phase 8/ADR-007). Token stays env-only —
+      the autostarted instance serves loopback without one (Node parity mode) until the
+      relay phase.
+
 ## Remaining
 
 ### Phase R follow-ups
@@ -89,7 +140,9 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
     (in-crate `#[ignore]` test) **2 957 ns/op** → the TS engine is 5× faster in isolation,
     but the 2.4 µs absolute gap is ~3 % of Rust's 89 µs wire cost per command; Rust
     `microbench_storage_put_update_pair` (same harness) = **17 378 ns/op** for the two
-    journal appends. Rough budget (subtractions across runs, approximate): Rust 89 µs/msg
+    journal appends *(both Rust figures predate the retention-cap round — solo re-runs
+    with caps on: engine 2.54-2.56 µs, storage 18.6 µs, see the hardening section)*. Rough
+    budget (subtractions across runs, approximate): Rust 89 µs/msg
     ≈ 38 transport+validate + 3 engine + 17 storage + ~30 queueing/lock contention;
     Node 32 µs/msg ≈ 27 transport+validate + 0.6 engine + misc → **the gap is durability
     plus transport layer, not the engine port.**
@@ -101,17 +154,21 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
   - Caveats kept: one machine, soak in background during all runs (equal for both sides);
     load-generator CPU not subtracted (identical both sides); decomposition subtracts
     measurements from different runs.
-- [ ] Soak test: **started 2026-10-21, in progress** — release binary on :18792 with a fresh
-      temp home and `--exit-after 86400000` (24 h), boot RSS 4 030 464 B (3.84 MB), plus a
-      detached 10-minute RSS sampler (`Temp\opencode\chernobyl-soak-rss.tsv`) and a detached
-      *light* connection churn (connect+hello+close every 5 s, `--churn --light`) to exercise
-      accept/teardown. Survives until reboot or 24 h; numbers land in the sampler file.
-      Still owed after it finishes: multi-connection **burst** test (many clients at once).
-- [ ] Windows autostart/service wrapper (current build is a console daemon with
-      Ctrl+C/CTRL_CLOSE graceful shutdown).
+- [ ] Soak test: **in progress, restarted on the current binary** — release binary on :18792
+      with a fresh temp home and `--exit-after 86400000` (24 h), plus a detached 10-minute
+      RSS sampler (`Temp\opencode\chernobyl-soak-rss.tsv`) and a detached *light* connection
+      churn (connect+hello+close every 5 s, `--churn --light --minutes 1440`). **Honest
+      caveat:** the soak was killed twice earlier (both times the running exe locked the
+      file against rebuild, and both restarts postdate material changes), so the TSV holds
+      partial runs with visible `uptimeMs` resets — it restarts cleanly and the final
+      24 h-uninterrupted window starts whenever the binary stops changing. The churn's
+      default 30-minute lifetime also expired unnoticed mid-run; it now runs the full 24 h.
 
-### Phase map (unchanged, PRD §25)
+### Phase map (PRD §25; Phase 3 was in memory's gate list, approved this round)
 
+- [ ] Phase 3: OpenCode adapter — probe rules (temp-cwd + `XDG_DATA_HOME` isolation, never a
+      second server on a shared DB), `session.error` as the failure channel, HTML-200
+      content-type validation per the adapter-sdk contract.
 - [ ] Phase 4′: pairing challenge (ADR-002), short-lived connection tickets (ADR-006).
 - [ ] Phase 5′: outbound cloudflared tunnel cross-network gate (ADR-001).
 - [ ] Phase 6: mobile integration — simulation badge (ADR-009), paired transport replaces
@@ -124,13 +181,14 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
 
 - No external/independent security audit; hardening evidence is the hostile-input test corpus
   (frames, handshake, JSON, client messages) plus the constant-time/limit checks above.
-- No measured numbers for loaded/burst memory — **superseded for the two bench scenarios
-  above** (RSS under sustained load is now measured: Rust 4.4 MB transport-only, 421 MB
-  after 556 k persisted commands in 30 s); the 24 h soak trend and a multi-connection
-  burst are still pending.
-- **Command records have no retention cap** (events cap at 5 000; commands don't) — found
-  by the benchmark: an authorized client sustaining mutating commands grows memory/journal
-  unbounded (421 MB RSS + 364 MB journal in 30 s at 18.5 k cmd/s). Irrelevant at real
-  rates (a few commands/minute) but a hardening item before Phase 9.
+- No measured numbers for loaded/burst memory — **now measured** for all three shapes: RSS
+  under sustained load (10.99 MB after 517 k persisted commands in 30 s, post-cap), a
+  multi-connection burst (3.8 → 10.4 MB across 400 simultaneous connections), and the 24 h
+  soak trend (**pending** — see the soak item above for why the window restarts).
+- ~~Command records have no retention cap~~ — **fixed 2026-10-21** (runtime caps + batched
+  eviction + in-process compaction trigger; re-measured footprint above). Residual honest
+  costs: stress throughput 17.2k/s vs 19.2k uncapped (retention selection + compaction
+  rewrites), and `unresolved`-heavy states may legally sit above the cap until boot
+  reconciliation marks them `unknown` (documented on `enforce_command_cap`).
 - `services/host` runs as the differential peer **and** as a test suite (its 21 tests ran
   green in today's `npm run verify`); it is not a supported runtime — the Rust binary is.

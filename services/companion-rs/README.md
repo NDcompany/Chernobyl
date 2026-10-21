@@ -14,7 +14,10 @@ cargo build --release                 # target\release\chernobyl-companion.exe
 
 Flags (env in parentheses): `--config <path>` · `--port <n>` (`PORT`, 0 = ephemeral,
 default 8787) · `--bind <addr>` (default 127.0.0.1) · `--token <t>` (`HOST_TOKEN`) ·
-`--diagnostics-port <n>` (default 9487) · `--exit-after <ms>` · `--self-test`.
+`--diagnostics-port <n>` (default 9487) · `--exit-after <ms>` · `--self-test` ·
+`--install-autostart` / `--uninstall-autostart` (HKCU Run start-on-login, user level,
+idempotent; carries `--config` when given, console window at login — packaging caveat in
+`TODO.md`).
 `CHERNOBYL_HOME` selects the data directory (config, journal).
 
 **Secure-by-default:** a non-loopback bind without `--token`/`HOST_TOKEN` is refused.
@@ -55,9 +58,15 @@ A second instance on one machine needs its own `--diagnostics-port` (default 948
 by any already-running instance — the new one refuses to start, by design).
 `--bench --kind malformed|command --duration 60 --conns 4` runs the closed-loop saturation
 benchmark (throughput + p50/p95/p99; measure server CPU externally per process — measured
-numbers and the caveats are in `TODO.md`). `tools/engine-bench.mjs` microbenches the TS
-engine alone (pair of the in-crate `microbench_engine_stale_decide` `#[ignore]` test; run
-`cargo test --release microbench -- --ignored --nocapture` for the Rust side).
+numbers and the caveats are in `TODO.md`). `--burst --conns 200` opens that many connections
+**simultaneously** (connect+hello+one persisted command+close) and reports wall, per-phase
+p50/p95, errors and the /health RSS delta — the reconnect-storm shape the staggered bench
+never exercises (it found the ~128-handshake std backlog ceiling; the binary now binds with
+`listen(SOMAXCONN)`). `tools/engine-bench.mjs [engine|full] [iters]` microbenches the TS side
+(engine alone, or the full in-process path `parse+validate+handle+encode` for the `full`
+mode), paired with the in-crate `#[ignore]` tests — run each Rust bench with a single
+filter, e.g. `cargo test --release microbench_engine -- --ignored --nocapture`, because
+`cargo test -- --ignored` runs the benches in **parallel threads** and contaminates them.
 `--churn --light --minutes N` runs connect/hello/close cycles for soak load.
 
 ## Layout
