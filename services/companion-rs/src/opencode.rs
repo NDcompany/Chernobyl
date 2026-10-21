@@ -672,10 +672,15 @@ impl Inner {
     }
 
     fn interrupt(&self, command_id: &str, session_id: &str) -> Result<ServerMsg, AdapterError> {
+        // OpenAPI: abort has NO requestBody — sending none is contract-
+        // faithful. (The Phase-3 live run's apparent ">15 s wedge" was the
+        // old read-to-end client: the server delivered a complete 200 `true`
+        // ~3.4 s post-turn but kept the socket open; client.rs now frames
+        // by Content-Length.)
         let resp = self.req(
             "POST",
             &format!("{}/session/{session_id}/abort", self.endpoint),
-            Some("{}"),
+            None,
         )?;
         if !(200..300).contains(&resp.status) {
             return Err(AdapterError::InvalidResponse(format!(

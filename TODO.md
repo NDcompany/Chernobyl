@@ -166,9 +166,20 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
 
 ### Phase map (PRD §25; Phase 3 was in memory's gate list, approved this round)
 
-- [ ] Phase 3: OpenCode adapter — probe rules (temp-cwd + `XDG_DATA_HOME` isolation, never a
-      second server on a shared DB), `session.error` as the failure channel, HTML-200
-      content-type validation per the adapter-sdk contract.
+- [x] Phase 3: OpenCode adapter — **done 2026-10-21** (Steps 1–3: `70e343f`, `ec86262`, live-e2e
+      round): attach-only adapter, probe rules honored (temp-cwd + `XDG_DATA_HOME` isolation,
+      never a second server on a shared DB), `session.error`/`MessageAbortedError` failure
+      channels, content-type validation, G2 two-phase permission routing, merged snapshot,
+      probe loop, restart recovery. Gated live e2e (`cargo test --test opencode_e2e --
+      --ignored --nocapture`, real `opencode serve` 1.17.7): attach → agent/session lists →
+      create → prompt 204 → live SSE normalization → interrupt **ack ok in 4.08 s** → diff →
+      kill→unhealthy→restart→reconnect with re-listed session. Found+fixed: the native abort
+      answer can arrive complete *without* the socket closing (old read-to-end client =
+      false 15 s timeout; `client.rs` now frames by Content-Length/chunked, 3 regression
+      tests, `docs/reverse-engineering/evidence/abort-no-fin-diagnostic.txt`). Honest gaps:
+      "abort stops a healthy long generation" unproven (provider 426s every live turn,
+      opencode.md §8); permission asked→reply live cycle unproven (fake-server tests prove
+      contract wiring only).
 - [ ] Phase 4′: pairing challenge (ADR-002), short-lived connection tickets (ADR-006).
 - [ ] Phase 5′: outbound cloudflared tunnel cross-network gate (ADR-001).
 - [ ] Phase 6: mobile integration — simulation badge (ADR-009), paired transport replaces

@@ -157,15 +157,13 @@ pub fn http_get(addr: &str, path: &str) -> Result<String, String> {
         .write_all(req.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     let mut reader = BufReader::new(stream);
-    let mut out = Vec::new();
-    reader
-        .read_to_end(&mut out)
-        .map_err(|e| format!("read: {e}"))?;
-    String::from_utf8(out).map_err(|_| "response was not utf-8".into())
+    let raw = read_http_response(&mut reader)?;
+    String::from_utf8(raw).map_err(|_| "response was not utf-8".into())
 }
 
 /* ---- Generic blocking HTTP (adapter transport, PRD §7.4) ---------------- */
 
+#[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     /// Lowercased `Content-Type` header ("" when absent).
@@ -174,9 +172,11 @@ pub struct HttpResponse {
 }
 
 /// Minimal HTTP/1.1 request/response for loopback integrations (no TLS by
-/// design: PRD §7.4 keeps native surfaces local+authenticated). Per-request
-/// `Connection: close` keeps framing trivial; chunked bodies are decoded
-/// because HTTP/1.1 servers are allowed to use them even then.
+/// design: PRD §7.4 keeps native surfaces local+authenticated). Bodies are
+/// framed per RFC 7230 §3.3.3 (Content-Length / chunked / no-body status):
+/// a response is complete when its framing is complete — NOT when the peer
+/// closes the connection (opencode 1.17.7 answers and can keep the socket
+/// open; the old read-to-end client reported that as a false timeout).
 /// Splits `http://host[:port]/path` into `(host[:port], /path…)` — shared by
 /// the one-shot request and the SSE stream (loopback HTTP only, no TLS).
 pub(crate) fn split_url(url: &str) -> Result<(String, String), String> {
@@ -231,11 +231,128 @@ pub fn http_request(
         .write_all(req.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     let mut reader = BufReader::new(stream);
-    let mut raw = Vec::new();
-    reader
-        .read_to_end(&mut raw)
-        .map_err(|e| format!("read: {e}"))?;
+    let raw = read_http_response(&mut reader)?;
     parse_response(&raw)
+}
+
+/// Read errors keep the bytes received so far (G4.1 honesty: a "timeout"
+/// that actually carried a complete answer stays visible in the error).
+fn read_err(e: impl std::fmt::Display, raw: &[u8], started: std::time::Instant) -> String {
+    if raw.is_empty() {
+        format!("read: {e}")
+    } else {
+        format!(
+            "read: {e} ({} bytes after {:?}: {:?})",
+            raw.len(),
+            started.elapsed(),
+            String::from_utf8_lossy(&raw[..raw.len().min(160)])
+        )
+    }
+}
+
+/// Reads one HTTP/1.1 response: headers until `\r\n\r\n`, then the body per
+/// the framing rules (1xx/204/304 have none, otherwise Content-Length,
+/// chunked, or read-to-close). A self-delimiting body completes WITHOUT
+/// waiting for the peer to close — the Phase-3 live run proved opencode
+/// delivers a full `200 true` abort answer and keeps the socket open.
+fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, String> {
+    const MAX_HEAD: usize = 64 * 1024;
+    let started = std::time::Instant::now();
+    let mut raw: Vec<u8> = Vec::with_capacity(4096);
+    let mut buf = [0u8; 8192];
+
+    // 1) headers
+    let head_end = loop {
+        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if raw.len() > MAX_HEAD {
+            return Err(format!("response head exceeds {MAX_HEAD} bytes"));
+        }
+        match reader.read(&mut buf) {
+            Ok(0) => return Err(read_err("connection closed before headers", &raw, started)),
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(read_err(e, &raw, started)),
+        }
+    };
+
+    // 2) parse just enough of the head to size the body
+    let head = std::str::from_utf8(&raw[..head_end]).map_err(|_| "response head was not ascii")?;
+    let mut lines = head.split("\r\n");
+    let status: u16 = lines
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            match k.trim().to_ascii_lowercase().as_str() {
+                "content-length" => content_length = v.trim().parse().ok(),
+                "transfer-encoding" => chunked = v.trim().to_ascii_lowercase().contains("chunked"),
+                _ => {}
+            }
+        }
+    }
+
+    // 3) body
+    if (100..200).contains(&status) || status == 204 || status == 304 {
+        raw.truncate(head_end);
+        return Ok(raw);
+    }
+    if chunked {
+        // shortcut: a 0-chunk followed by trailer headers (RFC-legal, never
+        // seen on loopback) is not detected and falls back to read-to-close
+        loop {
+            if raw.ends_with(b"0\r\n\r\n") || raw.windows(7).any(|w| w == b"\r\n0\r\n\r\n") {
+                return Ok(raw);
+            }
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    return Err(read_err(
+                        "connection closed mid chunked body",
+                        &raw,
+                        started,
+                    ));
+                }
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                Err(e) => return Err(read_err(e, &raw, started)),
+            }
+        }
+    }
+    if let Some(len) = content_length {
+        loop {
+            if raw.len() >= head_end + len {
+                raw.truncate(head_end + len);
+                return Ok(raw);
+            }
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    return Err(read_err(
+                        format!(
+                            "connection closed after {} of {len} body bytes",
+                            raw.len() - head_end
+                        ),
+                        &raw,
+                        started,
+                    ));
+                }
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                Err(e) => return Err(read_err(e, &raw, started)),
+            }
+        }
+    }
+    // HTTP/1.0-style: body delimited by close
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(raw),
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(read_err(e, &raw, started)),
+        }
+    }
 }
 
 fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
@@ -313,6 +430,74 @@ pub fn decode_chunked(raw: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod http_tests {
     use super::*;
+
+    /// Serves `resp` once and deliberately never closes the socket (no FIN),
+    /// replicating the live opencode 1.17.7 behavior the Phase-3 run hit.
+    fn serve_once_without_fin(resp: &[u8]) -> String {
+        serve_once(resp, false)
+    }
+
+    /// `close=true` drops the socket after writing (sends FIN).
+    fn serve_once(resp: &[u8], close: bool) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let resp = resp.to_vec();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req);
+            let _ = s.write_all(&resp);
+            if close {
+                drop(s);
+            } else {
+                std::mem::forget(s);
+            }
+        });
+        format!("http://{addr}/probe")
+    }
+
+    #[test]
+    fn http_request_returns_on_framing_not_fin() {
+        // live failure mode: complete Content-Length answer, no close
+        let url = serve_once_without_fin(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4\r\n\r\ntrue",
+        );
+        let r = http_request("POST", &url, None, None).unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, "true");
+
+        // prompt_async shape: 204 with no body framing at all
+        let url = serve_once_without_fin(b"HTTP/1.1 204 No Content\r\n\r\n");
+        let r = http_request("POST", &url, None, Some("{}")).unwrap();
+        assert_eq!(r.status, 204);
+        assert_eq!(r.body, "");
+
+        // chunked body completes on its 0-chunk, also without a FIN
+        let url = serve_once_without_fin(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"a\":1}\r\n0\r\n\r\n",
+        );
+        let r = http_request("GET", &url, None, None).unwrap();
+        assert_eq!(r.body, "{\"a\":1}");
+    }
+
+    #[test]
+    fn http_request_reports_truncation_honestly() {
+        // Content-Length promises more than the server delivers, then closes:
+        // the shortfall must be named, with the partial bytes still visible
+        let url = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\ntrue",
+            true,
+        );
+        let err = http_request("POST", &url, None, None).unwrap_err();
+        assert!(
+            err.contains("connection closed after 4 of 40 body bytes"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("true"),
+            "partial bytes must stay visible: {err}"
+        );
+    }
 
     #[test]
     fn parse_plain_and_chunked_responses() {
