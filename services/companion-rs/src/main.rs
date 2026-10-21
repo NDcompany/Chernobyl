@@ -12,6 +12,8 @@
 //!   --diagnostics-port <n>   loopback diagnostics port, default 9487
 //!   --exit-after <ms>        smoke mode: boot, serve, exit 0 after N ms
 //!   --self-test              boot in a temp dir, exercise the stack, exit
+//!   --install-autostart      start-on-login: write the HKCU Run entry and exit
+//!   --uninstall-autostart    remove that entry (idempotent) and exit
 //!   --version                print version and exit
 
 use chernobyl_companion::client::{WsClient, http_get};
@@ -39,6 +41,8 @@ fn run(args: &[String]) -> i32 {
     let mut diag_override: Option<i64> = None;
     let mut exit_after: Option<u64> = None;
     let mut self_test = false;
+    let mut install_autostart = false;
+    let mut uninstall_autostart = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -60,6 +64,8 @@ fn run(args: &[String]) -> i32 {
                 return 0;
             }
             "--self-test" => self_test = true,
+            "--install-autostart" => install_autostart = true,
+            "--uninstall-autostart" => uninstall_autostart = true,
             "--config" => config_path = take(&mut i),
             "--port" => port_override = take(&mut i).and_then(|v| v.parse().ok()),
             "--bind" => bind_override = take(&mut i),
@@ -78,6 +84,12 @@ fn run(args: &[String]) -> i32 {
 
     if self_test {
         return self_test_main();
+    }
+
+    // start-on-login (PRD §6.3) — before config load: installing an entry
+    // must work even with no config on disk yet
+    if install_autostart || uninstall_autostart {
+        return autostart_main(install_autostart, config_path);
     }
 
     // ---- config ------------------------------------------------------
@@ -194,6 +206,83 @@ fn next_ack(c: &mut WsClient) -> Result<json::Json, String> {
         }
     }
     Err("no ack within 32 frames".into())
+}
+
+/// The Run-key command line: quoted exe path so spaces survive, plus
+/// `--config` when the operator installed from a non-default config so the
+/// login instance boots the same file. Token stays env-only (HOST_TOKEN) —
+/// the autostarted daemon serves loopback without one, which is the Node
+/// parity mode; token-at-login arrives with the relay phase.
+fn autostart_value(exe: &std::path::Path, config_path: Option<&str>) -> String {
+    let mut value = format!("\"{}\"", exe.display());
+    if let Some(p) = config_path {
+        value.push_str(&format!(" --config \"{p}\""));
+    }
+    value
+}
+
+/// Start-on-login via the HKCU Run key (PRD §6.3): user-level, no elevation,
+/// reversible, and `reg.exe` instead of advapi32 FFI keeps it std-only.
+/// Known limitation: the console daemon appears as a console window at login;
+/// a windowless host is packaging work (Phase 8 / ADR-007).
+fn autostart_main(install: bool, config_path: Option<String>) -> i32 {
+    const VALUE_NAME: &str = "CHERNOBYL companion";
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    if install {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[companion] cannot resolve own exe path: {e}");
+                return 1;
+            }
+        };
+        let value = autostart_value(&exe, config_path.as_deref());
+        let status = std::process::Command::new("reg")
+            .args(["add", KEY, "/v", VALUE_NAME, "/d", &value, "/f"])
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                println!("[companion] start-on-login installed: {VALUE_NAME} = {value}");
+                0
+            }
+            Ok(s) => {
+                eprintln!("[companion] reg add exited with {s}");
+                1
+            }
+            Err(e) => {
+                eprintln!("[companion] reg add failed: {e}");
+                1
+            }
+        }
+    } else {
+        // idempotent uninstall: absent entry is success, not an error
+        let present = std::process::Command::new("reg")
+            .args(["query", KEY, "/v", VALUE_NAME])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !present {
+            println!("[companion] start-on-login not installed — nothing to do");
+            return 0;
+        }
+        let status = std::process::Command::new("reg")
+            .args(["delete", KEY, "/v", VALUE_NAME, "/f"])
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                println!("[companion] start-on-login removed");
+                0
+            }
+            Ok(s) => {
+                eprintln!("[companion] reg delete exited with {s}");
+                1
+            }
+            Err(e) => {
+                eprintln!("[companion] reg delete failed: {e}");
+                1
+            }
+        }
+    }
 }
 
 fn self_test_main() -> i32 {
@@ -530,4 +619,24 @@ fn self_test_main() -> i32 {
 fn _unused(f: impl Fn() -> bool) -> bool {
     let _ = Ordering::SeqCst;
     f()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::autostart_value;
+
+    #[test]
+    fn autostart_value_quotes_paths_and_appends_config() {
+        assert_eq!(
+            autostart_value(std::path::Path::new(r"C:\a b\c.exe"), None),
+            r#""C:\a b\c.exe""#
+        );
+        assert_eq!(
+            autostart_value(
+                std::path::Path::new(r"C:\x.exe"),
+                Some(r"C:\cfg dir\companion.json")
+            ),
+            r#""C:\x.exe" --config "C:\cfg dir\companion.json""#
+        );
+    }
 }
