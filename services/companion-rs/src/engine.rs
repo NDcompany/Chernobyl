@@ -81,6 +81,135 @@ impl Engine {
         self.seq
     }
 
+    /// Phase 3: an event originating on a native adapter stream enters the
+    /// SAME seq/envelope/emit path as engine events, so one sequence stays
+    /// continuous (C2) across mock and native sources.
+    pub fn publish_external(&mut self, kind: EventKind) {
+        if let EventKind::Activity(a) = &kind {
+            // the snapshot must show what the event stream already says
+            self.state.activity.insert(0, a.clone());
+            if self.state.activity.len() > MAX_ACTIVITY {
+                self.state.activity.pop();
+            }
+        }
+        self.broadcast(kind);
+    }
+
+    /// Phase 3: adapter-sourced permission request. The engine remains the
+    /// G2 authority — the native record becomes an ENGINE permission record
+    /// (engine revision/expiry policy applies) before anything can decide
+    /// it; never a bypass around revision/pending/expiry validation.
+    pub fn ingest_permission(&mut self, pr: PermissionRequest) {
+        self.state.permissions.insert(0, pr.clone());
+        let agent_name = self
+            .find_session(&pr.session_id)
+            .and_then(|s| self.find_agent(&s.agent_id).map(|a| a.name.clone()))
+            .unwrap_or_else(|| "Agent".into());
+        self.broadcast(EventKind::PermissionRequested(pr.clone()));
+        self.push_activity(
+            "permission",
+            &format!("{agent_name}: requested \"{}\" permission", pr.command),
+            Some(&pr.id),
+        );
+    }
+
+    /// Phase 3: G2 pre-validation for a decision the NATIVE runtime will
+    /// execute (`routes_to_adapter`). Same fail-closed checks as `decide`
+    /// (unknown, native metadata, pending, expiry, revision, supported
+    /// decision) — the authority never moves with the executor.
+    pub fn validate_native_permission_decision(
+        &mut self,
+        permission_id: &str,
+        decision: &str,
+        revision: f64,
+    ) -> Result<(), String> {
+        let Some(perm) = self.find_permission(permission_id).cloned() else {
+            return Err("unknown permission request".into());
+        };
+        match evaluate_permission_decision(&perm, decision, revision, now_ms()) {
+            Ok(()) => Ok(()),
+            Err(code) => {
+                if code == DecisionError::Expired {
+                    let mut p = perm.clone();
+                    self.expire(&mut p);
+                    if let Some(target) = self.find_permission_mut(permission_id) {
+                        *target = p;
+                    }
+                }
+                Err(code.message().to_string())
+            }
+        }
+    }
+
+    /// Phase 3: the native runtime ACCEPTED a decision this engine already
+    /// validated — fold the outcome into the G2 record (revision bump,
+    /// status, grant) and emit the same terminal events as `decide`.
+    /// Session-side branches are deliberately omitted: native sessions are
+    /// not engine runs, their flow arrives on the event stream instead.
+    pub fn complete_native_decision(
+        &mut self,
+        command_id: &str,
+        permission_id: &str,
+        decision: &str,
+    ) {
+        let Some(perm) = self.find_permission(permission_id).cloned() else {
+            return; // expired/evicted between validate and complete: honest no-op
+        };
+        let now = now_ms();
+        let agent_name = self
+            .find_agent(&perm.agent_id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| "Agent".into());
+        self.progress(command_id, "accepted", Some(&perm.session_id));
+        // resolution invalidates any older decision (G2)
+        if let Some(p) = self.find_permission_mut(permission_id) {
+            p.revision += 1;
+        }
+        if decision == "reject" {
+            if let Some(p) = self.find_permission_mut(permission_id) {
+                p.status = "rejected".into();
+                p.decided_at = Some(now);
+                p.decision = Some("reject".into());
+            }
+            let p = self.find_permission(permission_id).cloned().unwrap();
+            self.broadcast(EventKind::PermissionResolved(p.clone()));
+            self.push_activity(
+                "permission",
+                &format!("{agent_name}: rejected “{}”", p.command),
+                Some(&p.id),
+            );
+        } else {
+            if let Some(p) = self.find_permission_mut(permission_id) {
+                p.status = "approved".into();
+                p.decided_at = Some(now);
+                p.decision = Some(decision.to_string());
+            }
+            if decision == "approve-session" {
+                self.grants
+                    .insert(format!("{}::{}", perm.session_id, perm.command));
+            }
+            let p = self.find_permission(permission_id).cloned().unwrap();
+            self.broadcast(EventKind::PermissionResolved(p.clone()));
+            self.push_activity(
+                "permission",
+                if decision == "approve-once" {
+                    format!("{agent_name}: approved “{}” once", p.command)
+                } else {
+                    format!("{agent_name}: approved “{}” for this session", p.command)
+                }
+                .as_str(),
+                Some(&p.id),
+            );
+        }
+        self.result(
+            command_id,
+            "completed",
+            None,
+            Some(&perm.session_id),
+            Some(&perm.id),
+        );
+    }
+
     fn broadcast(&mut self, kind: EventKind) {
         self.seq += 1;
         let msg = ServerMsg::Event {

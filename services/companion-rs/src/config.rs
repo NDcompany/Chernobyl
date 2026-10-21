@@ -13,6 +13,12 @@ pub struct AdapterEntryConfig {
     pub id: String,
     pub kind: String,
     pub enabled: bool,
+    /// `opencode` entries: where the EXISTING server listens, required for
+    /// that kind (attach-only — see ADR/G4.3, no port guessing).
+    pub endpoint: Option<String>,
+    /// `opencode` entries: `user:pass` for a server started with
+    /// `OPENCODE_SERVER_PASSWORD` (sent as HTTP Basic on loopback).
+    pub basic_auth: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +61,8 @@ pub fn default_config() -> CompanionConfig {
             id: "mock-1".into(),
             kind: "mock".into(),
             enabled: true,
+            endpoint: None,
+            basic_auth: None,
         }],
         events_cap: 5_000,
         commands_cap: 5_000,
@@ -123,7 +131,23 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
             })
             .transpose()?
             .unwrap_or(true);
-        adapters.push(AdapterEntryConfig { id, kind, enabled });
+        let endpoint = json::get_str(entry, "endpoint").map(str::to_string);
+        let basic_auth = json::get_str(entry, "basicAuth").map(str::to_string);
+        // Attach-only adapter: where the server is must be stated — no
+        // implicit default port that could probe the wrong process (G4.3).
+        if enabled && kind == "opencode" && endpoint.is_none() {
+            return Err(format!(
+                "adapters[{i}].endpoint is required for type 'opencode' \
+                 (e.g. \"http://127.0.0.1:4096\" — attach to an existing serve)"
+            ));
+        }
+        adapters.push(AdapterEntryConfig {
+            id,
+            kind,
+            enabled,
+            endpoint,
+            basic_auth,
+        });
     }
     let ids: Vec<&str> = adapters
         .iter()
@@ -202,11 +226,18 @@ pub fn config_to_json(c: &CompanionConfig) -> Json {
                 c.adapters
                     .iter()
                     .map(|a| {
-                        json::obj(vec![
+                        let mut fields = vec![
                             ("id", json::s(&a.id)),
                             ("type", json::s(&a.kind)),
                             ("enabled", Json::Bool(a.enabled)),
-                        ])
+                        ];
+                        if let Some(e) = &a.endpoint {
+                            fields.push(("endpoint", json::s(e)));
+                        }
+                        if let Some(b) = &a.basic_auth {
+                            fields.push(("basicAuth", json::s(b)));
+                        }
+                        json::obj(fields)
                     })
                     .collect(),
             ),
@@ -270,6 +301,43 @@ mod tests {
         assert_eq!(parsed.events_cap, 5_000);
         assert_eq!(parsed.commands_cap, 5_000);
         assert_eq!(parsed.server_port, 8787);
+    }
+
+    #[test]
+    fn opencode_entry_requires_endpoint_and_round_trips() {
+        let mut v = config_to_json(&default_config());
+        if let Json::Obj(pairs) = &mut v {
+            for (_, val) in pairs.iter_mut() {
+                if let Json::Arr(adapters) = val {
+                    adapters.push(json::obj(vec![
+                        ("id", json::s("oc-1")),
+                        ("type", json::s("opencode")),
+                        ("enabled", Json::Bool(true)),
+                    ]));
+                }
+            }
+        }
+        // attach-only: no endpoint, no guessing a port (G4.3)
+        let err = validate_config(&v).unwrap_err();
+        assert!(err.contains("endpoint is required"), "{err}");
+
+        if let Json::Obj(pairs) = &mut v {
+            for (_, val) in pairs.iter_mut() {
+                if let Json::Arr(adapters) = val
+                    && let Some(Json::Obj(entry)) = adapters.last_mut()
+                {
+                    entry.push(("endpoint".into(), json::s("http://127.0.0.1:4096")));
+                    entry.push(("basicAuth".into(), json::s("u:p")));
+                }
+            }
+        }
+        let parsed = validate_config(&v).unwrap();
+        let oc = parsed.adapters.iter().find(|a| a.id == "oc-1").unwrap();
+        assert_eq!(oc.endpoint.as_deref(), Some("http://127.0.0.1:4096"));
+        assert_eq!(oc.basic_auth.as_deref(), Some("u:p"));
+        let out = crate::json::stringify(&config_to_json(&parsed));
+        assert!(out.contains("http://127.0.0.1:4096"), "{out}");
+        assert!(out.contains("\"basicAuth\""), "{out}");
     }
 
     #[test]

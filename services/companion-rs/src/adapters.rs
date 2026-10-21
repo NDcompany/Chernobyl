@@ -42,6 +42,26 @@ pub struct AdapterStatus {
     pub supported: bool,
     pub healthy: bool,
     pub last_error: Option<String>,
+    /// PRD §7.3 declaration; empty until an adapter attaches its list
+    /// (discovery alone cannot speak for a runtime it hasn't probed).
+    pub capabilities: Vec<Capability>,
+}
+
+/// Capability mirror of `packages/adapter-sdk/src/mockAdapter.ts` (the mock
+/// adapter's own honest declaration — parity so diagnostics read the same).
+fn mock_capabilities() -> Vec<Capability> {
+    vec![
+        Capability::new("session.list", "available", None),
+        Capability::new("session.message.send", "available", None),
+        Capability::new("session.interrupt", "available", None),
+        Capability::new("permission.review", "available", None),
+        Capability::new(
+            "diff.read",
+            "unavailable",
+            Some("not simulated by the mock runtime"),
+        ),
+        Capability::new("files.read", "limited", Some("metadata only")),
+    ]
 }
 
 pub struct AdapterManager {
@@ -49,13 +69,23 @@ pub struct AdapterManager {
 }
 
 impl AdapterManager {
-    /// Discovery: `mock` is served in-process by the engine; everything else
-    /// is recorded as unsupported (never silently dropped).
+    /// Discovery: `mock` is served in-process by the engine; `opencode` is
+    /// attachable (health resolves from the real boot/probe call); anything
+    /// else is recorded as unsupported (never silently dropped).
     pub fn discover(entries: &[AdapterEntryConfig]) -> AdapterManager {
         let mut statuses = HashMap::new();
         for entry in entries.iter().filter(|e| e.enabled) {
-            let (supported, healthy, last_error) = if entry.kind == "mock" {
-                (true, true, None)
+            let (supported, healthy, last_error, capabilities) = if entry.kind == "mock" {
+                (true, true, None, mock_capabilities())
+            } else if entry.kind == "opencode" {
+                // Phase 3: attachable — actual health comes from the HTTP
+                // probe at boot, never from discovery alone.
+                (
+                    true,
+                    false,
+                    Some("attachable — endpoint probe runs at boot".into()),
+                    Vec::new(),
+                )
             } else {
                 (
                     false,
@@ -64,6 +94,7 @@ impl AdapterManager {
                         "unsupported adapter type '{}' — discovery failed (recorded, not fatal)",
                         entry.kind
                     )),
+                    Vec::new(),
                 )
             };
             statuses.insert(
@@ -74,10 +105,29 @@ impl AdapterManager {
                     supported,
                     healthy,
                     last_error,
+                    capabilities,
                 },
             );
         }
         AdapterManager { statuses }
+    }
+
+    /// Phase 3: record the live OpenCode adapter's capability declaration
+    /// (boot, right after the adapter is constructed).
+    pub fn attach_opencode(&mut self, id: &str, capabilities: Vec<Capability>) {
+        if let Some(s) = self.statuses.get_mut(id) {
+            s.supported = true;
+            s.capabilities = capabilities;
+        }
+    }
+
+    /// Phase 3: fold a probe result (boot probe or probe loop) into the
+    /// status. `None` = healthy.
+    pub fn probe_result(&mut self, id: &str, error: Option<String>) {
+        if let Some(s) = self.statuses.get_mut(id) {
+            s.healthy = error.is_none();
+            s.last_error = error;
+        }
     }
 
     /// Auto-routing (Phase 2 rule): exactly one healthy adapter → route to it.
@@ -118,27 +168,57 @@ mod tests {
             id: id.into(),
             kind: kind.into(),
             enabled: true,
+            endpoint: None,
+            basic_auth: None,
         }
     }
 
     #[test]
-    fn mock_is_healthy_and_unknown_is_recorded_not_fatal() {
-        let m = AdapterManager::discover(&[
+    fn mock_is_healthy_and_opencode_is_attachable_unknown_is_recorded() {
+        let mut m = AdapterManager::discover(&[
             entry("mock-1", "mock"),
             entry("oc-1", "opencode"),
             AdapterEntryConfig {
                 id: "off-1".into(),
                 kind: "mock".into(),
                 enabled: false,
+                endpoint: None,
+                basic_auth: None,
             },
         ]);
         let list = m.list();
         assert_eq!(list.len(), 2); // disabled entry skipped
         let oc = list.iter().find(|s| s.id == "oc-1").unwrap();
-        assert!(!oc.supported);
+        // attachable, but health only ever comes from a real probe
+        assert!(oc.supported);
         assert!(!oc.healthy);
-        assert!(oc.last_error.as_deref().unwrap().contains("unsupported"));
+        assert!(oc.last_error.as_deref().unwrap().contains("attachable"));
+        let mock = list.iter().find(|s| s.id == "mock-1").unwrap();
+        assert!(!mock.capabilities.is_empty()); // PRD §7.3 declaration
         assert!(m.sole_healthy().is_some()); // only mock-1 is healthy
+
+        // boot + probe loop fold their results into the status
+        m.attach_opencode(
+            "oc-1",
+            vec![Capability::new("session.list", "available", None)],
+        );
+        m.probe_result("oc-1", None);
+        let oc = m.list().into_iter().find(|s| s.id == "oc-1").unwrap();
+        assert!(oc.healthy);
+        assert_eq!(oc.capabilities.len(), 1);
+        m.probe_result("oc-1", Some("runtime-unavailable: connect refused".into()));
+        let oc = m.list().into_iter().find(|s| s.id == "oc-1").unwrap();
+        assert!(!oc.healthy);
+        assert!(oc.last_error.unwrap().contains("runtime-unavailable"));
+    }
+
+    #[test]
+    fn unknown_type_is_recorded_not_fatal() {
+        let m = AdapterManager::discover(&[entry("x-1", "browser")]);
+        let x = &m.list()[0];
+        assert!(!x.supported);
+        assert!(!x.healthy);
+        assert!(x.last_error.as_deref().unwrap().contains("unsupported"));
     }
 
     #[test]

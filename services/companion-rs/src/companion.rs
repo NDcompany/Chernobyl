@@ -8,6 +8,7 @@ use crate::adapters::AdapterManager;
 use crate::config::CompanionConfig;
 use crate::engine::Engine;
 use crate::ffi;
+use crate::opencode::OpenCodeAdapter;
 use crate::protocol::{ClientMsg, EventKind, PROTOCOL_VERSION, ServerMsg, now_ms};
 use crate::storage::{CommandRecord, Storage};
 use std::sync::mpsc::Sender;
@@ -20,6 +21,8 @@ pub struct Shared {
     pub clients: Mutex<Vec<(u64, Sender<Vec<u8>>)>>,
     pub next_conn_id: std::sync::atomic::AtomicU64,
     pub adapters: Mutex<AdapterManager>,
+    /// Phase 3: the attached OpenCode adapter, when configured (attach-only).
+    pub opencode: Mutex<Option<Arc<OpenCodeAdapter>>>,
     pub started_at: i64,
     pub config: CompanionConfig,
     /// Consecutive auth failures; trips a cooldown (brute-force resistance).
@@ -28,7 +31,11 @@ pub struct Shared {
 
 pub struct Companion {
     pub shared: Arc<Shared>,
-    engine: Mutex<Engine>,
+    /// Arc'd so the adapter's event thread can publish into the same
+    /// sequence/pipeline (single seq authority).
+    engine: Arc<Mutex<Engine>>,
+    /// Last adapter probe timestamp for the probe-interval gate.
+    last_probe: Mutex<i64>,
     pub events_total: Arc<std::sync::atomic::AtomicU64>,
     pub malformed_total: std::sync::atomic::AtomicU64,
 }
@@ -39,11 +46,21 @@ impl Companion {
         // C2: the engine continues the event sequence from the journal
         let start_seq = storage.last_seq;
 
+        // Phase 3: locate the attach target before `config` moves into
+        // Shared. Only the first enabled opencode entry attaches — a second
+        // would be exactly the competing-server shape G4.3 forbids.
+        let oc_cfg = config
+            .adapters
+            .iter()
+            .find(|e| e.enabled && e.kind == "opencode")
+            .map(|e| (e.id.clone(), e.endpoint.clone(), e.basic_auth.clone()));
+
         let shared = Arc::new(Shared {
             storage: Mutex::new(storage),
             clients: Mutex::new(Vec::new()),
             next_conn_id: std::sync::atomic::AtomicU64::new(1),
             adapters: Mutex::new(AdapterManager::discover(&config.adapters)),
+            opencode: Mutex::new(None),
             started_at: now_ms(),
             config,
             auth_failures: Mutex::new(0),
@@ -91,7 +108,8 @@ impl Companion {
 
         let companion = Companion {
             shared,
-            engine: Mutex::new(engine),
+            engine: Arc::new(Mutex::new(engine)),
+            last_probe: Mutex::new(now_ms()),
             events_total,
             malformed_total: std::sync::atomic::AtomicU64::new(0),
         };
@@ -110,6 +128,44 @@ impl Companion {
                     expired.len()
                 ),
             );
+        }
+
+        // Phase 3: attach the OpenCode adapter (attach-only — G4.3 forbids
+        // spawning a competing server on a possibly-shared data dir).
+        if let Some((id, endpoint, auth)) = oc_cfg {
+            // File configs validate the endpoint (parse-time); direct
+            // programmatic configs fall back to OpenCode's documented
+            // serve default.
+            let endpoint = endpoint.unwrap_or_else(|| "http://127.0.0.1:4096".to_string());
+            let oc = Arc::new(OpenCodeAdapter::new(&id, &endpoint, auth.as_deref()));
+            let probe = oc.refresh();
+            {
+                let mut mgr = companion.shared.adapters.lock().unwrap();
+                mgr.attach_opencode(&id, oc.capabilities());
+                mgr.probe_result(&id, probe.as_ref().err().map(|e| e.to_string()));
+            }
+            // Native events enter the SAME seq/persist/fan-out pipeline as
+            // engine events; permissions are ingested first so the engine
+            // stays the G2 authority over them.
+            let cb_engine = companion.engine.clone();
+            oc.subscribe(move |kind| {
+                let mut engine = cb_engine.lock().unwrap();
+                match kind {
+                    EventKind::PermissionRequested(pr) => engine.ingest_permission(pr),
+                    other => engine.publish_external(other),
+                }
+            });
+            *companion.shared.opencode.lock().unwrap() = Some(oc.clone());
+            if let Err(e) = oc.start_events() {
+                // thread spawn failure: HTTP attach still works, but the
+                // failure channel doesn't — fail the status visible.
+                companion
+                    .shared
+                    .adapters
+                    .lock()
+                    .unwrap()
+                    .probe_result(&id, Some(format!("event stream unavailable: {e}")));
+            }
         }
 
         Ok(companion)
@@ -189,7 +245,67 @@ impl Companion {
             }
         }
 
-        let reply = {
+        // Phase 3 routing: a HEALTHY attached adapter owns the session-
+        // scoped mutating commands (the native runtime is the truth for
+        // sessions it knows); permission decisions go native only when the
+        // adapter surfaced that request — otherwise engine authority (G2).
+        // Session-neutral messages always stay with the engine.
+        let oc = self.shared.opencode.lock().unwrap().clone();
+        let to_adapter = matches!(
+            (&oc, &msg),
+            (Some(oc), m) if oc.is_healthy() && Self::routes_to_adapter(m, oc)
+        );
+        let reply = if to_adapter {
+            let oc = oc.as_ref().expect("routed only when attached");
+            match &msg {
+                // G2 stays with the engine: it validates the decision
+                // (native metadata, pending, expiry, revision), the native
+                // runtime only EXECUTES it, then the engine records the
+                // accepted outcome — success can never outrun validation.
+                ClientMsg::PermissionDecision {
+                    command_id,
+                    permission_id,
+                    decision,
+                    revision,
+                } => {
+                    let verdict = {
+                        let mut engine = self.engine.lock().unwrap();
+                        engine.validate_native_permission_decision(
+                            permission_id,
+                            decision,
+                            *revision,
+                        )
+                    };
+                    if let Err(e) = verdict {
+                        Some(ServerMsg::ack_err(command_id, &e))
+                    } else {
+                        match oc.send(&msg) {
+                            Ok(ack @ ServerMsg::Ack { ok: true, .. }) => {
+                                let mut engine = self.engine.lock().unwrap();
+                                engine.complete_native_decision(
+                                    command_id,
+                                    permission_id,
+                                    decision,
+                                );
+                                Some(ack)
+                            }
+                            // native refused → record stays pending; the
+                            // engine's expiry sweep resolves it honestly
+                            Ok(ack) => Some(ack),
+                            Err(e) => Some(ServerMsg::ack_err(command_id, &e.to_string())),
+                        }
+                    }
+                }
+                _ => Some(match oc.send(&msg) {
+                    Ok(reply) => reply,
+                    // transport/validation faults surface as refusals — never
+                    // as a fabricated engine outcome
+                    Err(e) => {
+                        ServerMsg::ack_err(msg_cmd_id.as_deref().unwrap_or(""), &e.to_string())
+                    }
+                }),
+            }
+        } else {
             let mut engine = self.engine.lock().unwrap();
             engine.handle(msg)
         };
@@ -227,7 +343,34 @@ impl Companion {
     /* ---------------------------------------------------------------- */
 
     pub fn snapshot(&self) -> crate::protocol::Snapshot {
-        self.engine.lock().unwrap().snapshot().clone()
+        let mut snap = self.engine.lock().unwrap().snapshot().clone();
+        if let Some(oc) = self.shared.opencode.lock().unwrap().as_ref()
+            && oc.is_healthy()
+        {
+            // A healthy real runtime is the truth for entities it owns;
+            // mock seed sessions/agents shown beside real ones would pass
+            // demo data off as live (PRD §13.1). Permissions/activity/hosts
+            // stay engine-owned — adapter permissions ARE engine records
+            // (ingested at subscribe time).
+            snap.sessions = oc.sessions();
+            snap.agents = oc.agents();
+        }
+        snap
+    }
+
+    /// Phase 3 routing rule (one place so tests can pin it).
+    fn routes_to_adapter(msg: &ClientMsg, oc: &OpenCodeAdapter) -> bool {
+        match msg {
+            ClientMsg::CreateSession { .. }
+            | ClientMsg::SubmitPrompt { .. }
+            | ClientMsg::Interrupt { .. } => true,
+            // engine-authoritative unless the adapter surfaced the request
+            // natively (revision/expiry checked by the engine either way)
+            ClientMsg::PermissionDecision { permission_id, .. } => {
+                oc.knows_permission(permission_id)
+            }
+            ClientMsg::Hello { .. } | ClientMsg::Ping { .. } | ClientMsg::ListState { .. } => false,
+        }
     }
 
     pub fn snapshot_json(&self) -> crate::json::Json {
@@ -239,19 +382,16 @@ impl Companion {
     }
 
     pub fn health(&self) -> crate::json::Json {
-        let (hosts, sessions, pending, last_seq) = {
-            let engine = self.engine.lock().unwrap();
-            let snap = engine.snapshot();
-            (
-                snap.hosts.len(),
-                snap.sessions.len(),
-                snap.permissions
-                    .iter()
-                    .filter(|p| p.status == "pending")
-                    .count(),
-                engine.last_seq(),
-            )
-        };
+        // merged view: with a healthy adapter attached, entity counts must
+        // match what the snapshot actually serves
+        let snap = self.snapshot();
+        let pending = snap
+            .permissions
+            .iter()
+            .filter(|p| p.status == "pending")
+            .count();
+        let last_seq = self.engine.lock().unwrap().last_seq();
+        let (hosts, sessions) = (snap.hosts.len(), snap.sessions.len());
         let store = self.shared.storage.lock().unwrap();
         let commands = store.commands.len();
         let unresolved = store
@@ -313,6 +453,13 @@ impl Companion {
                                 None => crate::json::Json::Null,
                             },
                         ),
+                        // PRD §7.3: what this adapter honestly supports
+                        (
+                            "capabilities",
+                            crate::json::Json::Arr(
+                                a.capabilities.iter().map(|c| c.to_json()).collect(),
+                            ),
+                        ),
                     ])
                 })
                 .collect(),
@@ -320,14 +467,44 @@ impl Companion {
     }
 
     /// Sweeps permission expiry and advances mock runs. Driven by the
-    /// scheduler thread (parity with the Node host heartbeat tick).
+    /// scheduler thread (parity with the Node host heartbeat tick). Also
+    /// hosts the adapter probe loop (`probe_interval_ms`): health + list
+    /// resync so the status line never lies about a dead native runtime.
     pub fn pump(&self) {
         let now = now_ms();
-        let mut engine = self.engine.lock().unwrap();
-        engine.pump(now);
+        {
+            let mut engine = self.engine.lock().unwrap();
+            engine.pump(now);
+        }
+        let due = {
+            let mut last = self.last_probe.lock().unwrap();
+            if now - *last >= self.shared.config.probe_interval_ms as i64 {
+                *last = now;
+                true
+            } else {
+                false
+            }
+        };
+        if due {
+            // clone the Arc out first: no companion lock is held across
+            // the HTTP probe (a dead endpoint costs its connect timeout)
+            let oc = self.shared.opencode.lock().unwrap().clone();
+            if let Some(oc) = oc {
+                let err = oc.refresh().err().map(|e| e.to_string());
+                self.shared
+                    .adapters
+                    .lock()
+                    .unwrap()
+                    .probe_result(&oc.id, err);
+            }
+        }
     }
 
     pub fn shutdown(&self) {
+        // stop the adapter's event thread before the audit line
+        if let Some(oc) = self.shared.opencode.lock().unwrap().take() {
+            oc.dispose();
+        }
         let mut store = self.shared.storage.lock().unwrap();
         let _ = store.append_audit("shutdown", "companion shut down gracefully");
         let _ = store.compact();
@@ -613,6 +790,212 @@ mod tests {
         // restart must NOT reset the sequence (C2)
         assert!(comp2.last_seq() >= seq1);
         comp2.shutdown();
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    // ---- Phase 3 Step 2: OpenCode adapter wiring ----
+
+    use crate::config::AdapterEntryConfig;
+    use crate::opencode::tests::{Opts as FakeOpts, start as start_fake};
+
+    fn with_opencode(mut c: CompanionConfig, endpoint: &str) -> CompanionConfig {
+        c.adapters.push(AdapterEntryConfig {
+            id: "oc-1".into(),
+            kind: "opencode".into(),
+            enabled: true,
+            endpoint: Some(endpoint.into()),
+            basic_auth: None,
+        });
+        c
+    }
+
+    #[test]
+    fn opencode_wiring_routes_session_commands_and_merges_snapshot() {
+        let f = start_fake(FakeOpts::default());
+        let c = with_opencode(temp_config("oc-route"), &f.addr);
+        let comp = Companion::boot(c.clone()).unwrap();
+
+        // healthy attach: status carries the PRD §7.3 capability declaration
+        let adapters_json = crate::json::stringify(&comp.adapters_json());
+        assert!(
+            adapters_json.contains("\"session.prompt\""),
+            "{adapters_json}"
+        );
+        assert!(
+            adapters_json.contains("\"event.replay\""),
+            "{adapters_json}"
+        );
+
+        // merged snapshot: the REAL runtime's entities replace mock seed
+        let snap = comp.snapshot();
+        let session_ids: Vec<&str> = snap.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(session_ids, vec!["ses_test1"]);
+        assert!(
+            snap.agents
+                .iter()
+                .any(|a| a.kind == "opencode" && a.name == "build")
+        );
+        assert!(snap.agents.iter().all(|a| a.kind == "opencode"));
+
+        // SubmitPrompt → native prompt_async, recorded executed (G1)
+        let reply = comp.handle_client_msg(ClientMsg::SubmitPrompt {
+            command_id: "cmd-oc-1".into(),
+            session_id: "ses_test1".into(),
+            text: "run it".into(),
+        });
+        assert!(matches!(reply, Some(ServerMsg::Ack { ok: true, .. })));
+        {
+            let store = comp.shared.storage.lock().unwrap();
+            assert_eq!(
+                store.commands.get("cmd-oc-1").map(|r| r.status.as_str()),
+                Some("executed")
+            );
+        }
+
+        // Interrupt → native abort
+        let reply = comp.handle_client_msg(ClientMsg::Interrupt {
+            command_id: "cmd-oc-2".into(),
+            session_id: "ses_test1".into(),
+        });
+        assert!(matches!(reply, Some(ServerMsg::Ack { ok: true, .. })));
+        {
+            let reqs = f.requests.lock().unwrap();
+            assert!(
+                reqs.iter()
+                    .any(|r| r.contains("prompt_async") && r.contains("run it"))
+            );
+            assert!(reqs.iter().any(|r| r.contains("/abort")));
+        }
+
+        // session-neutral messages stay with the engine, never sent native
+        let hello = comp.handle_client_msg(ClientMsg::Hello {
+            client_id: "c".into(),
+            protocol: 2.0,
+        });
+        assert!(matches!(hello, Some(ServerMsg::HelloAck { .. })));
+        assert!(
+            f.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| !r.contains("/hello"))
+        );
+
+        // permission the adapter never surfaced → engine authority refuses,
+        // nothing reaches the native reply endpoint
+        let reply = comp.handle_client_msg(ClientMsg::PermissionDecision {
+            command_id: "cmd-oc-3".into(),
+            permission_id: "engine-unknown".into(),
+            decision: "approve-once".into(),
+            revision: 1.0,
+        });
+        assert!(matches!(reply, Some(ServerMsg::Ack { ok: false, .. })));
+        assert!(
+            f.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| !r.contains("/permission/"))
+        );
+
+        comp.shutdown();
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    #[test]
+    fn native_permission_is_engine_validated_then_executed_natively() {
+        // native asked → SSE → ingested as an ENGINE record (G2) → every
+        // decision is validated engine-side BEFORE any native call
+        let script = concat!(
+            r#"data: {"payload":{"id":"evt_pa","type":"permission.asked","properties":{"id":"per_wire1","sessionID":"ses_test1","permission":"bash","patterns":["git status"],"tool":{"messageID":"msg_1","callID":"c1"}}}}"#,
+            "\n\n"
+        );
+        let f = start_fake(FakeOpts {
+            sse: Some(script.to_string()),
+            ..Default::default()
+        });
+        let c = with_opencode(temp_config("oc-perm"), &f.addr);
+        let comp = Companion::boot(c.clone()).unwrap();
+        let oc = comp
+            .shared
+            .opencode
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("attached at boot");
+
+        // the event thread is async: bounded wait for the ask
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !oc.knows_permission("per_wire1") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            oc.knows_permission("per_wire1"),
+            "adapter never saw permission.asked"
+        );
+
+        // the engine holds the ingested record: pending, native id preserved
+        let snap = comp.snapshot();
+        let p = snap
+            .permissions
+            .iter()
+            .find(|p| p.id == "per_wire1")
+            .expect("engine ingested the native request");
+        assert_eq!(p.status, "pending");
+        assert_eq!(p.native_request_id, "per_wire1");
+        assert_eq!(p.revision, 1);
+
+        // stale revision fails CLOSED before anything runs natively (G2)
+        let reply = comp.handle_client_msg(ClientMsg::PermissionDecision {
+            command_id: "cmd-perm-bad".into(),
+            permission_id: "per_wire1".into(),
+            decision: "approve-once".into(),
+            revision: 99.0,
+        });
+        assert!(matches!(reply, Some(ServerMsg::Ack { ok: false, .. })));
+        assert!(
+            f.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| !r.contains("/permission/"))
+        );
+        assert_eq!(
+            comp.snapshot()
+                .permissions
+                .iter()
+                .find(|p| p.id == "per_wire1")
+                .map(|p| p.status.as_str()),
+            Some("pending")
+        );
+
+        // valid decision: native executes exactly once, engine records it
+        let reply = comp.handle_client_msg(ClientMsg::PermissionDecision {
+            command_id: "cmd-perm-ok".into(),
+            permission_id: "per_wire1".into(),
+            decision: "approve-once".into(),
+            revision: 1.0,
+        });
+        assert!(matches!(reply, Some(ServerMsg::Ack { ok: true, .. })));
+        assert!(
+            f.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("/permission/per_wire1/reply")
+                    && r.contains("\"reply\":\"once\""))
+        );
+        let snap2 = comp.snapshot();
+        let p = snap2
+            .permissions
+            .iter()
+            .find(|p| p.id == "per_wire1")
+            .unwrap();
+        assert_eq!(p.status, "approved");
+        assert_eq!(p.decision.as_deref(), Some("approve-once"));
+        assert_eq!(p.revision, 2); // resolution invalidates the old revision
+
+        comp.shutdown();
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 

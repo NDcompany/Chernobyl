@@ -314,6 +314,18 @@ impl OpenCodeAdapter {
         self.inner.subs.lock().unwrap().retain(|(i, _)| *i != id);
     }
 
+    /// Whether the adapter surfaced this native permission request — the
+    /// routing gate that keeps engine-owned permission decisions on the
+    /// engine (companion.rs `routes_to_adapter`).
+    pub fn knows_permission(&self, permission_id: &str) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .asked
+            .contains_key(permission_id)
+    }
+
     /// Spawns the SSE reader (once). It reconnects with a bounded backoff
     /// until `dispose` — restart/recovery is part of the loop, not an
     /// afterthought (PRD Phase 3 exit criteria).
@@ -1282,20 +1294,23 @@ fn native_action(permission: &str) -> &'static str {
 /* Tests                                                               */
 /* ------------------------------------------------------------------ */
 
+/// Fake `opencode serve` for integration tests — `pub(crate)` so the
+/// companion wiring tests can drive the same fixture (threads per
+/// connection: SSE holds one open while other requests keep being served).
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::sync::mpsc;
 
     #[derive(Clone)]
-    struct Opts {
-        html_prompt: bool,
-        sse: Option<String>,
-        chunked_sse: bool,
+    pub struct Opts {
+        pub html_prompt: bool,
+        pub sse: Option<String>,
+        pub chunked_sse: bool,
         /// Hold the SSE connection open after the script (else close it,
         /// which drives the adapter's reconnect loop).
-        sse_hold: bool,
+        pub sse_hold: bool,
     }
 
     impl Default for Opts {
@@ -1309,12 +1324,11 @@ mod tests {
         }
     }
 
-    /// Fake `opencode serve`: threads per connection (SSE holds one open
-    /// while other requests keep being served), records every request.
-    struct Fake {
-        addr: String,
-        requests: Arc<Mutex<Vec<String>>>,
-        sse_conns: Arc<AtomicU64>,
+    /// Fake `opencode serve` fixture (see module comment).
+    pub struct Fake {
+        pub addr: String,
+        pub requests: Arc<Mutex<Vec<String>>>,
+        pub sse_conns: Arc<AtomicU64>,
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
@@ -1342,7 +1356,7 @@ mod tests {
     const SESSION_INFO: &str = r#"{"id":"ses_test1","slug":"test-session","projectID":"global","directory":"C:\\proj\\demo","title":"Demo session","time":{"created":1700000000000,"updated":1700000005000}}"#;
     const AGENTS: &str = r#"[{"name":"build","mode":"primary","model":null,"tools":0},{"name":"explore","mode":"subagent","model":null,"tools":0}]"#;
 
-    fn start(opts: Opts) -> Fake {
+    pub fn start(opts: Opts) -> Fake {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let addr = format!("http://127.0.0.1:{port}");
