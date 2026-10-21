@@ -21,6 +21,7 @@ pub struct CompanionConfig {
     pub data_dir: PathBuf,
     pub adapters: Vec<AdapterEntryConfig>,
     pub events_cap: usize,
+    pub commands_cap: usize,
     pub events_max_age_ms: i64,
     pub diagnostics_port: u16,
     pub probe_interval_ms: u64,
@@ -56,6 +57,7 @@ pub fn default_config() -> CompanionConfig {
             enabled: true,
         }],
         events_cap: 5_000,
+        commands_cap: 5_000,
         events_max_age_ms: 7 * 24 * 60 * 60 * 1000,
         diagnostics_port: 9487,
         probe_interval_ms: 15_000,
@@ -143,6 +145,11 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
         60_000,
         365 * 24 * 60 * 60 * 1000,
     )?;
+    // optional: default keeps configs written before command retention valid
+    let commands_cap = json::get(ret, "commands")
+        .map(|v| as_i64(Some(v), "retention.commands", 100, 1_000_000))
+        .transpose()?
+        .unwrap_or(5_000) as usize;
 
     let diag = json::get(raw, "diagnostics").ok_or("'diagnostics' is required")?;
     let diagnostics_port = as_i64(json::get(diag, "port"), "diagnostics.port", 0, 65_535)? as u16;
@@ -175,6 +182,7 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
         data_dir,
         adapters,
         events_cap,
+        commands_cap,
         events_max_age_ms,
         diagnostics_port,
         probe_interval_ms,
@@ -207,6 +215,7 @@ pub fn config_to_json(c: &CompanionConfig) -> Json {
             "retention",
             json::obj(vec![
                 ("events", Json::Int(c.events_cap as i64)),
+                ("commands", Json::Int(c.commands_cap as i64)),
                 ("eventsMaxAgeMs", Json::Int(c.events_max_age_ms)),
             ]),
         ),
@@ -259,6 +268,7 @@ mod tests {
         let parsed = validate_config(&v).unwrap();
         assert_eq!(parsed.name, c.name);
         assert_eq!(parsed.events_cap, 5_000);
+        assert_eq!(parsed.commands_cap, 5_000);
         assert_eq!(parsed.server_port, 8787);
     }
 
@@ -285,6 +295,13 @@ mod tests {
                 .unwrap_err()
                 .contains("retention.events")
         );
+        // out-of-range command retention fails closed like events does
+        let v = json::parse(r#"{"version":1,"name":"x","dataDir":"x","adapters":[],"retention":{"events":5000,"commands":10,"eventsMaxAgeMs":600000},"diagnostics":{"port":9487},"probeIntervalMs":15000}"#).unwrap();
+        assert!(
+            validate_config(&v)
+                .unwrap_err()
+                .contains("retention.commands")
+        );
     }
 
     #[test]
@@ -297,6 +314,8 @@ mod tests {
         let c = validate_config(&v).unwrap();
         assert_eq!(c.server_port, 8787);
         assert_eq!(c.server_bind, "127.0.0.1");
+        // written before command retention existed → default cap applies
+        assert_eq!(c.commands_cap, 5_000);
     }
 
     #[test]

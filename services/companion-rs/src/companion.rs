@@ -35,7 +35,7 @@ pub struct Companion {
 
 impl Companion {
     pub fn boot(config: CompanionConfig) -> Result<Companion, String> {
-        let storage = Storage::open(&config.data_dir, config.events_cap)?;
+        let storage = Storage::open(&config.data_dir, config.events_cap, config.commands_cap)?;
         // C2: the engine continues the event sequence from the journal
         let start_seq = storage.last_seq;
 

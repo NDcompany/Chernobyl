@@ -20,6 +20,11 @@ use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// Once this many bytes were appended since the last compaction (or boot),
+/// the journal is rewritten down to the live set — bounds file growth inside
+/// one long-running process instead of only across restarts.
+const JOURNAL_COMPACT_TRIGGER_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandRecord {
     pub command_id: String,
@@ -72,6 +77,13 @@ pub struct Storage {
     pub audit: Vec<AuditRecord>,
     pub kv: HashMap<String, String>,
     pub last_seq: i64,
+    /// Retention caps (config `retention.events` / `retention.commands`).
+    event_cap: usize,
+    command_cap: usize,
+    /// Bytes appended since the last compaction (boot: on-disk size), for
+    /// `maybe_compact`.
+    bytes_since_compact: u64,
+    compact_trigger: u64,
     /// Latched after any write failure: the store refuses further writes and
     /// the companion fails closed (PRD §19.4).
     failed: bool,
@@ -102,7 +114,7 @@ fn record_line(kind: &str, body: &Json) -> String {
 
 impl Storage {
     /// Opens (creating if absent) the journal at `<dir>/companion.journal`.
-    pub fn open(dir: &Path, event_cap: usize) -> Result<Storage, String> {
+    pub fn open(dir: &Path, event_cap: usize, command_cap: usize) -> Result<Storage, String> {
         fs::create_dir_all(dir).map_err(|e| format!("create data dir: {e}"))?;
         let path = dir.join("companion.journal");
 
@@ -119,6 +131,10 @@ impl Storage {
             audit: Vec::new(),
             kv: HashMap::new(),
             last_seq: 0,
+            event_cap,
+            command_cap,
+            bytes_since_compact: 0,
+            compact_trigger: JOURNAL_COMPACT_TRIGGER_BYTES,
             failed: false,
         };
 
@@ -137,20 +153,76 @@ impl Storage {
                 .map_err(|e| format!("truncate torn tail: {e}"))?;
         }
 
+        // first compaction trigger must consider the whole file, not only
+        // writes made in this process (a journal grown for weeks trips it
+        // on the first appends after boot)
+        store.bytes_since_compact = valid_bytes;
+
         // schema marker
         if !store.kv.contains_key("schema") {
             store.put_kv("schema", &SCHEMA_VERSION.to_string())?;
         }
 
-        // retention: prune events over the cap, then compact if the journal
-        // grew much larger than the live set
+        // retention: prune records over their caps, then compact so dropped
+        // records cannot be resurrected by the next journal replay
+        let mut pruned = false;
         if store.events.len() > event_cap {
             let drop_n = store.events.len() - event_cap;
             store.events.drain(..drop_n);
+            pruned = true;
+        }
+        if store.enforce_command_cap() {
+            pruned = true;
+        }
+        if pruned {
             store.compact()?;
+            store.bytes_since_compact = 0;
         }
 
         Ok(store)
+    }
+
+    /// Evicts the oldest completed command records while over `command_cap`;
+    /// returns whether anything was evicted. `unresolved` records are never
+    /// evicted: boot reconciliation and verbatim replay must find them.
+    /// shortcut: if unresolved alone reaches the cap, completed records yield
+    /// entirely — unresolved is bounded by in-flight work in practice, and
+    /// becomes evictable once boot reconciliation marks it `unknown`.
+    fn enforce_command_cap(&mut self) -> bool {
+        let mut evicted = false;
+        while self.commands.len() > self.command_cap {
+            let mut oldest: Option<(i64, String)> = None;
+            for (id, c) in &self.commands {
+                if c.status == "unresolved" {
+                    continue;
+                }
+                let key = (c.created_at, id.clone());
+                if oldest.as_ref().is_none_or(|k| key < *k) {
+                    oldest = Some(key);
+                }
+            }
+            match oldest {
+                Some((_, id)) => {
+                    self.commands.remove(&id);
+                    evicted = true;
+                }
+                None => break, // all remaining are in flight — over cap is legal
+            }
+        }
+        evicted
+    }
+
+    /// Bounds journal growth inside one process: past `compact_trigger` bytes
+    /// of appends, rewrite the journal down to the live set. Must only run
+    /// where the in-memory maps already match the journal (after inserts), or
+    /// a rewrite would drop a record the map still holds. Failure is ignored
+    /// on purpose: the preceding append succeeded, so the record is durable —
+    /// shortcut: a persistently failing compact leaves the journal growing
+    /// until a successful retry or restart, without ever losing data.
+    fn maybe_compact(&mut self) {
+        if self.bytes_since_compact >= self.compact_trigger && self.compact().is_ok() {
+            self.bytes_since_compact = 0;
+        }
     }
 
     fn load(&mut self, path: &Path) -> Result<u64, String> {
@@ -268,7 +340,10 @@ impl Storage {
             .write_all(line.as_bytes())
             .and_then(|_| self.journal.flush())
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.bytes_since_compact += line.len() as u64;
+                Ok(())
+            }
             Err(e) => {
                 self.failed = true;
                 Err(format!("journal append failed (latched): {e}"))
@@ -312,8 +387,13 @@ impl Storage {
 
     pub fn put_command(&mut self, rec: &CommandRecord) -> Result<(), String> {
         let body = Self::command_body(rec);
-        self.append(&record_line("command", &body))?;
+        let line = record_line("command", &body);
+        self.append(&line)?;
         self.commands.insert(rec.command_id.clone(), rec.clone());
+        self.enforce_command_cap();
+        // only after the map matches the journal: a compaction rewrites both
+        // consistently and can never drop the record just inserted
+        self.maybe_compact();
         Ok(())
     }
 
@@ -363,6 +443,13 @@ impl Storage {
             payload: payload.to_string(),
             occurred_at: now_ms(),
         });
+        // runtime retention — the cap used to apply only at boot, so a long
+        // session could grow the event set without bound
+        if self.events.len() > self.event_cap {
+            let drop_n = self.events.len() - self.event_cap;
+            self.events.drain(..drop_n);
+        }
+        self.maybe_compact();
         Ok(())
     }
 
@@ -562,7 +649,7 @@ mod tests {
     fn command_outcome_round_trips() {
         let dir = temp_dir("outcome");
         {
-            let mut s = Storage::open(&dir, 500).unwrap();
+            let mut s = Storage::open(&dir, 500, 500).unwrap();
             s.put_command(&command("c1", "unresolved")).unwrap();
             s.update_command_outcome(
                 "c1",
@@ -580,7 +667,7 @@ mod tests {
             // (the exact path that once lost `ok`)
             s.compact().unwrap();
         }
-        let s2 = Storage::open(&dir, 500).unwrap();
+        let s2 = Storage::open(&dir, 500, 500).unwrap();
         let rec = s2.commands.get("c1").unwrap();
         assert_eq!(rec.ok, Some(false), "ok outcome must survive the journal");
         assert_eq!(rec.error.as_deref(), Some("session is already running"));
@@ -594,7 +681,7 @@ mod tests {
         // + update_command_outcome (refused) = two journal appends per command
         const N: usize = 100_000;
         let dir = temp_dir("microbench-store");
-        let mut s = Storage::open(&dir, 500).unwrap();
+        let mut s = Storage::open(&dir, 500, 500).unwrap();
         let mut rec = command("mb-0", "unresolved");
         rec.kind = "permission_decision".into();
         rec.payload = r#"{"type":"permission_decision","commandId":"mb-0","permissionId":"p1","decision":"reject","revision":2}"#.into();
@@ -626,11 +713,11 @@ mod tests {
     #[test]
     fn journal_reopens_with_contiguous_seq() {
         let dir = temp_dir("reopen");
-        let mut s = Storage::open(&dir, 500).unwrap();
+        let mut s = Storage::open(&dir, 500, 500).unwrap();
         s.append_event("session_created", "{}", 1).unwrap();
         s.append_event("activity", "{}", 2).unwrap();
         drop(s);
-        let s2 = Storage::open(&dir, 500).unwrap();
+        let s2 = Storage::open(&dir, 500, 500).unwrap();
         assert_eq!(s2.last_seq, 2);
         assert_eq!(s2.events.len(), 2);
         assert_eq!(s2.kv.get("schema").map(String::as_str), Some("1"));
@@ -640,13 +727,13 @@ mod tests {
     #[test]
     fn commands_are_idempotent_by_id() {
         let dir = temp_dir("idem");
-        let mut s = Storage::open(&dir, 500).unwrap();
+        let mut s = Storage::open(&dir, 500, 500).unwrap();
         s.put_command(&command("c1", "unresolved")).unwrap();
         // same id again replaces in place (last write wins, single record)
         s.put_command(&command("c1", "unresolved")).unwrap();
         assert_eq!(s.commands.len(), 1);
         drop(s);
-        let s2 = Storage::open(&dir, 500).unwrap();
+        let s2 = Storage::open(&dir, 500, 500).unwrap();
         assert_eq!(s2.commands.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -654,7 +741,7 @@ mod tests {
     #[test]
     fn reconcile_marks_unresolved_unknown_and_expires_approvals() {
         let dir = temp_dir("recon");
-        let mut s = Storage::open(&dir, 500).unwrap();
+        let mut s = Storage::open(&dir, 500, 500).unwrap();
         s.put_command(&command("c1", "unresolved")).unwrap();
         s.put_command(&command("c2", "completed")).unwrap();
         s.put_approval(&ApprovalRecord {
@@ -695,18 +782,18 @@ mod tests {
     fn torn_tail_is_truncated_and_store_still_works() {
         let dir = temp_dir("torn");
         {
-            let mut s = Storage::open(&dir, 500).unwrap();
+            let mut s = Storage::open(&dir, 500, 500).unwrap();
             s.append_event("e1", "{}", 1).unwrap();
             // simulate torn write: half a record, no newline
             s.append("{\"kind\":\"event\",\"seq\":2,\"p").unwrap();
         }
-        let mut s2 = Storage::open(&dir, 500).unwrap();
+        let mut s2 = Storage::open(&dir, 500, 500).unwrap();
         assert_eq!(s2.last_seq, 1);
         assert_eq!(s2.events.len(), 1);
         // appends after recovery stay valid
         s2.append_event("e3", "{}", 2).unwrap();
         drop(s2);
-        let s3 = Storage::open(&dir, 500).unwrap();
+        let s3 = Storage::open(&dir, 500, 500).unwrap();
         assert_eq!(s3.events.len(), 2);
         assert_eq!(s3.last_seq, 2);
         let _ = fs::remove_dir_all(&dir);
@@ -715,12 +802,12 @@ mod tests {
     #[test]
     fn retention_cap_prunes_oldest_events() {
         let dir = temp_dir("retention");
-        let mut s = Storage::open(&dir, 3).unwrap();
+        let mut s = Storage::open(&dir, 3, 500).unwrap();
         for seq in 1..=10 {
             s.append_event("e", "{}", seq).unwrap();
         }
         drop(s);
-        let s2 = Storage::open(&dir, 3).unwrap();
+        let s2 = Storage::open(&dir, 3, 500).unwrap();
         assert_eq!(s2.events.len(), 3);
         assert_eq!(s2.last_seq, 10);
         let seqs: Vec<i64> = s2.events.iter().map(|e| e.seq).collect();
@@ -731,7 +818,7 @@ mod tests {
     #[test]
     fn compact_shrinks_journal_and_preserves_state() {
         let dir = temp_dir("compact");
-        let mut s = Storage::open(&dir, 500).unwrap();
+        let mut s = Storage::open(&dir, 500, 500).unwrap();
         for seq in 1..=50 {
             s.append_event("e", "{\"x\":1}", seq).unwrap();
         }
@@ -740,7 +827,7 @@ mod tests {
         assert_eq!(s.events.len(), 50);
         assert_eq!(s.commands.len(), 1);
         drop(s);
-        let s2 = Storage::open(&dir, 500).unwrap();
+        let s2 = Storage::open(&dir, 500, 500).unwrap();
         assert_eq!(s2.events.len(), 50);
         assert_eq!(s2.last_seq, 50);
         assert_eq!(s2.commands["c1"].status, "completed");
@@ -750,11 +837,93 @@ mod tests {
     #[test]
     fn kv_survives_reopen() {
         let dir = temp_dir("kv");
-        let mut s = Storage::open(&dir, 500).unwrap();
+        let mut s = Storage::open(&dir, 500, 500).unwrap();
         s.put_kv("bootCount", "3").unwrap();
         drop(s);
-        let s2 = Storage::open(&dir, 500).unwrap();
+        let s2 = Storage::open(&dir, 500, 500).unwrap();
         assert_eq!(s2.kv.get("bootCount").map(String::as_str), Some("3"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_retention_cap_evicts_oldest_completed_keeps_unresolved() {
+        let dir = temp_dir("cmd-retention");
+        let mut s = Storage::open(&dir, 500, 3).unwrap();
+        for i in 1..=3 {
+            let mut c = command(&format!("done-{i}"), "refused");
+            c.created_at = i;
+            c.ok = Some(false);
+            s.put_command(&c).unwrap();
+        }
+        // in-flight commands are never evicted: they yield the oldest completed
+        for i in 4..=5 {
+            let mut c = command(&format!("open-{i}"), "unresolved");
+            c.created_at = i;
+            s.put_command(&c).unwrap();
+        }
+        let mut c = command("done-6", "refused");
+        c.created_at = 6;
+        s.put_command(&c).unwrap();
+        assert_eq!(s.commands.len(), 3, "cap holds for the evictable class");
+        assert!(!s.commands.contains_key("done-1"));
+        assert!(!s.commands.contains_key("done-3"));
+        assert!(s.commands.contains_key("open-4") && s.commands.contains_key("open-5"));
+        assert!(s.commands.contains_key("done-6"));
+        // another in-flight command: the newest completed yields to in-flight
+        // (shortcut documented on enforce_command_cap) — unresolved all kept
+        let mut c = command("open-7", "unresolved");
+        c.created_at = 7;
+        s.put_command(&c).unwrap();
+        assert_eq!(s.commands.len(), 3);
+        assert!(!s.commands.contains_key("done-6"));
+        assert!(s.commands.contains_key("open-4") && s.commands.contains_key("open-5"));
+        assert!(s.commands.contains_key("open-7"));
+        drop(s);
+        // restart: the journal replay cannot resurrect the evicted records
+        // (open prunes again after load, then compacts)
+        let s2 = Storage::open(&dir, 500, 3).unwrap();
+        assert!(!s2.commands.contains_key("done-1"));
+        assert!(s2.commands.contains_key("open-4"));
+        assert!(s2.commands.contains_key("open-7"));
+        let _ = fs::remove_dir_all(&dir);
+
+        // all-in-flight legally exceeds the cap — dropping them would break
+        // boot reconciliation and verbatim replay
+        let dir = temp_dir("cmd-retention-flight");
+        let mut s = Storage::open(&dir, 500, 2).unwrap();
+        for i in 1..=4 {
+            let mut c = command(&format!("open-{i}"), "unresolved");
+            c.created_at = i;
+            s.put_command(&c).unwrap();
+        }
+        assert_eq!(
+            s.commands.len(),
+            4,
+            "no evictable records → over cap is legal"
+        );
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_compact_trigger_bounds_file_within_one_run() {
+        let dir = temp_dir("compact-trigger");
+        let mut s = Storage::open(&dir, 500, 500).unwrap();
+        s.compact_trigger = 4_096; // tiny for the test; default is 64 MB
+        for i in 0..50 {
+            let mut c = command(&format!("t-{i}"), "refused");
+            c.payload = "x".repeat(300); // ~400 B/record so the trigger trips often
+            c.created_at = i;
+            s.put_command(&c).unwrap();
+        }
+        let len = fs::metadata(dir.join("companion.journal")).unwrap().len();
+        // without the trigger this would be 100 appends ≈ 40 KB+ of raw growth
+        // per run compounding forever; with it the file stays near the trigger
+        assert!(len < 16 * 4_096, "journal grew to {len} bytes");
+        assert_eq!(s.commands.len(), 50, "compaction never drops live records");
+        drop(s);
+        let s2 = Storage::open(&dir, 500, 500).unwrap();
+        assert_eq!(s2.commands.len(), 50);
         let _ = fs::remove_dir_all(&dir);
     }
 }
