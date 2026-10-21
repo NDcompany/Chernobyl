@@ -64,7 +64,10 @@ function open(url, token) {
       closedCode = { closed: code };
       deliver(closedCode);
     });
-    ws.on('error', () => {});
+    // reject on connect failure (e.g. server dead) — swallowing it left the
+    // caller awaiting forever and drained the event loop into an unsettled
+    // top-level await; after 'open' this reject is a harmless no-op
+    ws.on('error', (e) => reject(e));
     ws.on('unexpected-response', (_, res) => reject(new Error(`http ${res.statusCode}`)));
     ws.on('open', () =>
       resolve({
@@ -222,6 +225,80 @@ function deepDiff(a, b, path = '', out = []) {
   return out;
 }
 
+// Closed-loop saturation benchmark: every connection sends and waits for the
+// reply before sending the next message (no timers, so Windows timer
+// resolution can't skew the offered rate). Server CPU is measured externally
+// per process — this reports client-side throughput and latency percentiles.
+async function bench(url, token, kind, durationSec, conns) {
+  const cs = [];
+  for (let i = 0; i < conns; i++) {
+    const c = await open(url, token);
+    c.send({ type: 'hello', protocol: 2, clientId: 'bench', resumeFrom: null });
+    await c.next();
+    cs.push(c);
+  }
+  let ok = 0;
+  let errs = 0;
+  const lats = [];
+  const started = Date.now();
+  const until = started + durationSec * 1000;
+  await Promise.all(
+    cs.map(async (c, idx) => {
+      let n = 0;
+      while (Date.now() < until) {
+        const t0 = performance.now();
+        if (kind === 'malformed') {
+          // transport hot path: frame decode -> JSON parse fail -> error ack,
+          // no engine, no persistence, no state growth on either side
+          c.send('## not json ##');
+        } else {
+          n++;
+          // full stack: validate -> engine (stale revision, refused every
+          // time, state unchanged); on Rust this also persists the command.
+          // 'reject' must be a protocol-valid decision or both sides only
+          // measure schema-rejection (the first run did exactly that).
+          c.send({
+            type: 'permission_decision',
+            commandId: `bench-${idx}-${n}-${Date.now()}`,
+            permissionId: 'p1',
+            decision: 'reject',
+            revision: 2,
+          });
+        }
+        const f = await c.next(5000).catch(() => null);
+        const el = performance.now() - t0;
+        if (!f || f.raw === undefined) {
+          errs++;
+          continue;
+        }
+        ok++;
+        lats.push(el);
+      }
+    }),
+  );
+  const elapsedMs = Date.now() - started;
+  lats.sort((a, b) => a - b);
+  const q = (p) => (lats.length ? lats[Math.min(lats.length - 1, Math.floor((p / 100) * lats.length))] : 0);
+  console.log(
+    JSON.stringify({
+      bench: {
+        kind,
+        conns,
+        durationSec,
+        elapsedMs,
+        sent: ok,
+        errs,
+        perSec: +(ok / (elapsedMs / 1000)).toFixed(1),
+        p50: +q(50).toFixed(2),
+        p95: +q(95).toFixed(2),
+        p99: +q(99).toFixed(2),
+        max: +(lats[lats.length - 1] ?? 0).toFixed(2),
+      },
+    }),
+  );
+  for (const c of cs) c.closeNow();
+}
+
 async function churn(url, token, minutes, light) {
   const until = Date.now() + minutes * 60_000;
   let ok = 0;
@@ -268,11 +345,19 @@ if (compare >= 0) {
 const url = opt('--url');
 const token = opt('--token');
 if (!url || !token) {
-  console.error('usage: --url ws://host:port --token T [--out f.json] [--compare a b] [--churn --light --minutes N]');
+  console.error('usage: --url ws://host:port --token T [--out f.json] [--compare a b] [--bench --kind malformed|command --duration 60 --conns 4] [--churn --light --minutes N]');
   process.exit(2);
 }
 
-if (args.includes('--churn')) {
+if (args.includes('--bench')) {
+  await bench(
+    url,
+    token,
+    opt('--kind') ?? 'malformed',
+    Number(opt('--duration') ?? 60),
+    Number(opt('--conns') ?? 4),
+  );
+} else if (args.includes('--churn')) {
   await churn(url, token, Number(opt('--minutes') ?? 30), args.includes('--light'));
 } else {
   const observations = await scenario(url, token);

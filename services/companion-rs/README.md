@@ -51,7 +51,12 @@ Gotchas (both found the hard way): **restart both servers between runs** — bot
 replies by `commandId`, so a second probe run replays run #1's outcomes and masks real diffs;
 and never reuse a dirty `CHERNOBYL_HOME` for an A/B run (boot reconciliation answers every
 old command honestly, which is correct behavior but not what you're diffing).
-`--churn --light --minutes N` runs connect/hello/close cycles for soak load.
+A second instance on one machine needs its own `--diagnostics-port` (default 9487 is held
+by any already-running instance — the new one refuses to start, by design).
+`--bench --kind malformed|command --duration 60 --conns 4` runs the closed-loop saturation
+benchmark (throughput + p50/p95/p99; measure server CPU externally per process — measured
+numbers and the caveats are in `TODO.md`). `--churn --light --minutes N` runs
+connect/hello/close cycles for soak load.
 
 ## Layout
 
