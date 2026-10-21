@@ -190,24 +190,31 @@ impl Storage {
     /// becomes evictable once boot reconciliation marks it `unknown`.
     fn enforce_command_cap(&mut self) -> bool {
         let mut evicted = false;
+        // evict in batches: one scan selects the oldest `k` completed records
+        // instead of rescanning the whole map per eviction. At cap 5 000 a
+        // per-eviction scan cost ~100 µs/command and turned the 19k/s
+        // saturation bench into 6.5k/s; one scan per ~78 commands is ~1 µs.
+        // Small caps (tests) keep exact cap+1 behavior: batch = 1.
+        let batch = (self.command_cap / 64).max(1);
         while self.commands.len() > self.command_cap {
-            let mut oldest: Option<(i64, String)> = None;
-            for (id, c) in &self.commands {
-                if c.status == "unresolved" {
-                    continue;
-                }
-                let key = (c.created_at, id.clone());
-                if oldest.as_ref().is_none_or(|k| key < *k) {
-                    oldest = Some(key);
-                }
+            let want = self.commands.len() - self.command_cap;
+            let mut completed: Vec<(i64, &String)> = self
+                .commands
+                .iter()
+                .filter(|(_, c)| c.status != "unresolved")
+                .map(|(id, c)| (c.created_at, id))
+                .collect();
+            if completed.is_empty() {
+                return evicted; // all remaining are in flight — over cap is legal
             }
-            match oldest {
-                Some((_, id)) => {
-                    self.commands.remove(&id);
-                    evicted = true;
-                }
-                None => break, // all remaining are in flight — over cap is legal
+            let k = want.max(batch).min(completed.len());
+            completed.select_nth_unstable_by(k - 1, |a, b| a.cmp(b));
+            let victims: Vec<String> = completed[..k].iter().map(|(_, id)| (*id).clone()).collect();
+            drop(completed); // borrows end — removal can start
+            for id in &victims {
+                self.commands.remove(id);
             }
+            evicted = true;
         }
         evicted
     }

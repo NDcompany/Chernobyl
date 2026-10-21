@@ -79,8 +79,14 @@ pub fn start(
     token: Option<String>,
     companion: Arc<Companion>,
 ) -> Result<ServerHandle, String> {
-    let listener =
-        TcpListener::bind((bind, port)).map_err(|e| format!("bind {bind}:{port}: {e}"))?;
+    let listener = match crate::ffi::bind_listener_backlog(bind, port) {
+        Ok(l) => l,
+        Err(e) => {
+            // IPv6 binds (and any exotic config) keep std's ~128-handshake backlog
+            eprintln!("[companion] large-backlog listener unavailable ({e}); using std bind");
+            TcpListener::bind((bind, port)).map_err(|e2| format!("bind {bind}:{port}: {e2}"))?
+        }
+    };
     let actual_port = listener.local_addr().map_err(|e| e.to_string())?.port();
     // diagnostics is loopback-only by contract (PRD §15.2)
     let diag_listener = TcpListener::bind(("127.0.0.1", diagnostics_port))

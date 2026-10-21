@@ -299,6 +299,93 @@ async function bench(url, token, kind, durationSec, conns) {
   for (const c of cs) c.closeNow();
 }
 
+// Multi-connection burst: N connections open SIMULTANEOUSLY (not staggered
+// like the closed-loop bench), each authenticates, hellos, runs one persisted
+// command, and closes. The "many clients at once" acceptance check the bench
+// skips — it reports wall time, per-phase latency, errors and RSS delta.
+async function burst(url, token, conns) {
+  const httpBase = url.replace(/^ws/, 'http').replace(/\/\?.*$/, '').replace(/\/$/, '');
+  const health = async () => {
+    try {
+      const res = await fetch(`${httpBase}/health`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      const h = await res.json();
+      return h.rssBytes ?? null; // only Rust reports rssBytes
+    } catch {
+      return null;
+    }
+  };
+  const rssBefore = await health();
+  const opens = [];
+  const acks = [];
+  let opened = 0;
+  let acked = 0;
+  let errs = 0;
+  const t0 = performance.now();
+  await Promise.all(
+    Array.from({ length: conns }, async (_, i) => {
+      try {
+        const s = performance.now();
+        const c = await open(url, token);
+        opens.push(performance.now() - s);
+        opened++;
+        c.send({ type: 'hello', protocol: 2, clientId: `burst-${i}`, resumeFrom: null });
+        const h = await c.next(10_000);
+        if (!h || h.raw === undefined) throw new Error('no hello reply');
+        const t1 = performance.now();
+        c.send({
+          type: 'permission_decision',
+          commandId: `burst-${i}-${Date.now()}`,
+          permissionId: 'p1',
+          decision: 'reject',
+          revision: 2,
+        });
+        let got = false;
+        for (let k = 0; k < 64 && !got; k++) {
+          const f = await c.next(10_000).catch(() => null);
+          if (!f || f.raw === undefined) break;
+          let parsed;
+          try {
+            parsed = JSON.parse(f.raw);
+          } catch {
+            continue;
+          }
+          if (parsed.type === 'ack') got = true;
+        }
+        if (!got) throw new Error('no ack');
+        acks.push(performance.now() - t1);
+        acked++;
+        c.closeNow();
+      } catch {
+        errs++;
+      }
+    }),
+  );
+  const wallMs = performance.now() - t0;
+  const rssAfter = await health();
+  const pct = (arr, p) =>
+    arr.length ? +arr.slice().sort((a, b) => a - b)[Math.min(arr.length - 1, Math.floor((p / 100) * arr.length))].toFixed(2) : 0;
+  console.log(
+    JSON.stringify({
+      burst: {
+        conns,
+        wallMs: +wallMs.toFixed(1),
+        opened,
+        acked,
+        errs,
+        openP50: pct(opens, 50),
+        openP95: pct(opens, 95),
+        ackP50: pct(acks, 50),
+        ackP95: pct(acks, 95),
+        rssBefore,
+        rssAfter,
+        rssDelta: rssBefore !== null && rssAfter !== null ? rssAfter - rssBefore : null,
+      },
+    }),
+  );
+}
+
 async function churn(url, token, minutes, light) {
   const until = Date.now() + minutes * 60_000;
   let ok = 0;
@@ -345,7 +432,7 @@ if (compare >= 0) {
 const url = opt('--url');
 const token = opt('--token');
 if (!url || !token) {
-  console.error('usage: --url ws://host:port --token T [--out f.json] [--compare a b] [--bench --kind malformed|command --duration 60 --conns 4] [--churn --light --minutes N]');
+  console.error('usage: --url ws://host:port --token T [--out f.json] [--compare a b] [--bench --kind malformed|command --duration 60 --conns 4] [--burst --conns 200] [--churn --light --minutes N]');
   process.exit(2);
 }
 
@@ -357,6 +444,8 @@ if (args.includes('--bench')) {
     Number(opt('--duration') ?? 60),
     Number(opt('--conns') ?? 4),
   );
+} else if (args.includes('--burst')) {
+  await burst(url, token, Number(opt('--conns') ?? 200));
 } else if (args.includes('--churn')) {
   await churn(url, token, Number(opt('--minutes') ?? 30), args.includes('--light'));
 } else {

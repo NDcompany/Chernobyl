@@ -1026,6 +1026,53 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "micro-benchmark — run: cargo test --release microbench -- --ignored --nocapture"]
+    fn microbench_parse_validate_handle_encode() {
+        // the whole in-process command path minus sockets and storage — the
+        // symmetric counterpart of `engine-bench.mjs full` on the TS side
+        const N: usize = 1_000_000;
+        let (mut engine, events) = make_engine();
+        let permission = engine
+            .snapshot()
+            .permissions
+            .iter()
+            .find(|p| p.status == "pending")
+            .cloned()
+            .expect("seeded pending permission");
+        let pid = permission.id.clone();
+        let rev = permission.revision + 1; // stale → refused every time
+        // prebuild raw frames so the timed loop measures the server path only
+        let raws: Vec<String> = (0..N)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"permission_decision","commandId":"mb-{i}","permissionId":"{pid}","decision":"reject","revision":{rev}}}"#
+                )
+            })
+            .collect();
+        let first_msg = crate::protocol::parse_client_message(&raws[0]).expect("parses+validates");
+        let first_ack = engine.handle(first_msg).expect("ack");
+        assert!(crate::json::stringify(&first_ack.to_json()).contains("\"ok\":false"));
+        let t0 = std::time::Instant::now();
+        for raw in &raws {
+            let Some(msg) = crate::protocol::parse_client_message(raw) else {
+                panic!("frame must parse+validate");
+            };
+            let Some(reply) = engine.handle(msg) else {
+                panic!("stale decision must ack");
+            };
+            let _encoded = crate::json::stringify(&reply.to_json());
+        }
+        let dt = t0.elapsed();
+        assert_eq!(events.lock().unwrap().len(), 0);
+        println!(
+            "rust in-process full path (parse+validate+handle+encode, no socket/storage): {} ns/op ({} ops in {:?})",
+            dt.as_nanos() / N as u128,
+            N,
+            dt
+        );
+    }
+
+    #[test]
     fn duplicate_command_ids_do_not_create_duplicate_sessions() {
         let (mut engine, _events) = make_engine();
         let before = engine.snapshot().sessions.len();
