@@ -55,8 +55,10 @@ A second instance on one machine needs its own `--diagnostics-port` (default 948
 by any already-running instance — the new one refuses to start, by design).
 `--bench --kind malformed|command --duration 60 --conns 4` runs the closed-loop saturation
 benchmark (throughput + p50/p95/p99; measure server CPU externally per process — measured
-numbers and the caveats are in `TODO.md`). `--churn --light --minutes N` runs
-connect/hello/close cycles for soak load.
+numbers and the caveats are in `TODO.md`). `tools/engine-bench.mjs` microbenches the TS
+engine alone (pair of the in-crate `microbench_engine_stale_decide` `#[ignore]` test; run
+`cargo test --release microbench -- --ignored --nocapture` for the Rust side).
+`--churn --light --minutes N` runs connect/hello/close cycles for soak load.
 
 ## Layout
 

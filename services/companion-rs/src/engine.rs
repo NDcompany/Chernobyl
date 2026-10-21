@@ -983,6 +983,49 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "micro-benchmark — run: cargo test --release microbench -- --ignored --nocapture"]
+    fn microbench_engine_stale_decide() {
+        const N: usize = 1_000_000;
+        let (mut engine, events) = make_engine();
+        let permission = engine
+            .snapshot()
+            .permissions
+            .iter()
+            .find(|p| p.status == "pending")
+            .cloned()
+            .expect("seeded pending permission");
+        let first = ack_of(engine.handle(ClientMsg::PermissionDecision {
+            command_id: "mb-0".into(),
+            permission_id: permission.id.clone(),
+            decision: "reject".into(),
+            revision: (permission.revision + 1) as f64,
+        }));
+        assert_eq!(
+            first.as_ref().map(|a| a.1),
+            Some(false),
+            "stale must refuse"
+        );
+        let t0 = std::time::Instant::now();
+        for i in 1..N {
+            let _ = engine.handle(ClientMsg::PermissionDecision {
+                command_id: format!("mb-{i}"),
+                permission_id: permission.id.clone(),
+                decision: "reject".into(),
+                revision: (permission.revision + 1) as f64,
+            });
+        }
+        let dt = t0.elapsed();
+        // stale refusals never emit events, so the sink stays empty
+        assert_eq!(events.lock().unwrap().len(), 0);
+        println!(
+            "engine stale decide (validate+find+refuse+ack-cache, unique ids): {} ns/op ({} ops in {:?})",
+            dt.as_nanos() / N as u128,
+            N,
+            dt
+        );
+    }
+
+    #[test]
     fn duplicate_command_ids_do_not_create_duplicate_sessions() {
         let (mut engine, _events) = make_engine();
         let before = engine.snapshot().sessions.len();

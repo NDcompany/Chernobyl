@@ -588,6 +588,42 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "micro-benchmark — run: cargo test --release microbench -- --ignored --nocapture"]
+    fn microbench_storage_put_update_pair() {
+        // mirrors the per-command wire cost on Rust: put_command (unresolved)
+        // + update_command_outcome (refused) = two journal appends per command
+        const N: usize = 100_000;
+        let dir = temp_dir("microbench-store");
+        let mut s = Storage::open(&dir, 500).unwrap();
+        let mut rec = command("mb-0", "unresolved");
+        rec.kind = "permission_decision".into();
+        rec.payload = r#"{"type":"permission_decision","commandId":"mb-0","permissionId":"p1","decision":"reject","revision":2}"#.into();
+        let t0 = std::time::Instant::now();
+        for i in 0..N {
+            rec.command_id = format!("mb-{i}");
+            s.put_command(&rec).unwrap();
+            s.update_command_outcome(
+                &rec.command_id,
+                "refused",
+                Some(false),
+                None,
+                None,
+                Some("request changed — review it again"),
+            )
+            .unwrap();
+        }
+        let dt = t0.elapsed();
+        println!(
+            "storage put+update pair (two appends + map inserts): {} ns/op ({} ops in {:?})",
+            dt.as_nanos() / N as u128,
+            N,
+            dt
+        );
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn journal_reopens_with_contiguous_seq() {
         let dir = temp_dir("reopen");
         let mut s = Storage::open(&dir, 500).unwrap();

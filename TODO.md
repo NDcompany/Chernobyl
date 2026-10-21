@@ -71,26 +71,36 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
       Re-run after fixes on fresh cold servers (fresh `CHERNOBYL_HOME` dir + restarted host —
       both sides cache by commandId): **IDENTICAL**, compare exit 0. Gates re-run green
       (`cargo test` **59**, clippy, fmt, `--self-test` 9/9, `npm run verify` exit 0).
-- [x] CPU/throughput benchmark vs Node host — **done 2026-10-21** (`tools/differential.mjs
+- [x] CPU/throughput benchmark vs Node host — **done 2026-10-21, repeated (3 reps/scenario,
+      fresh server per rep) + engine-only isolated on both sides** (`tools/differential.mjs
       --bench`, closed-loop saturation, 4 conns, same generator both sides, server CPU
-      measured per-process; 16 logical cores; soak running in background during all runs):
-  - **malformed (transport hot path, 60 s, zero state growth):** Rust **36 303/s**, 0.033
-    CPU-s/1k msgs, p50 0.10 ms — Node **15 319/s**, 0.066 CPU-s/1k, p50 0.24 ms →
-    **Rust 2.4× throughput at ½ the CPU per message** (Node pays V8 exception cost on
-    every unparseable frame; Rust's non-throwing parser doesn't).
-  - **command (validate → engine stale-refusal → ack; Rust additionally persists
-    persist-before-execute, 30 s):** Rust **18 532/s**, 0.091 CPU-s/1k, p50 0.19 ms, journal
-    364 MB, RSS 421 MB — Node **32 169/s**, 0.030 CPU-s/1k, p50 0.11 ms, RSS 181 MB →
-    **Node 1.7× faster here because it persists nothing**: Rust's 3× CPU/msg is engine +
-    two journal appends + record map per command (the §19.4/C2 durability design).
+      measured per-process; 16 logical cores; soak in background for all runs):
+  - **malformed (transport hot path, 60 s, zero state):** Rust **31 742/s** (31 380–32 360),
+    **0.034 CPU-s/1k**, p50 0.11 ms — Node **13 864/s** (13 747–13 970), 0.0717 CPU-s/1k,
+    p50 0.25 ms → **Rust 2.3× throughput at 2.1× less CPU per message.** Rep spread ±2 %;
+    initial single runs came in ~10 % higher on both sides (background drift).
+  - **command (validate → engine stale-refusal → ack; Rust also persists, 30 s):**
+    Node **29 803/s** (27 659–31 082), **0.032 CPU-s/1k**, p50 0.11 ms — Rust **19 194/s**
+    (18 912–19 543), 0.089 CPU-s/1k, p50 0.18 ms → **Node 1.55× throughput; Rust 2.8× CPU
+    per message = engine + two journal appends + record insert per command (§19.4/C2
+    durability design).** Rep spread: Rust ±1.6 %, Node ±6 %.
+  - **Engine-only isolation (release, 1 M unique stale decisions):** TS `MockEngine`
+    **596 ns/op** (`tools/engine-bench.mjs`) vs Rust `microbench_engine_stale_decide`
+    (in-crate `#[ignore]` test) **2 957 ns/op** → the TS engine is 5× faster in isolation,
+    but the 2.4 µs absolute gap is ~3 % of Rust's 89 µs wire cost per command; Rust
+    `microbench_storage_put_update_pair` (same harness) = **17 378 ns/op** for the two
+    journal appends. Rough budget (subtractions across runs, approximate): Rust 89 µs/msg
+    ≈ 38 transport+validate + 3 engine + 17 storage + ~30 queueing/lock contention;
+    Node 32 µs/msg ≈ 27 transport+validate + 0.6 engine + misc → **the gap is durability
+    plus transport layer, not the engine port.**
   - Lesson (kept in the tool's comments): the first command run used `decision: "deny"`,
     which fails the protocol enum (`approve-once|approve-session|reject`) on BOTH sides —
     it measured schema-rejection, not the engine (Rust's `malformed` counter exposed it:
     counter == exact sum of both phases, `commands: 0`). Re-run with `reject` verified
     `commands == sent`, `malformed: 0`.
-  - Honesty: single run per scenario, no repeats/variance; CPU of the shared load generator
-    not subtracted (identical for both sides); Rust's engine-only cost not separately
-    isolated (every protocol command is mutating → always persisted on Rust).
+  - Caveats kept: one machine, soak in background during all runs (equal for both sides);
+    load-generator CPU not subtracted (identical both sides); decomposition subtracts
+    measurements from different runs.
 - [ ] Soak test: **started 2026-10-21, in progress** — release binary on :18792 with a fresh
       temp home and `--exit-after 86400000` (24 h), boot RSS 4 030 464 B (3.84 MB), plus a
       detached 10-minute RSS sampler (`Temp\opencode\chernobyl-soak-rss.tsv`) and a detached
