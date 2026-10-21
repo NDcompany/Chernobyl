@@ -4,7 +4,36 @@
 //! etc.) arrive with Phase 3+; the manager shape is already here.
 
 use crate::config::AdapterEntryConfig;
+use crate::json::{self, Json};
 use std::collections::HashMap;
+
+/// PRD §7.3 capability declaration — what an adapter honestly supports
+/// (TS `@chernobyl/domain` `Capability`, mirrored). `status` values are the
+/// domain set: available | unavailable | limited | dependent-config.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Capability {
+    pub id: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+impl Capability {
+    pub fn new(id: &str, status: &str, detail: Option<&str>) -> Capability {
+        Capability {
+            id: id.to_string(),
+            status: status.to_string(),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    pub fn to_json(&self) -> Json {
+        let mut fields = vec![("id", json::s(&self.id)), ("status", json::s(&self.status))];
+        if let Some(d) = &self.detail {
+            fields.push(("detail", json::s(d)));
+        }
+        json::obj(fields)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdapterStatus {
