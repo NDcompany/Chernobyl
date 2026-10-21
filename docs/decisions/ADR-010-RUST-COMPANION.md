@@ -1,6 +1,8 @@
 # ADR-010: The local backend runs as one std-only Rust binary (Phase R)
 
-**Status:** Accepted
+**Status:** Accepted — amended 2026-10-21: `services/companion` (the Node companion) has been
+**removed**; `services/host` is retained solely as the TS conformance test suite (21 tests) until
+the differential run is done.
 **Date:** 2026-10-21
 **Relates to:** PRD §16.2, §19, §25 (phase map); conflict register C15; ADR-001, ADR-003, ADR-004
 

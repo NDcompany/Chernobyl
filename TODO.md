@@ -28,17 +28,28 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
   - `cargo test`: **57 passed, 0 failed**
   - `cargo clippy --all-targets -- -D warnings`: clean
   - `cargo fmt --check`: clean
-  - `--self-test` (7 end-to-end checks over real sockets, debug **and** release binary):
-    **ALL CHECKS PASSED** — hello/4001/4002/create+replay-dedupe//health/garbage-frame/seq-durability
+  - `--self-test` (9 end-to-end checks over real sockets, debug **and** release binary):
+    **ALL CHECKS PASSED** — hello/4001/4002/create+replay-dedupe//health/garbage-frame/
+    permission-decision/fan-out/seq-durability
   - boot RSS via `/health rssBytes`: **3.83 MB** (4 018 176 bytes); release exe **407 KB**
   - `npm run verify`: exit 0 (unchanged, still the repo-wide gate)
 - [x] Docs: `docs/decisions/ADR-010-RUST-COMPANION.md`, conflict register C15,
       `services/companion-rs/README.md`, this TODO, `npm run verify:rust` script.
+- [x] Self-test extended to **9/9 checks** (debug + release): added the two wire flows the app
+      depends on — permission decision (stale revision refused fail-closed, fresh revision
+      resolves + `permission_resolved` broadcast) and multi-client fan-out (a second connected
+      client sees `session_created` it did not cause).
+- [x] **`services/companion` (Node) removed** — the Rust binary is the only desktop runtime.
+      `npm run verify` re-run green after workspace rewiring (typecheck/test/build chains no
+      longer reference it; lockfile refreshed).
 
 ## Remaining
 
 ### Phase R follow-ups
 
+- [x] Decommission `services/companion` (Node) — **done 2026-10-21**. `services/host` remains,
+      not as runtime but as the TS conformance test suite (21 tests in `npm run verify`); move
+      its engine tests into `packages/protocol` and drop the host service when convenient.
 - [ ] Differential conformance: run the same client script against the Node host and the Rust
       binary and diff the wire traffic (`--self-test` is that script for the Rust side; pointing
       it at the Node host is the delta check). Parity is currently proven by ported unit tests,
@@ -46,8 +57,6 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
 - [ ] Soak test: 24 h idle RSS stability + a multi-connection burst test (not run).
 - [ ] Windows autostart/service wrapper (current build is a console daemon with
       Ctrl+C/CTRL_CLOSE graceful shutdown).
-- [ ] Decommission `services/host` + `services/companion` as runtime once the mobile app is
-      validated against the Rust binary (their tests stay as fixtures until then).
 
 ### Phase map (unchanged, PRD §25)
 
@@ -63,6 +72,6 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
 
 - No external/independent security audit; hardening evidence is the hostile-input test corpus
   (frames, handshake, JSON, client messages) plus the constant-time/limit checks above.
-- No measured numbers for loaded/burst memory — only boot RSS.
-- Node services were not run in this checkpoint; their last green state is commit `5789e4b`,
-  and `npm run verify` (typecheck+lint+test+build) passed today across the workspace.
+- No measured numbers for loaded/burst memory — only boot Rust RSS (3.83 MB).
+- `services/host` is exercised only as a test suite (its 21 tests ran green in today's
+  `npm run verify`); the Node host server itself was not run as a runtime this checkpoint.

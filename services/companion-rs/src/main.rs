@@ -14,8 +14,10 @@
 //!   --self-test              boot in a temp dir, exercise the stack, exit
 //!   --version                print version and exit
 
+use chernobyl_companion::client::{WsClient, http_get};
 use chernobyl_companion::companion::Companion;
 use chernobyl_companion::config;
+use chernobyl_companion::json;
 use chernobyl_companion::{ffi, server};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -182,10 +184,19 @@ fn run(args: &[String]) -> i32 {
 
 /// Boots everything in a temp dir, exercises the full stack over a real
 /// socket, and reports honestly. Exit 0 = all checks passed.
-fn self_test_main() -> i32 {
-    use chernobyl_companion::client::{WsClient, http_get};
-    use chernobyl_companion::json;
+// Events are broadcast on the same queue before the ack — skip to the ack.
+fn next_ack(c: &mut WsClient) -> Result<json::Json, String> {
+    for _ in 0..32 {
+        let text = c.next_text()?;
+        let v = json::parse(&text).map_err(|e| e.to_string())?;
+        if json::get(&v, "ok").is_some() {
+            return Ok(v);
+        }
+    }
+    Err("no ack within 32 frames".into())
+}
 
+fn self_test_main() -> i32 {
     let mut failures: Vec<String> = Vec::new();
     let check = |name: &str, ok: bool, detail: String, failures: &mut Vec<String>| {
         if ok {
@@ -301,17 +312,6 @@ fn self_test_main() -> i32 {
 
     // 4. create_session over the wire, dedupe on replay
     {
-        // events are broadcast on the same queue before the ack — skip to the ack
-        fn next_ack(c: &mut WsClient) -> Result<json::Json, String> {
-            for _ in 0..32 {
-                let text = c.next_text()?;
-                let v = json::parse(&text).map_err(|e| e.to_string())?;
-                if json::get(&v, "ok").is_some() {
-                    return Ok(v);
-                }
-            }
-            Err("no ack within 32 frames".into())
-        }
         let result = (|| -> Result<(), String> {
             let mut c = WsClient::connect(&addr, "/", Some("st-secret"))?;
             c.hello()?;
@@ -375,7 +375,113 @@ fn self_test_main() -> i32 {
         );
     }
 
-    // 7. durable seq across restart
+    // 7. permission decision over the wire: stale revision refused (G2
+    // fail-closed), fresh revision resolves and broadcasts
+    {
+        let result = (|| -> Result<(), String> {
+            let mut c = WsClient::connect(&addr, "/", Some("st-secret"))
+                .map_err(|e| format!("connect: {e}"))?;
+            c.hello().map_err(|e| format!("hello: {e}"))?;
+            // seeded p1 is pending at revision 1 — a stale revision must be refused
+            c.send_text(r#"{"type":"permission_decision","commandId":"st-perm-1","permissionId":"p1","decision":"approve-once","revision":2}"#)?;
+            let refused = next_ack(&mut c).map_err(|e| format!("stale-decision ack: {e}"))?;
+            if json::get(&refused, "ok").and_then(json::as_bool) != Some(false) {
+                return Err(format!(
+                    "stale revision not refused: {}",
+                    json::stringify(&refused)
+                ));
+            }
+            // fresh revision resolves; events precede the ack on the same
+            // queue, so watch every frame while waiting for the ack
+            c.send_text(r#"{"type":"permission_decision","commandId":"st-perm-2","permissionId":"p1","decision":"approve-once","revision":1}"#)?;
+            let mut seen_resolved = false;
+            let mut accepted = None;
+            for _ in 0..64 {
+                let text = c.next_text().map_err(|e| format!("fresh-decision: {e}"))?;
+                let v = json::parse(&text).map_err(|e| e.to_string())?;
+                if json::get(&v, "type").and_then(json::as_str) == Some("permission_resolved")
+                    && json::get(&v, "permission")
+                        .and_then(|p| json::get(p, "id"))
+                        .and_then(json::as_str)
+                        == Some("p1")
+                {
+                    seen_resolved = true;
+                }
+                if json::get(&v, "ok").is_some() {
+                    accepted = Some(v);
+                    break;
+                }
+            }
+            let Some(accepted) = accepted else {
+                return Err("no ack for fresh decision".into());
+            };
+            if json::get(&accepted, "ok").and_then(json::as_bool) != Some(true) {
+                return Err(format!(
+                    "fresh revision not accepted: {}",
+                    json::stringify(&accepted)
+                ));
+            }
+            if !seen_resolved {
+                return Err("no permission_resolved event for p1".into());
+            }
+            Ok(())
+        })();
+        check(
+            "permission decision: stale refused, fresh resolves",
+            result.is_ok(),
+            result.as_ref().err().cloned().unwrap_or_default(),
+            &mut failures,
+        );
+    }
+
+    // 8. events fan out to every connected client (the phone sees activity
+    // it did not cause)
+    {
+        let result = (|| -> Result<(), String> {
+            let mut watcher = WsClient::connect(&addr, "/", Some("st-secret"))?;
+            watcher.hello()?;
+            let mut actor = WsClient::connect(&addr, "/", Some("st-secret"))?;
+            actor.hello()?;
+            actor.send_text(r#"{"type":"create_session","commandId":"st-fan-1","agentId":"a4","title":"Fanout","prompt":"p"}"#)?;
+            // actor finds its ack (events precede it on the same queue)
+            let mut sid: Option<String> = None;
+            for _ in 0..32 {
+                let text = actor.next_text()?;
+                let v = json::parse(&text).map_err(|e| e.to_string())?;
+                if json::get(&v, "ok").is_some() {
+                    sid = json::get(&v, "sessionId")
+                        .and_then(json::as_str)
+                        .map(str::to_string);
+                    break;
+                }
+            }
+            let Some(sid) = sid else {
+                return Err("actor got no create ack".into());
+            };
+            // watcher sees the session_created event it did not cause
+            for _ in 0..64 {
+                let text = watcher.next_text()?;
+                let v = json::parse(&text).map_err(|e| e.to_string())?;
+                if json::get(&v, "type").and_then(json::as_str) == Some("session_created") {
+                    let id = json::get(&v, "session")
+                        .and_then(|s| json::get(s, "id"))
+                        .and_then(json::as_str);
+                    if id == Some(sid.as_str()) {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(format!("watcher never saw session {sid}"))
+        })();
+        check(
+            "events fan out to other connected clients",
+            result.is_ok(),
+            result.as_ref().err().cloned().unwrap_or_default(),
+            &mut failures,
+        );
+    }
+
+    // 9. durable seq across restart
     {
         let seq_before = companion.last_seq();
         srv.stop();
