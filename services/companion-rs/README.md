@@ -9,7 +9,7 @@ is intentionally empty — std only.
 ```powershell
 cargo build --release                 # target\release\chernobyl-companion.exe
 .\target\release\chernobyl-companion.exe            # default: 127.0.0.1:8787
-.\target\release\chernobyl-companion.exe --self-test # 7-check end-to-end probe
+.\target\release\chernobyl-companion.exe --self-test # 9-check end-to-end probe
 ```
 
 Flags (env in parentheses): `--config <path>` · `--port <n>` (`PORT`, 0 = ephemeral,
@@ -28,6 +28,30 @@ npm run verify:rust   # from repo root: cargo test + clippy -D warnings + fmt --
 
 `npm run verify` (the Node/workspace gate) is unchanged and must stay green — see `TODO.md`
 for current evidence and remaining work.
+
+## Differential conformance (A/B vs the Node host)
+
+`tools/differential.mjs` (Node, uses the workspace `ws`) runs one scripted 12-observation
+protocol scenario and diffs normalized transcripts between two servers — timestamps and
+generated ids are stripped, everything else (acks, error strings, close codes, event shapes,
+seed snapshot) must match exactly:
+
+```powershell
+# terminal 1 — reference (stateless, in-memory): rebuild first so dist matches src
+$env:PORT="18790"; $env:HOST_TOKEN="diff-secret"; node services\host\dist\server.js
+# terminal 2 — candidate: always give it a FRESH home, else its journal replays old commands
+$env:CHERNOBYL_HOME="$env:TEMP\ab-fresh"; .\services\companion-rs\target\release\chernobyl-companion.exe --port 18791 --token diff-secret
+# terminal 3 — probe both, then compare (exit 0 + IDENTICAL = parity)
+node services\companion-rs\tools\differential.mjs --url ws://127.0.0.1:18790 --token diff-secret --out host.json
+node services\companion-rs\tools\differential.mjs --url ws://127.0.0.1:18791 --token diff-secret --out rust.json
+node services\companion-rs\tools\differential.mjs --compare host.json rust.json
+```
+
+Gotchas (both found the hard way): **restart both servers between runs** — both sides cache
+replies by `commandId`, so a second probe run replays run #1's outcomes and masks real diffs;
+and never reuse a dirty `CHERNOBYL_HOME` for an A/B run (boot reconciliation answers every
+old command honestly, which is correct behavior but not what you're diffing).
+`--churn --light --minutes N` runs connect/hello/close cycles for soak load.
 
 ## Layout
 

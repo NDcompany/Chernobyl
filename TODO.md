@@ -24,14 +24,16 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
       caps, latched fail-closed on write (§19.4) — logged as conflict **C15** vs PRD §16.2.
 - [x] Hardening beyond parity: non-loopback bind refuses without a token (secure-by-default,
       documented deviation in ADR-010).
-- [x] Gates (all measured today, all green):
-  - `cargo test`: **57 passed, 0 failed**
+- [x] Gates (all measured today, all green — final numbers after the A/B fixes):
+  - `cargo test`: **59 passed, 0 failed**
   - `cargo clippy --all-targets -- -D warnings`: clean
   - `cargo fmt --check`: clean
   - `--self-test` (9 end-to-end checks over real sockets, debug **and** release binary):
     **ALL CHECKS PASSED** — hello/4001/4002/create+replay-dedupe//health/garbage-frame/
     permission-decision/fan-out/seq-durability
-  - boot RSS via `/health rssBytes`: **3.83 MB** (4 018 176 bytes); release exe **407 KB**
+  - live A/B vs Node host (`tools/differential.mjs --compare`): **IDENTICAL** (12/12
+    observations, normalized)
+  - boot RSS via `/health rssBytes`: **3.83-3.84 MB**; release exe **407 KB**
   - `npm run verify`: exit 0 (unchanged, still the repo-wide gate)
 - [x] Docs: `docs/decisions/ADR-010-RUST-COMPANION.md`, conflict register C15,
       `services/companion-rs/README.md`, this TODO, `npm run verify:rust` script.
@@ -50,11 +52,31 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
 - [x] Decommission `services/companion` (Node) — **done 2026-10-21**. `services/host` remains,
       not as runtime but as the TS conformance test suite (21 tests in `npm run verify`); move
       its engine tests into `packages/protocol` and drop the host service when convenient.
-- [ ] Differential conformance: run the same client script against the Node host and the Rust
-      binary and diff the wire traffic (`--self-test` is that script for the Rust side; pointing
-      it at the Node host is the delta check). Parity is currently proven by ported unit tests,
-      not by a live A/B.
-- [ ] Soak test: 24 h idle RSS stability + a multi-connection burst test (not run).
+- [x] Differential conformance vs the Node host — **done 2026-10-21, IDENTICAL**. New
+      `services/companion-rs/tools/differential.mjs` runs a fixed 12-observation scenario
+      (auth 4001, hello + full seed snapshot, malformed ack, create + event fan-out, replay
+      dedupe, submit refusal text, permission stale/fresh, interrupts, 4002 version gate,
+      /health) against both servers and diffs the normalized transcripts (volatile timestamps
+      and generated ids stripped). First run found **three real Rust-side parity bugs**, all
+      fixed at one root cause + one satellite:
+      1. store-replayed acks were *fabricated* from the record (`ok = status != "failed"`),
+         so refused commands replayed as success and permission/interrupt acks carried the
+         wrong id fields — now the original ack outcome (ok/error/sessionId/permissionId) is
+         persisted and replayed **verbatim**, incl. across restart;
+      2. journal **compaction had a second, older command serializer** that silently dropped
+         `ok`/`permissionId` (found while testing fix 1; shared `command_body()` now, with a
+         compact-preserves-outcome test);
+      3. (symptom of 1) boot reconciliation of in-flight commands now answers
+         `ok:false, "reconciled at boot"` on replay instead of success.
+      Re-run after fixes on fresh cold servers (fresh `CHERNOBYL_HOME` dir + restarted host —
+      both sides cache by commandId): **IDENTICAL**, compare exit 0. Gates re-run green
+      (`cargo test` **59**, clippy, fmt, `--self-test` 9/9, `npm run verify` exit 0).
+- [ ] Soak test: **started 2026-10-21, in progress** — release binary on :18792 with a fresh
+      temp home and `--exit-after 86400000` (24 h), boot RSS 4 030 464 B (3.84 MB), plus a
+      detached 10-minute RSS sampler (`Temp\opencode\chernobyl-soak-rss.tsv`) and a detached
+      *light* connection churn (connect+hello+close every 5 s, `--churn --light`) to exercise
+      accept/teardown. Survives until reboot or 24 h; numbers land in the sampler file.
+      Still owed after it finishes: multi-connection **burst** test (many clients at once).
 - [ ] Windows autostart/service wrapper (current build is a console daemon with
       Ctrl+C/CTRL_CLOSE graceful shutdown).
 
@@ -72,6 +94,7 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
 
 - No external/independent security audit; hardening evidence is the hostile-input test corpus
   (frames, handshake, JSON, client messages) plus the constant-time/limit checks above.
-- No measured numbers for loaded/burst memory — only boot Rust RSS (3.83 MB).
-- `services/host` is exercised only as a test suite (its 21 tests ran green in today's
-  `npm run verify`); the Node host server itself was not run as a runtime this checkpoint.
+- No measured numbers for loaded/burst memory — only boot Rust RSS (3.83-3.84 MB) and the
+  in-progress soak trend (light connection churn, no heavy multi-client burst yet).
+- `services/host` runs as the differential peer **and** as a test suite (its 21 tests ran
+  green in today's `npm run verify`); it is not a supported runtime — the Rust binary is.

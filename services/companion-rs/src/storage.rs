@@ -25,10 +25,15 @@ pub struct CommandRecord {
     pub command_id: String,
     pub kind: String,
     pub payload: String, // raw client message JSON
-    pub status: String,  // unresolved | completed | failed | cancelled | expired | unknown
+    pub status: String,  // unresolved | executed | refused | unknown | ...
     pub created_at: i64,
     pub updated_at: i64,
+    /// The original ack's `ok` once recorded; `None` = in flight. Replays
+    /// must return this verbatim (the Node host replays its engine-cached
+    /// ack exactly — refusals replay as refusals, never as success).
+    pub ok: Option<bool>,
     pub session_id: Option<String>,
+    pub permission_id: Option<String>,
     pub error: Option<String>,
 }
 
@@ -199,7 +204,9 @@ impl Storage {
                             status: gs("status").unwrap_or_else(|| "unresolved".into()),
                             created_at: gi("createdAt"),
                             updated_at: gi("updatedAt"),
+                            ok: json::as_bool(&g("ok")),
                             session_id: gs("sessionId"),
+                            permission_id: gs("permissionId"),
                             error: gs("error"),
                         },
                     );
@@ -275,48 +282,67 @@ impl Storage {
 
     /* ---- writes ------------------------------------------------- */
 
-    pub fn put_command(&mut self, rec: &CommandRecord) -> Result<(), String> {
-        let body = json::obj(vec![
+    /// The single command serializer — put_command and compact() both use it,
+    /// so a new field can never be dropped by one of the two writers again
+    /// (compaction once silently lost `ok`, turning refusals into in-flight
+    /// answers after restart; found by the A/B differential).
+    fn command_body(rec: &CommandRecord) -> Json {
+        let mut fields = vec![
             ("id", json::s(&rec.command_id)),
             ("cmdKind", json::s(&rec.kind)),
             ("payload", json::s(&rec.payload)),
             ("status", json::s(&rec.status)),
             ("createdAt", Json::Int(rec.created_at)),
             ("updatedAt", Json::Int(rec.updated_at)),
-        ]);
-        let mut fields = vec![];
+        ];
+        if let Some(ok) = rec.ok {
+            fields.push(("ok", Json::Bool(ok)));
+        }
         if let Some(s) = &rec.session_id {
             fields.push(("sessionId", json::s(s)));
+        }
+        if let Some(p) = &rec.permission_id {
+            fields.push(("permissionId", json::s(p)));
         }
         if let Some(e) = &rec.error {
             fields.push(("error", json::s(e)));
         }
-        let body = match body {
-            Json::Obj(mut pairs) => {
-                pairs.extend(fields.into_iter().map(|(k, v)| (k.to_string(), v)));
-                Json::Obj(pairs)
-            }
-            other => other,
-        };
+        json::obj(fields)
+    }
+
+    pub fn put_command(&mut self, rec: &CommandRecord) -> Result<(), String> {
+        let body = Self::command_body(rec);
         self.append(&record_line("command", &body))?;
         self.commands.insert(rec.command_id.clone(), rec.clone());
         Ok(())
     }
 
-    pub fn update_command_status(
+    /// Records the outcome of a command so replays return it verbatim.
+    /// `ok: None` leaves the recorded ack outcome untouched (used by the
+    /// async command_result closer, which updates status only — replays
+    /// return the original acceptance ack, exactly like the Node host).
+    pub fn update_command_outcome(
         &mut self,
         command_id: &str,
         status: &str,
+        ok: Option<bool>,
         session_id: Option<&str>,
+        permission_id: Option<&str>,
         error: Option<&str>,
     ) -> Result<(), String> {
         let Some(mut rec) = self.commands.get(command_id).cloned() else {
             return Ok(());
         };
         rec.status = status.to_string();
+        if ok.is_some() {
+            rec.ok = ok;
+        }
         rec.updated_at = now_ms();
         if session_id.is_some() {
             rec.session_id = session_id.map(str::to_string);
+        }
+        if permission_id.is_some() {
+            rec.permission_id = permission_id.map(str::to_string);
         }
         rec.error = error.map(str::to_string);
         self.put_command(&rec)
@@ -390,7 +416,16 @@ impl Storage {
             .map(|c| c.command_id.clone())
             .collect();
         for id in &unresolved {
-            self.update_command_status(id, "unknown", None, Some("reconciled at boot"))?;
+            // a command interrupted mid-flight is answered as unknown, never
+            // re-executed (PRD §10.4); replays keep this honest refusal
+            self.update_command_outcome(
+                id,
+                "unknown",
+                Some(false),
+                None,
+                None,
+                Some("reconciled at boot"),
+            )?;
         }
         Ok(unresolved)
     }
@@ -439,21 +474,7 @@ impl Storage {
                     .map_err(|e| format!("compact write: {e}"))?;
             }
             for c in self.commands.values() {
-                let mut fields = vec![
-                    ("id", json::s(&c.command_id)),
-                    ("cmdKind", json::s(&c.kind)),
-                    ("payload", json::s(&c.payload)),
-                    ("status", json::s(&c.status)),
-                    ("createdAt", Json::Int(c.created_at)),
-                    ("updatedAt", Json::Int(c.updated_at)),
-                ];
-                if let Some(s) = &c.session_id {
-                    fields.push(("sessionId", json::s(s)));
-                }
-                if let Some(e) = &c.error {
-                    fields.push(("error", json::s(e)));
-                }
-                write_rec("command", &json::obj(fields))
+                write_rec("command", &Self::command_body(c))
                     .map_err(|e| format!("compact write: {e}"))?;
             }
             for e in &self.events {
@@ -530,9 +551,40 @@ mod tests {
             status: status.into(),
             created_at: 1,
             updated_at: 1,
+            ok: None,
             session_id: None,
+            permission_id: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn command_outcome_round_trips() {
+        let dir = temp_dir("outcome");
+        {
+            let mut s = Storage::open(&dir, 500).unwrap();
+            s.put_command(&command("c1", "unresolved")).unwrap();
+            s.update_command_outcome(
+                "c1",
+                "refused",
+                Some(false),
+                None,
+                None,
+                Some("session is already running"),
+            )
+            .unwrap();
+            let rec = s.commands.get("c1").unwrap();
+            assert_eq!(rec.ok, Some(false));
+            assert_eq!(rec.error.as_deref(), Some("session is already running"));
+            // compaction rewrites every record — it must not drop fields
+            // (the exact path that once lost `ok`)
+            s.compact().unwrap();
+        }
+        let s2 = Storage::open(&dir, 500).unwrap();
+        let rec = s2.commands.get("c1").unwrap();
+        assert_eq!(rec.ok, Some(false), "ok outcome must survive the journal");
+        assert_eq!(rec.error.as_deref(), Some("session is already running"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

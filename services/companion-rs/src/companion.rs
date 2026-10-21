@@ -67,12 +67,16 @@ impl Companion {
                         ..
                     } = kind
                     {
-                        // terminal outcome closes the command row (C2)
+                        // terminal outcome closes the command row (C2); the
+                        // ack outcome (ok) stays as captured — replays return
+                        // the original acceptance ack, like the Node host
                         let mut store = emit_shared.storage.lock().unwrap();
-                        let _ = store.update_command_status(
+                        let _ = store.update_command_outcome(
                             command_id,
                             status,
+                            None,
                             session_id.as_deref(),
+                            None,
                             None,
                         );
                     }
@@ -130,14 +134,31 @@ impl Companion {
                 ));
             }
             if let Some(existing) = store.commands.get(cmd_id) {
-                // already executed (or in flight): duplicate ack, never re-run
+                // already executed (or in flight): replay the ORIGINAL ack
+                // verbatim — refusals replay as refusals, never as success
+                // (parity with the Node host's engine-cache replay; found by
+                // the A/B differential against services/host)
+                let (ok, error, session_id, permission_id) = match existing.ok {
+                    Some(ok) => (
+                        ok,
+                        existing.error.clone(),
+                        existing.session_id.clone(),
+                        existing.permission_id.clone(),
+                    ),
+                    None => (
+                        false,
+                        Some("command is still in flight — outcome not recorded yet".into()),
+                        None,
+                        None,
+                    ),
+                };
                 return Some(ServerMsg::Ack {
                     command_id: cmd_id.to_string(),
-                    ok: existing.status != "failed",
-                    error: existing.error.clone(),
+                    ok,
+                    error,
                     duplicate: true,
-                    session_id: existing.session_id.clone(),
-                    permission_id: None,
+                    session_id,
+                    permission_id,
                 });
             }
             let kind = match msg {
@@ -155,7 +176,9 @@ impl Companion {
                 status: "unresolved".into(),
                 created_at: now_ms(),
                 updated_at: now_ms(),
+                ok: None,
                 session_id: None,
+                permission_id: None,
                 error: None,
             };
             if let Err(e) = store.put_command(&record) {
@@ -171,19 +194,30 @@ impl Companion {
             engine.handle(msg)
         };
 
-        // capture the session id from fresh acks so replays carry it
+        // capture the ORIGINAL ack outcome (ok, error, ids) so replays —
+        // including after a restart, when the engine's ack cache is gone —
+        // return the very same ack
         if let (
             Some(ServerMsg::Ack {
-                ok: true,
-                session_id: Some(sid),
+                ok,
+                error,
                 duplicate: false,
+                session_id,
+                permission_id,
                 ..
             }),
             Some(cmd_id),
         ) = (&reply, msg_cmd_id)
         {
             let mut store = self.shared.storage.lock().unwrap();
-            let _ = store.update_command_status(&cmd_id, "unresolved", Some(sid), None);
+            let _ = store.update_command_outcome(
+                &cmd_id,
+                if *ok { "executed" } else { "refused" },
+                Some(*ok),
+                session_id.as_deref(),
+                permission_id.as_deref(),
+                error.as_deref(),
+            );
         }
         reply
     }
@@ -459,6 +493,104 @@ mod tests {
             sessions_before, sessions_after,
             "replay must not create a session"
         );
+        comp2.shutdown();
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    /// Regression from the A/B differential against services/host: a REFUSED
+    /// command must replay its refusal (ok:false + error) across restart, and
+    /// a permission ack must replay with its permissionId — verbatim, never
+    /// rewritten as success.
+    #[test]
+    fn refusals_and_permission_acks_replay_verbatim_across_restart() {
+        let c = temp_config("replay-verbatim");
+        let comp = Companion::boot(c.clone()).unwrap();
+
+        // create a session (its plan starts immediately), then a submit the
+        // engine refuses — "session is already running"
+        let created = comp.handle_client_msg(ClientMsg::CreateSession {
+            command_id: "cmd-v1".into(),
+            agent_id: "a4".into(),
+            title: "Verbatim".into(),
+            prompt: "p".into(),
+            project: None,
+        });
+        let session_id = match created {
+            Some(ServerMsg::Ack {
+                session_id: Some(s),
+                ..
+            }) => s,
+            other => panic!("expected create ack, got {other:?}"),
+        };
+        let refused = comp.handle_client_msg(ClientMsg::SubmitPrompt {
+            command_id: "cmd-v2".into(),
+            session_id: session_id.clone(),
+            text: "again".into(),
+        });
+        assert!(matches!(
+            refused,
+            Some(ServerMsg::Ack {
+                ok: false,
+                duplicate: false,
+                ..
+            })
+        ));
+
+        // a permission decision: ok:true carrying permissionId p1
+        let decided = comp.handle_client_msg(ClientMsg::PermissionDecision {
+            command_id: "cmd-v3".into(),
+            permission_id: "p1".into(),
+            decision: "approve-once".into(),
+            revision: 1.0,
+        });
+        assert!(matches!(
+            decided,
+            Some(ServerMsg::Ack {
+                ok: true,
+                permission_id: Some(p),
+                ..
+            }) if p == "p1"
+        ));
+
+        comp.shutdown();
+        drop(comp);
+
+        let comp2 = Companion::boot(c.clone()).unwrap();
+        // replay the refusal: same ok:false + error, marked duplicate
+        let replay_refused = comp2.handle_client_msg(ClientMsg::SubmitPrompt {
+            command_id: "cmd-v2".into(),
+            session_id,
+            text: "again".into(),
+        });
+        match replay_refused {
+            Some(ServerMsg::Ack {
+                ok: false,
+                error,
+                duplicate: true,
+                ..
+            }) => {
+                assert_eq!(error.as_deref(), Some("session is already running"));
+            }
+            other => panic!("expected stored refusal, got {other:?}"),
+        }
+        // replay the permission ack: ok:true + permissionId, verbatim
+        let replay_decided = comp2.handle_client_msg(ClientMsg::PermissionDecision {
+            command_id: "cmd-v3".into(),
+            permission_id: "p1".into(),
+            decision: "approve-once".into(),
+            revision: 1.0,
+        });
+        match replay_decided {
+            Some(ServerMsg::Ack {
+                ok: true,
+                permission_id: Some(p),
+                duplicate: true,
+                ..
+            }) => {
+                assert_eq!(p, "p1");
+            }
+            other => panic!("expected stored permission ack, got {other:?}"),
+        }
         comp2.shutdown();
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
