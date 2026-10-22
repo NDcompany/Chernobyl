@@ -17,6 +17,7 @@ pub mod engine;
 pub mod ffi;
 pub mod json;
 pub mod opencode;
+pub mod pairing;
 pub mod protocol;
 pub mod qr;
 pub mod seed;

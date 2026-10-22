@@ -68,6 +68,28 @@ pub struct AuditRecord {
     pub text: String,
 }
 
+/// A pending pairing offer (ADR-011): single-use, short-TTL. The PSK is stored
+/// DPAPI-protected (base64) so the on-disk journal never holds a plaintext key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairingRecord {
+    pub device_id: String,
+    pub psk_protected: String, // base64 of DPAPI-protected 32-byte PSK
+    pub challenge: String,     // base64 of the 16-byte challenge
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub consumed: bool,
+}
+
+/// A paired device's registry entry (ADR-002/011).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceRecord {
+    pub device_id: String,
+    pub name: String,
+    pub psk_protected: String, // base64 of DPAPI-protected 32-byte PSK
+    pub paired_at: i64,
+    pub revoked: bool,
+}
+
 pub struct Storage {
     dir: PathBuf,
     journal: File,
@@ -76,6 +98,8 @@ pub struct Storage {
     pub approvals: HashMap<String, ApprovalRecord>,
     pub audit: Vec<AuditRecord>,
     pub kv: HashMap<String, String>,
+    pub pairings: HashMap<String, PairingRecord>,
+    pub devices: HashMap<String, DeviceRecord>,
     pub last_seq: i64,
     /// Retention caps (config `retention.events` / `retention.commands`).
     event_cap: usize,
@@ -130,6 +154,8 @@ impl Storage {
             approvals: HashMap::new(),
             audit: Vec::new(),
             kv: HashMap::new(),
+            pairings: HashMap::new(),
+            devices: HashMap::new(),
             last_seq: 0,
             event_cap,
             command_cap,
@@ -334,6 +360,37 @@ impl Storage {
                     self.kv.insert(k, v);
                 }
             }
+            "pairing" => {
+                let id = gs("deviceId").unwrap_or_default();
+                if !id.is_empty() {
+                    self.pairings.insert(
+                        id.clone(),
+                        PairingRecord {
+                            device_id: id,
+                            psk_protected: gs("psk").unwrap_or_default(),
+                            challenge: gs("challenge").unwrap_or_default(),
+                            created_at: gi("createdAt"),
+                            expires_at: gi("expiresAt"),
+                            consumed: json::as_bool(&g("consumed")).unwrap_or(false),
+                        },
+                    );
+                }
+            }
+            "device" => {
+                let id = gs("deviceId").unwrap_or_default();
+                if !id.is_empty() {
+                    self.devices.insert(
+                        id.clone(),
+                        DeviceRecord {
+                            device_id: id,
+                            name: gs("name").unwrap_or_default(),
+                            psk_protected: gs("psk").unwrap_or_default(),
+                            paired_at: gi("pairedAt"),
+                            revoked: json::as_bool(&g("revoked")).unwrap_or(false),
+                        },
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -476,6 +533,44 @@ impl Storage {
         Ok(())
     }
 
+    fn pairing_body(rec: &PairingRecord) -> Json {
+        json::obj(vec![
+            ("deviceId", json::s(&rec.device_id)),
+            ("psk", json::s(&rec.psk_protected)),
+            ("challenge", json::s(&rec.challenge)),
+            ("createdAt", Json::Int(rec.created_at)),
+            ("expiresAt", Json::Int(rec.expires_at)),
+            ("consumed", Json::Bool(rec.consumed)),
+        ])
+    }
+
+    /// Persists a pending (or consumed) pairing offer. The PSK field must
+    /// already be DPAPI-protected base64 — the journal never holds plaintext.
+    pub fn put_pairing(&mut self, rec: &PairingRecord) -> Result<(), String> {
+        self.append(&record_line("pairing", &Self::pairing_body(rec)))?;
+        self.pairings.insert(rec.device_id.clone(), rec.clone());
+        self.maybe_compact();
+        Ok(())
+    }
+
+    fn device_body(rec: &DeviceRecord) -> Json {
+        json::obj(vec![
+            ("deviceId", json::s(&rec.device_id)),
+            ("name", json::s(&rec.name)),
+            ("psk", json::s(&rec.psk_protected)),
+            ("pairedAt", Json::Int(rec.paired_at)),
+            ("revoked", Json::Bool(rec.revoked)),
+        ])
+    }
+
+    /// Persists a paired-device registry entry (PSK already DPAPI-protected).
+    pub fn put_device(&mut self, rec: &DeviceRecord) -> Result<(), String> {
+        self.append(&record_line("device", &Self::device_body(rec)))?;
+        self.devices.insert(rec.device_id.clone(), rec.clone());
+        self.maybe_compact();
+        Ok(())
+    }
+
     pub fn append_audit(&mut self, kind: &str, text: &str) -> Result<(), String> {
         let body = json::obj(vec![
             ("ts", Json::Int(now_ms())),
@@ -608,6 +703,14 @@ impl Storage {
                     ]),
                 )
                 .map_err(|e| format!("compact write: {e}"))?;
+            }
+            for p in self.pairings.values() {
+                write_rec("pairing", &Self::pairing_body(p))
+                    .map_err(|e| format!("compact write: {e}"))?;
+            }
+            for d in self.devices.values() {
+                write_rec("device", &Self::device_body(d))
+                    .map_err(|e| format!("compact write: {e}"))?;
             }
             f.sync_all().map_err(|e| format!("compact sync: {e}"))?;
         }
@@ -849,6 +952,52 @@ mod tests {
         drop(s);
         let s2 = Storage::open(&dir, 500, 500).unwrap();
         assert_eq!(s2.kv.get("bootCount").map(String::as_str), Some("3"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pairing_and_device_records_round_trip() {
+        let dir = temp_dir("pairing");
+        {
+            let mut s = Storage::open(&dir, 500, 500).unwrap();
+            s.put_pairing(&PairingRecord {
+                device_id: "d1".into(),
+                psk_protected: "PROTECTED_PSK".into(),
+                challenge: "Q0hBTA".into(),
+                created_at: 100,
+                expires_at: 400_000,
+                consumed: false,
+            })
+            .unwrap();
+            // redemption flips single-use; the update must persist too
+            let mut used = s.pairings.get("d1").unwrap().clone();
+            used.consumed = true;
+            s.put_pairing(&used).unwrap();
+            s.put_device(&DeviceRecord {
+                device_id: "d1".into(),
+                name: "phone".into(),
+                psk_protected: "PROTECTED_PSK".into(),
+                paired_at: 200,
+                revoked: false,
+            })
+            .unwrap();
+            // compaction must not drop either record kind
+            s.compact().unwrap();
+        }
+        let s2 = Storage::open(&dir, 500, 500).unwrap();
+        let p = s2
+            .pairings
+            .get("d1")
+            .expect("pairing survives reopen+compact");
+        assert!(p.consumed, "single-use flag survives");
+        assert_eq!(p.psk_protected, "PROTECTED_PSK");
+        assert_eq!(p.expires_at, 400_000);
+        let d = s2
+            .devices
+            .get("d1")
+            .expect("device survives reopen+compact");
+        assert_eq!(d.name, "phone");
+        assert!(!d.revoked);
         let _ = fs::remove_dir_all(&dir);
     }
 

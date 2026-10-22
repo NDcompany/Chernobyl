@@ -14,6 +14,8 @@
 //!   --self-test              boot in a temp dir, exercise the stack, exit
 //!   --install-autostart      start-on-login: write the HKCU Run entry and exit
 //!   --uninstall-autostart    remove that entry (idempotent) and exit
+//!   --pair                   create a pairing offer, print its terminal QR, exit
+//!   --endpoint <ws-url>      endpoint embedded in the pairing QR (default ws://bind:port)
 //!   --version                print version and exit
 
 use chernobyl_companion::client::{WsClient, http_get};
@@ -43,6 +45,8 @@ fn run(args: &[String]) -> i32 {
     let mut self_test = false;
     let mut install_autostart = false;
     let mut uninstall_autostart = false;
+    let mut pair = false;
+    let mut endpoint_override: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -66,6 +70,8 @@ fn run(args: &[String]) -> i32 {
             "--self-test" => self_test = true,
             "--install-autostart" => install_autostart = true,
             "--uninstall-autostart" => uninstall_autostart = true,
+            "--pair" => pair = true,
+            "--endpoint" => endpoint_override = take(&mut i),
             "--config" => config_path = take(&mut i),
             "--port" => port_override = take(&mut i).and_then(|v| v.parse().ok()),
             "--bind" => bind_override = take(&mut i),
@@ -122,6 +128,13 @@ fn run(args: &[String]) -> i32 {
     }
     if let Some(n) = diag_override {
         cfg.diagnostics_port = n as u16;
+    }
+
+    // `companion pair` — create + persist a pairing offer and print its QR.
+    // Runs before the token check: it never binds a socket (the QR carries the
+    // endpoint the phone dials instead).
+    if pair {
+        return pair_main(&cfg, endpoint_override.as_deref());
     }
 
     // Secure-by-default: exposing beyond loopback requires a token.
@@ -219,6 +232,95 @@ fn autostart_value(exe: &std::path::Path, config_path: Option<&str>) -> String {
         value.push_str(&format!(" --config \"{p}\""));
     }
     value
+}
+
+/// `companion pair` — create a pairing offer, persist it to the shared journal
+/// (PSK DPAPI-protected so the on-disk record never holds it plaintext), and
+/// print the terminal QR the phone scans. The running daemon redeems the offer
+/// when the phone proves knowledge of the PSK during the E2E handshake.
+fn pair_main(cfg: &config::CompanionConfig, endpoint: Option<&str>) -> i32 {
+    use chernobyl_companion::{base64, pairing, protocol, qr, storage};
+
+    // Open the same journal a running daemon uses, so the offer is visible.
+    let mut store = match storage::Storage::open(&cfg.data_dir, cfg.events_cap, cfg.commands_cap) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[companion] pair: cannot open store: {e}");
+            return 1;
+        }
+    };
+
+    // Stable host id, created on first pairing.
+    let host_id = match store.kv.get("hostId") {
+        Some(h) => h.clone(),
+        None => {
+            let id = match ffi::csprng_bytes(8) {
+                Ok(b) => b.iter().map(|x| format!("{x:02x}")).collect::<String>(),
+                Err(e) => {
+                    eprintln!("[companion] pair: RNG failed: {e}");
+                    return 1;
+                }
+            };
+            if let Err(e) = store.put_kv("hostId", &id) {
+                eprintln!("[companion] pair: cannot persist hostId: {e}");
+                return 1;
+            }
+            id
+        }
+    };
+
+    // Fresh single-use offer.
+    let offer = match pairing::PairingOffer::new(protocol::now_ms()) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[companion] pair: offer failed: {e}");
+            return 1;
+        }
+    };
+
+    // Protect the PSK at rest before it touches the journal.
+    let psk_protected = match ffi::dpapi_protect(&offer.psk).map(|c| base64::encode(&c)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[companion] pair: cannot protect PSK: {e}");
+            return 1;
+        }
+    };
+    let rec = storage::PairingRecord {
+        device_id: offer.device_id.clone(),
+        psk_protected,
+        challenge: base64::encode(&offer.challenge),
+        created_at: offer.created_at,
+        expires_at: offer.expires_at,
+        consumed: false,
+    };
+    if let Err(e) = store.put_pairing(&rec) {
+        eprintln!("[companion] pair: cannot persist offer: {e}");
+        return 1;
+    }
+
+    // Endpoint the phone should dial (override for LAN reachability: a loopback
+    // bind is not dialable from a phone — pass `--endpoint ws://<lan-ip>:<port>`).
+    let fallback = format!("ws://{}:{}", cfg.server_bind, cfg.server_port);
+    let ep = endpoint.unwrap_or(&fallback).to_string();
+    let payload = offer.payload_json(&host_id, std::slice::from_ref(&ep));
+
+    let qr = match qr::encode(payload.as_bytes()) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("[companion] pair: payload too large for QR: {e}");
+            return 1;
+        }
+    };
+    println!("{}", qr::render_terminal(&qr));
+    println!();
+    println!("payload: {payload}");
+    println!(
+        "device {} — valid {}s, single-use (scan with the phone)",
+        offer.device_id,
+        pairing::PAIRING_TTL_MS / 1000
+    );
+    0
 }
 
 /// Start-on-login via the HKCU Run key (PRD §6.3): user-level, no elevation,

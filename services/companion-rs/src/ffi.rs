@@ -4,6 +4,7 @@
 
 #![allow(non_snake_case)]
 
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -188,6 +189,112 @@ pub fn csprng_bytes(n: usize) -> Result<Vec<u8>, String> {
     Ok(b)
 }
 
+// --- DPAPI (at-rest hardening for stored PSKs, ADR-011) ---
+// CryptProtectData/CryptUnprotectData bind secrets to the current Windows user
+// so a stolen journal file cannot be replayed on another account/machine.
+
+#[repr(C)]
+struct DataBlob {
+    cb_data: u32,
+    pb_data: *mut u8,
+}
+
+const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+
+#[link(name = "crypt32")]
+unsafe extern "system" {
+    fn CryptProtectData(
+        data_in: *const DataBlob,
+        descr: *const u16,
+        entropy: *const DataBlob,
+        reserved: *mut c_void,
+        prompt: *mut c_void,
+        flags: u32,
+        data_out: *mut DataBlob,
+    ) -> i32;
+    fn CryptUnprotectData(
+        data_in: *const DataBlob,
+        descr: *mut *mut u16,
+        entropy: *const DataBlob,
+        reserved: *mut c_void,
+        prompt: *mut c_void,
+        flags: u32,
+        data_out: *mut DataBlob,
+    ) -> i32;
+}
+
+unsafe extern "system" {
+    fn LocalFree(mem: *mut c_void) -> *mut c_void;
+}
+
+fn last_win_err() -> String {
+    std::io::Error::last_os_error().to_string()
+}
+
+/// Encrypt `plaintext` to a blob only decryptable by the current user on this
+/// machine. No UI prompt (headless daemon). Used to protect PSKs at rest.
+pub fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let in_blob = DataBlob {
+        cb_data: plaintext.len() as u32,
+        pb_data: plaintext.as_ptr() as *mut u8,
+    };
+    let mut out = DataBlob {
+        cb_data: 0,
+        pb_data: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptProtectData(
+            &in_blob,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut out,
+        )
+    };
+    if ok == 0 {
+        return Err(format!("CryptProtectData failed: {}", last_win_err()));
+    }
+    let res = unsafe { std::slice::from_raw_parts(out.pb_data, out.cb_data as usize) }.to_vec();
+    unsafe { LocalFree(out.pb_data as *mut c_void) };
+    Ok(res)
+}
+
+/// Decrypt a blob produced by [`dpapi_protect`]. Fails closed if the blob was
+/// written by another user/machine or was tampered with.
+pub fn dpapi_unprotect(cipher: &[u8]) -> Result<Vec<u8>, String> {
+    let in_blob = DataBlob {
+        cb_data: cipher.len() as u32,
+        pb_data: cipher.as_ptr() as *mut u8,
+    };
+    let mut out = DataBlob {
+        cb_data: 0,
+        pb_data: std::ptr::null_mut(),
+    };
+    let mut descr: *mut u16 = std::ptr::null_mut();
+    let ok = unsafe {
+        CryptUnprotectData(
+            &in_blob,
+            &mut descr,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut out,
+        )
+    };
+    if ok == 0 {
+        return Err(format!("CryptUnprotectData failed: {}", last_win_err()));
+    }
+    let res = unsafe { std::slice::from_raw_parts(out.pb_data, out.cb_data as usize) }.to_vec();
+    unsafe { LocalFree(out.pb_data as *mut c_void) };
+    if !descr.is_null() {
+        unsafe { LocalFree(descr as *mut c_void) };
+    }
+    Ok(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +318,20 @@ mod tests {
         assert!(a.iter().any(|&x| x != 0));
         // empty request is a no-op, not an error
         assert!(csprng_fill(&mut []).is_ok());
+    }
+
+    #[test]
+    fn dpapi_round_trip_protects_and_restores() {
+        let secret = b"the quick brown fox PSK 0123456789";
+        let cipher = dpapi_protect(secret).unwrap();
+        // ciphertext must differ from plaintext (actually encrypted)
+        assert_ne!(cipher.as_slice(), secret.as_slice());
+        // ...and round-trips back to the exact original
+        assert_eq!(dpapi_unprotect(&cipher).unwrap(), secret);
+        // tampered ciphertext must fail closed (no silent wrong plaintext)
+        let mut bad = cipher.clone();
+        let n = bad.len();
+        bad[n - 1] ^= 0xff;
+        assert!(dpapi_unprotect(&bad).is_err());
     }
 }
