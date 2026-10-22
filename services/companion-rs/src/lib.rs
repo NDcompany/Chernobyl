@@ -18,6 +18,7 @@ pub mod ffi;
 pub mod json;
 pub mod opencode;
 pub mod protocol;
+pub mod qr;
 pub mod seed;
 pub mod server;
 pub mod sha1;
