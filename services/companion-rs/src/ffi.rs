@@ -153,6 +153,41 @@ pub fn rss_bytes() -> u64 {
     }
 }
 
+#[link(name = "bcrypt")]
+unsafe extern "system" {
+    fn BCryptGenRandom(alg: *mut u8, buf: *mut u8, len: u32, flags: u32) -> i32;
+}
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
+/// Cryptographically secure random bytes via the OS CSPRNG (BCryptGenRandom,
+/// system-preferred RNG). Fails closed on error — never returns predictable
+/// bytes. Used for PSKs, nonces, and pairing challenges (ADR-011).
+pub fn csprng_fill(buf: &mut [u8]) -> Result<(), String> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!("BCryptGenRandom failed: NTSTATUS {status:#x}"))
+    }
+}
+
+/// Convenience: exactly `n` random bytes.
+pub fn csprng_bytes(n: usize) -> Result<Vec<u8>, String> {
+    let mut b = vec![0u8; n];
+    csprng_fill(&mut b)?;
+    Ok(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +198,18 @@ mod tests {
         assert!(l.local_addr().unwrap().port() > 0);
         // IPv6 is the std-bind fallback path, not an error state for the server
         assert!(bind_listener_backlog("::1", 0).is_err());
+    }
+
+    #[test]
+    fn csprng_fills_and_is_nondeterministic() {
+        let a = csprng_bytes(32).unwrap();
+        let b = csprng_bytes(32).unwrap();
+        assert_eq!(a.len(), 32);
+        // two independent 32-byte draws colliding would mean a broken RNG
+        assert_ne!(a, b, "CSPRNG returned identical blocks");
+        // not all-zero (a real RNG essentially never returns an all-zero block)
+        assert!(a.iter().any(|&x| x != 0));
+        // empty request is a no-op, not an error
+        assert!(csprng_fill(&mut []).is_ok());
     }
 }

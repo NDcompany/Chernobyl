@@ -12,6 +12,7 @@ pub mod base64;
 pub mod client;
 pub mod companion;
 pub mod config;
+pub mod crypto;
 pub mod engine;
 pub mod ffi;
 pub mod json;
