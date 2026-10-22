@@ -44,6 +44,35 @@ X25519 forward secrecy yet (PSK + fresh nonces — post-compromise secrecy is no
 
 The `?token=` loopback path is unchanged and stays for dev/differential parity.
 
+### E2E wire format (the contract a phone client must implement)
+
+All frames are WebSocket **text** frames carrying JSON. Handshake first (plaintext), then a
+sealed envelope per frame.
+
+Handshake (PSK = the 32 bytes from the QR, base64):
+
+1. C→S `{"type":"hs_hello","deviceId":"<hex>"}`
+2. S→C `{"type":"hs_challenge","nonce":"<b64 16B>","salt":"<b64 16B>"}` — fresh per connection
+3. C→S `{"type":"hs_proof","proof":"<b64 32B>"}`
+   `proof = HMAC-SHA256(psk, "client" ‖ 0x00 ‖ deviceId ‖ 0x00 ‖ nonce ‖ 0x00 ‖ salt)`
+4. S→C `{"type":"hs_ok","serverProof":"<b64 32B>"}` (mutual auth; same HMAC with role
+   `"server"`) — or `{"type":"hs_err","reason":"…"}` on rejection.
+
+After `hs_ok` both sides switch to sealed frames. Each frame payload is:
+
+```
+{"n": <counter>, "d": "<base64 ChaCha20-Poly1305(ciphertext ‖ 16B tag)>"}
+```
+
+- **Keys** (per connection, from PSK + the `salt` from step 2): client→host =
+  `HKDF-SHA256(PRK = HMAC(salt, psk), info = "chernobyl-e2e-c2h", 32B)`; host→client uses
+  `"chernobyl-e2e-h2c"`.
+- **AEAD nonce** = 8-byte big-endian `n`, zero-padded to 12 bytes; no AAD.
+- **Counter** `n` starts at 0 per direction and increments by exactly 1 per frame. The server
+  requires strict sequence: a lower `n` is a replay, a higher one is desync — both close the
+  connection. A bad tag (tamper) also closes it.
+- The **inner plaintext** is the normal protocol JSON (`hello`, `ping`, `create_session`, …).
+
 ## Verify
 
 ```powershell
