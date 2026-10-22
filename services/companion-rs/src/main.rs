@@ -16,6 +16,8 @@
 //!   --uninstall-autostart    remove that entry (idempotent) and exit
 //!   --pair                   create a pairing offer, print its terminal QR, exit
 //!   --endpoint <ws-url>      endpoint embedded in the pairing QR (default ws://bind:port)
+//!   --devices                list the paired-device registry, exit
+//!   --revoke <device-id>     revoke a paired device (blocks future E2E handshakes), exit
 //!   --version                print version and exit
 
 use chernobyl_companion::client::{WsClient, http_get};
@@ -47,6 +49,8 @@ fn run(args: &[String]) -> i32 {
     let mut uninstall_autostart = false;
     let mut pair = false;
     let mut endpoint_override: Option<String> = None;
+    let mut list_devices = false;
+    let mut revoke: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -72,6 +76,8 @@ fn run(args: &[String]) -> i32 {
             "--uninstall-autostart" => uninstall_autostart = true,
             "--pair" => pair = true,
             "--endpoint" => endpoint_override = take(&mut i),
+            "--devices" => list_devices = true,
+            "--revoke" => revoke = take(&mut i),
             "--config" => config_path = take(&mut i),
             "--port" => port_override = take(&mut i).and_then(|v| v.parse().ok()),
             "--bind" => bind_override = take(&mut i),
@@ -135,6 +141,13 @@ fn run(args: &[String]) -> i32 {
     // endpoint the phone dials instead).
     if pair {
         return pair_main(&cfg, endpoint_override.as_deref());
+    }
+    // Device-registry maintenance (also socket-free).
+    if list_devices {
+        return devices_main(&cfg);
+    }
+    if let Some(device_id) = revoke.as_deref() {
+        return revoke_main(&cfg, device_id);
     }
 
     // Secure-by-default: exposing beyond loopback requires a token.
@@ -320,6 +333,59 @@ fn pair_main(cfg: &config::CompanionConfig, endpoint: Option<&str>) -> i32 {
         offer.device_id,
         pairing::PAIRING_TTL_MS / 1000
     );
+    0
+}
+
+/// `companion devices` — list the paired-device registry (id, name, paired-at,
+/// state) so an operator knows what to revoke.
+fn devices_main(cfg: &config::CompanionConfig) -> i32 {
+    use chernobyl_companion::storage;
+    let store = match storage::Storage::open(&cfg.data_dir, cfg.events_cap, cfg.commands_cap) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[companion] devices: cannot open store: {e}");
+            return 1;
+        }
+    };
+    if store.devices.is_empty() {
+        println!("no paired devices");
+        return 0;
+    }
+    for d in store.devices.values() {
+        let state = if d.revoked { "revoked" } else { "active" };
+        println!(
+            "{}  {}  paired_at={}  {state}",
+            d.device_id, d.name, d.paired_at
+        );
+    }
+    0
+}
+
+/// `companion revoke <device-id>` — mark a paired device revoked. The E2E
+/// handshake refuses revoked devices, so this cuts a lost/stolen phone off.
+fn revoke_main(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
+    use chernobyl_companion::storage;
+    let mut store = match storage::Storage::open(&cfg.data_dir, cfg.events_cap, cfg.commands_cap) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[companion] revoke: cannot open store: {e}");
+            return 1;
+        }
+    };
+    let Some(mut d) = store.devices.get(device_id).cloned() else {
+        eprintln!("[companion] revoke: unknown device {device_id}");
+        return 1;
+    };
+    if d.revoked {
+        println!("device {device_id} already revoked");
+        return 0;
+    }
+    d.revoked = true;
+    if let Err(e) = store.put_device(&d) {
+        eprintln!("[companion] revoke: cannot persist: {e}");
+        return 1;
+    }
+    println!("revoked device {device_id}");
     0
 }
 

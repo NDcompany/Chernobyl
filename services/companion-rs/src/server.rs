@@ -890,4 +890,26 @@ mod e2e_tests {
         assert!(s2.is_some());
         shutdown(f);
     }
+
+    #[test]
+    fn revoking_a_live_device_blocks_reconnect() {
+        // a device works, then revocation (the same put_device persistence the
+        // `companion revoke` CLI uses) cuts it off at the next handshake.
+        let f = fixture_paired("revoke-live", false);
+        let mut c1 = connect(&f);
+        let (r1, _s1) = attempt(&mut c1, &f.psk, &f.device_id);
+        assert!(r1.contains("hs_ok"), "unrevoked device must connect: {r1}");
+        // revoke it
+        {
+            let mut store = f.companion.shared.storage.lock().unwrap();
+            let mut d = store.devices.get(&f.device_id).cloned().unwrap();
+            d.revoked = true;
+            store.put_device(&d).unwrap();
+        }
+        let mut c2 = connect(&f);
+        let (r2, s2) = attempt(&mut c2, &f.psk, &f.device_id);
+        assert!(s2.is_none(), "revoked device must not reconnect");
+        assert!(r2.contains("revoked"), "got: {r2}");
+        shutdown(f);
+    }
 }

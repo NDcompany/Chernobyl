@@ -17,11 +17,32 @@ default 8787) · `--bind <addr>` (default 127.0.0.1) · `--token <t>` (`HOST_TOK
 `--diagnostics-port <n>` (default 9487) · `--exit-after <ms>` · `--self-test` ·
 `--install-autostart` / `--uninstall-autostart` (HKCU Run start-on-login, user level,
 idempotent; carries `--config` when given, console window at login — packaging caveat in
-`TODO.md`).
-`CHERNOBYL_HOME` selects the data directory (config, journal).
+`TODO.md`) · `--pair` (create a pairing offer, print its terminal QR, exit) ·
+`--endpoint <ws-url>` (address embedded in the QR, default `ws://bind:port`) ·
+`--devices` (list the paired-device registry) · `--revoke <device-id>` (revoke a paired
+device). `CHERNOBYL_HOME` selects the data directory (config, journal).
 
 **Secure-by-default:** a non-loopback bind without `--token`/`HOST_TOKEN` is refused.
 Loopback with no token keeps Node-parity behavior (dev/demo).
+
+## Pairing + E2E session (ADR-002/006/011)
+
+`companion pair` creates a single-use, 5-minute pairing offer, persists it to the shared
+journal (the per-device 256-bit PSK is DPAPI-protected at rest — never plaintext on disk),
+and prints a terminal QR the phone scans at close physical range. The QR payload carries the
+host id, an endpoint to dial, the PSK and a challenge.
+
+After the phone connects, a handshake (`hs_hello → hs_challenge → hs_proof → hs_ok`) proves
+mutual PSK knowledge — the server answers with a fresh nonce+salt and both sides HMAC it, so
+a captured proof cannot be replayed and a MITM without the PSK is rejected. A pending offer is
+redeemed on first connect (single-use consume + device registration); a paired device
+reconnects with its stored PSK. From `hs_ok` on, every frame is ChaCha20-Poly1305-sealed with
+HKDF-SHA-256 directional keys and a monotonic counter nonce, so replay, desync and tampering
+all tear the connection down. Revocation (`companion revoke <device-id>`) blocks a device at
+the next handshake. All crypto is std-only with official RFC/NIST known-answer tests; no
+X25519 forward secrecy yet (PSK + fresh nonces — post-compromise secrecy is not claimed).
+
+The `?token=` loopback path is unchanged and stays for dev/differential parity.
 
 ## Verify
 
@@ -79,7 +100,10 @@ filter, e.g. `cargo test --release microbench_engine -- --ignored --nocapture`, 
 | `seed` / `engine` | deterministic seed state + the MockEngine port (plans, G1/G2, ack cache) |
 | `storage` | append-only JSONL journal: torn-tail recovery, atomic compaction, retention |
 | `config` / `adapters` / `companion` | Node-parity config, adapter discovery, boot/reconcile/idempotency |
-| `server` | accept loops, auth (4001/429), version gate (4002), heartbeat, diagnostics HTTP |
+| `server` | accept loops, auth (4001/429), version gate (4002), heartbeat, diagnostics HTTP, E2E handshake + sealed-frame dispatch |
 | `client` | test WS client + loopback `http_get` (used by `--self-test`) |
-| `ffi` | `SetConsoleCtrlHandler` (graceful shutdown), `GetProcessMemoryInfo` (rssBytes) |
-| `main` | CLI/env wiring, scheduler pump (50 ms), `--self-test`, graceful shutdown |
+| `crypto` | std-only SHA-256, HMAC, HKDF, ChaCha20, Poly1305, AEAD (official RFC/NIST KATs) |
+| `e2e` | PSK handshake proofs, HKDF directional keys, sealed frames with counter nonces |
+| `qr` / `pairing` | std-only QR Model-2 encoder + single-use, TTL/rate-limited pairing offers |
+| `ffi` | `SetConsoleCtrlHandler` (graceful shutdown), `GetProcessMemoryInfo` (rssBytes), `BCryptGenRandom`, DPAPI, large-backlog listener |
+| `main` | CLI/env wiring, scheduler pump (50 ms), `--self-test`, pairing/revoke, graceful shutdown |

@@ -1,6 +1,6 @@
 # CHERNOBYL — TODO
 
-Updated: 2026-10-21 (Phase R checkpoint + ADR-011 phase-map revision). Status of the Rust companion rewrite + everything left.
+Updated: 2026-10-22 (Phase 4′ complete: pairing + E2E session layer + revocation). Status of the Rust companion rewrite + everything left.
 
 ## Done
 
@@ -96,6 +96,43 @@ Updated: 2026-10-21 (Phase R checkpoint + ADR-011 phase-map revision). Status of
       the autostarted instance serves loopback without one (Node parity mode) until the
       relay phase.
 
+### Phase 4′ — pairing + E2E session layer + revocation (committed `3dc75be`, `63b206f`, `4a6e42f`, `6c55420`, this checkpoint)
+
+- [x] **Crypto primitives** (`3dc75be`, `crypto.rs`): std-only SHA-256, HMAC-SHA-256, HKDF,
+      ChaCha20, Poly1305, ChaCha20-Poly1305 AEAD, constant-time eq — verified against official
+      known-answer tests (RFC 4231/5869/8439), not remembered vectors. OS CSPRNG via
+      `BCryptGenRandom` (fails closed).
+- [x] **QR encoder** (`63b206f`, `qr.rs`): std-only Model-2 byte-mode encoder, EC level M,
+      versions 1–10, terminal half-block ANSI rendering (4-module quiet zone). Frozen
+      byte-mode reference matrices from the trusted `qrcode` lib (installed only in Temp,
+      outside the repo) — a format-info placement bug (row/col swap) was found and fixed
+      against them.
+- [x] **Pairing + device registry + CLI** (`4a6e42f`): `PairingOffer` (single-use, 5-min TTL,
+      rate-limited) issuing a per-device 256-bit PSK + challenge; `companion pair` persists the
+      offer to the shared journal and prints its terminal QR; the PSK is DPAPI-protected at
+      rest (`CryptProtectData`) so the journal never holds plaintext. Storage gains `pairing`
+      (pending) and `device` (registry) record kinds with compaction round-trip.
+- [x] **E2E session layer** (`6c55420`, `e2e.rs` + `server.rs`): `hs_hello → hs_challenge
+      (fresh server nonce+salt) → hs_proof → hs_ok` handshake; the offer is redeemed on first
+      connect (single-use consume + device registration) or a paired device reconnects; after
+      `hs_ok` every frame is ChaCha20-Poly1305-sealed (HKDF directional keys, counter nonce) and
+      replay / desync / tamper tears the connection down. Handshake messages are new
+      `ClientMsg`/`ServerMsg` variants; the `?token=` loopback path is untouched (differential
+      parity preserved).
+- [x] **Revocation** (this commit, `main.rs`): `companion devices` lists the registry;
+      `companion revoke <device-id>` flips the persisted `revoked` flag — the handshake refuses
+      revoked devices (proved by the `revoking_a_live_device_blocks_reconnect` test).
+- [x] **Security matrix** (ADR-011 §Future, all green, 129 `cargo test`): happy path seals/
+      unseals, frame replay, tampered frame, bad proof (MITM without PSK), unknown device,
+      expired QR, spent-QR reuse, revoked device, paired-device reconnect, live revocation —
+      plus 8 `e2e.rs` unit tests (directional keys, proof binding, replay/desync/tamper,
+      garbage envelopes). Full gates: `verify:rust` exit 0 (129 tests, clippy `-D warnings`,
+      fmt, `--self-test`), `npm run verify` exit 0.
+- [x] **Honest gaps kept**: no X25519 forward secrecy (PSK + fresh nonces; post-compromise
+      secrecy explicitly not claimed — documented in `e2e.rs`); the manual phone-scan gate
+      (physical QR scan with a real phone) is still owed at the end of the phase; no
+      independent security audit.
+
 ## Remaining
 
 ### Phase R follow-ups
@@ -180,14 +217,16 @@ Updated: 2026-10-21 (Phase R checkpoint + ADR-011 phase-map revision). Status of
       "abort stops a healthy long generation" unproven (provider 426s every live turn,
       opencode.md §8); permission asked→reply live cycle unproven (fake-server tests prove
       contract wiring only).
-- [ ] Phase 4′: pairing + identity + **E2E session layer** (ADR-002/006/011): `companion pair`
-      prints a single-use, short-lived QR (hostId + endpoint list + companion key fingerprint
-      + per-device 256-bit PSK + challenge) via a hand-rolled terminal-QR encoder; every WS
-      frame thereafter ChaCha20-Poly1305 AEAD (HKDF-SHA-256 directional keys from the PSK,
-      monotonic counters; all crypto std-only with official known-answer tests — RFC 4231/
-      8439/NIST); per-device credentials in phone keystore; per-device revocation. Security
-      matrix: expired/replayed QR, revoked reuse, ticket replay, MITM without PSK, frame
-      replay, counter desync.
+- [x] Phase 4′: pairing + identity + **E2E session layer** (ADR-002/006/011) — **done
+      2026-10-22** (5 commits `3dc75be`…this): `companion pair` prints a single-use, short-lived
+      terminal QR (hostId + endpoint + per-device 256-bit PSK + challenge, hand-rolled QR
+      encoder); PSK DPAPI-protected at rest; `hs_hello→hs_challenge→hs_proof→hs_ok` handshake
+      (fresh server nonce, mutual HMAC proof); every frame thereafter ChaCha20-Poly1305 AEAD
+      (HKDF-SHA-256 directional keys, monotonic counters; all crypto std-only with official
+      RFC/NIST known-answer tests); `companion devices` / `companion revoke <id>` registry +
+      revocation. **Security matrix green** (129 tests): expired/reused QR, revoked device, bad
+      proof (MITM without PSK), frame replay, counter desync, tampered frame, paired-device
+      reconnect, live revocation. Still owed: manual phone-scan gate with a real phone.
 - [ ] Phase 5′: **transport-agnostic remote access** (ADR-011) — no mandatory third party:
       companion advertises all reachable endpoints (LAN always; optional tailnet / DDNS +
       port-forward / cloudflared how-tos, incl. CGNAT check); app reconnects trying endpoints
