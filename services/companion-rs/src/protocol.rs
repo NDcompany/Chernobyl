@@ -356,12 +356,22 @@ pub enum ClientMsg {
     ListState {
         command_id: String,
     },
+    /// E2E handshake, step 1 (ADR-011): request to connect as `device_id`.
+    /// Plaintext; the server answers with a fresh nonce+salt to bind the proof.
+    HsHello {
+        device_id: String,
+    },
+    /// E2E handshake, step 2: HMAC proof of PSK knowledge over the server's
+    /// fresh nonce+salt (base64 of the 32-byte HMAC).
+    HsProof {
+        proof: String,
+    },
 }
 
 impl ClientMsg {
     pub fn command_id(&self) -> Option<&str> {
         match self {
-            ClientMsg::Hello { .. } => None,
+            ClientMsg::Hello { .. } | ClientMsg::HsHello { .. } | ClientMsg::HsProof { .. } => None,
             ClientMsg::Ping { command_id }
             | ClientMsg::CreateSession { command_id, .. }
             | ClientMsg::SubmitPrompt { command_id, .. }
@@ -452,6 +462,12 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
         "list_state" => Some(ClientMsg::ListState {
             command_id: req("commandId")?,
         }),
+        "hs_hello" => Some(ClientMsg::HsHello {
+            device_id: req("deviceId")?,
+        }),
+        "hs_proof" => Some(ClientMsg::HsProof {
+            proof: req("proof")?,
+        }),
         _ => None,
     }
 }
@@ -496,6 +512,21 @@ pub enum ServerMsg {
     Event {
         kind: EventKind,
         env: Envelope,
+    },
+    /// E2E handshake, server reply to `hs_hello`: fresh nonce+salt (base64) for
+    /// the client to bind its proof to.
+    HsChallenge {
+        nonce: String,
+        salt: String,
+    },
+    /// E2E handshake, server reply to a valid `hs_proof`: the server's own proof
+    /// (base64), letting the client mutually authenticate the host.
+    HsOk {
+        server_proof: String,
+    },
+    /// E2E handshake failure (unknown/expired/revoked device, bad proof).
+    HsErr {
+        reason: String,
     },
 }
 
@@ -704,6 +735,19 @@ impl ServerMsg {
                 }
                 json::obj(fields)
             }
+            ServerMsg::HsChallenge { nonce, salt } => json::obj(vec![
+                ("type", json::s("hs_challenge")),
+                ("nonce", json::s(nonce)),
+                ("salt", json::s(salt)),
+            ]),
+            ServerMsg::HsOk { server_proof } => json::obj(vec![
+                ("type", json::s("hs_ok")),
+                ("serverProof", json::s(server_proof)),
+            ]),
+            ServerMsg::HsErr { reason } => json::obj(vec![
+                ("type", json::s("hs_err")),
+                ("reason", json::s(reason)),
+            ]),
         }
     }
 

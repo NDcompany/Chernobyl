@@ -13,6 +13,7 @@ pub mod client;
 pub mod companion;
 pub mod config;
 pub mod crypto;
+pub mod e2e;
 pub mod engine;
 pub mod ffi;
 pub mod json;

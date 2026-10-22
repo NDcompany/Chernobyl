@@ -369,7 +369,11 @@ impl Companion {
             ClientMsg::PermissionDecision { permission_id, .. } => {
                 oc.knows_permission(permission_id)
             }
-            ClientMsg::Hello { .. } | ClientMsg::Ping { .. } | ClientMsg::ListState { .. } => false,
+            ClientMsg::Hello { .. }
+            | ClientMsg::Ping { .. }
+            | ClientMsg::ListState { .. }
+            | ClientMsg::HsHello { .. }
+            | ClientMsg::HsProof { .. } => false,
         }
     }
 
@@ -579,6 +583,14 @@ fn json_text(msg: &ClientMsg) -> String {
         ClientMsg::ListState { command_id } => json::obj(vec![
             ("type", json::s("list_state")),
             ("commandId", json::s(command_id)),
+        ]),
+        ClientMsg::HsHello { device_id } => json::obj(vec![
+            ("type", json::s("hs_hello")),
+            ("deviceId", json::s(device_id)),
+        ]),
+        ClientMsg::HsProof { proof } => json::obj(vec![
+            ("type", json::s("hs_proof")),
+            ("proof", json::s(proof)),
         ]),
     };
     json::stringify(&v)

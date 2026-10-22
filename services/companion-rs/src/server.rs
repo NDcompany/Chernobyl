@@ -6,9 +6,12 @@
 //! caps in the frame codec, no panics on hostile input (garbage closes the
 //! one connection; the server survives).
 
+use crate::base64;
 use crate::companion::Companion;
+use crate::e2e;
 use crate::json;
 use crate::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg, parse_client_message};
+use crate::storage::DeviceRecord;
 use crate::ws::{self, Frame, Handshake};
 use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
@@ -284,6 +287,111 @@ fn http_route(
     }
 }
 
+/// Per-connection handshake state: the device that asked to connect and the
+/// server's fresh nonce+salt its proof must be bound to (ADR-011).
+struct HsPending {
+    device_id: String,
+    nonce: [u8; 16],
+    salt: [u8; 16],
+}
+
+fn hs_err(tx: &Sender<Vec<u8>>, reason: &str) {
+    let _ = tx.send(
+        ServerMsg::HsErr {
+            reason: reason.to_string(),
+        }
+        .to_text()
+        .into_bytes(),
+    );
+}
+
+/// Recover a stored PSK from its DPAPI-protected base64 form. Fails closed.
+fn unprotect_psk(b64: &str) -> Result<[u8; 32], String> {
+    let cipher = base64::decode(b64).ok_or("bad psk encoding")?;
+    crate::ffi::dpapi_unprotect(&cipher)
+        .map_err(|e| format!("psk decrypt: {e}"))?
+        .try_into()
+        .map_err(|_| "psk must be 32 bytes".to_string())
+}
+
+/// Resolve + verify a handshake and, for a fresh pairing, redeem it (single-use
+/// consume + device registration). Returns the live session and the server's
+/// mutual-auth proof. Rejects expired / spent / revoked / unknown devices and
+/// any proof that is not a valid HMAC under the device's PSK.
+fn establish_session(
+    companion: &Companion,
+    pending: &HsPending,
+    client_proof: &str,
+) -> Result<(e2e::Session, String), String> {
+    let proof = base64::decode(client_proof).ok_or("bad proof encoding")?;
+    let mut store = companion.shared.storage.lock().unwrap();
+    let now = crate::protocol::now_ms();
+    let pairing = store.pairings.get(&pending.device_id).cloned();
+    let device = store.devices.get(&pending.device_id).cloned();
+
+    let verify = |psk: &[u8; 32]| -> Result<(), String> {
+        let expected = e2e::handshake_proof(
+            psk,
+            "client",
+            &pending.device_id,
+            &pending.nonce,
+            &pending.salt,
+        );
+        if e2e::proof_ok(&expected, &proof) {
+            Ok(())
+        } else {
+            Err("proof verification failed".to_string())
+        }
+    };
+
+    let (psk, redeem) = match (pairing, device) {
+        // fresh, unexpired offer: first connection (redeemed below)
+        (Some(p), _) if !p.consumed && now < p.expires_at => {
+            let psk = unprotect_psk(&p.psk_protected)?;
+            verify(&psk)?;
+            (psk, Some(p))
+        }
+        // already-paired device, or an offer whose redemption already ran
+        (_, Some(d)) => {
+            if d.revoked {
+                return Err("device revoked".to_string());
+            }
+            let psk = unprotect_psk(&d.psk_protected)?;
+            verify(&psk)?;
+            (psk, None)
+        }
+        (Some(p), None) if p.consumed => return Err("pairing offer already used".to_string()),
+        (Some(p), None) if now >= p.expires_at => return Err("pairing offer expired".to_string()),
+        _ => return Err("unknown device".to_string()),
+    };
+
+    if let Some(mut p) = redeem {
+        p.consumed = true;
+        store
+            .put_pairing(&p)
+            .map_err(|e| format!("redeem pairing: {e}"))?;
+        store
+            .put_device(&DeviceRecord {
+                device_id: pending.device_id.clone(),
+                name: pending.device_id.clone(),
+                psk_protected: p.psk_protected.clone(),
+                paired_at: now,
+                revoked: false,
+            })
+            .map_err(|e| format!("register device: {e}"))?;
+    }
+
+    let keys = e2e::derive_keys(&psk, &pending.salt);
+    let server_proof = e2e::handshake_proof(
+        &psk,
+        "server",
+        &pending.device_id,
+        &pending.nonce,
+        &pending.salt,
+    );
+    Ok((e2e::Session::host(keys), base64::encode(&server_proof)))
+}
+
 fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>) -> io::Result<()> {
     let (tx, rx) = channel::<Vec<u8>>();
     let conn_id = companion
@@ -325,6 +433,10 @@ fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>)
     // the Node host's HEARTBEAT_MS cadence and miss limit)
     reader.set_read_timeout(Some(Duration::from_millis(crate::protocol::HEARTBEAT_MS)))?;
     let mut misses: u32 = 0;
+    // E2E session (ADR-011): `e2e` is live once a handshake succeeds; `hs`
+    // holds the in-flight handshake between hs_hello and hs_proof.
+    let mut e2e: Option<e2e::Session> = None;
+    let mut hs: Option<HsPending> = None;
 
     let result: io::Result<()> = loop {
         let frame = match ws::read_frame(&mut reader, true) {
@@ -357,17 +469,68 @@ fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>)
             Frame::Pong(_) => {}
             Frame::Close(_, _) => break Ok(()),
             Frame::Text(payload) => {
-                let raw = match std::str::from_utf8(&payload) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        send_malformed(&tx, &companion);
-                        continue;
+                // When an E2E session is live the frame is sealed: open it first
+                // and tear the connection down on replay / desync / tamper.
+                let plaintext: String = if let Some(session) = e2e.as_mut() {
+                    let p = match std::str::from_utf8(&payload) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => break Err(io::Error::other("e2e: non-utf8 sealed frame")),
+                    };
+                    match session.open(&p) {
+                        Ok(t) => t,
+                        Err(reason) => break Err(io::Error::other(format!("e2e: {reason}"))),
+                    }
+                } else {
+                    match String::from_utf8(payload) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            send_malformed(&tx, &companion);
+                            continue;
+                        }
                     }
                 };
-                let Some(msg) = parse_client_message(raw) else {
+                let Some(msg) = parse_client_message(&plaintext) else {
                     send_malformed(&tx, &companion);
                     continue;
                 };
+                // E2E handshake control (plaintext phase only, before a session)
+                if e2e.is_none() {
+                    match &msg {
+                        ClientMsg::HsHello { device_id } => {
+                            let (nonce, salt) = e2e::fresh_nonce_salt();
+                            hs = Some(HsPending {
+                                device_id: device_id.clone(),
+                                nonce,
+                                salt,
+                            });
+                            let reply = ServerMsg::HsChallenge {
+                                nonce: base64::encode(&nonce),
+                                salt: base64::encode(&salt),
+                            };
+                            let _ = tx.send(reply.to_text().into_bytes());
+                            continue;
+                        }
+                        ClientMsg::HsProof { proof } => {
+                            let Some(pending) = hs.take() else {
+                                hs_err(&tx, "no handshake in progress");
+                                continue;
+                            };
+                            match establish_session(&companion, &pending, proof) {
+                                Ok((session, server_proof)) => {
+                                    // HsOk is plaintext; both sides switch to
+                                    // sealed frames from the next message on.
+                                    let _ = tx.send(
+                                        ServerMsg::HsOk { server_proof }.to_text().into_bytes(),
+                                    );
+                                    e2e = Some(session);
+                                }
+                                Err(reason) => hs_err(&tx, &reason),
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 if let ClientMsg::Hello { protocol, .. } = &msg
                     && *protocol as u32 != PROTOCOL_VERSION
                 {
@@ -402,7 +565,12 @@ fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>)
                     _ => companion.handle_client_msg(msg),
                 };
                 if let Some(reply) = reply {
-                    let _ = tx.send(reply.to_text().into_bytes());
+                    let text = reply.to_text();
+                    let out = match e2e.as_mut() {
+                        Some(session) => session.seal(&text).into_bytes(),
+                        None => text.into_bytes(),
+                    };
+                    let _ = tx.send(out);
                 }
             }
             Frame::Binary(_) | Frame::Continuation(_) => {
@@ -445,4 +613,281 @@ fn send_malformed(tx: &Sender<Vec<u8>>, companion: &Companion) {
             .to_text()
             .into_bytes(),
     );
+}
+
+/* ------------------------------------------------------------------ */
+/* E2E security matrix (ADR-011) — server-level integration tests.    */
+/* ------------------------------------------------------------------ */
+
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+    use crate::client::WsClient;
+    use crate::companion::Companion;
+    use crate::config::default_config;
+    use crate::protocol::now_ms;
+    use crate::storage::{DeviceRecord, PairingRecord};
+
+    struct Fixture {
+        companion: Arc<Companion>,
+        handle: ServerHandle,
+        psk: [u8; 32],
+        device_id: String,
+        data_dir: std::path::PathBuf,
+    }
+
+    fn shutdown(f: Fixture) {
+        let Fixture {
+            companion,
+            handle,
+            data_dir,
+            ..
+        } = f;
+        handle.stop();
+        companion.shutdown();
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chernobyl-e2e-{}-{}-{}",
+            tag,
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Boot a companion + server (loopback, no token) and seed a pending
+    /// pairing offer with a known PSK.
+    fn fixture(tag: &str, expires_at: i64, consumed: bool) -> Fixture {
+        let dir = temp_dir(tag);
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let psk = [42u8; 32];
+        let device_id = "dev-e2e".to_string();
+        let protected = base64::encode(&crate::ffi::dpapi_protect(&psk).unwrap());
+        {
+            let mut store = companion.shared.storage.lock().unwrap();
+            store
+                .put_pairing(&PairingRecord {
+                    device_id: device_id.clone(),
+                    psk_protected: protected,
+                    challenge: base64::encode(b"CHALLENGE"),
+                    created_at: now_ms(),
+                    expires_at,
+                    consumed,
+                })
+                .unwrap();
+        }
+        let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        Fixture {
+            companion,
+            handle,
+            psk,
+            device_id,
+            data_dir: dir,
+        }
+    }
+
+    /// Boot + seed an already-paired device registry entry (no pending offer).
+    fn fixture_paired(tag: &str, revoked: bool) -> Fixture {
+        let dir = temp_dir(tag);
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let psk = [42u8; 32];
+        let device_id = "dev-paired".to_string();
+        let protected = base64::encode(&crate::ffi::dpapi_protect(&psk).unwrap());
+        {
+            let mut store = companion.shared.storage.lock().unwrap();
+            store
+                .put_device(&DeviceRecord {
+                    device_id: device_id.clone(),
+                    name: "phone".into(),
+                    psk_protected: protected,
+                    paired_at: now_ms(),
+                    revoked,
+                })
+                .unwrap();
+        }
+        let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        Fixture {
+            companion,
+            handle,
+            psk,
+            device_id,
+            data_dir: dir,
+        }
+    }
+
+    fn connect(f: &Fixture) -> WsClient {
+        WsClient::connect(&format!("127.0.0.1:{}", f.handle.port), "/", None).unwrap()
+    }
+
+    /// Drive one full handshake attempt with `psk`. Returns the server's final
+    /// `hs_ok`/`hs_err` payload and, on success, the client-side session.
+    fn attempt(
+        c: &mut WsClient,
+        psk: &[u8; 32],
+        device_id: &str,
+    ) -> (String, Option<e2e::Session>) {
+        c.send_text(&format!(
+            "{{\"type\":\"hs_hello\",\"deviceId\":\"{device_id}\"}}"
+        ))
+        .unwrap();
+        let challenge = c.next_text().unwrap();
+        let v = json::parse(&challenge).unwrap();
+        let nonce = base64::decode(json::get_str(&v, "nonce").unwrap()).unwrap();
+        let salt = base64::decode(json::get_str(&v, "salt").unwrap()).unwrap();
+        let proof = e2e::handshake_proof(psk, "client", device_id, &nonce, &salt);
+        c.send_text(&format!(
+            "{{\"type\":\"hs_proof\",\"proof\":\"{}\"}}",
+            base64::encode(&proof)
+        ))
+        .unwrap();
+        let resp = c.next_text().unwrap();
+        let v = json::parse(&resp).unwrap();
+        if json::get_str(&v, "type") == Some("hs_ok") {
+            // mutual auth: the server must prove PSK knowledge too
+            let sp = base64::decode(json::get_str(&v, "serverProof").unwrap()).unwrap();
+            let expected = e2e::handshake_proof(psk, "server", device_id, &nonce, &salt);
+            assert_eq!(sp.as_slice(), expected.as_slice(), "server must prove PSK");
+            let keys = e2e::derive_keys(psk, &salt);
+            (resp, Some(e2e::Session::client(keys)))
+        } else {
+            (resp, None)
+        }
+    }
+
+    #[test]
+    fn happy_path_seals_and_unseals_frames() {
+        let f = fixture("happy", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        let (resp, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        assert!(resp.contains("hs_ok"), "got: {resp}");
+        let mut sess = sess.unwrap();
+        // sealed ping → sealed pong
+        let ping = "{\"type\":\"ping\",\"commandId\":\"p1\"}";
+        c.send_text(&sess.seal(ping)).unwrap();
+        let pong = sess.open(&c.next_text().unwrap()).unwrap();
+        assert!(pong.contains("pong"), "got: {pong}");
+        // sealed hello → sealed hello_ack (snapshot round-trips)
+        let hello = format!(
+            "{{\"type\":\"hello\",\"clientId\":\"c1\",\"protocol\":{}}}",
+            PROTOCOL_VERSION
+        );
+        c.send_text(&sess.seal(&hello)).unwrap();
+        let ack = sess.open(&c.next_text().unwrap()).unwrap();
+        assert!(ack.contains("protocol"), "got: {ack}");
+        shutdown(f);
+    }
+
+    #[test]
+    fn replayed_frame_tears_down_connection() {
+        let f = fixture("replay", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        let (_resp, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        let mut sess = sess.unwrap();
+        let ping = "{\"type\":\"ping\",\"commandId\":\"p1\"}";
+        let frame = sess.seal(ping); // counter 0
+        c.send_text(&frame).unwrap();
+        let _ = sess.open(&c.next_text().unwrap()).unwrap(); // pong
+        // resend the identical frame: server sees counter 0 again (already at 1)
+        c.send_text(&frame).unwrap();
+        assert!(
+            c.next_text().is_err(),
+            "server must close the connection on frame replay"
+        );
+        shutdown(f);
+    }
+
+    #[test]
+    fn tampered_frame_tears_down_connection() {
+        let f = fixture("tamper", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        let (_resp, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        let mut sess = sess.unwrap();
+        let frame = sess.seal("{\"type\":\"ping\",\"commandId\":\"p1\"}");
+        // flip one body byte (counter stays 0) ⇒ AEAD tag fails server-side
+        let mut bad = frame.clone();
+        let idx = bad.rfind('\"').unwrap() - 1;
+        let b = bad.as_bytes()[idx];
+        bad.replace_range(idx..idx + 1, if b == b'A' { "B" } else { "A" });
+        c.send_text(&bad).unwrap();
+        assert!(
+            c.next_text().is_err(),
+            "server must close the connection on a tampered frame"
+        );
+        shutdown(f);
+    }
+
+    #[test]
+    fn bad_proof_is_rejected() {
+        let f = fixture("badproof", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        let wrong_psk = [99u8; 32];
+        let (resp, sess) = attempt(&mut c, &wrong_psk, &f.device_id);
+        assert!(sess.is_none());
+        assert!(resp.contains("proof verification failed"), "got: {resp}");
+        shutdown(f);
+    }
+
+    #[test]
+    fn unknown_device_is_rejected() {
+        let f = fixture("unknown", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        let (resp, sess) = attempt(&mut c, &f.psk, "no-such-device");
+        assert!(sess.is_none());
+        assert!(resp.contains("unknown device"), "got: {resp}");
+        shutdown(f);
+    }
+
+    #[test]
+    fn expired_pairing_is_rejected() {
+        let f = fixture("expired", now_ms() - 1_000, false); // already expired
+        let mut c = connect(&f);
+        let (resp, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        assert!(sess.is_none());
+        assert!(resp.contains("expired"), "got: {resp}");
+        shutdown(f);
+    }
+
+    #[test]
+    fn spent_pairing_cannot_be_reused() {
+        let f = fixture("spent", now_ms() + 60_000, true); // already redeemed
+        let mut c = connect(&f);
+        let (resp, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        assert!(sess.is_none());
+        assert!(resp.contains("already used"), "got: {resp}");
+        shutdown(f);
+    }
+
+    #[test]
+    fn revoked_device_is_rejected() {
+        let f = fixture_paired("revoked", true);
+        let mut c = connect(&f);
+        let (resp, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        assert!(sess.is_none());
+        assert!(resp.contains("revoked"), "got: {resp}");
+        shutdown(f);
+    }
+
+    #[test]
+    fn paired_device_can_reconnect_after_redemption() {
+        // full lifecycle: redeem a fresh offer (registers the device), then
+        // reconnect using the device registry with the same PSK.
+        let f = fixture("lifecycle", now_ms() + 60_000, false);
+        let mut c1 = connect(&f);
+        let (r1, _s1) = attempt(&mut c1, &f.psk, &f.device_id);
+        assert!(r1.contains("hs_ok"), "first connect must redeem: {r1}");
+        // the offer is now spent AND a device record exists → reconnect works
+        let mut c2 = connect(&f);
+        let (r2, s2) = attempt(&mut c2, &f.psk, &f.device_id);
+        assert!(r2.contains("hs_ok"), "paired device must reconnect: {r2}");
+        assert!(s2.is_some());
+        shutdown(f);
+    }
 }

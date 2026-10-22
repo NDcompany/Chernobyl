@@ -263,9 +263,13 @@ impl OpenCodeAdapter {
             } => self
                 .inner
                 .permission_decision(command_id, permission_id, decision),
-            ClientMsg::Hello { .. } | ClientMsg::Ping { .. } | ClientMsg::ListState { .. } => Err(
-                AdapterError::Unsupported("session-neutral messages stay with the engine".into()),
-            ),
+            ClientMsg::Hello { .. }
+            | ClientMsg::Ping { .. }
+            | ClientMsg::ListState { .. }
+            | ClientMsg::HsHello { .. }
+            | ClientMsg::HsProof { .. } => Err(AdapterError::Unsupported(
+                "session-neutral messages stay with the engine".into(),
+            )),
         }
     }
 

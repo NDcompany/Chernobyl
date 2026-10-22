@@ -279,6 +279,8 @@ impl Engine {
             ClientMsg::SubmitPrompt { .. } => self.submit_prompt(msg),
             ClientMsg::Interrupt { .. } => self.interrupt(msg),
             ClientMsg::PermissionDecision { .. } => self.decide(msg),
+            // handshake frames are terminated in the server, never the engine
+            ClientMsg::HsHello { .. } | ClientMsg::HsProof { .. } => None,
         };
 
         if let (Some(ServerMsg::Ack { .. }), Some(cmd_id), true) = (&reply, &cmd_id, mutating)
