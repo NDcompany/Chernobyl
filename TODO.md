@@ -1,6 +1,6 @@
 # CHERNOBYL — TODO
 
-Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite + everything left.
+Updated: 2026-10-21 (Phase R checkpoint + ADR-011 phase-map revision). Status of the Rust companion rewrite + everything left.
 
 ## Done
 
@@ -180,13 +180,27 @@ Updated: 2026-10-21 (Phase R checkpoint). Status of the Rust companion rewrite +
       "abort stops a healthy long generation" unproven (provider 426s every live turn,
       opencode.md §8); permission asked→reply live cycle unproven (fake-server tests prove
       contract wiring only).
-- [ ] Phase 4′: pairing challenge (ADR-002), short-lived connection tickets (ADR-006).
-- [ ] Phase 5′: outbound cloudflared tunnel cross-network gate (ADR-001).
+- [ ] Phase 4′: pairing + identity + **E2E session layer** (ADR-002/006/011): `companion pair`
+      prints a single-use, short-lived QR (hostId + endpoint list + companion key fingerprint
+      + per-device 256-bit PSK + challenge) via a hand-rolled terminal-QR encoder; every WS
+      frame thereafter ChaCha20-Poly1305 AEAD (HKDF-SHA-256 directional keys from the PSK,
+      monotonic counters; all crypto std-only with official known-answer tests — RFC 4231/
+      8439/NIST); per-device credentials in phone keystore; per-device revocation. Security
+      matrix: expired/replayed QR, revoked reuse, ticket replay, MITM without PSK, frame
+      replay, counter desync.
+- [ ] Phase 5′: **transport-agnostic remote access** (ADR-011) — no mandatory third party:
+      companion advertises all reachable endpoints (LAN always; optional tailnet / DDNS +
+      port-forward / cloudflared how-tos, incl. CGNAT check); app reconnects trying endpoints
+      in order; transport is a dumb pipe — security is the Phase 4′ E2E layer.
 - [ ] Phase 6: mobile integration — simulation badge (ADR-009), paired transport replaces
-      `EXPO_PUBLIC_HOST_WS_URL` + fake sign-in.
+      `EXPO_PUBLIC_HOST_WS_URL` + fake sign-in, endpoint-list host records, **persistent WS +
+      Android foreground-service local notifications (no FCM)**.
 - [ ] Phase 7: adapters in order Claude Code → Ollama → Hermes (ADR-008) — as Rust modules.
-- [ ] Phase 8: FCM push from the companion (needs Firebase project) + packaging (ADR-007).
-- [ ] Phase 9: release gate — no mock advertised as real (PRD §13.1).
+- [ ] Phase 8: **TUI** (status, sessions, approvals with keybinds, pairing flow) + windowless
+      autostart host + packaging (ADR-007) + backup/restore, log redaction, local metrics.
+      (FCM push removed — replaced by Phase 6 persistent-WS notifications.)
+- [ ] Phase 9: release gate — no mock advertised as real (PRD §13.1); E2E crypto known-answer
+      tests + adversarial matrix green.
 
 ## Explicitly not done (honesty)
 
