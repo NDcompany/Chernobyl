@@ -13,7 +13,7 @@ use crate::json;
 use crate::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg, parse_client_message};
 use crate::storage::DeviceRecord;
 use crate::ws::{self, Frame, Handshake};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -249,6 +249,19 @@ fn handle_conn(
 
     // HTTP routes (non-upgrade) -------------------------------------------
     if !handshake.is_websocket_upgrade() {
+        // Phase 7: POST hook ingress (Claude Code) — reachable ONLY on the
+        // loopback diagnostics listener (PRD §15.2). The main listener never
+        // answers a POST: its auth/session surface is untouched. RFC 6455
+        // upgrades are GET-only (`validate_upgrade`), so a POST here is always
+        // a plain HTTP request.
+        if handshake.method == "POST" {
+            let path = handshake.target.split('?').next().unwrap_or("/");
+            if !diagnostics_only || path != "/hooks/claude" {
+                let _ = ws::write_http_error(&mut writer, 404, "Not Found", "");
+                return Ok(());
+            }
+            return hook_ingress(&mut reader, &mut writer, &handshake, &companion);
+        }
         // D6: on a non-loopback main listener /health joins the token gate.
         let require_health_auth = !diagnostics_only && remote_posture && token.is_some();
         return http_route(
@@ -363,6 +376,46 @@ fn http_route(
         _ => writer
             .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"),
     }
+}
+
+/// Phase 7: read one Claude Code hook POST body (Content-Length framed, capped
+/// at `MAX_HOOK_BODY_BYTES`) and route it into the engine pipeline. Returns the
+/// adapter's verdict as an HTTP status: 200 accepted, 400 malformed, 507 when
+/// no Claude adapter is mounted. The body read fails closed on a missing or
+/// oversized Content-Length.
+fn hook_ingress(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    h: &Handshake,
+    companion: &Companion,
+) -> io::Result<()> {
+    let clen = h
+        .header("content-length")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n <= ws::MAX_HOOK_BODY_BYTES);
+    let Some(clen) = clen else {
+        // no body, non-numeric, or oversize: refuse without reading a byte
+        return writer.write_all(
+            b"HTTP/1.1 411 Length Required\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        );
+    };
+    let mut body = vec![0u8; clen];
+    if reader.read_exact(&mut body).is_err() {
+        return writer.write_all(
+            b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        );
+    }
+    let payload = String::from_utf8(body)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "hook body was not utf-8"))?;
+    let status = companion.ingest_claude_hook(&payload);
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        _ => "Service Unavailable", // 404: no Claude adapter mounted
+    };
+    let resp =
+        format!("HTTP/1.1 {status} {reason}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+    writer.write_all(resp.as_bytes())
 }
 
 /// Per-connection handshake state: the device that asked to connect and the
@@ -868,7 +921,7 @@ fn send_malformed(outbound: &Outbound, companion: &Companion) -> Result<(), Enqu
 #[cfg(test)]
 mod e2e_tests {
     use super::*;
-    use crate::client::{WsClient, http_get};
+    use crate::client::{WsClient, http_get, http_request};
     use crate::companion::Companion;
     use crate::config::default_config;
     use crate::protocol::now_ms;
@@ -1268,6 +1321,76 @@ mod e2e_tests {
         let plain = http_get(&format!("127.0.0.1:{}", g.handle.port), "/health").unwrap();
         assert!(plain.starts_with("HTTP/1.1 200"), "got: {plain}");
         shutdown(g);
+    }
+
+    /* D8: bounded outbound queue — count + byte caps, explicit overload
+    teardown, writer lifecycle. All deterministic: no sleeps in the
+    assertions, real sockets only where the writer's wire behavior is
+    the invariant under test. */
+
+    /// Boot a companion with a Claude hook ingress mounted and start the
+    /// server (loopback, no token). Returns the fixture + the claude adapter.
+    fn fixture_claude(tag: &str) -> Fixture {
+        let dir = temp_dir(tag);
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        c.adapters.push(crate::config::AdapterEntryConfig {
+            id: "cc-1".into(),
+            kind: "claude".into(),
+            enabled: true,
+            endpoint: None,
+            basic_auth: None,
+        });
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        Fixture {
+            companion,
+            handle,
+            psk: [0u8; 32],
+            device_id: String::new(),
+            data_dir: dir,
+        }
+    }
+
+    #[test]
+    fn claude_hook_ingress_accepts_on_diagnostics_and_rejects_on_main() {
+        let f = fixture_claude("cc-ingress");
+        // the REAL captured SessionStart payload (Claude Code 2.1.309)
+        let payload = r#"{"session_id":"24e5d08e-906e-47bf-b902-4fc7d50acdec","transcript_path":"C:\\t.jsonl","cwd":"G:\\Chernobyl","hook_event_name":"SessionStart","source":"startup"}"#;
+
+        // diagnostics listener (loopback): accepted, event enters the pipeline
+        let diag = format!("http://127.0.0.1:{}", f.handle.diagnostics_port);
+        let r = http_request("POST", &format!("{diag}/hooks/claude"), None, Some(payload)).unwrap();
+        assert!(r.status == 200, "diag POST must accept, got {}", r.status);
+        let snap = f.companion.snapshot();
+        assert!(
+            snap.activity
+                .iter()
+                .any(|a| a.text.contains("session started")),
+            "hook must surface as activity: {:?}",
+            snap.activity
+        );
+
+        // the MAIN listener never answers a POST: its auth/session surface is
+        // untouched — a hook there is a 404.
+        let main = format!("http://127.0.0.1:{}", f.handle.port);
+        let m = http_request("POST", &format!("{main}/hooks/claude"), None, Some(payload)).unwrap();
+        assert!(
+            m.status == 404,
+            "main listener must refuse POST, got {}",
+            m.status
+        );
+
+        // malformed payload on the ingress: 400, never a fabricated event
+        let bad =
+            http_request("POST", &format!("{diag}/hooks/claude"), None, Some("{nope")).unwrap();
+        assert!(
+            bad.status == 400,
+            "malformed hook must 400, got {}",
+            bad.status
+        );
+
+        shutdown(f);
     }
 
     /* D8: bounded outbound queue — count + byte caps, explicit overload

@@ -95,6 +95,13 @@ impl AdapterManager {
                     Some("attachable — model-runtime probe runs at boot".into()),
                     Vec::new(),
                 )
+            } else if entry.kind == "claude" {
+                // Phase 7: hook INGRESS (PRD §7.5) — no endpoint to probe;
+                // the companion exposes a loopback route and a Claude Code
+                // hook bridge posts to it. Healthy = the ingress is mounted;
+                // whether a bridge is actually delivering is a runtime signal
+                // the adapter reports, not a discovery-time claim.
+                (true, true, None, Vec::new())
             } else {
                 (
                     false,
@@ -134,6 +141,15 @@ impl AdapterManager {
     /// (boot, right after the adapter is constructed). Same shape as
     /// OpenCode — the honest §7.3 list replaces the discovery placeholder.
     pub fn attach_ollama(&mut self, id: &str, capabilities: Vec<Capability>) {
+        if let Some(s) = self.statuses.get_mut(id) {
+            s.supported = true;
+            s.capabilities = capabilities;
+        }
+    }
+
+    /// Phase 7: record the Claude hook-ingress capability declaration (boot).
+    /// The ingress has no probe; its honest §7.3 list replaces discovery's.
+    pub fn attach_claude(&mut self, id: &str, capabilities: Vec<Capability>) {
         if let Some(s) = self.statuses.get_mut(id) {
             s.supported = true;
             s.capabilities = capabilities;

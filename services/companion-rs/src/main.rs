@@ -52,6 +52,7 @@ fn run(args: &[String]) -> i32 {
     let mut endpoint_override: Vec<String> = Vec::new();
     let mut list_devices = false;
     let mut revoke: Option<String> = None;
+    let mut claude_hooks = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -79,6 +80,7 @@ fn run(args: &[String]) -> i32 {
             "--endpoint" => endpoint_override.extend(take(&mut i)),
             "--devices" => list_devices = true,
             "--revoke" => revoke = take(&mut i),
+            "--claude-hooks" => claude_hooks = true,
             "--config" => config_path = take(&mut i),
             "--port" => port_override = take(&mut i).and_then(|v| v.parse().ok()),
             "--bind" => bind_override = take(&mut i),
@@ -149,6 +151,12 @@ fn run(args: &[String]) -> i32 {
     }
     if let Some(device_id) = revoke.as_deref() {
         return revoke_main(&cfg, device_id);
+    }
+    // `companion claude-hooks` — print the Claude Code hook-bridge snippet for
+    // THIS companion's loopback diagnostics ingress (explicit install: the
+    // companion never writes the user's settings.json). Socket-free.
+    if claude_hooks {
+        return claude_hooks_main(&cfg);
     }
 
     // Secure-by-default: exposing beyond loopback requires a token.
@@ -398,6 +406,16 @@ fn revoke_main(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
         return 1;
     }
     println!("revoked device {device_id}");
+    0
+}
+
+/// `companion claude-hooks` — print the Claude Code hook-bridge snippet that
+/// forwards every hook to THIS companion's loopback diagnostics ingress. The
+/// operator pastes it into `~/.claude/settings.json` themselves (explicit
+/// install; the companion never writes the user's settings). Socket-free.
+fn claude_hooks_main(cfg: &config::CompanionConfig) -> i32 {
+    let ingress = format!("http://127.0.0.1:{}/hooks/claude", cfg.diagnostics_port);
+    print!("{}", chernobyl_companion::claude::bridge_config(&ingress));
     0
 }
 

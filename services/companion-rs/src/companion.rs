@@ -5,6 +5,7 @@
 //! continuity (C2).
 
 use crate::adapters::AdapterManager;
+use crate::claude::ClaudeAdapter;
 use crate::config::CompanionConfig;
 use crate::engine::Engine;
 use crate::ffi;
@@ -29,6 +30,9 @@ pub struct Shared {
     /// Phase 7: the attached Ollama model-runtime adapter, when configured
     /// (attach-only — PRD §7.7, a model provider not a session manager).
     pub ollama: Mutex<Option<Arc<OllamaAdapter>>>,
+    /// Phase 7: the Claude Code hook ingress, when configured (PRD §7.5) —
+    /// Claude Code pushes hook events to the companion's loopback route.
+    pub claude: Mutex<Option<Arc<ClaudeAdapter>>>,
     pub started_at: i64,
     pub config: CompanionConfig,
     /// Consecutive auth failures; trips a cooldown (brute-force resistance).
@@ -69,6 +73,14 @@ impl Companion {
             .find(|e| e.enabled && e.kind == "ollama")
             .map(|e| (e.id.clone(), e.endpoint.clone()));
 
+        // Phase 7: the Claude Code hook ingress — no endpoint (it is a
+        // route the companion exposes), just the enabled adapter id.
+        let claude_cfg = config
+            .adapters
+            .iter()
+            .find(|e| e.enabled && e.kind == "claude")
+            .map(|e| e.id.clone());
+
         let shared = Arc::new(Shared {
             storage: Mutex::new(storage),
             clients: Mutex::new(Vec::new()),
@@ -76,6 +88,7 @@ impl Companion {
             adapters: Mutex::new(AdapterManager::discover(&config.adapters)),
             opencode: Mutex::new(None),
             ollama: Mutex::new(None),
+            claude: Mutex::new(None),
             started_at: now_ms(),
             config,
             auth_failures: Mutex::new(0),
@@ -203,6 +216,18 @@ impl Companion {
                 mgr.probe_result(&id, probe.as_ref().err().map(|e| e.to_string()));
             }
             *companion.shared.ollama.lock().unwrap() = Some(ol);
+        }
+
+        // Phase 7: mount the Claude Code hook ingress (PRD §7.5). No probe
+        // and no endpoint — the companion exposes a loopback route and the
+        // user-installed bridge posts to it; health is the route being ready.
+        if let Some(id) = claude_cfg {
+            let cl = Arc::new(ClaudeAdapter::new(&id));
+            {
+                let mut mgr = companion.shared.adapters.lock().unwrap();
+                mgr.attach_claude(&id, cl.capabilities());
+            }
+            *companion.shared.claude.lock().unwrap() = Some(cl);
         }
 
         Ok(companion)
@@ -505,6 +530,33 @@ impl Companion {
                 })
                 .collect(),
         )
+    }
+
+    /// Phase 7: accept one Claude Code hook payload (already read off the
+    /// wire) and route it into the SAME seq/persist/fan-out pipeline as
+    /// engine and OpenCode events — one sequence authority (C2). Returns the
+    /// HTTP status the ingress should answer: 200 on acceptance (including an
+    /// ignorable unknown hook, which is counted but not surfaced), 400 on a
+    /// malformed payload, 404 when no Claude adapter is mounted.
+    pub fn ingest_claude_hook(&self, payload: &str) -> u16 {
+        let Some(cl) = self.shared.claude.lock().unwrap().clone() else {
+            return 404;
+        };
+        match cl.ingest(payload) {
+            Ok(Some(kind)) => {
+                let mut engine = self.engine.lock().unwrap();
+                engine.publish_external(kind);
+                200
+            }
+            // an unknown-but-well-formed hook is counted, never faked
+            Ok(None) => 200,
+            Err(e) => {
+                self.malformed_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[companion] claude hook rejected: {e}");
+                400
+            }
+        }
     }
 
     /// Sweeps permission expiry and advances mock runs. Driven by the

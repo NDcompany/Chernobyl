@@ -126,6 +126,10 @@ pub fn read_handshake<R: Read>(r: &mut R) -> Result<Handshake, WsError> {
     parse_handshake(&text)
 }
 
+/// Maximum accepted POST body for the loopback hook ingress. A Claude Code
+/// hook payload is small (sub-1 KB); this cap bounds the ingress memory.
+pub const MAX_HOOK_BODY_BYTES: usize = 64 * 1024;
+
 fn parse_handshake(text: &str) -> Result<Handshake, WsError> {
     let mut lines = text.split("\r\n");
     let request_line = lines.next().ok_or(WsError::BadHandshake)?;
@@ -133,7 +137,10 @@ fn parse_handshake(text: &str) -> Result<Handshake, WsError> {
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("").to_string();
     let version = parts.next().unwrap_or("");
-    if method != "GET" || !version.starts_with("HTTP/1.") {
+    // GET for the WS upgrade + HTTP routes; POST only for the loopback hook
+    // ingress (Phase 7). `validate_upgrade` additionally requires GET, so a
+    // POST can never reach the upgrade path regardless of its headers.
+    if (method != "GET" && method != "POST") || !version.starts_with("HTTP/1.") {
         return Err(WsError::BadHandshake);
     }
     let mut headers = Vec::new();
@@ -159,6 +166,11 @@ fn parse_handshake(text: &str) -> Result<Handshake, WsError> {
 
 /// Validates the upgrade headers and returns the accept value.
 pub fn validate_upgrade(h: &Handshake) -> Result<String, WsError> {
+    // RFC 6455 upgrades are GET-only; a POST (the loopback hook ingress) can
+    // never reach the upgrade path regardless of the headers it carries.
+    if h.method != "GET" {
+        return Err(WsError::BadHandshake);
+    }
     if !h.is_websocket_upgrade() {
         return Err(WsError::NotAWebSocket);
     }
@@ -346,12 +358,18 @@ mod tests {
         let raw = "GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: YQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
         let h = read_handshake(&mut Cursor::new(raw.as_bytes())).unwrap();
         assert_eq!(validate_upgrade(&h), Err(WsError::BadKey));
-        // non-GET
-        let raw = "POST / HTTP/1.1\r\n\r\n";
+        // unsupported method (neither GET nor POST) is still rejected at parse
+        let raw = "PUT / HTTP/1.1\r\n\r\n";
         assert_eq!(
             read_handshake(&mut Cursor::new(raw.as_bytes())),
             Err(WsError::BadHandshake)
         );
+        // POST parses (loopback hook ingress), but a POST — even with full
+        // upgrade headers — can NEVER reach the WS upgrade path.
+        let raw = "POST /hooks/claude HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let h = read_handshake(&mut Cursor::new(raw.as_bytes())).unwrap();
+        assert_eq!(h.method, "POST");
+        assert_eq!(validate_upgrade(&h), Err(WsError::BadHandshake));
     }
 
     #[test]

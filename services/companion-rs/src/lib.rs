@@ -4,11 +4,13 @@
 //! permission authority), seed (mock snapshot), engine (mock agent engine),
 //! ws (RFC 6455 codec), sha1/base64 (handshake primitives), storage
 //! (crash-safe journal), config, adapters, opencode (Phase 3 OpenCode
-//! adapter), companion (orchestration), server (WS/HTTP), client (test
+//! adapter), ollama (Phase 7 model-runtime adapter), claude (Phase 7 hook
+//! ingress), companion (orchestration), server (WS/HTTP), client (test
 //! client), ffi (Windows console/memory).
 
 pub mod adapters;
 pub mod base64;
+pub mod claude;
 pub mod client;
 pub mod companion;
 pub mod config;
