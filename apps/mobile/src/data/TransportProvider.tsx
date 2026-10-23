@@ -4,9 +4,10 @@
  */
 import { useEffect, type ReactNode } from 'react';
 import type { ServerMessage, Snapshot } from '@chernobyl/protocol';
-import { getTransport, hostUrl, setTransport, type Transport } from './transport';
+import { createE2eTransport, parsePairingPayload } from '@chernobyl/e2e';
+import { getTransport, hostUrl, resetTransport, setTransport, type Transport } from './transport';
 import { createWsTransport } from './wsTransport';
-import { readHostToken } from '@/platform/secure';
+import { readHostToken, readPairing } from '@/platform/secure';
 import { applyMessage, queryClient, STATE_KEY } from './state';
 import { useAppStore } from '@/store/appStore';
 import { initNotifications, notify } from '@/platform/notify';
@@ -52,6 +53,9 @@ async function handleSideEffect(msg: ServerMessage): Promise<void> {
 }
 
 export function TransportProvider({ children }: { children: ReactNode }) {
+  // Rebuilt whenever the credential changes (a new pairing was saved).
+  const epoch = useAppStore((s) => s.transportEpoch);
+
   useEffect(() => {
     let disposed = false;
     let cleanupTransport: Transport | null = null;
@@ -59,23 +63,46 @@ export function TransportProvider({ children }: { children: ReactNode }) {
     let unsubStatus: (() => void) | null = null;
 
     void (async () => {
-      // A secured host expects the keystore token on the connect URL; build the
-      // transport here (awaiting secure storage) and install it before any
-      // command resolves a transport via getTransport().
-      const url = hostUrl();
+      // Build the transport here (awaiting keystore reads) and install it
+      // before any command resolves a transport via getTransport().
+      // Order of authority: a saved pairing wins (real E2E handshake against
+      // the QR endpoint), then EXPO_PUBLIC_HOST_WS_URL (loopback dev parity),
+      // then the mock transport.
+      const token = await readHostToken();
+      const withToken = (u: string) =>
+        token ? `${u}${u.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}` : u;
+      const pairingJson = await readPairing();
+
       let active: Transport;
-      if (url) {
-        const token = await readHostToken();
-        const full = token
-          ? `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`
-          : url;
-        active = createWsTransport(full);
-        setTransport(active);
+      if (pairingJson) {
+        try {
+          const cred = parsePairingPayload(pairingJson);
+          active = createE2eTransport({ url: withToken(cred.endpoints[0]), pairing: cred });
+          setTransport(active);
+        } catch (e) {
+          // A corrupt stored pairing must not brick the app — surface it.
+          useAppStore
+            .getState()
+            .addToast(e instanceof Error ? e.message : 'Stored pairing is invalid', 'error');
+          const url = hostUrl();
+          if (url) {
+            active = createWsTransport(withToken(url));
+            setTransport(active);
+          } else {
+            active = getTransport();
+          }
+        }
       } else {
-        active = getTransport();
+        const url = hostUrl();
+        if (url) {
+          active = createWsTransport(withToken(url));
+          setTransport(active);
+        } else {
+          active = getTransport();
+        }
       }
       if (disposed) {
-        active.close();
+        resetTransport();
         return;
       }
       cleanupTransport = active;
@@ -96,8 +123,9 @@ export function TransportProvider({ children }: { children: ReactNode }) {
       unsubMessages?.();
       unsubStatus?.();
       cleanupTransport?.close();
+      resetTransport();
     };
-  }, []);
+  }, [epoch]);
 
   return <>{children}</>;
 }

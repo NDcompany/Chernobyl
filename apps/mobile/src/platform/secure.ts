@@ -43,3 +43,47 @@ export async function clearHostToken(): Promise<void> {
     /* nothing to clear */
   }
 }
+
+/**
+ * The pairing payload (QR JSON) IS the credential — it carries the PSK, so it
+ * lives in the keystore exactly like the host token, never in SQLite or plain
+ * state (ADR-002/012). Stored as the raw scanned/pasted text; validated by
+ * parsePairingPayload on every read.
+ */
+const PAIRING_KEY = 'chernobyl_pairing';
+let webPairing: string | null = null;
+
+export async function savePairing(payloadJson: string): Promise<void> {
+  if (Platform.OS === 'web') {
+    webPairing = payloadJson;
+    return;
+  }
+  try {
+    await SecureStore.setItemAsync(PAIRING_KEY, payloadJson, {
+      keychainAccessible: SecureStore.WHEN_UNLOCKED,
+    });
+  } catch {
+    webPairing = payloadJson;
+  }
+}
+
+export async function readPairing(): Promise<string | null> {
+  if (Platform.OS === 'web') return webPairing;
+  try {
+    return await SecureStore.getItemAsync(PAIRING_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export async function clearPairing(): Promise<void> {
+  if (Platform.OS === 'web') {
+    webPairing = null;
+    return;
+  }
+  try {
+    await SecureStore.deleteItemAsync(PAIRING_KEY);
+  } catch {
+    /* nothing to clear */
+  }
+}

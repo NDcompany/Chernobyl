@@ -7,10 +7,12 @@ import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import { applyCommandLifecycle, type CommandTracker } from '@chernobyl/domain';
 import { nextId, type AgentKind, type ServerMessage } from '@chernobyl/protocol';
+import type { TransportStatus } from '@/data/transport';
 import { sqliteStorage } from '@/platform/storage';
 
 export type SessionFilter = 'all' | 'running' | 'waiting' | 'completed';
-export type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'offline';
+/** Mirrors the transport union exactly — includes handshaking/denied (E2E). */
+export type ConnectionStatus = TransportStatus;
 export type ToastTone = 'default' | 'success' | 'warning' | 'error';
 
 export interface ToastItem {
@@ -60,6 +62,11 @@ export interface AppState {
   user: AppUser;
   settings: Settings;
   connection: ConnectionStatus;
+  /**
+   * Bumped when the active transport must be rebuilt (a new pairing was
+   * saved). The provider re-runs its boot effect on change; not persisted.
+   */
+  transportEpoch: number;
   toasts: ToastItem[];
   homeQuery: string;
   agentsQuery: string;
@@ -80,6 +87,7 @@ export interface AppState {
   addToast: (message: string, tone?: ToastTone) => void;
   dismissToast: (id: string) => void;
   setConnection: (c: ConnectionStatus) => void;
+  bumpTransport: () => void;
   setQuery: (key: 'homeQuery' | 'agentsQuery' | 'sessionsQuery', value: string) => void;
   setSessionFilter: (f: SessionFilter) => void;
   /** returns false when an identical command is already in flight */
@@ -101,6 +109,7 @@ export const useAppStore = create<AppState>()(
       user: DEFAULT_USER,
       settings: DEFAULT_SETTINGS,
       connection: 'connecting',
+      transportEpoch: 0,
       toasts: [],
       homeQuery: '',
       agentsQuery: '',
@@ -121,6 +130,8 @@ export const useAppStore = create<AppState>()(
       dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 
       setConnection: (connection) => set({ connection }),
+
+      bumpTransport: () => set((s) => ({ transportEpoch: s.transportEpoch + 1 })),
 
       setQuery: (key, value) => set({ [key]: value } as Pick<AppState, typeof key>),
 

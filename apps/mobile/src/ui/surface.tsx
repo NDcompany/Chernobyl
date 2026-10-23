@@ -385,6 +385,10 @@ const SIMULATION_PATHS = new Set([
 
 export function SimulationBadge() {
   const segments = useSegments();
+  // Re-render when the transport lifecycle changes: pairing swaps mock →
+  // live mid-session, and the badge must never show "Simulation" over a
+  // real connection (ADR-009).
+  useAppStore((s) => s.connection);
   const top = segments[segments.length - 1];
   if (typeof top === 'string' && SIMULATION_PATHS.has(top)) return null;
   if (transportKind() !== 'mock') return null;

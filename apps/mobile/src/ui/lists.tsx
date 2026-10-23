@@ -30,6 +30,7 @@ import { AgentIcon } from '@/ui/graphics';
 import { Icon, type IconName } from '@/ui/icons';
 import { zodHandler } from '@/forms/zodBridge';
 import { transportKind } from '@/data/transport';
+import { useAppStore } from '@/store/appStore';
 import { z } from 'zod';
 import {
   agentStatusLabel,
@@ -337,6 +338,8 @@ export function PromptComposer({
   });
   // ADR-009 honesty: never tell a live-companion user "nothing is executed
   // for real." The caption reflects the ACTIVE transport, not a hardcoded claim.
+  // Subscribing to the connection keeps it current when pairing swaps transports.
+  useAppStore((s) => s.connection);
   const idleCaption =
     transportKind() === 'mock'
       ? 'Mock host — nothing is executed for real'

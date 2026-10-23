@@ -3,10 +3,16 @@
  * Both emit the same ServerMessage stream and resolve the same command acks.
  */
 import type { ClientMessage, ServerMessage } from '@chernobyl/protocol';
+import type { TransportStatus as E2eStatus } from '@chernobyl/e2e';
 import { createMockTransport } from './mockTransport';
 import { createWsTransport } from './wsTransport';
 
-export type TransportStatus = 'connecting' | 'connected' | 'reconnecting' | 'offline';
+/**
+ * All transport statuses, including the E2E handshake's honest authorization
+ * states ('handshaking' = authorizing with the host, 'denied' = credential
+ * refused — terminal, not retried). Mock/ws emit a subset.
+ */
+export type TransportStatus = E2eStatus;
 
 export type Ack = Extract<ServerMessage, { type: 'ack' }>;
 
@@ -47,4 +53,14 @@ export function getTransport(): Transport {
 /** The active transport's kind — 'mock' (simulation) or 'websocket' (live). */
 export function transportKind(): Transport['kind'] {
   return getTransport().kind;
+}
+
+/**
+ * Tear down the active transport so the next getTransport() rebuilds it.
+ * The provider calls this when a new pairing is saved (the credential
+ * changed, so the connection must too).
+ */
+export function resetTransport(): void {
+  transport?.close();
+  transport = null;
 }
