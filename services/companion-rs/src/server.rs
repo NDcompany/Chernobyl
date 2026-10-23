@@ -16,8 +16,8 @@ use crate::ws::{self, Frame, Handshake};
 use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::thread;
 use std::time::Duration;
 
@@ -25,6 +25,20 @@ pub const CLOSE_UNAUTHORIZED: u16 = 4001;
 pub const CLOSE_PROTOCOL_MISMATCH: u16 = 4002;
 
 const AUTH_FAILURE_LIMIT: u32 = 5;
+
+// Per-connection outbound bounds (D8). Typical event/ack frames are a few KB
+// (SessionOutput emits one line per event; hello snapshots are a few KB), while
+// a single frame may legally reach the 256 000-B codec cap (ws.rs). The count
+// bound caps per-message bookkeeping for tiny frames; the byte bound caps
+// payload memory at 16x one max-size frame — a writer that cannot drain 4 MiB
+// while the peer still drives the heartbeat is stalled. The write timeout
+// bounds every write_frame (and every control-frame write: `control` shares
+// the socket's options), so the writer thread and the teardown join() can
+// never block forever; 10 s is generous for loopback/LAN and far inside the
+// 3-beat (45 s) dead-peer window.
+const OUTBOUND_QUEUE_MAX_MESSAGES: usize = 256;
+const OUTBOUND_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Constant-time secret comparison (content comparison leaks nothing).
 fn ct_eq(a: &str, b: &str) -> bool {
@@ -295,14 +309,14 @@ struct HsPending {
     salt: [u8; 16],
 }
 
-fn hs_err(tx: &Sender<Vec<u8>>, reason: &str) {
-    let _ = tx.send(
+fn hs_err(outbound: &Outbound, reason: &str) -> Result<(), EnqueueError> {
+    outbound.enqueue(
         ServerMsg::HsErr {
             reason: reason.to_string(),
         }
         .to_text()
         .into_bytes(),
-    );
+    )
 }
 
 /// Recover a stored PSK from its DPAPI-protected base64 form. Fails closed.
@@ -392,46 +406,157 @@ fn establish_session(
     Ok((e2e::Session::host(keys), base64::encode(&server_proof)))
 }
 
-fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>) -> io::Result<()> {
-    let (tx, rx) = channel::<Vec<u8>>();
-    let conn_id = companion
-        .shared
-        .next_conn_id
-        .fetch_add(1, Ordering::Relaxed);
-    companion
-        .shared
-        .clients
-        .lock()
-        .unwrap()
-        .push((conn_id, tx.clone()));
+/// Per-connection outbound queue (D8): bounded by message count AND total
+/// payload bytes — payload sizes vary by orders of magnitude, so a
+/// count-only bound still allows unbounded memory. Saturation is never a
+/// silent drop: `enqueue` fails and marks the connection terminated, and the
+/// read loop tears the socket down; the client reconnects and resyncs via a
+/// fresh hello snapshot. Every producer uses non-blocking `enqueue`, so a
+/// stalled peer can never park the engine, the registry lock, or the read
+/// loop — no deadlock is possible between producers and the writer.
+pub struct Outbound {
+    tx: SyncSender<Vec<u8>>,
+    /// bytes reserved by queued payloads (not yet dequeued by the writer);
+    /// shared with the writer thread so it can release on dequeue
+    queued_bytes: Arc<AtomicUsize>,
+    /// set on saturation/disconnect: the read loop must tear this connection down
+    terminated: AtomicBool,
+}
 
-    // writer thread: outbound events/replies
-    let writer_stop = Arc::new(AtomicBool::new(false));
-    let wstop = writer_stop.clone();
-    let mut writer = writer;
-    let writer_thread = thread::Builder::new()
-        .name("ws-writer".into())
-        .spawn(move || {
-            while !wstop.load(Ordering::SeqCst) {
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(payload) => {
-                        let frame = ws::encode_frame(ws::OP_TEXT, &payload, false);
-                        if write_frame(&mut writer, &frame).is_err() {
-                            break;
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break,
+/// Why an outbound message could not be queued. Both variants end the
+/// connection — nothing is ever silently discarded.
+#[derive(Debug)]
+pub enum EnqueueError {
+    /// count/byte bound hit, or the connection is already being torn down
+    Full,
+    /// writer thread is gone (socket write failed or timed out)
+    Disconnected,
+}
+
+impl Outbound {
+    fn new() -> (Arc<Outbound>, Receiver<Vec<u8>>) {
+        let (tx, rx) = sync_channel(OUTBOUND_QUEUE_MAX_MESSAGES);
+        (
+            Arc::new(Outbound {
+                tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+                terminated: AtomicBool::new(false),
+            }),
+            rx,
+        )
+    }
+
+    /// Reserve payload bytes against the byte bound; fails without side
+    /// effects when the reservation cannot fit.
+    fn reserve(&self, len: usize) -> bool {
+        self.queued_bytes
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+                queued
+                    .checked_add(len)
+                    .filter(|total| *total <= OUTBOUND_QUEUE_MAX_BYTES)
+            })
+            .is_ok()
+    }
+
+    /// Queue one payload for the writer thread (FIFO). On failure the
+    /// connection is marked terminated so the read loop starts teardown.
+    pub(crate) fn enqueue(&self, payload: Vec<u8>) -> Result<(), EnqueueError> {
+        if self.terminated.load(Ordering::SeqCst) {
+            return Err(EnqueueError::Full);
+        }
+        let len = payload.len();
+        if !self.reserve(len) {
+            self.terminated.store(true, Ordering::SeqCst);
+            return Err(EnqueueError::Full);
+        }
+        match self.tx.try_send(payload) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(p)) => {
+                self.queued_bytes.fetch_sub(p.len(), Ordering::SeqCst);
+                self.terminated.store(true, Ordering::SeqCst);
+                Err(EnqueueError::Full)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // the channel — and every payload it still held — is gone:
+                // every reservation against it is void
+                self.queued_bytes.store(0, Ordering::SeqCst);
+                self.terminated.store(true, Ordering::SeqCst);
+                Err(EnqueueError::Disconnected)
+            }
+        }
+    }
+
+    pub(crate) fn is_terminated(&self) -> bool {
+        self.terminated.load(Ordering::SeqCst)
+    }
+}
+
+/// Writer thread body: dequeue queued payloads and write them as text
+/// frames. Exits on the stop flag, a socket write failure (including the
+/// write timeout against a stalled peer) or when every sender is gone.
+/// Exiting drops `rx`, which makes every future `enqueue` fail with
+/// `Disconnected` — that is how writer death propagates to producers.
+/// `queued_bytes` is released as soon as a payload leaves the queue for
+/// the socket; only the kernel's bounded send buffer remains beyond it.
+fn run_writer(
+    mut stream: TcpStream,
+    rx: Receiver<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+    queued_bytes: Arc<AtomicUsize>,
+) {
+    while !stop.load(Ordering::SeqCst) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(payload) => {
+                queued_bytes.fetch_sub(payload.len(), Ordering::SeqCst);
+                let frame = ws::encode_frame(ws::OP_TEXT, &payload, false);
+                if write_frame(&mut stream, &frame).is_err() {
+                    break;
                 }
             }
-        })
-        .map_err(|_| io::Error::other("writer spawn"))?;
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
 
+fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>) -> io::Result<()> {
+    // Fallible socket setup first: the cleanup below runs only after the
+    // read loop, so anything that can fail with `?` must happen before the
+    // writer is spawned or the connection is registered — otherwise a
+    // failure here would leak the registry entry and the writer thread.
     // a dedicated handle for control frames (ping/pong/close)
     let mut control = reader.try_clone()?;
     // heartbeat: read timeout = one beat; N misses → dead peer (parity with
     // the Node host's HEARTBEAT_MS cadence and miss limit)
     reader.set_read_timeout(Some(Duration::from_millis(crate::protocol::HEARTBEAT_MS)))?;
+    // the write timeout (D8) bounds every write, so a stalled peer can no
+    // longer park the writer forever and teardown's join() is always bounded
+    writer.set_write_timeout(Some(WRITE_TIMEOUT))?;
+
+    let (outbound, rx) = Outbound::new();
+    let conn_id = companion
+        .shared
+        .next_conn_id
+        .fetch_add(1, Ordering::Relaxed);
+
+    // writer thread: outbound events/replies
+    let writer_stop = Arc::new(AtomicBool::new(false));
+    let wstop = writer_stop.clone();
+    let wbytes = outbound.queued_bytes.clone();
+    let writer_thread = thread::Builder::new()
+        .name("ws-writer".into())
+        .spawn(move || run_writer(writer, rx, wstop, wbytes))
+        .map_err(|_| io::Error::other("writer spawn"))?;
+    // register only now: a spawn failure above leaves nothing behind, and
+    // any event missed between spawn and registration is recovered by the
+    // hello snapshot the client requests next
+    companion
+        .shared
+        .clients
+        .lock()
+        .unwrap()
+        .push((conn_id, outbound.clone()));
+
     let mut misses: u32 = 0;
     // E2E session (ADR-011): `e2e` is live once a handshake succeeds; `hs`
     // holds the in-flight handshake between hs_hello and hs_proof.
@@ -448,6 +573,9 @@ fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>)
                 if misses > crate::protocol::HEARTBEAT_MISS_LIMIT {
                     break Err(io::Error::other("heartbeat miss limit"));
                 }
+                if outbound.is_terminated() {
+                    break Err(io::Error::other("outbound queue saturated (slow consumer)"));
+                }
                 let ping = ws::encode_frame(ws::OP_PING, b"", false);
                 if write_frame(&mut control, &ping).is_err() {
                     break Err(io::Error::other("ping write failed"));
@@ -459,6 +587,12 @@ fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>)
             Err(_) => break Err(io::Error::other("protocol violation")),
         };
         misses = 0;
+        // D8: a saturated queue means this peer is stalled — tear down even
+        // if it keeps driving the heartbeat (checked before handling the
+        // frame so no further reply is produced for a terminated peer)
+        if outbound.is_terminated() {
+            break Err(io::Error::other("outbound queue saturated (slow consumer)"));
+        }
         match frame {
             Frame::Ping(p) => {
                 let pong = ws::encode_frame(ws::OP_PONG, &p, false);
@@ -484,13 +618,17 @@ fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>)
                     match String::from_utf8(payload) {
                         Ok(s) => s,
                         Err(_) => {
-                            send_malformed(&tx, &companion);
+                            if send_malformed(&outbound, &companion).is_err() {
+                                break Err(io::Error::other("outbound queue saturated"));
+                            }
                             continue;
                         }
                     }
                 };
                 let Some(msg) = parse_client_message(&plaintext) else {
-                    send_malformed(&tx, &companion);
+                    if send_malformed(&outbound, &companion).is_err() {
+                        break Err(io::Error::other("outbound queue saturated"));
+                    }
                     continue;
                 };
                 // E2E handshake control (plaintext phase only, before a session)
@@ -507,24 +645,37 @@ fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>)
                                 nonce: base64::encode(&nonce),
                                 salt: base64::encode(&salt),
                             };
-                            let _ = tx.send(reply.to_text().into_bytes());
+                            if outbound.enqueue(reply.to_text().into_bytes()).is_err() {
+                                break Err(io::Error::other("outbound queue saturated"));
+                            }
                             continue;
                         }
                         ClientMsg::HsProof { proof } => {
                             let Some(pending) = hs.take() else {
-                                hs_err(&tx, "no handshake in progress");
+                                if hs_err(&outbound, "no handshake in progress").is_err() {
+                                    break Err(io::Error::other("outbound queue saturated"));
+                                }
                                 continue;
                             };
                             match establish_session(&companion, &pending, proof) {
                                 Ok((session, server_proof)) => {
                                     // HsOk is plaintext; both sides switch to
                                     // sealed frames from the next message on.
-                                    let _ = tx.send(
-                                        ServerMsg::HsOk { server_proof }.to_text().into_bytes(),
-                                    );
+                                    if outbound
+                                        .enqueue(
+                                            ServerMsg::HsOk { server_proof }.to_text().into_bytes(),
+                                        )
+                                        .is_err()
+                                    {
+                                        break Err(io::Error::other("outbound queue saturated"));
+                                    }
                                     e2e = Some(session);
                                 }
-                                Err(reason) => hs_err(&tx, &reason),
+                                Err(reason) => {
+                                    if hs_err(&outbound, &reason).is_err() {
+                                        break Err(io::Error::other("outbound queue saturated"));
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -572,12 +723,16 @@ fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>)
                         Some(session) => session.seal(&text).into_bytes(),
                         None => text.into_bytes(),
                     };
-                    let _ = tx.send(out);
+                    if outbound.enqueue(out).is_err() {
+                        break Err(io::Error::other("outbound queue saturated"));
+                    }
                 }
             }
             Frame::Binary(_) | Frame::Continuation(_) => {
                 // not part of the protocol: refuse politely, stay open
-                send_malformed(&tx, &companion);
+                if send_malformed(&outbound, &companion).is_err() {
+                    break Err(io::Error::other("outbound queue saturated"));
+                }
             }
         }
     };
@@ -608,13 +763,13 @@ fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>)
     Ok(())
 }
 
-fn send_malformed(tx: &Sender<Vec<u8>>, companion: &Companion) {
+fn send_malformed(outbound: &Outbound, companion: &Companion) -> Result<(), EnqueueError> {
     companion.malformed_total.fetch_add(1, Ordering::Relaxed);
-    let _ = tx.send(
+    outbound.enqueue(
         ServerMsg::ack_err("invalid", "malformed message")
             .to_text()
             .into_bytes(),
-    );
+    )
 }
 
 /* ------------------------------------------------------------------ */
@@ -869,6 +1024,199 @@ mod e2e_tests {
         c.send_text(r#"{"type":"ping","commandId":"d7-ping"}"#)
             .unwrap();
         assert!(c.next_text().unwrap().contains("pong"));
+        shutdown(f);
+    }
+
+    /* D8: bounded outbound queue — count + byte caps, explicit overload
+    teardown, writer lifecycle. All deterministic: no sleeps in the
+    assertions, real sockets only where the writer's wire behavior is
+    the invariant under test. */
+
+    fn tcp_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (server, client)
+    }
+
+    #[test]
+    fn outbound_queue_bounds_count_releases_on_dequeue_and_preserves_fifo() {
+        let (outbound, rx) = Outbound::new();
+        for i in 0..OUTBOUND_QUEUE_MAX_MESSAGES {
+            outbound.enqueue(vec![i as u8]).unwrap();
+        }
+        assert_eq!(
+            outbound.queued_bytes.load(Ordering::SeqCst),
+            OUTBOUND_QUEUE_MAX_MESSAGES
+        );
+        // count bound hit: explicit failure, connection marked terminated
+        assert!(matches!(outbound.enqueue(vec![0]), Err(EnqueueError::Full)));
+        assert!(outbound.is_terminated());
+        // queue drains in FIFO order (byte release on dequeue is the writer's
+        // job — asserted in run_writer_writes_queued_frames_in_order)
+        for i in 0..OUTBOUND_QUEUE_MAX_MESSAGES {
+            assert_eq!(rx.try_recv().unwrap(), vec![i as u8]);
+        }
+    }
+
+    #[test]
+    fn outbound_queue_bounds_total_bytes() {
+        let (outbound, rx) = Outbound::new();
+        let msg = vec![b'x'; 2_000_000];
+        outbound.enqueue(msg.clone()).unwrap();
+        outbound.enqueue(msg).unwrap(); // 4 MB of 4.19 MB budget
+        assert!(matches!(
+            outbound.enqueue(vec![b'x'; 2_000_000]),
+            Err(EnqueueError::Full)
+        ));
+        assert!(outbound.is_terminated());
+        // reservations are released by the writer on dequeue; without one,
+        // draining the channel by hand leaves them accounted (see the
+        // run_writer test for the release path)
+        assert_eq!(outbound.queued_bytes.load(Ordering::SeqCst), 4_000_000);
+        rx.try_recv().unwrap();
+    }
+
+    #[test]
+    fn outbound_byte_bound_is_inclusive_at_the_cap() {
+        let (outbound, _rx) = Outbound::new();
+        // a payload exactly at the cap fits; anything more does not
+        outbound
+            .enqueue(vec![b'x'; OUTBOUND_QUEUE_MAX_BYTES])
+            .unwrap();
+        assert!(matches!(outbound.enqueue(vec![0]), Err(EnqueueError::Full)));
+    }
+
+    #[test]
+    fn outbound_queue_reports_disconnected_and_resets_bytes_after_receiver_drops() {
+        let (outbound, rx) = Outbound::new();
+        outbound.enqueue(vec![1, 2, 3]).unwrap();
+        drop(rx);
+        assert!(matches!(
+            outbound.enqueue(vec![9]),
+            Err(EnqueueError::Disconnected)
+        ));
+        assert!(outbound.is_terminated());
+        // the dropped channel took its queued payloads with it: no reservation survives
+        assert_eq!(outbound.queued_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn run_writer_writes_queued_frames_in_order() {
+        let (server_sock, mut peer) = tcp_pair();
+        let (outbound, rx) = Outbound::new();
+        let wbytes = outbound.queued_bytes.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let wstop = stop.clone();
+        let writer = thread::spawn(move || run_writer(server_sock, rx, wstop, wbytes));
+        for i in 0..3u8 {
+            outbound.enqueue(vec![b'0' + i]).unwrap();
+        }
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        for i in 0..3u8 {
+            match ws::read_frame(&mut peer, false).unwrap() {
+                Frame::Text(p) => assert_eq!(p, vec![b'0' + i]),
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+        // every dequeued payload released its byte reservation on the way out
+        assert_eq!(outbound.queued_bytes.load(Ordering::SeqCst), 0);
+        stop.store(true, Ordering::SeqCst);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn run_writer_exits_when_all_senders_drop() {
+        let (server_sock, _peer) = tcp_pair();
+        let (outbound, rx) = Outbound::new();
+        let wbytes = outbound.queued_bytes.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = thread::spawn(move || run_writer(server_sock, rx, stop, wbytes));
+        // last sender gone → the writer must wake and exit (no stop flag, no leak)
+        drop(outbound);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn run_writer_terminates_on_reset_peer() {
+        let (server_sock, peer) = tcp_pair();
+        // standalone channel: this test exercises the writer's socket-error
+        // path, not the Outbound accounting
+        let (tx, rx) = sync_channel(64);
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer =
+            thread::spawn(move || run_writer(server_sock, rx, stop, Arc::new(AtomicUsize::new(0))));
+        drop(peer); // peer gone: once the reset lands, every write fails
+        // keep the writer fed until it dies on the write error; the socket
+        // buffers cannot absorb 32 MiB, so a live writer would never let
+        // this loop finish — the bounded spin is the failure detector
+        let mut spins = 0;
+        while !writer.is_finished() {
+            match tx.try_send(vec![b'x'; 65_536]) {
+                Ok(()) | Err(TrySendError::Full(_)) => std::thread::yield_now(),
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+            spins += 1;
+            assert!(spins < 50_000, "writer never terminated after peer reset");
+        }
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn saturated_outbound_queue_tears_the_connection_down() {
+        let f = fixture("d8-sat", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        // registration happens right after the upgrade response reaches the
+        // client; settle for it without asserting on timing
+        let outbound = {
+            let mut found = None;
+            for _ in 0..200 {
+                let clients = f.companion.shared.clients.lock().unwrap();
+                if let Some((_, q)) = clients.last() {
+                    found = Some(q.clone());
+                    break;
+                }
+                drop(clients);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            found.expect("connection must register with the client registry")
+        };
+        // one oversized payload cannot be reserved: explicit Full + terminated
+        assert!(
+            outbound
+                .enqueue(vec![b'x'; OUTBOUND_QUEUE_MAX_BYTES + 1])
+                .is_err()
+        );
+        assert!(outbound.is_terminated());
+        // the next inbound frame triggers teardown: no reply, socket closes
+        c.send_text(r#"{"type":"ping","commandId":"d8"}"#).unwrap();
+        if let Ok(other) = c.read_frame() {
+            // EOF/reset (Err) is the expected teardown outcome
+            panic!("expected the connection to close, got {other:?}");
+        }
+        // the registry entry is gone too (teardown ran)
+        assert!(f.companion.shared.clients.lock().unwrap().is_empty());
+        shutdown(f);
+    }
+
+    #[test]
+    fn sequential_command_replies_stay_in_order() {
+        let f = fixture("d8-fifo", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        for i in 0..20 {
+            c.send_text(&format!(r#"{{"type":"ping","commandId":"fifo-{i}"}}"#))
+                .unwrap();
+        }
+        for i in 0..20 {
+            let pong = c.next_text().unwrap();
+            let v = json::parse(&pong).unwrap();
+            assert_eq!(
+                json::get_str(&v, "commandId"),
+                Some(format!("fifo-{i}").as_str()),
+                "replies must keep enqueue order"
+            );
+        }
         shutdown(f);
     }
 

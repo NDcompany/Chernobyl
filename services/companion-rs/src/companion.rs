@@ -10,15 +10,17 @@ use crate::engine::Engine;
 use crate::ffi;
 use crate::opencode::OpenCodeAdapter;
 use crate::protocol::{ClientMsg, EventKind, PROTOCOL_VERSION, ServerMsg, now_ms};
+use crate::server::Outbound;
 use crate::storage::{CommandRecord, Storage};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 pub struct Shared {
     pub storage: Mutex<Storage>,
     /// Outbound payload queues, one per live WS connection, keyed by a
     /// monotonic connection id (mpsc Sender has no channel identity).
-    pub clients: Mutex<Vec<(u64, Sender<Vec<u8>>)>>,
+    /// Bounded by count and bytes (D8); a saturated queue marks its
+    /// connection terminated and the broadcast drops the registration.
+    pub clients: Mutex<Vec<(u64, Arc<Outbound>)>>,
     pub next_conn_id: std::sync::atomic::AtomicU64,
     pub adapters: Mutex<AdapterManager>,
     /// Phase 3: the attached OpenCode adapter, when configured (attach-only).
@@ -102,7 +104,11 @@ impl Companion {
                 }
                 events_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut clients = emit_shared.clients.lock().unwrap();
-                clients.retain(|(_, tx)| tx.send(text.clone().into_bytes()).is_ok());
+                // Non-blocking enqueue (D8): a saturated peer is marked
+                // terminated (its read loop closes the socket) and dropped
+                // from the registry; the engine is never parked by a slow
+                // client and no event is silently dropped for healthy ones.
+                clients.retain(|(_, q)| q.enqueue(text.clone().into_bytes()).is_ok());
             }),
         );
 
