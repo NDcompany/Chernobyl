@@ -1,6 +1,6 @@
 # CHERNOBYL — TODO
 
-Updated: 2026-10-23 (Phase 5′ release-readiness round complete: D8 queue bound + posture policies D1/D2/D6 implemented + soak harness built; root README corrected; mobile ADR-009 honesty fixes). Status of the Rust companion rewrite + everything left.
+Updated: 2026-10-23 (Phase 6 client round: ADR-012 + `@chernobyl/e2e` + QR `dev` fix + real-companion interop 13/13 + app wiring; 24 h soak for S11 running in the frozen `G:\Chernobyl-soak` worktree). Status of the Rust companion rewrite + everything left.
 
 ## Done
 
@@ -238,13 +238,19 @@ Updated: 2026-10-23 (Phase 5′ release-readiness round complete: D8 queue bound
       **multi-endpoint** advertisement (LAN + optional tailnet / DDNS + port-forward /
       cloudflared, with CGNAT-check how-tos), the **app-side ordered reconnect** across that
       list (lands with Phase 6), and the optional-transport how-to docs.
-- [~] Phase 6: mobile integration — **simulation badge done** (`66d3a7f`, ADR-009 honest
-      "Simulation" pill + transport-derived composer caption). Still owed: paired E2E
-      transport (QR scan → `hs_*` handshake → sealed frames, replaces
-      `EXPO_PUBLIC_HOST_WS_URL` + fake sign-in), endpoint-list host records, and **persistent
-      WS + Android foreground-service local notifications (no FCM)**. Blocked on a mobile
-      crypto-stack + native-module decision + a physical device (see
-      `docs/validation/PHONE-VALIDATION-CHECKLIST.md`, "To unblock the Phase 6 rows").
+- [~] Phase 6: mobile integration — **client + wiring done 2026-10-23** (ADR-012 `e7eec9d`,
+      QR `dev` contract fix `4e9ff07`, `@chernobyl/e2e` + interop `e6f68b4`, app wiring
+      `d5f828e`): crypto decision (pure-JS `@noble/*`, no build-model change), the real
+      client (strict pairing parse → `hs_*` mutual handshake → sealed frames → reconnecting
+      transport with visible handshaking/denied states), keystore pairing storage,
+      pairing-first transport boot + epoch rebuild, QR paste-pairing UI with honest failure
+      states, badge/caption reactivity. Verified in layers: 27 unit tests (RFC KATs exact vs
+      the Rust suite) + **13/13 interop vs the real Rust binary** (`npm run verify:e2e`:
+      dev redemption, wrong-PSK denial, sealed hello_ack, heartbeat, replay/tamper teardown,
+      two devices, restart recovery, revocation-at-restart semantics). Still owed: QR
+      scanner camera path + on-device rows (physical device —
+      `docs/validation/PHONE-VALIDATION-CHECKLIST.md`), endpoint-list host records, and
+      **persistent WS + Android foreground-service local notifications (no FCM)**.
 - [ ] Phase 7: adapters in order Claude Code → Ollama → Hermes (ADR-008) — as Rust modules.
 - [ ] Phase 8: **TUI** (status, sessions, approvals with keybinds, pairing flow) + windowless
       autostart host + packaging (ADR-007) + backup/restore, log redaction, local metrics.
