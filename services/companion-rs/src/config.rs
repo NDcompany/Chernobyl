@@ -141,6 +141,13 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
                  (e.g. \"http://127.0.0.1:4096\" — attach to an existing serve)"
             ));
         }
+        // Same attach-only rule for the Phase 7 Ollama model runtime.
+        if enabled && kind == "ollama" && endpoint.is_none() {
+            return Err(format!(
+                "adapters[{i}].endpoint is required for type 'ollama' \
+                 (e.g. \"http://127.0.0.1:11434\" — attach to an existing serve)"
+            ));
+        }
         adapters.push(AdapterEntryConfig {
             id,
             kind,

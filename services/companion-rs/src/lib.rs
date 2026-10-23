@@ -17,6 +17,7 @@ pub mod e2e;
 pub mod engine;
 pub mod ffi;
 pub mod json;
+pub mod ollama;
 pub mod opencode;
 pub mod pairing;
 pub mod protocol;

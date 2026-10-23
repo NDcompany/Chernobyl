@@ -86,6 +86,15 @@ impl AdapterManager {
                     Some("attachable — endpoint probe runs at boot".into()),
                     Vec::new(),
                 )
+            } else if entry.kind == "ollama" {
+                // Phase 7: attachable model-runtime provider (PRD §7.7) —
+                // health + inventory come from the boot/probe HTTP calls.
+                (
+                    true,
+                    false,
+                    Some("attachable — model-runtime probe runs at boot".into()),
+                    Vec::new(),
+                )
             } else {
                 (
                     false,
@@ -115,6 +124,16 @@ impl AdapterManager {
     /// Phase 3: record the live OpenCode adapter's capability declaration
     /// (boot, right after the adapter is constructed).
     pub fn attach_opencode(&mut self, id: &str, capabilities: Vec<Capability>) {
+        if let Some(s) = self.statuses.get_mut(id) {
+            s.supported = true;
+            s.capabilities = capabilities;
+        }
+    }
+
+    /// Phase 7: record the live Ollama adapter's capability declaration
+    /// (boot, right after the adapter is constructed). Same shape as
+    /// OpenCode — the honest §7.3 list replaces the discovery placeholder.
+    pub fn attach_ollama(&mut self, id: &str, capabilities: Vec<Capability>) {
         if let Some(s) = self.statuses.get_mut(id) {
             s.supported = true;
             s.capabilities = capabilities;

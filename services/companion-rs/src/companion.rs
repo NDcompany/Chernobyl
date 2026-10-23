@@ -8,6 +8,7 @@ use crate::adapters::AdapterManager;
 use crate::config::CompanionConfig;
 use crate::engine::Engine;
 use crate::ffi;
+use crate::ollama::OllamaAdapter;
 use crate::opencode::OpenCodeAdapter;
 use crate::protocol::{ClientMsg, EventKind, PROTOCOL_VERSION, ServerMsg, now_ms};
 use crate::server::Outbound;
@@ -25,6 +26,9 @@ pub struct Shared {
     pub adapters: Mutex<AdapterManager>,
     /// Phase 3: the attached OpenCode adapter, when configured (attach-only).
     pub opencode: Mutex<Option<Arc<OpenCodeAdapter>>>,
+    /// Phase 7: the attached Ollama model-runtime adapter, when configured
+    /// (attach-only — PRD §7.7, a model provider not a session manager).
+    pub ollama: Mutex<Option<Arc<OllamaAdapter>>>,
     pub started_at: i64,
     pub config: CompanionConfig,
     /// Consecutive auth failures; trips a cooldown (brute-force resistance).
@@ -57,12 +61,21 @@ impl Companion {
             .find(|e| e.enabled && e.kind == "opencode")
             .map(|e| (e.id.clone(), e.endpoint.clone(), e.basic_auth.clone()));
 
+        // Phase 7: locate the Ollama attach target the same way — first
+        // enabled entry wins (attach-only; no second server, G4.3).
+        let ol_cfg = config
+            .adapters
+            .iter()
+            .find(|e| e.enabled && e.kind == "ollama")
+            .map(|e| (e.id.clone(), e.endpoint.clone()));
+
         let shared = Arc::new(Shared {
             storage: Mutex::new(storage),
             clients: Mutex::new(Vec::new()),
             next_conn_id: std::sync::atomic::AtomicU64::new(1),
             adapters: Mutex::new(AdapterManager::discover(&config.adapters)),
             opencode: Mutex::new(None),
+            ollama: Mutex::new(None),
             started_at: now_ms(),
             config,
             auth_failures: Mutex::new(0),
@@ -172,6 +185,24 @@ impl Companion {
                     .unwrap()
                     .probe_result(&id, Some(format!("event stream unavailable: {e}")));
             }
+        }
+
+        // Phase 7: attach the Ollama model-runtime adapter (attach-only —
+        // G4.3 forbids spawning a second server; PRD §7.7 keeps it a model
+        // provider, never a session manager). Poll-only: no SSE, no session
+        // subscription, so nothing enters the engine's session pipeline.
+        if let Some((id, endpoint)) = ol_cfg {
+            // File configs validate the endpoint (parse-time); direct
+            // programmatic configs fall back to Ollama's documented default.
+            let endpoint = endpoint.unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
+            let ol = Arc::new(OllamaAdapter::new(&id, &endpoint));
+            let probe = ol.refresh();
+            {
+                let mut mgr = companion.shared.adapters.lock().unwrap();
+                mgr.attach_ollama(&id, ol.capabilities());
+                mgr.probe_result(&id, probe.as_ref().err().map(|e| e.to_string()));
+            }
+            *companion.shared.ollama.lock().unwrap() = Some(ol);
         }
 
         Ok(companion)
@@ -506,6 +537,16 @@ impl Companion {
                     .lock()
                     .unwrap()
                     .probe_result(&oc.id, err);
+            }
+            // Phase 7: same probe cadence for Ollama (poll-only model runtime)
+            let ol = self.shared.ollama.lock().unwrap().clone();
+            if let Some(ol) = ol {
+                let err = ol.refresh().err().map(|e| e.to_string());
+                self.shared
+                    .adapters
+                    .lock()
+                    .unwrap()
+                    .probe_result(&ol.id, err);
             }
         }
     }

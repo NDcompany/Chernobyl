@@ -334,7 +334,9 @@ fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
             println!();
         }
         Err(e) => {
-            eprintln!("[companion] pair: payload too large for QR ({e}) — paste the payload line instead");
+            eprintln!(
+                "[companion] pair: payload too large for QR ({e}) — paste the payload line instead"
+            );
             return 1;
         }
     }
