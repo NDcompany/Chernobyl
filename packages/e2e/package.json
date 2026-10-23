@@ -1,0 +1,27 @@
+{
+  "name": "@chernobyl/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Client side of the frozen CHERNOBYL E2E wire contract (ADR-011/012): pairing payload parsing, hs_* handshake, HKDF directional keys, ChaCha20-Poly1305 sealed frames, reconnecting transport.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test \"dist/*.test.js\""
+  },
+  "dependencies": {
+    "@chernobyl/protocol": "*",
+    "@noble/ciphers": "2.4.0",
+    "@noble/hashes": "2.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "~6.0.3"
+  },
+  "private": true
+}
