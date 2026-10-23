@@ -257,6 +257,10 @@ fn handle_conn(
         if handshake.method == "POST" {
             let path = handshake.target.split('?').next().unwrap_or("/");
             if !diagnostics_only || path != "/hooks/claude" {
+                // Drain the (capped) body before refusing so the close is a
+                // graceful FIN, not a RST racing the client's read of our 404
+                // (Windows resets a socket closed with an unread body).
+                drain_body(&mut reader, &handshake);
                 let _ = ws::write_http_error(&mut writer, 404, "Not Found", "");
                 return Ok(());
             }
@@ -373,9 +377,39 @@ fn http_route(
             let body = json::stringify(&companion.adapters_json());
             writer.write_all(ok_body(body).as_bytes())
         }
+        // Phase 8: local metrics — loopback diagnostics only, same posture as
+        // /version and /adapters (never exposed on the main listener).
+        (true, "/metrics") => {
+            let body = companion.metrics_text();
+            writer.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/plain; version=0.0.4; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+        }
         _ => writer
             .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"),
     }
+}
+
+/// Best-effort drain of a POST body we are about to refuse, so the connection
+/// closes with a graceful FIN rather than a RST (Windows resets a socket that
+/// is closed while a request body is still unread in the receive buffer, which
+/// can race the client's read of our refusal). Bounded and non-fatal: if the
+/// peer lies about Content-Length we simply stop reading.
+fn drain_body(reader: &mut TcpStream, h: &Handshake) {
+    let n = h
+        .header("content-length")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(ws::MAX_HOOK_BODY_BYTES);
+    if n == 0 {
+        return;
+    }
+    let mut sink = vec![0u8; n];
+    let _ = reader.read_exact(&mut sink);
 }
 
 /// Phase 7: read one Claude Code hook POST body (Content-Length framed, capped
@@ -1321,6 +1355,27 @@ mod e2e_tests {
         let plain = http_get(&format!("127.0.0.1:{}", g.handle.port), "/health").unwrap();
         assert!(plain.starts_with("HTTP/1.1 200"), "got: {plain}");
         shutdown(g);
+    }
+
+    #[test]
+    fn metrics_served_on_diagnostics_and_absent_on_main() {
+        let f = fixture("p8-metrics", now_ms() + 60_000, false);
+        // loopback diagnostics listener: Prometheus text exposition
+        let diag = format!("127.0.0.1:{}", f.handle.diagnostics_port);
+        let d = http_get(&diag, "/metrics").unwrap();
+        assert!(d.starts_with("HTTP/1.1 200"), "got: {d}");
+        assert!(
+            d.contains("chernobyl_events_total") && d.contains("chernobyl_up 1"),
+            "metrics must expose counters + up gauge: {d}"
+        );
+        // the main listener never serves /metrics (operator counters stay local)
+        let main = format!("127.0.0.1:{}", f.handle.port);
+        let m = http_get(&main, "/metrics").unwrap();
+        assert!(
+            m.starts_with("HTTP/1.1 404"),
+            "main must not serve /metrics: {m}"
+        );
+        shutdown(f);
     }
 
     /* D8: bounded outbound queue — count + byte caps, explicit overload

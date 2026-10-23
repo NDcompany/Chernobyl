@@ -180,14 +180,37 @@ pub struct HttpResponse {
 /// Splits `http://host[:port]/path` into `(host[:port], /path…)` — shared by
 /// the one-shot request and the SSE stream (loopback HTTP only, no TLS).
 pub(crate) fn split_url(url: &str) -> Result<(String, String), String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| format!("only http:// endpoints are supported (got {url})"))?;
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        format!(
+            "only http:// endpoints are supported (got {})",
+            redact_url(url)
+        )
+    })?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
+    // Redaction: never let `user:pass@host` userinfo survive into the authority.
+    // It would otherwise leak into the `Host:` header and into `resolve`/`no
+    // addresses` error strings that reach logs and adapter detail. Auth is the
+    // separate `basicAuth` field — userinfo here is stripped, never auto-used.
+    let authority = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) if !host.is_empty() => host,
+        _ => authority,
+    };
     Ok((authority.to_string(), path.to_string()))
+}
+
+/// Scrub any `user:pass@` userinfo out of a URL for safe logging/error text.
+fn redact_url(url: &str) -> String {
+    // strip any scheme (http://, https://, …) before looking for userinfo
+    let scheme_end = url.find("://").map(|i| i + 3).unwrap_or(0);
+    let (scheme, rest) = url.split_at(scheme_end);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}{host}"),
+        None => url.to_string(),
+    }
 }
 
 pub fn http_request(
@@ -496,6 +519,25 @@ mod http_tests {
         assert!(
             err.contains("true"),
             "partial bytes must stay visible: {err}"
+        );
+    }
+
+    #[test]
+    fn endpoint_userinfo_never_reaches_authority_or_errors() {
+        // An operator endpoint with embedded `user:pass@` must not leak the
+        // credential into the Host header, nor into resolve/connect error text.
+        let (authority, path) = split_url("http://user:sekret@127.0.0.1:11434/api/tags").unwrap();
+        assert_eq!(authority, "127.0.0.1:11434");
+        assert_eq!(path, "/api/tags");
+        // a host with no userinfo is untouched
+        let (a2, _) = split_url("http://127.0.0.1:4096/session").unwrap();
+        assert_eq!(a2, "127.0.0.1:4096");
+        // the "only http" rejection scrubs userinfo before echoing the URL
+        let err = split_url("https://user:sekret@example.com/x").unwrap_err();
+        assert!(!err.contains("sekret"), "credential leaked: {err}");
+        assert!(
+            err.contains("example.com"),
+            "host should stay visible: {err}"
         );
     }
 

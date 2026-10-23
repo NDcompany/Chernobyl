@@ -500,6 +500,123 @@ impl Companion {
         ])
     }
 
+    /// Phase 8: local metrics in Prometheus text exposition format, served on
+    /// the LOOPBACK diagnostics listener only (`/metrics`). No secrets, no
+    /// card/PSK material — only counters and gauges the operator already sees
+    /// on `/health`, in a scrapeable shape (PRD §7.x "local metrics").
+    pub fn metrics_text(&self) -> String {
+        let snap = self.snapshot();
+        let pending = snap
+            .permissions
+            .iter()
+            .filter(|p| p.status == "pending")
+            .count();
+        let last_seq = self.engine.lock().unwrap().last_seq();
+        let (hosts, sessions) = (snap.hosts.len(), snap.sessions.len());
+        let store = self.shared.storage.lock().unwrap();
+        let commands = store.commands.len();
+        let unresolved = store
+            .commands
+            .values()
+            .filter(|c| c.status == "unresolved")
+            .count();
+        let storage_failed = store.is_failed();
+        drop(store);
+        let clients = self.shared.clients.lock().unwrap().len();
+        let auth_failures = *self.shared.auth_failures.lock().unwrap();
+        let uptime_ms = now_ms() - self.shared.started_at;
+        let g = |name: &str, help: &str, kind: &str, v: i64| {
+            format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}\n")
+        };
+        let mut out = String::with_capacity(1024);
+        out += &g(
+            "chernobyl_up",
+            "always 1 once the companion is serving",
+            "gauge",
+            1,
+        );
+        out += &g(
+            "chernobyl_uptime_ms",
+            "process uptime since boot",
+            "gauge",
+            uptime_ms,
+        );
+        out += &g(
+            "chernobyl_events_total",
+            "events published into the pipeline",
+            "counter",
+            self.events_total.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        out += &g(
+            "chernobyl_malformed_total",
+            "malformed payloads rejected",
+            "counter",
+            self.malformed_total
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        out += &g(
+            "chernobyl_auth_failures",
+            "consecutive WS auth failures since last success",
+            "gauge",
+            auth_failures as i64,
+        );
+        out += &g(
+            "chernobyl_clients",
+            "connected WS clients",
+            "gauge",
+            clients as i64,
+        );
+        out += &g(
+            "chernobyl_hosts",
+            "hosts in the current snapshot",
+            "gauge",
+            hosts as i64,
+        );
+        out += &g(
+            "chernobyl_sessions",
+            "sessions in the current snapshot",
+            "gauge",
+            sessions as i64,
+        );
+        out += &g(
+            "chernobyl_pending_permissions",
+            "pending permission requests",
+            "gauge",
+            pending as i64,
+        );
+        out += &g(
+            "chernobyl_commands",
+            "command rows in the journal",
+            "gauge",
+            commands as i64,
+        );
+        out += &g(
+            "chernobyl_unresolved_commands",
+            "commands still unresolved",
+            "gauge",
+            unresolved as i64,
+        );
+        out += &g(
+            "chernobyl_last_seq",
+            "last event sequence number",
+            "gauge",
+            last_seq,
+        );
+        out += &g(
+            "chernobyl_storage_failed",
+            "1 if the journal is in a failed state",
+            "gauge",
+            i64::from(storage_failed),
+        );
+        out += &g(
+            "chernobyl_rss_bytes",
+            "resident set size",
+            "gauge",
+            ffi::rss_bytes() as i64,
+        );
+        out
+    }
+
     pub fn adapters_json(&self) -> crate::json::Json {
         let adapters = self.shared.adapters.lock().unwrap();
         crate::json::Json::Arr(
