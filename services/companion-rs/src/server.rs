@@ -96,6 +96,29 @@ pub fn start(
     token: Option<String>,
     companion: Arc<Companion>,
 ) -> Result<ServerHandle, String> {
+    // Remote posture (D2/D6): binding beyond loopback hardens the server —
+    // same predicate as main.rs's "non-loopback requires a token" check.
+    let remote_posture = bind != "127.0.0.1" && bind != "localhost";
+    start_with_posture(
+        bind,
+        port,
+        diagnostics_port,
+        token,
+        companion,
+        remote_posture,
+    )
+}
+
+/// Same as [`start`] with the remote-posture flag set explicitly, so tests
+/// can exercise the non-loopback policies while still binding loopback.
+pub fn start_with_posture(
+    bind: &str,
+    port: u16,
+    diagnostics_port: u16,
+    token: Option<String>,
+    companion: Arc<Companion>,
+    remote_posture: bool,
+) -> Result<ServerHandle, String> {
     let listener = match crate::ffi::bind_listener_backlog(bind, port) {
         Ok(l) => l,
         Err(e) => {
@@ -138,7 +161,16 @@ pub fn start(
         threads.push(
             thread::Builder::new()
                 .name(name.into())
-                .spawn(move || accept_loop(listener, stop, token, companion, diagnostics_only))
+                .spawn(move || {
+                    accept_loop(
+                        listener,
+                        stop,
+                        token,
+                        companion,
+                        diagnostics_only,
+                        remote_posture,
+                    )
+                })
                 .map_err(|e| e.to_string())?,
         );
     }
@@ -173,6 +205,7 @@ fn accept_loop(
     token: Option<String>,
     companion: Arc<Companion>,
     diagnostics_only: bool,
+    remote_posture: bool,
 ) {
     if listener.set_nonblocking(true).is_err() {
         return;
@@ -183,7 +216,7 @@ fn accept_loop(
                 let token = token.clone();
                 let companion = companion.clone();
                 let _ = thread::Builder::new().name("conn".into()).spawn(move || {
-                    let _ = handle_conn(stream, token, companion, diagnostics_only);
+                    let _ = handle_conn(stream, token, companion, diagnostics_only, remote_posture);
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -199,6 +232,7 @@ fn handle_conn(
     token: Option<String>,
     companion: Arc<Companion>,
     diagnostics_only: bool,
+    remote_posture: bool,
 ) -> io::Result<()> {
     // Windows quirk: sockets returned by accept() on a NONBLOCKING listener
     // inherit nonblocking mode — force blocking or every idle read "fails".
@@ -215,10 +249,30 @@ fn handle_conn(
 
     // HTTP routes (non-upgrade) -------------------------------------------
     if !handshake.is_websocket_upgrade() {
-        return http_route(&mut writer, &handshake, &companion, diagnostics_only);
+        // D6: on a non-loopback main listener /health joins the token gate.
+        let require_health_auth = !diagnostics_only && remote_posture && token.is_some();
+        return http_route(
+            &mut writer,
+            &handshake,
+            &companion,
+            diagnostics_only,
+            token.as_deref(),
+            require_health_auth,
+        );
     }
 
     // WS upgrade ----------------------------------------------------------
+    // D1: browsers are unsupported until the web app ships (ADR-011 §5).
+    // An Origin header marks a browser-initiated upgrade, which is refused
+    // outright — this closes cross-site WebSocket hijacking in the default
+    // config (loopback, token-less, plaintext commands). Non-browser clients
+    // (phone app, CLI, test tooling) send no Origin, so nothing else is
+    // affected. When the web app ships this becomes an Origin allow-list.
+    if handshake.header("origin").is_some() {
+        let _ = ws::write_http_error(&mut writer, 403, "Forbidden", "");
+        return Ok(());
+    }
+
     let Ok(accept) = ws::validate_upgrade(&handshake) else {
         let _ = ws::write_http_error(&mut writer, 400, "Bad Request", "");
         return Ok(());
@@ -250,7 +304,7 @@ fn handle_conn(
         *companion.shared.auth_failures.lock().unwrap() = 0;
     }
     ws::write_handshake_response(&mut writer, &accept)?;
-    serve_ws(reader, writer, companion)
+    serve_ws(reader, writer, companion, remote_posture)
 }
 
 fn close_payload(code: u16, reason: &str) -> Vec<u8> {
@@ -268,6 +322,8 @@ fn http_route(
     h: &Handshake,
     companion: &Companion,
     diagnostics_only: bool,
+    token: Option<&str>,
+    require_health_auth: bool,
 ) -> io::Result<()> {
     let path = h.target.split('?').next().unwrap_or("/");
     let ok_body = |body: String| -> String {
@@ -278,6 +334,14 @@ fn http_route(
     };
     match (diagnostics_only, path) {
         (_, "/health") => {
+            // D6: beyond loopback the counters are operator-only — same
+            // posture as the WS token gate (loopback needs no token).
+            // The diagnostics listener (loopback-bound by contract) stays open.
+            if require_health_auth && !token.is_some_and(|t| authorized(h, t)) {
+                return writer.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                );
+            }
             let body = json::stringify(&companion.health());
             writer.write_all(ok_body(body).as_bytes())
         }
@@ -519,7 +583,12 @@ fn run_writer(
     }
 }
 
-fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>) -> io::Result<()> {
+fn serve_ws(
+    mut reader: TcpStream,
+    writer: TcpStream,
+    companion: Arc<Companion>,
+    require_e2e: bool,
+) -> io::Result<()> {
     // Fallible socket setup first: the cleanup below runs only after the
     // read loop, so anything that can fail with `?` must happen before the
     // writer is spawned or the connection is registered — otherwise a
@@ -682,6 +751,26 @@ fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>)
                         _ => {}
                     }
                 }
+                // D2: remote posture — beyond loopback a stolen token alone
+                // must not buy command execution (ADR-011: the credential
+                // travels only inside AEAD frames, so a live E2E session
+                // gates every command). Hello (version gate) and Ping
+                // (liveness) plus the hs_* handshake above are the only
+                // pre-session messages a compliant client needs; everything
+                // else gets an explicit refusal it can recover from by
+                // completing the handshake, never silent execution.
+                if require_e2e
+                    && e2e.is_none()
+                    && !matches!(msg, ClientMsg::Hello { .. } | ClientMsg::Ping { .. })
+                {
+                    let cid = msg.command_id().unwrap_or("unknown").to_string();
+                    let refusal =
+                        ServerMsg::ack_err(&cid, "e2e session required (remote posture)").to_text();
+                    if outbound.enqueue(refusal.into_bytes()).is_err() {
+                        break Err(io::Error::other("outbound queue saturated"));
+                    }
+                    continue;
+                }
                 // strict integer equality, matching host.ts `!==`: the `as u32`
                 // cast truncates (2.5 → 2), so the fractional check must run first
                 if let ClientMsg::Hello { protocol, .. } = &msg
@@ -779,7 +868,7 @@ fn send_malformed(outbound: &Outbound, companion: &Companion) -> Result<(), Enqu
 #[cfg(test)]
 mod e2e_tests {
     use super::*;
-    use crate::client::WsClient;
+    use crate::client::{WsClient, http_get};
     use crate::companion::Companion;
     use crate::config::default_config;
     use crate::protocol::now_ms;
@@ -1025,6 +1114,160 @@ mod e2e_tests {
             .unwrap();
         assert!(c.next_text().unwrap().contains("pong"));
         shutdown(f);
+    }
+
+    /* D1: browser origins are refused before the WS handshake. */
+
+    #[test]
+    fn ws_upgrade_with_origin_header_is_refused_403() {
+        use std::io::Read;
+        let f = fixture("d1-origin", now_ms() + 60_000, false);
+        let mut s = std::net::TcpStream::connect(format!("127.0.0.1:{}", f.handle.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let key = base64::encode(&[7u8; 16]);
+        let req = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n\
+             Sec-WebSocket-Version: 13\r\nOrigin: http://evil.example\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        // read until the status line is complete (one read may be partial)
+        let mut resp = String::new();
+        let mut buf = [0u8; 512];
+        while !resp.contains("\r\n") {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed before a status line");
+            resp.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        drop(s);
+        // control: the identical upgrade without Origin still connects
+        let mut c = connect(&f);
+        c.send_text(r#"{"type":"ping","commandId":"d1-ping"}"#)
+            .unwrap();
+        assert!(c.next_text().unwrap().contains("pong"));
+        shutdown(f);
+    }
+
+    /* D2 + D6: remote posture — beyond loopback a live E2E session gates
+    every command and /health joins the token gate. The server still binds
+    loopback inside the test; the posture flag makes it behave as if bound
+    beyond loopback (production posture main.rs enforces with a token). */
+
+    const REMOTE_TOKEN: &str = "remote-secret";
+
+    /// Paired device + token + remote posture in one fixture.
+    fn fixture_remote(tag: &str) -> Fixture {
+        let dir = temp_dir(tag);
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let psk = [42u8; 32];
+        let device_id = "dev-paired".to_string();
+        let protected = base64::encode(&crate::ffi::dpapi_protect(&psk).unwrap());
+        {
+            let mut store = companion.shared.storage.lock().unwrap();
+            store
+                .put_device(&DeviceRecord {
+                    device_id: device_id.clone(),
+                    name: "phone".into(),
+                    psk_protected: protected,
+                    paired_at: now_ms(),
+                    revoked: false,
+                })
+                .unwrap();
+        }
+        let handle = start_with_posture(
+            "127.0.0.1",
+            0,
+            0,
+            Some(REMOTE_TOKEN.into()),
+            companion.clone(),
+            true,
+        )
+        .unwrap();
+        Fixture {
+            companion,
+            handle,
+            psk,
+            device_id,
+            data_dir: dir,
+        }
+    }
+
+    fn connect_remote(f: &Fixture) -> WsClient {
+        WsClient::connect(
+            &format!("127.0.0.1:{}", f.handle.port),
+            "/",
+            Some(REMOTE_TOKEN),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_posture_gates_commands_until_the_session_is_handshaken() {
+        let f = fixture_remote("d2-enforce");
+        let mut c = connect_remote(&f);
+        // pre-session: version gate and liveness still work
+        c.send_text(&format!(
+            r#"{{"type":"hello","clientId":"d2","protocol":{PROTOCOL_VERSION}}}"#
+        ))
+        .unwrap();
+        let ack = c.next_text().unwrap();
+        assert!(ack.contains("hello_ack"), "got: {ack}");
+        c.send_text(r#"{"type":"ping","commandId":"d2-ping"}"#)
+            .unwrap();
+        assert!(c.next_text().unwrap().contains("pong"));
+        // pre-session: a command is refused, not executed — the commandId
+        // survives so the client sees a correlated failure, and the
+        // connection stays open so it can recover by handshaking
+        c.send_text(r#"{"type":"list_state","commandId":"d2-1"}"#)
+            .unwrap();
+        let err = c.next_text().unwrap();
+        assert!(err.contains("e2e session required"), "got: {err}");
+        assert!(err.contains("d2-1"), "commandId must survive: {err}");
+        // recovery: complete the handshake, the same command now runs
+        let (resp, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        assert!(resp.contains("hs_ok"), "got: {resp}");
+        let mut sess = sess.unwrap();
+        c.send_text(&sess.seal(r#"{"type":"list_state","commandId":"d2-2"}"#))
+            .unwrap();
+        let reply = sess.open(&c.next_text().unwrap()).unwrap();
+        assert!(reply.contains("\"state\""), "got: {reply}");
+        shutdown(f);
+    }
+
+    #[test]
+    fn loopback_posture_still_accepts_plaintext_commands() {
+        // parity control: the flag is what changes — plain loopback keeps
+        // the documented dev parity path (ADR-010 deviation note)
+        let f = fixture("d2-parity", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        c.send_text(r#"{"type":"list_state","commandId":"d2-p"}"#)
+            .unwrap();
+        let reply = c.next_text().unwrap();
+        assert!(reply.contains("\"state\""), "got: {reply}");
+        shutdown(f);
+    }
+
+    #[test]
+    fn health_gates_on_the_token_beyond_loopback_but_stays_open_on_loopback() {
+        let f = fixture_remote("d6-health");
+        let addr = format!("127.0.0.1:{}", f.handle.port);
+        let denied = http_get(&addr, "/health").unwrap();
+        assert!(denied.starts_with("HTTP/1.1 401"), "got: {denied}");
+        let allowed = http_get(&addr, "/health?token=remote-secret").unwrap();
+        assert!(allowed.starts_with("HTTP/1.1 200"), "got: {allowed}");
+        // the diagnostics listener is loopback-only by contract: stays open
+        let diag = format!("127.0.0.1:{}", f.handle.diagnostics_port);
+        let d = http_get(&diag, "/health").unwrap();
+        assert!(d.starts_with("HTTP/1.1 200"), "got: {d}");
+        shutdown(f);
+        // loopback posture: /health stays open without a token (dev parity)
+        let g = fixture("d6-loopback", now_ms() + 60_000, false);
+        let plain = http_get(&format!("127.0.0.1:{}", g.handle.port), "/health").unwrap();
+        assert!(plain.starts_with("HTTP/1.1 200"), "got: {plain}");
+        shutdown(g);
     }
 
     /* D8: bounded outbound queue — count + byte caps, explicit overload
