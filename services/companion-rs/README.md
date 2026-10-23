@@ -23,7 +23,13 @@ idempotent; carries `--config` when given, console window at login — packaging
 device). `CHERNOBYL_HOME` selects the data directory (config, journal).
 
 **Secure-by-default:** a non-loopback bind without `--token`/`HOST_TOKEN` is refused.
-Loopback with no token keeps Node-parity behavior (dev/demo).
+Loopback with no token keeps Node-parity behavior (dev/demo). Three posture policies layer on
+top (resolved D1/D2/D6, threat model §3.4/§3.1.3/§3.7): a WS upgrade carrying a browser
+`Origin` header is refused **403** (browsers unsupported until the web app, ADR-011 §5);
+**beyond loopback** every command requires a live E2E session — a stolen token alone gets an
+explicit `ack_err("e2e session required")`, never execution; and `/health` on the main
+listener **beyond loopback** requires the token (401 otherwise). Loopback keeps the open
+counters + plaintext dev parity path.
 
 ## Pairing + E2E session (ADR-002/006/011)
 
@@ -42,7 +48,9 @@ all tear the connection down. Revocation (`companion revoke <device-id>`) blocks
 the next handshake. All crypto is std-only with official RFC/NIST known-answer tests; no
 X25519 forward secrecy yet (PSK + fresh nonces — post-compromise secrecy is not claimed).
 
-The `?token=` loopback path is unchanged and stays for dev/differential parity.
+The `?token=` loopback path is unchanged and stays for dev/differential parity. Beyond
+loopback the token alone is **not** enough to run commands (D2): complete the `hs_*`
+handshake first.
 
 ### E2E wire format (the contract a phone client must implement)
 
@@ -119,6 +127,37 @@ filter, e.g. `cargo test --release microbench_engine -- --ignored --nocapture`, 
 `cargo test -- --ignored` runs the benches in **parallel threads** and contaminates them.
 `--churn --light --minutes N` runs connect/hello/close cycles for soak load.
 
+## Soak testing (repeatability over time)
+
+`tools/soak.mjs` (Node, workspace `ws`, no new deps) spawns the **real** binary on loopback
+with an isolated temp home (`CHERNOBYL_HOME` under the run dir) and an `--exit-after`
+failsafe, drives it through lifecycle stress, samples `/health` resources every 30 s, and
+writes timestamped JSONL events plus a machine-readable `summary.json` (threshold provenance
+included: existing source limits vs newly proposed soak limits).
+
+```powershell
+npm run soak:smoke                                       # ~2-3 min, CI-suitable
+npm run soak:long -- --duration 86400                   # explicit 24 h run (default 86400)
+node services\companion-rs\tools\soak.mjs --inject server-kill   # failure-detection demo
+```
+
+Phases: token auth failure/429/recovery · pipelined-ping FIFO ordering · churn with
+registry-leak checks · reconnect recovery · stopped-consumer saturation (count- and
+byte-bound paths, chosen adaptively from measured reply size vs the 4 MiB/256 = 16 KiB
+threshold) · heartbeat dead-peer release · abrupt client death · graceful `--exit-after`
+shutdown with live clients + queued work · restart on the same data dir. Pass/fail criteria
+(10, listed in the tool header and evaluated from observations — never process-liveness
+alone): unexpected exits, ordering violations, unauthorized data, peer leaks, missing D8
+teardowns, dead-peer survival, graceful-shutdown exit code, restart recovery, RSS growth +
+absolute caps, connection failures. Any failure ⇒ exit 1.
+
+Gotchas: the machine must **stay awake** for a long run (a prior 24 h attempt died at ~4.7 h
+on PC sleep); a short long-mode run is labeled by its measured duration in `summary.json`
+and does **not** close soak gate S11 — only a genuine 24 h window does. The standard
+`verify` scripts never depend on a soak run. The harness is loopback-only by design (no LAN
+exposure); it does not simulate a phone and does not exercise E2E-sealed sessions (the Rust
+matrix covers those).
+
 ## Layout
 
 | Module | Role |
@@ -129,7 +168,7 @@ filter, e.g. `cargo test --release microbench_engine -- --ignored --nocapture`, 
 | `seed` / `engine` | deterministic seed state + the MockEngine port (plans, G1/G2, ack cache) |
 | `storage` | append-only JSONL journal: torn-tail recovery, atomic compaction, retention |
 | `config` / `adapters` / `companion` | Node-parity config, adapter discovery, boot/reconcile/idempotency |
-| `server` | accept loops, auth (4001/429), version gate (4002), heartbeat, diagnostics HTTP, E2E handshake + sealed-frame dispatch |
+| `server` | accept loops, auth (4001/429), origin refusal (403), posture gates (D1/D2/D6), version gate (4002), heartbeat, diagnostics HTTP, E2E handshake + sealed-frame dispatch |
 | `client` | test WS client + loopback `http_get` (used by `--self-test`) |
 | `crypto` | std-only SHA-256, HMAC, HKDF, ChaCha20, Poly1305, AEAD (official RFC/NIST KATs) |
 | `e2e` | PSK handshake proofs, HKDF directional keys, sealed frames with counter nonces |
