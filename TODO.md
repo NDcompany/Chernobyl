@@ -266,6 +266,14 @@ Updated: 2026-10-23 (Phase 6 client round: ADR-012 + `@chernobyl/e2e` + QR `dev`
 - [ ] Phase 8: **TUI** (status, sessions, approvals with keybinds, pairing flow) + windowless
       autostart host + packaging (ADR-007) + backup/restore, log redaction, local metrics.
       (FCM push removed — replaced by Phase 6 persistent-WS notifications.)
+      **Ops core done 2026-10-23 (`2dccf42`):** `/metrics` on the loopback diagnostics listener
+      only (Prometheus text; never on the main listener); endpoint-credential redaction at the
+      root (`split_url` strips `user:pass@` from the authority so it never reaches the `Host:`
+      header or error text); and a real transport fix — the main-listener POST reject path now
+      drains the (capped) body before closing (Windows RST-on-unread-body race that made the
+      Claude-hook test intermittently fail). `companion claude-hooks` prints the settings.json
+      bridge snippet (explicit install — never auto-writes the user's settings). Remaining:
+      backup/restore, windowless autostart host, packaging (ADR-007 checksums), TUI.
 - [ ] Phase 9: release gate — no mock advertised as real (PRD §13.1); E2E crypto known-answer
       tests + adversarial matrix green.
 
