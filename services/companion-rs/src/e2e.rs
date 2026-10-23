@@ -286,4 +286,57 @@ mod tests {
         let (a, b) = fresh_nonce_salt();
         assert_ne!(a, b, "nonce must be fresh");
     }
+
+    #[test]
+    fn rejected_envelopes_leave_rx_intact_and_next_frame_still_opens() {
+        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT");
+        let mut host = Session::host(keys.clone());
+        let mut peer = Session::client(keys);
+        let f0 = peer.seal("legit-0");
+
+        // hostile envelopes: each rejected without advancing rx or touching tx
+        let hostile = [
+            "not json",
+            "",
+            "{\"n\":0}",                                   // missing body
+            "{\"d\":\"AAAA\"}",                            // missing counter
+            "{\"n\":-1,\"d\":\"AAAA\"}",                   // negative counter
+            "{\"n\":1.5,\"d\":\"AAAA\"}",                  // float counter is not an int
+            "{\"n\":99999999999999999999,\"d\":\"AAAA\"}", // beyond i64
+            "{\"n\":0,\"d\":\"!!\"}",                      // invalid base64
+            "{\"n\":0,\"d\":\"AAAA\"}",                    // decodes, fails AEAD
+        ];
+        for env in &hostile {
+            let err = host.open(env).unwrap_err();
+            assert!(!err.is_empty(), "must reject with a reason: {env}");
+            assert_eq!(host.rx, 0, "rx must not advance on: {env} (got {err})");
+        }
+        assert_eq!(host.tx, 0, "rejected opens must not touch the send counter");
+
+        // the next legitimate frame still opens: no state was corrupted
+        assert_eq!(host.open(&f0).unwrap(), "legit-0");
+        assert_eq!(host.rx, 1);
+        // replay of the accepted frame: rejected, rx stays 1
+        assert!(host.open(&f0).unwrap_err().contains("replay"));
+        assert_eq!(host.rx, 1);
+
+        // future counter is desync, not corruption: rx stays, then in-order works
+        let f1 = peer.seal("legit-1");
+        let f2 = peer.seal("legit-2");
+        assert!(host.open(&f2).unwrap_err().contains("desync"));
+        assert_eq!(host.rx, 1);
+        assert_eq!(host.open(&f1).unwrap(), "legit-1");
+
+        // tampered body at the expected counter: AEAD rejection, rx intact
+        let mut bad = f2.clone();
+        let start = bad.find("\"d\":\"").unwrap() + 5; // first body char
+        let c = bad.as_bytes()[start];
+        let repl = if c == b'A' { b'B' } else { b'A' };
+        bad.replace_range(start..start + 1, &(repl as char).to_string());
+        assert!(host.open(&bad).unwrap_err().contains("AEAD"));
+        assert_eq!(host.rx, 2);
+        // the untampered frame still opens afterward
+        assert_eq!(host.open(&f2).unwrap(), "legit-2");
+        assert_eq!(host.rx, 3);
+    }
 }

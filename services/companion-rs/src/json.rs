@@ -606,4 +606,100 @@ mod tests {
     fn integer_overflow_falls_back_to_float() {
         assert_eq!(parse("99999999999999999999").unwrap(), Json::Float(1e20));
     }
+
+    #[test]
+    fn truncation_sweep_never_panics_and_full_doc_still_parses() {
+        // Every strict prefix of a valid document is incomplete or invalid:
+        // the parser must reject all of them without panicking, and the full
+        // document must still parse identically (deterministic stateless fn).
+        let doc = r#"{"type":"ping","commandId":"c-1"}"#;
+        let chars: Vec<char> = doc.chars().collect();
+        for cut in 0..chars.len() {
+            let prefix: String = chars[..cut].iter().collect();
+            assert!(parse(&prefix).is_err(), "prefix len {cut} must be rejected");
+        }
+        assert_eq!(parse(doc), parse(doc));
+    }
+
+    #[test]
+    fn object_depth_boundary_is_thirty_one() {
+        // Arrays are pinned at 32 by rejects_adversarial_inputs; objects use
+        // the same value() recursion, so their innermost scalar sits one
+        // level deeper than the object count.
+        let ok = format!("{}1{}", "{\"a\":".repeat(31), "}".repeat(31));
+        assert!(parse(&ok).is_ok());
+        let bomb = format!("{}1{}", "{\"a\":".repeat(32), "}".repeat(32));
+        assert_eq!(parse(&bomb), Err(JsonError::DepthExceeded));
+    }
+
+    #[test]
+    fn number_boundaries_and_non_finite_fallback() {
+        // i64 edges parse as Int; one past either edge falls back to Float.
+        assert_eq!(parse("9223372036854775807").unwrap(), Json::Int(i64::MAX));
+        assert_eq!(parse("-9223372036854775808").unwrap(), Json::Int(i64::MIN));
+        assert_eq!(
+            parse("9223372036854775808").unwrap(),
+            Json::Float(9223372036854775808.0)
+        );
+        assert_eq!(
+            parse("-9223372036854775809").unwrap(),
+            Json::Float(-9223372036854775809.0)
+        );
+        // exponent overflow yields a non-finite Float; as_f64() filters it at
+        // the protocol layer, but json::parse itself does not error.
+        let inf = parse("1e999").unwrap();
+        assert!(matches!(inf, Json::Float(f) if f.is_infinite()));
+        // empty / whitespace-only input is Eof, never a panic
+        assert_eq!(parse(""), Err(JsonError::Eof));
+        assert_eq!(parse("   "), Err(JsonError::Eof));
+    }
+
+    #[test]
+    fn bounded_seeded_stress_never_panics_and_stays_deterministic() {
+        // Deterministic LCG corpus of JSON metacharacter fragments: bounded,
+        // reproducible, exercising strings/escapes/numbers/containers without
+        // new dependencies. Every parse returns Ok or Err — never a panic —
+        // and identical input gives identical output (parse is pure).
+        let pool = [
+            "{",
+            "}",
+            "[",
+            "]",
+            ":",
+            ",",
+            "\"",
+            "\\",
+            "u",
+            "d800",
+            "dc00",
+            "0",
+            "1.5e",
+            "-",
+            "nul",
+            "tru",
+            "fals",
+            " ",
+            "\u{1}",
+            "\u{10FFFF}",
+            "é",
+            "x",
+        ];
+        let mut state: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for _ in 0..2000 {
+            let len = (next() % 24) as usize + 1;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push_str(pool[(next() as usize) % pool.len()]);
+            }
+            let a = parse(&s);
+            let b = parse(&s);
+            assert_eq!(a, b, "stateless parse must be deterministic for {s:?}");
+        }
+    }
 }

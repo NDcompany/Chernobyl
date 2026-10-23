@@ -1028,4 +1028,65 @@ mod tests {
         let v = json::parse(&text).unwrap();
         assert_eq!(json::get(&v, "lastSeenAt").unwrap(), &Json::Int(42));
     }
+
+    #[test]
+    fn hostile_json_at_the_trust_boundary_is_none_not_a_panic() {
+        let bomb = format!("{}{}", "[".repeat(64), "]".repeat(64));
+        assert!(parse_client_message(&bomb).is_none());
+        // duplicate keys
+        assert!(
+            parse_client_message(r#"{"type":"ping","commandId":"a","commandId":"b"}"#).is_none()
+        );
+        // raw control char inside a string
+        assert!(parse_client_message("{\"type\":\"ping\",\"commandId\":\"\u{1}\"}").is_none());
+        // lone surrogate escape
+        assert!(parse_client_message(r#"{"type":"ping","commandId":"\ud800"}"#).is_none());
+        // trailing garbage after a valid value
+        assert!(parse_client_message("{\"type\":\"ping\",\"commandId\":\"c\"} x").is_none());
+        // truncated document
+        assert!(parse_client_message(r#"{"type":"ping","commandId":"c"#).is_none());
+        // non-object JSON scalars
+        assert!(parse_client_message("123").is_none());
+        assert!(parse_client_message("\"str\"").is_none());
+        assert!(parse_client_message("true").is_none());
+        // type must be a non-empty string
+        assert!(parse_client_message(r#"{"type":7}"#).is_none());
+        assert!(parse_client_message(r#"{"type":""}"#).is_none());
+    }
+
+    #[test]
+    fn protocol_number_field_follows_is_num_boundaries() {
+        // is_num = finite number: ints and finite floats parse; strings,
+        // non-finite exponents, and missing values are None. Version
+        // mismatch itself is rejected later by the server's version gate.
+        let hello =
+            |proto: &str| format!(r#"{{"type":"hello","clientId":"c","protocol":{proto}}}"#);
+        assert!(parse_client_message(&hello("2")).is_some());
+        assert!(parse_client_message(&hello("2.5")).is_some());
+        assert!(parse_client_message(&hello("-1")).is_some());
+        assert!(parse_client_message(&hello("1e999")).is_none()); // → inf → filtered
+        assert!(parse_client_message(&hello("\"2\"")).is_none()); // string is not a number
+    }
+
+    #[test]
+    fn known_good_message_is_stable_across_hostile_input() {
+        // determinism of a stateless parser: the same valid message parses
+        // identically before and after a hostile corpus (a purity check, not
+        // a claim about recovering from internal state corruption)
+        let good = r#"{"type":"interrupt","commandId":"c1","sessionId":"s1"}"#;
+        let before = parse_client_message(good);
+        assert!(before.is_some());
+        let bomb = format!("{}{}", "[".repeat(64), "]".repeat(64));
+        for hostile in [
+            bomb.as_str(),
+            "\u{1}",
+            r#"{"type":"ping","commandId":"\ud800"}"#,
+            "123",
+            "",
+        ] {
+            let _ = parse_client_message(hostile);
+        }
+        let after = parse_client_message(good);
+        assert_eq!(before, after);
+    }
 }

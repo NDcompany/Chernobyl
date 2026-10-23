@@ -912,4 +912,44 @@ mod e2e_tests {
         assert!(r2.contains("revoked"), "got: {r2}");
         shutdown(f);
     }
+
+    #[test]
+    fn malformed_message_is_acked_and_connection_survives() {
+        // message-level garbage is an ack + continue (send_malformed); only
+        // frame-level violations tear the connection down
+        let f = fixture("malformed-msg", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        c.send_text(r#"{"bogus":1}"#).unwrap();
+        let reply = c.next_text().unwrap();
+        assert!(reply.contains("malformed message"), "got: {reply}");
+        // a binary frame is also message-level: acked, not fatal
+        c.send_raw(&ws::encode_frame(ws::OP_BINARY, b"\x00\x01", true))
+            .unwrap();
+        let reply = c.next_text().unwrap();
+        assert!(reply.contains("malformed message"), "got: {reply}");
+        // the same connection still completes a full handshake
+        let (resp, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        assert!(
+            resp.contains("hs_ok"),
+            "connection must survive malformed input: {resp}"
+        );
+        assert!(sess.is_some());
+        shutdown(f);
+    }
+
+    #[test]
+    fn hs_proof_before_hello_is_rejected_but_connection_survives() {
+        // out-of-order handshake is an hs_err + continue, not a teardown
+        let f = fixture("hs-order", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        c.send_text(r#"{"type":"hs_proof","proof":"AAAA"}"#)
+            .unwrap();
+        let reply = c.next_text().unwrap();
+        assert!(reply.contains("no handshake in progress"), "got: {reply}");
+        // a proper handshake on the same connection still succeeds
+        let (resp, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        assert!(resp.contains("hs_ok"), "got: {resp}");
+        assert!(sess.is_some());
+        shutdown(f);
+    }
 }

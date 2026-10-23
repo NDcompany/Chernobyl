@@ -463,4 +463,140 @@ mod tests {
         let bytes = encode_frame(OP_TEXT, b"hello", false);
         assert_eq!(bytes[1] & 0x80, 0);
     }
+
+    #[test]
+    fn truncation_sweep_never_panics_and_fresh_reader_still_parses() {
+        // Cutting a valid frame at any byte yields an IO error (incomplete),
+        // never a panic; a fresh reader with the full bytes still decodes —
+        // the decoder holds no cross-call state to corrupt.
+        let bytes = encode_frame(OP_TEXT, b"hello world", true);
+        for cut in 0..bytes.len() {
+            let r = read_frame(&mut Cursor::new(&bytes[..cut]), true);
+            assert!(matches!(&r, Err(WsError::Io(_))), "cut {cut}: {r:?}");
+        }
+        assert!(read_frame(&mut Cursor::new(&bytes), true).is_ok());
+        // also sweep a 16-bit-length frame (extended header + mask + payload)
+        let long = encode_frame(OP_TEXT, &vec![b'x'; 300], true);
+        for cut in 0..long.len() {
+            let r = read_frame(&mut Cursor::new(&long[..cut]), true);
+            assert!(matches!(&r, Err(WsError::Io(_))), "cut {cut}: {r:?}");
+        }
+        assert!(read_frame(&mut Cursor::new(&long), true).is_ok());
+    }
+
+    #[test]
+    fn payload_size_boundaries_at_cap_and_length_marker_edges() {
+        // exactly at the cap decodes; one past it is rejected before any
+        // payload allocation (header-only input proves the check runs first)
+        let at_cap = encode_frame(OP_TEXT, &vec![b'x'; MAX_PAYLOAD_BYTES], false);
+        assert!(read_frame(&mut Cursor::new(&at_cap), false).is_ok());
+        let mut over = vec![0x81u8, 0x7f]; // FIN+text, 64-bit length marker
+        over.extend_from_slice(&((MAX_PAYLOAD_BYTES as u64) + 1).to_be_bytes());
+        assert_eq!(
+            read_frame(&mut Cursor::new(&over), false),
+            Err(WsError::FrameTooLarge)
+        );
+        // 16-bit length marker boundary: 65535 ok, 65536 moves to the 64-bit path
+        let at_16 = encode_frame(OP_TEXT, &vec![b'y'; 65_535], false);
+        assert!(read_frame(&mut Cursor::new(&at_16), false).is_ok());
+        let past_16 = encode_frame(OP_TEXT, &vec![b'y'; 65_536], false);
+        assert!(read_frame(&mut Cursor::new(&past_16), false).is_ok());
+    }
+
+    #[test]
+    fn close_frame_payload_boundaries() {
+        let decode = |payload: &[u8]| {
+            read_frame(
+                &mut Cursor::new(encode_frame(OP_CLOSE, payload, true)),
+                true,
+            )
+        };
+        assert_eq!(decode(b""), Ok(Frame::Close(None, String::new())));
+        assert_eq!(decode(&[0x03]), Err(WsError::BadClosePayload));
+        assert_eq!(
+            decode(&[0x03, 0xe8]),
+            Ok(Frame::Close(Some(1000), String::new()))
+        );
+        assert_eq!(decode(&[0x03, 0xe8, 0xff]), Err(WsError::BadUtf8));
+    }
+
+    #[test]
+    fn unmasked_frames_decode_when_mask_not_required() {
+        // client-side reading (client.rs uses mask_required=false): server
+        // frames are unmasked; masked frames still decode and unmask correctly
+        let unmasked = encode_frame(OP_TEXT, b"from-server", false);
+        assert_eq!(
+            read_frame(&mut Cursor::new(unmasked), false),
+            Ok(Frame::Text(b"from-server".to_vec()))
+        );
+        let masked = encode_frame(OP_TEXT, b"from-server", true);
+        assert_eq!(
+            read_frame(&mut Cursor::new(masked), false),
+            Ok(Frame::Text(b"from-server".to_vec()))
+        );
+    }
+
+    #[test]
+    fn sequential_frames_decode_from_one_reader() {
+        // the decoder consumes exactly one frame's bytes per call: two frames
+        // back-to-back decode in order, then EOF errors
+        let mut buf = encode_frame(OP_TEXT, b"first", true);
+        buf.extend(encode_frame(OP_PING, b"p", true));
+        buf.extend(encode_frame(OP_TEXT, b"second", true));
+        let mut r = Cursor::new(buf);
+        assert_eq!(
+            read_frame(&mut r, true).unwrap(),
+            Frame::Text(b"first".to_vec())
+        );
+        assert_eq!(
+            read_frame(&mut r, true).unwrap(),
+            Frame::Ping(b"p".to_vec())
+        );
+        assert_eq!(
+            read_frame(&mut r, true).unwrap(),
+            Frame::Text(b"second".to_vec())
+        );
+        assert!(matches!(read_frame(&mut r, true), Err(WsError::Io(_))));
+    }
+
+    #[test]
+    fn handshake_truncation_and_header_boundaries() {
+        let full = b"GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n";
+        // truncated before the final CRLFCRLF is an IO error, never a panic
+        for cut in 0..full.len() {
+            let r = read_handshake(&mut Cursor::new(&full[..cut]));
+            assert!(matches!(&r, Err(WsError::Io(_))), "cut {cut}: {r:?}");
+        }
+        assert!(read_handshake(&mut Cursor::new(&full[..])).is_ok());
+        // a header line without a colon is rejected
+        let bad = b"GET / HTTP/1.1\r\noops\r\n\r\n";
+        assert!(matches!(
+            read_handshake(&mut Cursor::new(&bad[..])),
+            Err(WsError::BadHandshake)
+        ));
+        // header-count boundary: 64 accepted, 65 rejected
+        let mut many = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..64 {
+            many.extend_from_slice(format!("x-{i}: v\r\n").as_bytes());
+        }
+        many.extend_from_slice(b"\r\n");
+        assert!(read_handshake(&mut Cursor::new(&many)).is_ok());
+        many = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..65 {
+            many.extend_from_slice(format!("x-{i}: v\r\n").as_bytes());
+        }
+        many.extend_from_slice(b"\r\n");
+        assert!(matches!(
+            read_handshake(&mut Cursor::new(&many)),
+            Err(WsError::BadHandshake)
+        ));
+        // non-UTF8 head bytes are rejected
+        let mut raw = b"GET / HTTP/1.1\r\nX: ".to_vec();
+        raw.push(0xff);
+        raw.extend_from_slice(b"\r\n\r\n");
+        assert!(matches!(
+            read_handshake(&mut Cursor::new(&raw)),
+            Err(WsError::BadHandshake)
+        ));
+    }
 }
