@@ -1,6 +1,6 @@
 # CHERNOBYL — TODO
 
-Updated: 2026-10-22 (Phase 4′ complete: pairing + E2E session layer + revocation). Status of the Rust companion rewrite + everything left.
+Updated: 2026-10-23 (Phase 5′ release-readiness round complete: D8 queue bound + posture policies D1/D2/D6 implemented + soak harness built; root README corrected; mobile ADR-009 honesty fixes). Status of the Rust companion rewrite + everything left.
 
 ## Done
 
@@ -191,15 +191,19 @@ Updated: 2026-10-22 (Phase 4′ complete: pairing + E2E session layer + revocati
   - Caveats kept: one machine, soak in background during all runs (equal for both sides);
     load-generator CPU not subtracted (identical both sides); decomposition subtracts
     measurements from different runs.
-- [ ] Soak test: **in progress, restarted on the current binary** — release binary on :18792
-      with a fresh temp home and `--exit-after 86400000` (24 h), plus a detached 10-minute
-      RSS sampler (`Temp\opencode\chernobyl-soak-rss.tsv`) and a detached *light* connection
-      churn (connect+hello+close every 5 s, `--churn --light --minutes 1440`). **Honest
-      caveat:** the soak was killed twice earlier (both times the running exe locked the
-      file against rebuild, and both restarts postdate material changes), so the TSV holds
-      partial runs with visible `uptimeMs` resets — it restarts cleanly and the final
-      24 h-uninterrupted window starts whenever the binary stops changing. The churn's
-      default 30-minute lifetime also expired unnoticed mid-run; it now runs the full 24 h.
+- [x] Soak test harness — **built 2026-10-23** (`services/companion-rs/tools/soak.mjs`,
+      committed `032257d`). Two modes: `npm run soak:smoke` (~80 s, 10 predefined pass/fail
+      criteria) and `npm run soak:long -- --duration <s>` (explicit long/24-hour mode).
+      Emits JSONL telemetry + a machine-readable `summary.json`; threshold provenance is
+      labelled (server-derived limits vs newly proposed RSS/timeout bounds); a fault-injection
+      mode (`--inject server-kill`) proves the harness detects an unexpected exit (exit 1)
+      instead of passing blindly. **Smoke: 10/10 PASS.** A **1-hour long run** on the current
+      binary passed all 10 criteria (exit 0): 13 936 connects / 0 failures, 233 000 pongs in
+      order (0 violations), D8 saturation teardowns ~517–559 ms across 130 cycles, dead-peer
+      released at 60 s, RSS growth 5.1→9.9 MB (peak 10.5 MB) over the hour, graceful exit 0,
+      restart 2/2, peers released to 0. The **24 h run for gate S11** is the same command with
+      `--duration 86400` and needs one uninterrupted awake window (an earlier pre-harness
+      attempt died ~4.7 h on PC sleep — keep the machine awake).
 
 ### Phase map (PRD §25; Phase 3 was in memory's gate list, approved this round)
 
@@ -227,13 +231,20 @@ Updated: 2026-10-22 (Phase 4′ complete: pairing + E2E session layer + revocati
       revocation. **Security matrix green** (129 tests): expired/reused QR, revoked device, bad
       proof (MITM without PSK), frame replay, counter desync, tampered frame, paired-device
       reconnect, live revocation. Still owed: manual phone-scan gate with a real phone.
-- [ ] Phase 5′: **transport-agnostic remote access** (ADR-011) — no mandatory third party:
-      companion advertises all reachable endpoints (LAN always; optional tailnet / DDNS +
-      port-forward / cloudflared how-tos, incl. CGNAT check); app reconnects trying endpoints
-      in order; transport is a dumb pipe — security is the Phase 4′ E2E layer.
-- [ ] Phase 6: mobile integration — simulation badge (ADR-009), paired transport replaces
-      `EXPO_PUBLIC_HOST_WS_URL` + fake sign-in, endpoint-list host records, **persistent WS +
-      Android foreground-service local notifications (no FCM)**.
+- [~] Phase 5′: **transport-agnostic remote access** (ADR-011) — **posture half done**
+      (decisions D1/D2/D6 implemented + tested, `d12bf9e`; D8 outbound-queue bound, `24f8020`;
+      soak harness, `032257d`). The QR advertises a single dialable endpoint (`--endpoint`
+      override for LAN reachability, else `ws://bind:port`). Still owed: the full
+      **multi-endpoint** advertisement (LAN + optional tailnet / DDNS + port-forward /
+      cloudflared, with CGNAT-check how-tos), the **app-side ordered reconnect** across that
+      list (lands with Phase 6), and the optional-transport how-to docs.
+- [~] Phase 6: mobile integration — **simulation badge done** (`66d3a7f`, ADR-009 honest
+      "Simulation" pill + transport-derived composer caption). Still owed: paired E2E
+      transport (QR scan → `hs_*` handshake → sealed frames, replaces
+      `EXPO_PUBLIC_HOST_WS_URL` + fake sign-in), endpoint-list host records, and **persistent
+      WS + Android foreground-service local notifications (no FCM)**. Blocked on a mobile
+      crypto-stack + native-module decision + a physical device (see
+      `docs/validation/PHONE-VALIDATION-CHECKLIST.md`, "To unblock the Phase 6 rows").
 - [ ] Phase 7: adapters in order Claude Code → Ollama → Hermes (ADR-008) — as Rust modules.
 - [ ] Phase 8: **TUI** (status, sessions, approvals with keybinds, pairing flow) + windowless
       autostart host + packaging (ADR-007) + backup/restore, log redaction, local metrics.
@@ -247,8 +258,9 @@ Updated: 2026-10-22 (Phase 4′ complete: pairing + E2E session layer + revocati
   (frames, handshake, JSON, client messages) plus the constant-time/limit checks above.
 - No measured numbers for loaded/burst memory — **now measured** for all three shapes: RSS
   under sustained load (10.99 MB after 517 k persisted commands in 30 s, post-cap), a
-  multi-connection burst (3.8 → 10.4 MB across 400 simultaneous connections), and the 24 h
-  soak trend (**pending** — see the soak item above for why the window restarts).
+  multi-connection burst (3.8 → 10.4 MB across 400 simultaneous connections), and the soak
+  trend (**1-hour run: 5.1 → 9.9 MB, peak 10.5 MB**, 13 936 connects — the full **24 h**
+  window for gate S11 is still pending one uninterrupted awake run).
 - ~~Command records have no retention cap~~ — **fixed 2026-10-21** (runtime caps + batched
   eviction + in-process compaction trigger; re-measured footprint above). Residual honest
   costs: stress throughput 17.2k/s vs 19.2k uncapped (retention selection + compaction

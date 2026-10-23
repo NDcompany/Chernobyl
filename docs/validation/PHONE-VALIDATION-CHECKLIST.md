@@ -6,9 +6,9 @@ evidence until a row has a recorded observation.
 real-phone validation of the companion. Gate **S4** closes only when the "Required for S4"
 rows carry recorded evidence.
 **Scope honesty:** server-side behavior behind these items is proven by the Rust suite
-(`cargo test`, 160 passed / 0 failed / 3 ignored at `24f8020`+D1/D2/D6) and the soak harness —
-**that is not phone evidence**. This checklist is what converts server proof into integration
-proof.
+(`cargo test`, 160 passed / 0 failed / 3 ignored on the post-D1/D2/D6 tree, `d12bf9e`+) and
+the soak harness — **that is not phone evidence**. This checklist is what converts server
+proof into integration proof.
 
 **Status legend:** `NOT RUN` = never attempted · `BLOCKED` = feature not implemented yet
 (Phase 6) · `RUN` = attempted, evidence recorded (write date + observation in the row).
@@ -109,6 +109,33 @@ test artifact path. Store under `docs/validation/evidence/<YYYY-MM-DD>-<item-id>
    paths are NOT exercised from the phone (they are covered by server tests + soak only).
    Validating them requires a deliberately non-loopback bind, which is a Phase 5′ decision for
    the product owner, not a test-harness action.
+
+## To unblock the Phase 6 rows (1.1, 2.x, 3.1, 3.2, 7.1, 7.2)
+
+These are `BLOCKED` only on the **mobile client**, not on the server. The server half is
+done and tested; what is missing is a phone client that speaks the frozen wire contract in
+`services/companion-rs/README.md` ("E2E wire format"), which is the exact handshake
+(`hs_hello → hs_challenge → hs_proof → hs_ok`) plus the sealed-frame envelope
+(`{"n":counter,"d":base64 AEAD}`). Building it needs three things that are a
+**product/security decision, not a coding unknown** — the reason they were not made
+unilaterally:
+
+1. **Mobile crypto stack.** The handshake needs HMAC-SHA-256, HKDF-SHA-256 and
+   ChaCha20-Poly1305 on the phone. Options: pure-JS audited libs (e.g. `@noble/*`, no
+   build-model change), a native module (`react-native-quick-crypto`, faster but requires
+   an Expo dev-client / prebuild, not Expo Go), or hand-rolled TS crypto (rejected — the
+   mandate and ADR-011 favour an established implementation over custom crypto where one
+   is available). This choice changes the mobile app's security posture and build model.
+2. **QR scanning.** Reading the pairing QR needs `expo-camera` (native, camera permission,
+   device-only). A manual paste/type fallback for the QR JSON is testable without it.
+3. **Foreground service + persistent WS** for backgrounded notifications (Android native,
+   device-only) — ADR-011 §4.
+
+Once the stack is chosen, implement the client against the documented contract and validate
+it **in a Node harness against the real companion first** (the server's own crypto
+known-answer tests give the cross-check vectors), then run rows 1.1→8.4 above on the
+physical device. No crypto or transport claim should be treated as proven until the device
+rows carry recorded evidence.
 
 ## Required for gate S4
 
