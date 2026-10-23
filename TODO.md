@@ -254,7 +254,15 @@ Updated: 2026-10-23 (Phase 6 client round: ADR-012 + `@chernobyl/e2e` + QR `dev`
       scanner camera path + on-device rows (physical device —
       `docs/validation/PHONE-VALIDATION-CHECKLIST.md`), endpoint-list host records, and
       **persistent WS + Android foreground-service local notifications (no FCM)**.
-- [ ] Phase 7: adapters in order Claude Code → Ollama → Hermes (ADR-008) — as Rust modules.
+- [x] Phase 7: adapters — **done 2026-10-23**. Ollama (`04117ee`) + Claude Code (`b0bf067`) as Rust
+      modules; **Hermes deferred** per ADR-008 (not installed — no pretend capability claims; the
+      adapter SDK keeps unsupported adapters invisible rather than broken). Ollama is a model-runtime
+      provider (attach-only HTTP: version/tags/ps; session ops honestly `unavailable` — PRD §7.7).
+      Claude Code is a hook **ingress** (loopback diagnostics POST, GET-only upgrades preserved;
+      explicit install via `companion claude-hooks`, never an auto-write to `settings.json`); only
+      `SessionStart` live-verified (real 2.1.309 capture), other shapes parse defensively and report
+      `limited`. PRD §7.5 "do not assume" list honored: session.list/create/prompt/interrupt +
+      permission.review reported `unavailable`.
 - [ ] Phase 8: **TUI** (status, sessions, approvals with keybinds, pairing flow) + windowless
       autostart host + packaging (ADR-007) + backup/restore, log redaction, local metrics.
       (FCM push removed — replaced by Phase 6 persistent-WS notifications.)
