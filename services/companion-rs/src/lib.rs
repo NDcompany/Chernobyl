@@ -3,12 +3,14 @@
 //! Modules: json (strict parser/serializer), protocol (v2 wire contract +
 //! permission authority), seed (mock snapshot), engine (mock agent engine),
 //! ws (RFC 6455 codec), sha1/base64 (handshake primitives), storage
-//! (crash-safe journal), config, adapters, opencode (Phase 3 OpenCode
-//! adapter), ollama (Phase 7 model-runtime adapter), claude (Phase 7 hook
-//! ingress), companion (orchestration), server (WS/HTTP), client (test
-//! client), ffi (Windows console/memory).
+//! (crash-safe journal), backup (Phase 8 journal backup/restore), config,
+//! adapters, opencode (Phase 3 OpenCode adapter), ollama (Phase 7
+//! model-runtime adapter), claude (Phase 7 hook ingress), companion
+//! (orchestration), server (WS/HTTP), client (test client), ffi (Windows
+//! console/memory).
 
 pub mod adapters;
+pub mod backup;
 pub mod base64;
 pub mod claude;
 pub mod client;

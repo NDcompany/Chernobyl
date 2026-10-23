@@ -53,6 +53,8 @@ fn run(args: &[String]) -> i32 {
     let mut list_devices = false;
     let mut revoke: Option<String> = None;
     let mut claude_hooks = false;
+    let mut backup_path: Option<String> = None;
+    let mut restore_path: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -81,6 +83,8 @@ fn run(args: &[String]) -> i32 {
             "--devices" => list_devices = true,
             "--revoke" => revoke = take(&mut i),
             "--claude-hooks" => claude_hooks = true,
+            "--backup" => backup_path = take(&mut i),
+            "--restore" => restore_path = take(&mut i),
             "--config" => config_path = take(&mut i),
             "--port" => port_override = take(&mut i).and_then(|v| v.parse().ok()),
             "--bind" => bind_override = take(&mut i),
@@ -157,6 +161,11 @@ fn run(args: &[String]) -> i32 {
     // companion never writes the user's settings.json). Socket-free.
     if claude_hooks {
         return claude_hooks_main(&cfg);
+    }
+    // Phase 8: `companion backup <path>` / `companion restore <path>` —
+    // snapshot/restore the durable journal with a SHA-256 sidecar. Socket-free.
+    if backup_path.is_some() || restore_path.is_some() {
+        return backup_main(&cfg, backup_path.as_deref(), restore_path.as_deref());
     }
 
     // Secure-by-default: exposing beyond loopback requires a token.
@@ -417,6 +426,45 @@ fn claude_hooks_main(cfg: &config::CompanionConfig) -> i32 {
     let ingress = format!("http://127.0.0.1:{}/hooks/claude", cfg.diagnostics_port);
     print!("{}", chernobyl_companion::claude::bridge_config(&ingress));
     0
+}
+
+/// Phase 8: `companion backup <path>` / `companion restore <path>`. Copies the
+/// durable journal with a SHA-256 sidecar; restore refuses a checksum mismatch.
+/// Socket-free (no server started). Caveat: PSKs are DPAPI-bound to this
+/// machine+user, so a restore on another machine needs re-pairing.
+fn backup_main(cfg: &config::CompanionConfig, backup: Option<&str>, restore: Option<&str>) -> i32 {
+    use chernobyl_companion::backup;
+    use std::path::Path;
+    if let Some(dest) = backup {
+        match backup::backup(&cfg.data_dir, Path::new(dest)) {
+            Ok(digest) => {
+                println!("backed up {} -> {dest}", backup::JOURNAL_NAME);
+                println!("sha256 {digest}");
+                0
+            }
+            Err(e) => {
+                eprintln!("[companion] backup failed: {e}");
+                1
+            }
+        }
+    } else if let Some(src) = restore {
+        match backup::restore(Path::new(src), &cfg.data_dir) {
+            Ok(digest) => {
+                println!(
+                    "restored {src} -> {}",
+                    cfg.data_dir.join(backup::JOURNAL_NAME).display()
+                );
+                println!("sha256 {digest}");
+                0
+            }
+            Err(e) => {
+                eprintln!("[companion] restore failed: {e}");
+                1
+            }
+        }
+    } else {
+        2
+    }
 }
 
 /// Start-on-login via the HKCU Run key (PRD §6.3): user-level, no elevation,
