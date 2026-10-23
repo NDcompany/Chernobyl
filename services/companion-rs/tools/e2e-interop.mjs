@@ -14,6 +14,8 @@
  *   7. revoked device       -> after --revoke + restart: hs_err 'device revoked'
  *      (also asserts today's D4 semantic: revocation takes effect at restart,
  *       not live — documented, deliberately not changed here)
+ *   8. S10 ordered endpoints -> multi --endpoint payload keeps CLI order, and
+ *      the client fails over from a dead first endpoint to the live one
  *
  * No device claim: this is Node-vs-real-companion evidence only.
  */
@@ -62,6 +64,20 @@ async function freePort() {
   });
 }
 
+/** A free port in 1024..9999 (4 digits) — keeps a two-endpoint QR payload inside QR v10-M's 213-byte cap. */
+async function freePort4() {
+  for (let i = 0; i < 40; i += 1) {
+    const p = 1024 + Math.floor(Math.random() * 8976);
+    const ok = await new Promise((res) => {
+      const s = createServer();
+      s.on('error', () => res(false));
+      s.listen(p, '127.0.0.1', () => s.close(() => res(true)));
+    });
+    if (ok) return p;
+  }
+  throw new Error('no free 4-digit port available');
+}
+
 /* ---------------------------------------------------------------- */
 /* process plumbing                                                  */
 /* ---------------------------------------------------------------- */
@@ -89,15 +105,23 @@ async function waitListening(srv, port) {
   assert.ok(ok, `server did not report listening; stderr so far:\n${srv.stderrBuf}`);
 }
 
-function runPair(home, endpoint) {
+function runPair(home, { endpoints, expectQrOverflow = false } = {}) {
   const env = { ...process.env };
   delete env.PORT;
   delete env.HOST_TOKEN;
   env.CHERNOBYL_HOME = home;
-  const r = spawnSync(BIN, ['--pair', '--endpoint', endpoint], { env, encoding: 'utf8' });
-  assert.equal(r.status, 0, `pair failed: ${r.stderr}`);
+  const args = ['--pair', ...endpoints.flatMap((e) => ['--endpoint', e])];
+  const r = spawnSync(BIN, args, { env, encoding: 'utf8' });
   const m = /^payload: (.+)$/m.exec(r.stdout);
-  assert.ok(m, `no payload line in pair output:\n${r.stdout}`);
+  assert.ok(m, `no payload line in pair output:\n${r.stdout}\n${r.stderr}`);
+  if (expectQrOverflow) {
+    // documented: payload prints first, QR failure is reported (exit 1) so
+    // the operator knows to paste instead of scan
+    assert.equal(r.status, 1, `QR overflow expected (exit 1) but got ${r.status}: ${r.stderr}`);
+    assert.match(r.stderr, /too large for QR/, 'QR failure must be reported');
+  } else {
+    assert.equal(r.status, 0, `pair failed: ${r.stderr}`);
+  }
   return parsePairingPayload(m[1]);
 }
 
@@ -160,14 +184,39 @@ async function main() {
   assert.equal(build.status, 0, `cargo build failed:\n${build.stdout}\n${build.stderr}`);
 
   const home = mkdtempSync(join(tmpdir(), 'chernobyl-e2e-interop-'));
-  const port = await freePort();
+  // 4-digit server port: two `ws://127.0.0.1:PORT` entries in one QR payload
+  // then land at exactly 213 bytes = QR v10-M capacity (see pair checks below)
+  const port = await freePort4();
   const url = `ws://127.0.0.1:${port}`;
 
   // Pairing offers must exist in the journal BEFORE the daemon starts
   // (the running store is loaded once at startup — see establish_session).
-  const pairA = runPair(home, url);
-  const pairB = runPair(home, url);
+  const pairA = runPair(home, { endpoints: [url] });
+  const pairB = runPair(home, { endpoints: [url] });
+  // S10: dead endpoint FIRST (a second 4-digit port — two 4-digit entries =
+  // exactly 213 bytes = QR v10-M capacity), live second. Distinct from the
+  // server port or the "dead" dial would hit the live daemon.
+  let deadPort = await freePort4();
+  while (deadPort === port) deadPort = await freePort4();
+  const deadUrl = `ws://127.0.0.1:${deadPort}`;
+  const pairC = runPair(home, { endpoints: [deadUrl, url] });
   check('pair payload carries the redemption device id (ADR-012 dev field)', /^[0-9a-f]{16}$/.test(pairA.deviceId), pairA.deviceId);
+  check(
+    'S10: multi-endpoint QR payload keeps CLI order (dead, live)',
+    JSON.stringify(pairC.endpoints) === JSON.stringify([deadUrl, url]),
+    pairC.endpoints.join(', '),
+  );
+  // Documented capacity edge: two full 5-digit-port endpoints = 215 bytes >
+  // 213 (v10-M) — the payload must still print for paste, QR failure reported.
+  const pairOver = runPair(home, {
+    endpoints: [url, `ws://127.0.0.1:${await freePort()}`],
+    expectQrOverflow: true,
+  });
+  check(
+    'S10: QR overflow keeps a pasteable payload with endpoint order intact',
+    pairOver.endpoints.length === 2 && pairOver.endpoints[0] === url,
+    pairOver.endpoints.join(', '),
+  );
 
   let srv = spawnServer(home, port);
   await waitListening(srv, port);
@@ -285,6 +334,28 @@ async function main() {
     await sleep(500);
     check('revoked device does not auto-retry', tRevoked.status() === 'denied');
     tRevoked.close();
+  }
+
+  /* 8. S10: ordered failover across the advertised endpoint list (real binary) */
+  {
+    const t = createE2eTransport({
+      pairing: pairC, // defaults to the payload's own ordered list (dead, live)
+      retryBaseMs: 200,
+      retryMaxMs: 400,
+      heartbeatMs: 0,
+      handshakeTimeoutMs: 1500, // a random 4-digit port that answers as a non-companion service rotates quickly
+    });
+    transports.push(t);
+    t.connect();
+    const connected = await waitFor(() => t.status() === 'connected', 8000);
+    check(
+      'S10: dead first endpoint fails over to the live second endpoint',
+      connected,
+      `status=${t.status()}`,
+    );
+    await sleep(600);
+    check('S10: session stays on the live endpoint (no churn)', t.status() === 'connected', `status=${t.status()}`);
+    t.close();
   }
 
   for (const t of transports) t.close();

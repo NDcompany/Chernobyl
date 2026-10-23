@@ -77,7 +77,12 @@ export function TransportProvider({ children }: { children: ReactNode }) {
       if (pairingJson) {
         try {
           const cred = parsePairingPayload(pairingJson);
-          active = createE2eTransport({ url: withToken(cred.endpoints[0]), pairing: cred });
+          // ordered endpoint list (ADR-011 §2 / S10): every advertised
+          // endpoint, in QR order, each carrying the keystore token
+          active = createE2eTransport({
+            endpoints: cred.endpoints.map(withToken),
+            pairing: cred,
+          });
           setTransport(active);
         } catch (e) {
           // A corrupt stored pairing must not brick the app — surface it.

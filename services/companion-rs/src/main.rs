@@ -15,7 +15,8 @@
 //!   --install-autostart      start-on-login: write the HKCU Run entry and exit
 //!   --uninstall-autostart    remove that entry (idempotent) and exit
 //!   --pair                   create a pairing offer, print its terminal QR, exit
-//!   --endpoint <ws-url>      endpoint embedded in the pairing QR (default ws://bind:port)
+//!   --endpoint <ws-url>      endpoint embedded in the pairing QR (repeatable, kept in
+//!                             CLI order; default ws://bind:port when none given)
 //!   --devices                list the paired-device registry, exit
 //!   --revoke <device-id>     revoke a paired device (blocks future E2E handshakes), exit
 //!   --version                print version and exit
@@ -48,7 +49,7 @@ fn run(args: &[String]) -> i32 {
     let mut install_autostart = false;
     let mut uninstall_autostart = false;
     let mut pair = false;
-    let mut endpoint_override: Option<String> = None;
+    let mut endpoint_override: Vec<String> = Vec::new();
     let mut list_devices = false;
     let mut revoke: Option<String> = None;
 
@@ -75,7 +76,7 @@ fn run(args: &[String]) -> i32 {
             "--install-autostart" => install_autostart = true,
             "--uninstall-autostart" => uninstall_autostart = true,
             "--pair" => pair = true,
-            "--endpoint" => endpoint_override = take(&mut i),
+            "--endpoint" => endpoint_override.extend(take(&mut i)),
             "--devices" => list_devices = true,
             "--revoke" => revoke = take(&mut i),
             "--config" => config_path = take(&mut i),
@@ -140,7 +141,7 @@ fn run(args: &[String]) -> i32 {
     // Runs before the token check: it never binds a socket (the QR carries the
     // endpoint the phone dials instead).
     if pair {
-        return pair_main(&cfg, endpoint_override.as_deref());
+        return pair_main(&cfg, &endpoint_override);
     }
     // Device-registry maintenance (also socket-free).
     if list_devices {
@@ -251,7 +252,7 @@ fn autostart_value(exe: &std::path::Path, config_path: Option<&str>) -> String {
 /// (PSK DPAPI-protected so the on-disk record never holds it plaintext), and
 /// print the terminal QR the phone scans. The running daemon redeems the offer
 /// when the phone proves knowledge of the PSK during the E2E handshake.
-fn pair_main(cfg: &config::CompanionConfig, endpoint: Option<&str>) -> i32 {
+fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
     use chernobyl_companion::{base64, pairing, protocol, qr, storage};
 
     // Open the same journal a running daemon uses, so the offer is visible.
@@ -313,21 +314,30 @@ fn pair_main(cfg: &config::CompanionConfig, endpoint: Option<&str>) -> i32 {
     }
 
     // Endpoint the phone should dial (override for LAN reachability: a loopback
-    // bind is not dialable from a phone — pass `--endpoint ws://<lan-ip>:<port>`).
-    let fallback = format!("ws://{}:{}", cfg.server_bind, cfg.server_port);
-    let ep = endpoint.unwrap_or(&fallback).to_string();
-    let payload = offer.payload_json(&host_id, std::slice::from_ref(&ep));
+    // Endpoint list for the QR (ADR-011 §2 / S10): every --endpoint flag is
+    // advertised in CLI order; with none given, the bind address stands alone
+    // (bind is not dialable from a phone — pass `--endpoint ws://<lan-ip>:<port>`,
+    // repeatable for LAN + tailnet + tunnel in one payload).
+    let eps: Vec<String> = if endpoints.is_empty() {
+        vec![format!("ws://{}:{}", cfg.server_bind, cfg.server_port)]
+    } else {
+        endpoints.to_vec()
+    };
+    let payload = offer.payload_json(&host_id, &eps);
 
-    let qr = match qr::encode(payload.as_bytes()) {
-        Ok(q) => q,
+    // The payload prints BEFORE the QR: a long endpoint list that outruns QR
+    // capacity still yields a pasteable credential (QR failure = warning + exit 1).
+    println!("payload: {payload}");
+    match qr::encode(payload.as_bytes()) {
+        Ok(q) => {
+            println!("{}", qr::render_terminal(&q));
+            println!();
+        }
         Err(e) => {
-            eprintln!("[companion] pair: payload too large for QR: {e}");
+            eprintln!("[companion] pair: payload too large for QR ({e}) — paste the payload line instead");
             return 1;
         }
-    };
-    println!("{}", qr::render_terminal(&qr));
-    println!();
-    println!("payload: {payload}");
+    }
     println!(
         "device {} — valid {}s, single-use (scan with the phone)",
         offer.device_id,

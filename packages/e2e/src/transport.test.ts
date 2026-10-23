@@ -308,3 +308,72 @@ test('close() fails in-flight commands and stops all retrying', async () => {
   assert.equal(t.status(), 'offline');
 });
 
+test('ordered reconnect walks the QR endpoint list in order, restarting each cycle at the primary (ADR-011 §2)', async () => {
+  const multi: PairingCredential = { ...pairing, endpoints: ['ws://dead:1', 'ws://live:2'] };
+  const dialed: string[] = [];
+  const socks: FakeSocket[] = [];
+  const t = createE2eTransport({
+    pairing: multi,
+    retryBaseMs: 5,
+    retryMaxMs: 10,
+    heartbeatMs: 0,
+    handshakeTimeoutMs: 300, // the final un-answered dial must not hold the suite open
+    openSocket: (url) => {
+      dialed.push(url);
+      const s = new FakeSocket();
+      socks.push(s);
+      if (url === 'ws://dead:1') {
+        // dead endpoint: never opens, the dial dies asynchronously
+        setTimeout(() => s.serverClose(1006), 0);
+      } else {
+        setTimeout(() => s.serverOpen(), 0);
+      }
+      return s;
+    },
+  });
+  // poll (the machine may be loaded — the 24 h soak runs beside the suite);
+  // finally-close so a failed assertion can never leave a live retry chain
+  const waitFor = async (fn: () => boolean, ms = 2000): Promise<boolean> => {
+    const deadline = Date.now() + ms;
+    while (!fn()) {
+      if (Date.now() > deadline) return false;
+      await sleep(5);
+    }
+    return true;
+  };
+
+  try {
+    t.connect();
+    assert.deepEqual(dialed, ['ws://dead:1'], 'first attempt is the primary endpoint');
+    assert.ok(
+      await waitFor(() => dialed.length >= 2),
+      `failed primary must advance to the second endpoint; dialed=${dialed.join(',')}`,
+    );
+    assert.equal(
+      dialed[1],
+      'ws://live:2',
+      'a failed attempt advances to the next endpoint in advertised order',
+    );
+    assert.ok(await waitFor(() => (socks[1]?.sent.length ?? 0) > 0), 'live socket must open');
+    const host = await serverHandshake(socks[1]);
+    assert.ok(host);
+    assert.equal(t.status(), 'connected');
+
+    // the established session drops: the next cycle restarts at the PRIMARY
+    // (dead again — one wasted dial — then failover back to the live endpoint)
+    socks[1].serverClose();
+    assert.ok(
+      await waitFor(() => dialed.length >= 3),
+      `post-session drop must restart at the primary; dialed=${dialed.join(',')}`,
+    );
+    assert.equal(dialed[2], 'ws://dead:1', 'after a live session the order restarts from the primary');
+    assert.ok(
+      await waitFor(() => dialed.length >= 4),
+      `cycle must still fail over; dialed=${dialed.join(',')}`,
+    );
+    assert.equal(dialed[3], 'ws://live:2', 'and still fails over to the second endpoint');
+  } finally {
+    t.close();
+  }
+});
+

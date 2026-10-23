@@ -12,7 +12,11 @@
  * - a heartbeat ping every `heartbeatMs` (server's dead-peer window is 3×15 s,
  *   ADR-011 / server.rs) whose missing pong forces a reconnect;
  * - any sealed-frame violation (replay/desync/tamper) tears the connection
- *   down; the next connection re-handshakes from scratch with fresh counters.
+ *   down; the next connection re-handshakes from scratch with fresh counters;
+ * - ordered reconnect over the QR's endpoint list (ADR-011 §2 / S10): each
+ *   failed attempt advances to the next endpoint in the advertised order, a
+ *   successful handshake resets to the first. The list is dial order only —
+ *   endpoints are not credentials (see docs/decisions/PHASE5-THREAT-MODEL.md §3.9).
  */
 import { PROTOCOL_VERSION, nextId, parseServerMessage } from '@chernobyl/protocol';
 import type { ClientMessage, ServerMessage } from '@chernobyl/protocol';
@@ -42,7 +46,13 @@ export interface SocketLike {
 }
 
 export interface E2eTransportOptions {
-  url: string;
+  /** Single endpoint (tests/simple callers). Ignored when `endpoints` is given. */
+  url?: string;
+  /**
+   * Ordered endpoint list from the pairing payload (or token-appended copies
+   * of it). Defaults to `pairing.endpoints` when neither is provided.
+   */
+  endpoints?: string[];
   pairing: PairingCredential;
   /** Injected for tests/Node (`ws`); defaults to the runtime's global WebSocket. */
   openSocket?: (url: string) => SocketLike;
@@ -95,7 +105,9 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
   const heartbeatMs = opts.heartbeatMs ?? DEFAULTS.heartbeatMs;
   const pongTimeoutMs = opts.pongTimeoutMs ?? DEFAULTS.pongTimeoutMs;
   const openSocket = opts.openSocket ?? defaultOpenSocket;
-  const { url, pairing } = opts;
+  const { pairing } = opts;
+  const endpoints: string[] = opts.endpoints ?? (opts.url ? [opts.url] : pairing.endpoints);
+  if (endpoints.length === 0) throw new Error('e2e transport: no endpoint to dial');
   const clientId = nextId('app');
 
   const msgSubs = new Set<(m: ServerMessage) => void>();
@@ -107,6 +119,9 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
   let session: SealedSession | null = null;
   let status: TransportStatus = 'offline';
   let attempts = 0;
+  // position in the QR endpoint list; advanced per failed attempt, reset to
+  // the primary endpoint on a successful handshake (ordered reconnect)
+  let endpointIdx = 0;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let stopped = true;
@@ -211,8 +226,9 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
     setStatus(attempts === 0 ? 'connecting' : 'reconnecting');
     let socket: SocketLike;
     try {
-      socket = openSocket(url);
+      socket = openSocket(endpoints[endpointIdx]);
     } catch {
+      endpointIdx = (endpointIdx + 1) % endpoints.length;
       scheduleRetry();
       return;
     }
@@ -242,6 +258,7 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
           session = s;
           handshakeDone = true;
           attempts = 0;
+          endpointIdx = 0; // live session → future reconnects start from the primary
           setStatus('connected');
           try {
             socket.send(s.seal(JSON.stringify({ type: 'hello', clientId, protocol: PROTOCOL_VERSION })));
@@ -295,6 +312,13 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
         return;
       }
       if (status === 'denied') return; // terminal — no auto-retry
+      // Ordered reconnect over the QR endpoint list (ADR-011 §2 / S10):
+      // a cycle that never reached a session advances to the NEXT endpoint
+      // (this one refused/died mid-handshake); a drop after a live session
+      // restarts the cycle from the primary (wraps; 1 endpoint = no-op).
+      endpointIdx = handshakeDone
+        ? 0
+        : (endpointIdx + 1) % endpoints.length;
       setStatus('reconnecting');
       scheduleRetry();
     };
@@ -321,6 +345,7 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
     connect() {
       stopped = false;
       if (status === 'denied') setStatus('offline'); // explicit retry clears the terminal state
+      endpointIdx = 0; // an explicit connect starts at the primary endpoint
       if (!ws) open();
     },
 
