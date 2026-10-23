@@ -67,13 +67,17 @@ impl PairingOffer {
         Ok(())
     }
 
-    /// The QR payload the phone scans (versioned compact JSON).
+    /// The QR payload the phone scans (versioned compact JSON). `dev` is the
+    /// device id the client must send in `hs_hello` — the redemption lookup is
+    /// keyed by it, so without it in the payload a QR-scan-only client cannot
+    /// pair (the id used to be printed only as terminal text).
     pub fn payload_json(&self, host_id: &str, endpoints: &[String]) -> String {
         let ep = endpoints.iter().map(|e| json::s(e)).collect();
         json::stringify(&json::obj(vec![
             ("v", Json::Int(1)),
             ("host", json::s(host_id)),
             ("ep", Json::Arr(ep)),
+            ("dev", json::s(&self.device_id)),
             ("psk", json::s(&base64::encode(&self.psk))),
             ("chal", json::s(&base64::encode(&self.challenge))),
             ("exp", Json::Int(self.expires_at / 1000)),
@@ -150,6 +154,8 @@ mod tests {
         let v = json::parse(&payload).expect("payload is valid JSON");
         assert_eq!(json::get_i64(&v, "v"), Some(1));
         assert_eq!(json::get_str(&v, "host"), Some("host-abc"));
+        // the device id the client redeems under must be in the payload
+        assert_eq!(json::get_str(&v, "dev"), Some(o.device_id.as_str()));
         // PSK in payload is base64 of the exact 32 bytes
         let psk = json::get_str(&v, "psk").unwrap();
         assert_eq!(base64::decode(psk).unwrap(), o.psk);
