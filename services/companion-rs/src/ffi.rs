@@ -20,6 +20,18 @@ type HandlerRoutine = extern "system" fn(u32) -> i32;
 unsafe extern "system" {
     fn SetConsoleCtrlHandler(handler: Option<HandlerRoutine>, add: i32) -> i32;
     fn GetCurrentProcess() -> usize;
+    fn FreeConsole() -> i32;
+}
+
+/// Detach this process from its console window (Phase 8 windowless host). The
+/// HKCU Run autostart used to flash a console window at login; calling this
+/// after boot closes that window while the daemon keeps serving on its sockets.
+/// Diagnostics remain reachable via the loopback `/health` + `/metrics` routes,
+/// so detaching the console costs no observability. No-op if already detached.
+pub fn detach_console() {
+    unsafe {
+        FreeConsole();
+    }
 }
 
 #[link(name = "psapi")]

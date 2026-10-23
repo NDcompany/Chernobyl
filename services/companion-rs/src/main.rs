@@ -55,6 +55,7 @@ fn run(args: &[String]) -> i32 {
     let mut claude_hooks = false;
     let mut backup_path: Option<String> = None;
     let mut restore_path: Option<String> = None;
+    let mut background = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -85,6 +86,7 @@ fn run(args: &[String]) -> i32 {
             "--claude-hooks" => claude_hooks = true,
             "--backup" => backup_path = take(&mut i),
             "--restore" => restore_path = take(&mut i),
+            "--background" => background = true,
             "--config" => config_path = take(&mut i),
             "--port" => port_override = take(&mut i).and_then(|v| v.parse().ok()),
             "--bind" => bind_override = take(&mut i),
@@ -218,6 +220,14 @@ fn run(args: &[String]) -> i32 {
         srv.diagnostics_port
     );
 
+    // Phase 8 windowless host: `--background` (used by the HKCU Run autostart)
+    // closes the console window after a successful boot, so the login daemon
+    // runs without flashing a console. Diagnostics stay reachable on the
+    // loopback /health + /metrics routes, so nothing is lost.
+    if background {
+        ffi::detach_console();
+    }
+
     // ---- run ---------------------------------------------------------
     let start = std::time::Instant::now();
     loop {
@@ -254,11 +264,12 @@ fn next_ack(c: &mut WsClient) -> Result<json::Json, String> {
 
 /// The Run-key command line: quoted exe path so spaces survive, plus
 /// `--config` when the operator installed from a non-default config so the
-/// login instance boots the same file. Token stays env-only (HOST_TOKEN) —
-/// the autostarted daemon serves loopback without one, which is the Node
-/// parity mode; token-at-login arrives with the relay phase.
+/// login instance boots the same file. `--background` (Phase 8) closes the
+/// console window after boot so the login daemon is windowless. Token stays
+/// env-only (HOST_TOKEN) — the autostarted daemon serves loopback without one,
+/// which is the Node parity mode; token-at-login arrives with the relay phase.
 fn autostart_value(exe: &std::path::Path, config_path: Option<&str>) -> String {
-    let mut value = format!("\"{}\"", exe.display());
+    let mut value = format!("\"{}\" --background", exe.display());
     if let Some(p) = config_path {
         value.push_str(&format!(" --config \"{p}\""));
     }
@@ -875,14 +886,14 @@ mod tests {
     fn autostart_value_quotes_paths_and_appends_config() {
         assert_eq!(
             autostart_value(std::path::Path::new(r"C:\a b\c.exe"), None),
-            r#""C:\a b\c.exe""#
+            r#""C:\a b\c.exe" --background"#
         );
         assert_eq!(
             autostart_value(
                 std::path::Path::new(r"C:\x.exe"),
                 Some(r"C:\cfg dir\companion.json")
             ),
-            r#""C:\x.exe" --config "C:\cfg dir\companion.json""#
+            r#""C:\x.exe" --background --config "C:\cfg dir\companion.json""#
         );
     }
 }
