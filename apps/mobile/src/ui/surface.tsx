@@ -20,6 +20,7 @@ import { Button, Text } from '@/ui/primitives';
 import { Contours, type ContourVariant } from '@/ui/graphics';
 import { Icon, type IconName } from '@/ui/icons';
 import { useAppStore } from '@/store/appStore';
+import { transportKind } from '@/data/transport';
 
 /* ------------------------------------------------------------------ */
 /* Screen                                                              */
@@ -364,6 +365,44 @@ export function ConfirmModal({
 /* Styles                                                              */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Simulation badge (ADR-009)                                          */
+/*                                                                     */
+/* Persistent, visible "Simulation" indication wherever state or       */
+/* approvals are shown. Hidden on onboarding (the demo is the point)   */
+/* and when a real companion transport is active. Uses a render-time   */
+/* read of the active transport (set once at boot, before any screen   */
+/* renders) — not a reactive subscription — so it stays a leaf with no */
+/* re-render coupling.                                                 */
+/* ------------------------------------------------------------------ */
+
+const SIMULATION_PATHS = new Set([
+  'sign-in',
+  'connect-host',
+  'settings/[section]',
+  'new-task',
+]);
+
+export function SimulationBadge() {
+  const segments = useSegments();
+  const top = segments[segments.length - 1];
+  if (typeof top === 'string' && SIMULATION_PATHS.has(top)) return null;
+  if (transportKind() !== 'mock') return null;
+  return (
+    <View
+      pointerEvents="none"
+      style={styles.simBadge}
+      accessibilityRole="text"
+      accessibilityLabel="Simulation mode: showing demo data, not a real agent"
+    >
+      <Icon name="eye" size={12} color={colors.white} />
+      <Text variant="xs" color={colors.white}>
+        Simulation
+      </Text>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
@@ -434,5 +473,18 @@ const styles = StyleSheet.create({
     borderRadius: radii.sm,
     padding: spacing.md,
     alignItems: 'flex-start',
+  },
+  simBadge: {
+    position: 'absolute',
+    top: spacing.sm,
+    left: spacing.xl,
+    zIndex: 50,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    backgroundColor: colors.black,
+    borderRadius: radii.pill,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 3,
   },
 });

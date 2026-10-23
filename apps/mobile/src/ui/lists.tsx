@@ -29,6 +29,7 @@ import { Card } from '@/ui/surface';
 import { AgentIcon } from '@/ui/graphics';
 import { Icon, type IconName } from '@/ui/icons';
 import { zodHandler } from '@/forms/zodBridge';
+import { transportKind } from '@/data/transport';
 import { z } from 'zod';
 import {
   agentStatusLabel,
@@ -334,6 +335,12 @@ export function PromptComposer({
     onSubmit(data.prompt.trim());
     form.reset({ prompt: '' });
   });
+  // ADR-009 honesty: never tell a live-companion user "nothing is executed
+  // for real." The caption reflects the ACTIVE transport, not a hardcoded claim.
+  const idleCaption =
+    transportKind() === 'mock'
+      ? 'Mock host — nothing is executed for real'
+      : 'Connected to the real companion — commands are enforced host-side';
 
   return (
     <View style={styles.composer}>
@@ -346,7 +353,7 @@ export function PromptComposer({
       />
       <View style={styles.composerRow}>
         <Text variant="xs" color={colors.text3} style={{ flex: 1 }} numberOfLines={1}>
-          {busy ? hint ?? 'Agent is working…' : hint ?? 'Mock host — nothing is executed for real'}
+          {busy ? hint ?? 'Agent is working…' : hint ?? idleCaption}
         </Text>
         {busy && onInterrupt ? (
           <Button

@@ -4,7 +4,7 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { queryClient } from '@/data/state';
 import { TransportProvider } from '@/data/TransportProvider';
-import { ToastHost } from '@/ui/surface';
+import { ToastHost, SimulationBadge } from '@/ui/surface';
 import { colors } from '@/theme/tokens';
 
 export default function RootLayout() {
@@ -35,6 +35,7 @@ export default function RootLayout() {
             <Stack.Screen name="settings/[section]" />
           </Stack>
           <StatusBar style="dark" />
+          <SimulationBadge />
           <ToastHost />
         </TransportProvider>
       </SafeAreaProvider>

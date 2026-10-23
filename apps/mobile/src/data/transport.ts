@@ -43,3 +43,8 @@ export function getTransport(): Transport {
   }
   return transport;
 }
+
+/** The active transport's kind — 'mock' (simulation) or 'websocket' (live). */
+export function transportKind(): Transport['kind'] {
+  return getTransport().kind;
+}
