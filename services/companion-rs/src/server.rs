@@ -531,8 +531,10 @@ fn serve_ws(mut reader: TcpStream, writer: TcpStream, companion: Arc<Companion>)
                         _ => {}
                     }
                 }
+                // strict integer equality, matching host.ts `!==`: the `as u32`
+                // cast truncates (2.5 → 2), so the fractional check must run first
                 if let ClientMsg::Hello { protocol, .. } = &msg
-                    && *protocol as u32 != PROTOCOL_VERSION
+                    && (protocol.fract() != 0.0 || *protocol as u32 != PROTOCOL_VERSION)
                 {
                     // write the mismatch ack synchronously, THEN close —
                     // ordering must be guaranteed before the socket dies
@@ -821,6 +823,52 @@ mod e2e_tests {
             c.next_text().is_err(),
             "server must close the connection on a tampered frame"
         );
+        shutdown(f);
+    }
+
+    /* D7: protocol-version gate — strict integer equality, no f64 truncation. */
+
+    #[test]
+    fn hello_gate_rejects_fractional_and_wrong_versions_with_4002() {
+        let f = fixture("d7-gate", now_ms() + 60_000, false);
+        // 2.5 used to pass via `as u32` truncation; 1 = older, 3 = newer
+        for bad in ["2.5", "1", "3"] {
+            let mut c = connect(&f);
+            c.send_text(&format!(
+                r#"{{"type":"hello","clientId":"d7","protocol":{bad}}}"#
+            ))
+            .unwrap();
+            let ack = c.next_text().unwrap();
+            assert!(
+                ack.contains("protocol mismatch"),
+                "v{bad} must be rejected, got: {ack}"
+            );
+            match c.read_frame().unwrap() {
+                Frame::Close(Some(code), reason) => {
+                    assert_eq!(code, CLOSE_PROTOCOL_MISMATCH, "v{bad}");
+                    assert!(reason.contains("protocol mismatch"), "v{bad}: {reason}");
+                }
+                other => panic!("v{bad}: expected close 4002, got {other:?}"),
+            }
+        }
+        shutdown(f);
+    }
+
+    #[test]
+    fn hello_gate_accepts_the_exact_supported_version() {
+        let f = fixture("d7-accept", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        c.send_text(&format!(
+            r#"{{"type":"hello","clientId":"d7","protocol":{}}}"#,
+            PROTOCOL_VERSION
+        ))
+        .unwrap();
+        let ack = c.next_text().unwrap();
+        assert!(ack.contains("hello_ack"), "got: {ack}");
+        // the connection must stay open for the session
+        c.send_text(r#"{"type":"ping","commandId":"d7-ping"}"#)
+            .unwrap();
+        assert!(c.next_text().unwrap().contains("pong"));
         shutdown(f);
     }
 

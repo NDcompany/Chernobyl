@@ -115,6 +115,22 @@ test('protocol mismatch is rejected with 4002', async (t) => {
   assert.equal((await c.closed).code, 4002);
 });
 
+test('fractional and older protocol versions are rejected with 4002 (D7)', async (t) => {
+  const host = await createHost({ port: 0 });
+  t.after(() => host.close());
+
+  // 2.5 used to slip past the Rust gate via u32 truncation — both sides
+  // must reject it, plus any version older than PROTOCOL_VERSION
+  for (const protocol of [2.5, 1]) {
+    const c = await connect(host.url);
+    c.send({ type: 'hello', clientId: `d7-client-${protocol}`, protocol });
+    const ack = await waitFor<Ack>(c.messages, (m) => m.type === 'ack');
+    assert.equal(ack.ok, false, `v${protocol} must be rejected`);
+    assert.match(ack.error ?? '', /protocol mismatch/);
+    assert.equal((await c.closed).code, 4002, `v${protocol} must close 4002`);
+  }
+});
+
 test('token gate: missing token closes 4001, query and header both pass', async (t) => {
   const host = await createHost({ port: 0, token: 'sekrit' });
   t.after(() => host.close());
