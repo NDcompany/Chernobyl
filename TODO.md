@@ -231,13 +231,16 @@ Updated: 2026-10-23 (Phase 6 client round: ADR-012 + `@chernobyl/e2e` + QR `dev`
       revocation. **Security matrix green** (129 tests): expired/reused QR, revoked device, bad
       proof (MITM without PSK), frame replay, counter desync, tampered frame, paired-device
       reconnect, live revocation. Still owed: manual phone-scan gate with a real phone.
-- [~] Phase 5′: **transport-agnostic remote access** (ADR-011) — **posture half done**
-      (decisions D1/D2/D6 implemented + tested, `d12bf9e`; D8 outbound-queue bound, `24f8020`;
-      soak harness, `032257d`). The QR advertises a single dialable endpoint (`--endpoint`
-      override for LAN reachability, else `ws://bind:port`). Still owed: the full
-      **multi-endpoint** advertisement (LAN + optional tailnet / DDNS + port-forward /
-      cloudflared, with CGNAT-check how-tos), the **app-side ordered reconnect** across that
-      list (lands with Phase 6), and the optional-transport how-to docs.
+- [~] Phase 5′: **transport-agnostic remote access** (ADR-011) — **posture + multi-endpoint
+      done** (decisions D1/D2/D6 implemented + tested, `d12bf9e`; D8 outbound-queue bound,
+      `24f8020`; soak harness, `032257d`; **S10 multi-endpoint + ordered reconnect**,
+      `c5e77c1` — repeatable `--endpoint` → QR `ep` in CLI order, client ordered failover,
+      threat-model §3.9 review + S10 gate ✅ `74ce7f3`). Remaining transport decisions:
+      **D3 re-scheduled** with interim statement (ADR-013, S7 ✅ — token = connection-admission
+      only post-ADR-011; ticket flow deferred to the web-app milestone); **D4
+      recommendation only** (ADR-014, S8 ⛔ — terminate-on-revoke via in-process revoke, needs
+      product-owner ratification; not implemented, current restart-scoped semantics + exposure
+      documented). Optional-transport how-to docs still owed.
 - [~] Phase 6: mobile integration — **client + wiring done 2026-10-23** (ADR-012 `e7eec9d`,
       QR `dev` contract fix `4e9ff07`, `@chernobyl/e2e` + interop `e6f68b4`, app wiring
       `d5f828e`): crypto decision (pure-JS `@noble/*`, no build-model change), the real
