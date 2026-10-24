@@ -910,7 +910,9 @@ fn serve_ws(
                     && (protocol.fract() != 0.0 || *protocol as u32 != PROTOCOL_VERSION)
                 {
                     // write the mismatch ack synchronously, THEN close —
-                    // ordering must be guaranteed before the socket dies
+                    // ordering must be guaranteed before the socket dies.
+                    // Sealed when a session is live (wire contract), written
+                    // directly to `control` to keep the ack-before-close order.
                     let ack = ServerMsg::ack_err(
                         "hello",
                         &format!(
@@ -918,9 +920,16 @@ fn serve_ws(
                         ),
                     )
                     .to_text();
+                    let ack_payload = {
+                        let mut guard = outbound.session.lock().unwrap();
+                        match guard.as_mut() {
+                            Some(session) => session.seal(&ack),
+                            None => ack.clone(),
+                        }
+                    };
                     let _ = write_frame(
                         &mut control,
-                        &ws::encode_frame(ws::OP_TEXT, ack.as_bytes(), false),
+                        &ws::encode_frame(ws::OP_TEXT, ack_payload.as_bytes(), false),
                     );
                     let close = ws::encode_frame(
                         ws::OP_CLOSE,
@@ -1288,6 +1297,41 @@ mod e2e_tests {
         c.send_text(r#"{"type":"ping","commandId":"d7-ping"}"#)
             .unwrap();
         assert!(c.next_text().unwrap().contains("pong"));
+        shutdown(f);
+    }
+
+    /// Post-integration threat-model completeness (§3.10): the protocol-mismatch
+    /// ack is a side-channel frame. It is written directly to `control` (to
+    /// guarantee ack-before-close ordering), but it must STILL be sealed when a
+    /// session is live — the mobile app sends its `hello` *after* the handshake,
+    /// so a version-drift hits this path with a live session. A plaintext ack
+    /// here would break `handleSealed` (no plaintext fallback) right before the
+    /// close. This pins that the mismatch ack arrives sealed and openable.
+    #[test]
+    fn hello_gate_mismatch_ack_is_sealed_for_a_session_client() {
+        let f = fixture("d7-sealed-gate", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        let (_r, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        let mut sess = sess.unwrap();
+        // a version-drifted hello, sent SEALED over the live session
+        let hello = r#"{"type":"hello","clientId":"d7s","protocol":999}"#;
+        c.send_text(&sess.seal(hello)).unwrap();
+        // the mismatch ack must come back SEALED: it opens cleanly with the
+        // session and reports the protocol mismatch. A plaintext ack would
+        // fail sess.open (AEAD/counter) — the exact mobile breakage.
+        let frame = c.next_text().unwrap();
+        let ack = sess
+            .open(&frame)
+            .unwrap_or_else(|e| panic!("mismatch ack was not sealed: {e} ({frame})"));
+        assert!(ack.contains("protocol mismatch"), "got: {ack}");
+        // and the server still closes with 4002 after the sealed ack
+        match c.read_frame().unwrap() {
+            Frame::Close(Some(code), reason) => {
+                assert_eq!(code, CLOSE_PROTOCOL_MISMATCH);
+                assert!(reason.contains("protocol mismatch"), "got: {reason}");
+            }
+            other => panic!("expected close 4002, got {other:?}"),
+        }
         shutdown(f);
     }
 
