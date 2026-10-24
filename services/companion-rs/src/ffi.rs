@@ -146,6 +146,68 @@ pub fn shutdown_requested() -> bool {
     SHUTDOWN.load(Ordering::SeqCst)
 }
 
+// --- Console input mode (Phase 8 terminal TUI) ---
+// A keybind TUI needs one keystroke per read (no line buffering, no echo), and
+// arrow keys as VT escape sequences. These helpers flip the console input mode
+// and restore it on drop so the shell prompt is never left in raw mode.
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(n: u32) -> usize;
+    fn GetConsoleMode(handle: usize, mode: *mut u32) -> i32;
+    fn SetConsoleMode(handle: usize, mode: u32) -> i32;
+}
+
+const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6; // (DWORD)-10
+const INVALID_HANDLE_VALUE: usize = usize::MAX; // (HANDLE)-1
+const ENABLE_LINE_INPUT: u32 = 0x0002;
+const ENABLE_ECHO_INPUT: u32 = 0x0004;
+const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+/// Restores the saved console input mode when dropped.
+pub struct ConsoleInputMode {
+    handle: usize,
+    saved: u32,
+}
+
+impl Drop for ConsoleInputMode {
+    fn drop(&mut self) {
+        unsafe {
+            SetConsoleMode(self.handle, self.saved);
+        }
+    }
+}
+
+/// Puts the console input into raw, VT-translated mode so a TUI reads one
+/// keystroke per read and arrow keys arrive as `\x1b[A`…`\x1b[D`. Returns a
+/// guard that restores the previous mode on drop. Fails (without changing
+/// anything) when stdin is not a console — e.g. piped/redirected — so callers
+/// can fall back to line input instead of hanging.
+pub fn enable_raw_console_input() -> Result<ConsoleInputMode, String> {
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+            return Err("stdin is not a console".into());
+        }
+        let mut saved = 0u32;
+        if GetConsoleMode(handle, &mut saved) == 0 {
+            return Err(format!(
+                "GetConsoleMode failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let raw =
+            (saved & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) | ENABLE_VIRTUAL_TERMINAL_INPUT;
+        if SetConsoleMode(handle, raw) == 0 {
+            return Err(format!(
+                "SetConsoleMode failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(ConsoleInputMode { handle, saved })
+    }
+}
+
 /// Resident set size in bytes (working set).
 pub fn rss_bytes() -> u64 {
     unsafe {

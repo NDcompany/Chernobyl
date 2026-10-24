@@ -19,6 +19,8 @@
 //!                             CLI order; default ws://bind:port when none given)
 //!   --devices                list the paired-device registry, exit
 //!   --revoke <device-id>     revoke a paired device (blocks future E2E handshakes), exit
+//!   --tui                    boot the daemon and open the terminal UI (status,
+//!                            sessions, approvals, pairing, keybinds) on loopback
 //!   --version                print version and exit
 
 use chernobyl_companion::client::{WsClient, http_get};
@@ -56,6 +58,7 @@ fn run(args: &[String]) -> i32 {
     let mut backup_path: Option<String> = None;
     let mut restore_path: Option<String> = None;
     let mut background = false;
+    let mut tui = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -87,6 +90,7 @@ fn run(args: &[String]) -> i32 {
             "--backup" => backup_path = take(&mut i),
             "--restore" => restore_path = take(&mut i),
             "--background" => background = true,
+            "--tui" => tui = true,
             "--config" => config_path = take(&mut i),
             "--port" => port_override = take(&mut i).and_then(|v| v.parse().ok()),
             "--bind" => bind_override = take(&mut i),
@@ -228,6 +232,26 @@ fn run(args: &[String]) -> i32 {
         ffi::detach_console();
     }
 
+    // Phase 8 terminal UI (ADR-011 §5): `--tui` boots the daemon, then opens
+    // an interactive operator console as a loopback client of this same server.
+    // On quit (or Ctrl-C) the server and companion shut down cleanly. Built for
+    // the default loopback posture — a non-loopback bind still requires the E2E
+    // handshake, which the TUI surfaces verbatim rather than pretending to work.
+    if tui {
+        let addr = format!("127.0.0.1:{}", srv.port);
+        let res = chernobyl_companion::tui::run_tui(&addr, token_override.as_deref(), || {
+            pairing_block(&cfg, &endpoint_override).map(|b| b.render())
+        });
+        if let Err(e) = res {
+            eprintln!("[companion] tui error: {e}");
+        }
+        eprintln!("[companion] shutting down");
+        srv.stop();
+        companion.shutdown();
+        eprintln!("[companion] bye");
+        return 0;
+    }
+
     // ---- run ---------------------------------------------------------
     let start = std::time::Instant::now();
     loop {
@@ -276,58 +300,68 @@ fn autostart_value(exe: &std::path::Path, config_path: Option<&str>) -> String {
     value
 }
 
-/// `companion pair` — create a pairing offer, persist it to the shared journal
-/// (PSK DPAPI-protected so the on-disk record never holds it plaintext), and
-/// print the terminal QR the phone scans. The running daemon redeems the offer
-/// when the phone proves knowledge of the PSK during the E2E handshake.
-fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
+/// A pairing offer rendered for humans: the payload line, the terminal QR (or
+/// the encode error when the payload outran QR capacity), and the device line.
+struct PairingBlock {
+    payload: String,
+    qr: Result<String, String>,
+    device_line: String,
+}
+
+impl PairingBlock {
+    /// Everything in one block (payload + QR/note + device line) — what the
+    /// `--tui` pairing overlay shows; the CLI prints the same pieces separately
+    /// so a QR failure still lands the payload on stdout and exits 1.
+    fn render(&self) -> String {
+        let mut out = format!("payload: {}\n", self.payload);
+        match &self.qr {
+            Ok(q) => {
+                out.push_str(q);
+                out.push('\n');
+            }
+            Err(_) => out.push_str("[payload too large for QR — paste the payload line above]\n"),
+        }
+        out.push_str(&self.device_line);
+        out
+    }
+}
+
+/// Creates + persists a single-use pairing offer and renders it. Shared by
+/// `companion pair` (stdout) and the `--tui` pairing overlay; the running
+/// daemon redeems the offer when the phone proves PSK knowledge in the E2E
+/// handshake. Opens the same journal a running daemon uses, so the offer is
+/// visible to it (the documented `--pair`-against-a-running-daemon pattern).
+fn pairing_block(
+    cfg: &config::CompanionConfig,
+    endpoints: &[String],
+) -> Result<PairingBlock, String> {
     use chernobyl_companion::{base64, pairing, protocol, qr, storage};
 
-    // Open the same journal a running daemon uses, so the offer is visible.
-    let mut store = match storage::Storage::open(&cfg.data_dir, cfg.events_cap, cfg.commands_cap) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[companion] pair: cannot open store: {e}");
-            return 1;
-        }
-    };
+    let mut store = storage::Storage::open(&cfg.data_dir, cfg.events_cap, cfg.commands_cap)
+        .map_err(|e| format!("cannot open store: {e}"))?;
 
     // Stable host id, created on first pairing.
     let host_id = match store.kv.get("hostId") {
         Some(h) => h.clone(),
         None => {
-            let id = match ffi::csprng_bytes(8) {
-                Ok(b) => b.iter().map(|x| format!("{x:02x}")).collect::<String>(),
-                Err(e) => {
-                    eprintln!("[companion] pair: RNG failed: {e}");
-                    return 1;
-                }
-            };
-            if let Err(e) = store.put_kv("hostId", &id) {
-                eprintln!("[companion] pair: cannot persist hostId: {e}");
-                return 1;
-            }
+            let id = ffi::csprng_bytes(8)
+                .map_err(|e| format!("RNG failed: {e}"))?
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect::<String>();
+            store
+                .put_kv("hostId", &id)
+                .map_err(|e| format!("cannot persist hostId: {e}"))?;
             id
         }
     };
 
-    // Fresh single-use offer.
-    let offer = match pairing::PairingOffer::new(protocol::now_ms()) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("[companion] pair: offer failed: {e}");
-            return 1;
-        }
-    };
-
-    // Protect the PSK at rest before it touches the journal.
-    let psk_protected = match ffi::dpapi_protect(&offer.psk).map(|c| base64::encode(&c)) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("[companion] pair: cannot protect PSK: {e}");
-            return 1;
-        }
-    };
+    // Fresh single-use offer, PSK protected at rest before it touches disk.
+    let offer =
+        pairing::PairingOffer::new(protocol::now_ms()).map_err(|e| format!("offer failed: {e}"))?;
+    let psk_protected = ffi::dpapi_protect(&offer.psk)
+        .map(|c| base64::encode(&c))
+        .map_err(|e| format!("cannot protect PSK: {e}"))?;
     let rec = storage::PairingRecord {
         device_id: offer.device_id.clone(),
         psk_protected,
@@ -336,12 +370,10 @@ fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
         expires_at: offer.expires_at,
         consumed: false,
     };
-    if let Err(e) = store.put_pairing(&rec) {
-        eprintln!("[companion] pair: cannot persist offer: {e}");
-        return 1;
-    }
+    store
+        .put_pairing(&rec)
+        .map_err(|e| format!("cannot persist offer: {e}"))?;
 
-    // Endpoint the phone should dial (override for LAN reachability: a loopback
     // Endpoint list for the QR (ADR-011 §2 / S10): every --endpoint flag is
     // advertised in CLI order; with none given, the bind address stands alone
     // (bind is not dialable from a phone — pass `--endpoint ws://<lan-ip>:<port>`,
@@ -352,28 +384,52 @@ fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
         endpoints.to_vec()
     };
     let payload = offer.payload_json(&host_id, &eps);
-
-    // The payload prints BEFORE the QR: a long endpoint list that outruns QR
-    // capacity still yields a pasteable credential (QR failure = warning + exit 1).
-    println!("payload: {payload}");
-    match qr::encode(payload.as_bytes()) {
-        Ok(q) => {
-            println!("{}", qr::render_terminal(&q));
-            println!();
-        }
-        Err(e) => {
-            eprintln!(
-                "[companion] pair: payload too large for QR ({e}) — paste the payload line instead"
-            );
-            return 1;
-        }
-    }
-    println!(
+    let qr = qr::encode(payload.as_bytes())
+        .map(|q| qr::render_terminal(&q))
+        .map_err(|e| e.to_string());
+    let device_line = format!(
         "device {} — valid {}s, single-use (scan with the phone)",
         offer.device_id,
         pairing::PAIRING_TTL_MS / 1000
     );
-    0
+    Ok(PairingBlock {
+        payload,
+        qr,
+        device_line,
+    })
+}
+
+/// `companion pair` — create a pairing offer, persist it to the shared journal
+/// (PSK DPAPI-protected so the on-disk record never holds it plaintext), and
+/// print the terminal QR the phone scans. The running daemon redeems the offer
+/// when the phone proves knowledge of the PSK during the E2E handshake.
+fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
+    match pairing_block(cfg, endpoints) {
+        Err(e) => {
+            eprintln!("[companion] pair: {e}");
+            1
+        }
+        Ok(b) => {
+            // The payload prints BEFORE the QR: a long endpoint list that
+            // outruns QR capacity still yields a pasteable credential
+            // (QR failure = warning + exit 1).
+            println!("payload: {}", b.payload);
+            match &b.qr {
+                Ok(q) => {
+                    println!("{q}");
+                    println!();
+                    println!("{}", b.device_line);
+                    0
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[companion] pair: payload too large for QR ({e}) — paste the payload line instead"
+                    );
+                    1
+                }
+            }
+        }
+    }
 }
 
 /// `companion devices` — list the paired-device registry (id, name, paired-at,

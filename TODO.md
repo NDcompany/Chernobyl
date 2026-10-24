@@ -1,6 +1,6 @@
 # CHERNOBYL — TODO
 
-Updated: 2026-10-23 (Phase 6 client round: ADR-012 + `@chernobyl/e2e` + QR `dev` fix + real-companion interop 13/13 + app wiring; 24 h soak for S11 running in the frozen `G:\Chernobyl-soak` worktree). Status of the Rust companion rewrite + everything left.
+Updated: 2026-10-24 (Phase 8 complete: TUI + pairing overlay + windowless autostart + packaging ADR-007; client read-timeout cross-handle fix; 24 h soak for S11 running in the frozen `G:\Chernobyl-soak` worktree). Status of the Rust companion rewrite + everything left.
 
 ## Done
 
@@ -263,17 +263,29 @@ Updated: 2026-10-23 (Phase 6 client round: ADR-012 + `@chernobyl/e2e` + QR `dev`
       `SessionStart` live-verified (real 2.1.309 capture), other shapes parse defensively and report
       `limited`. PRD §7.5 "do not assume" list honored: session.list/create/prompt/interrupt +
       permission.review reported `unavailable`.
-- [ ] Phase 8: **TUI** (status, sessions, approvals with keybinds, pairing flow) + windowless
-      autostart host + packaging (ADR-007) + backup/restore, log redaction, local metrics.
+- [x] Phase 8: **TUI** + windowless autostart host + packaging (ADR-007) + backup/restore,
+      log redaction, local metrics — **complete 2026-10-24.**
       (FCM push removed — replaced by Phase 6 persistent-WS notifications.)
-      **Ops core done 2026-10-23 (`2dccf42`):** `/metrics` on the loopback diagnostics listener
+      **Ops core (`2dccf42`):** `/metrics` on the loopback diagnostics listener
       only (Prometheus text; never on the main listener); endpoint-credential redaction at the
       root (`split_url` strips `user:pass@` from the authority so it never reaches the `Host:`
       header or error text); and a real transport fix — the main-listener POST reject path now
       drains the (capped) body before closing (Windows RST-on-unread-body race that made the
       Claude-hook test intermittently fail). `companion claude-hooks` prints the settings.json
-      bridge snippet (explicit install — never auto-writes the user's settings). Remaining:
-      backup/restore, windowless autostart host, packaging (ADR-007 checksums), TUI.
+      bridge snippet (explicit install — never auto-writes the user's settings).
+      **Backup/restore + windowless autostart (`95d084f`, `39ce2ed`), packaging (`0fe365e`,
+      ADR-007: published SHA-256 checksums + SmartScreen guidance).**
+      **Terminal TUI (this checkpoint):** `src/tui.rs` — pure/testable core (state model,
+      ANSI render, key decode, keybinds) + thin interactive loop on the in-repo WS client;
+      `--tui` boots the daemon in-process and opens a loopback operator console (sessions,
+      pending approvals with risk colors, selection, approve-once/reject, refresh, help,
+      pairing overlay with payload + QR via the shared `pairing_block`, inert keys while the
+      overlay is open). Raw console via new FFI `enable_raw_console_input` (VT input,
+      restore-on-drop; falls back when stdin is not a console). While wiring it, fixed a
+      real client bug: on Windows `TcpStream::try_clone` duplicates do NOT inherit socket
+      options, so the read timeout set on the writer never bounded reads through the
+      `BufReader` handle (dead 10 s bound in `connect`; `next_text_matching` could hang
+      forever mid-match) — timeouts now set on the reading handle at all three sites.
 - [ ] Phase 9: release gate — no mock advertised as real (PRD §13.1); E2E crypto known-answer
       tests + adversarial matrix green.
 

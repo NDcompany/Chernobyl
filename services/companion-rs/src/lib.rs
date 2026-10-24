@@ -6,8 +6,8 @@
 //! (crash-safe journal), backup (Phase 8 journal backup/restore), config,
 //! adapters, opencode (Phase 3 OpenCode adapter), ollama (Phase 7
 //! model-runtime adapter), claude (Phase 7 hook ingress), companion
-//! (orchestration), server (WS/HTTP), client (test client), ffi (Windows
-//! console/memory).
+//! (orchestration), server (WS/HTTP), client (test client), tui (Phase 8
+//! terminal UI), ffi (Windows console/memory).
 
 pub mod adapters;
 pub mod backup;
@@ -30,4 +30,5 @@ pub mod seed;
 pub mod server;
 pub mod sha1;
 pub mod storage;
+pub mod tui;
 pub mod ws;

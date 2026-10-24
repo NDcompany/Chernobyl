@@ -41,6 +41,7 @@ Run the pieces:
 cargo run --release --manifest-path services/companion-rs/Cargo.toml
 #   default ws://127.0.0.1:8787 (+ loopback diagnostics on 9487)
 #   add --token <t> (or HOST_TOKEN=...) to require auth; --pair to print a pairing QR
+#   add --tui to boot with the terminal UI (status / sessions / approvals keybinds)
 
 npm run dev:mobile   # Expo dev server (press a / w for Android / web)
 npm run dev:host     # OPTIONAL: Node reference host (MockEngine) for differential testing
@@ -107,14 +108,18 @@ protocol-v2 the mobile app already emits:
   (`hs_hello → hs_challenge → hs_proof → hs_ok`) proves mutual PSK knowledge; from
   `hs_ok` on every frame is ChaCha20-Poly1305-sealed with HKDF directional keys and a
   monotonic counter nonce (replay/tamper-proof). Revocation blocks a device at its next
-  handshake. See `services/companion-rs/README.md` for the exact wire format.
+  handshake (an already-established session survives until the companion restarts —
+  ADR-014 proposes terminate-on-revoke and awaits product-owner ratification).
+  See `services/companion-rs/README.md` for the exact wire format.
 - **Posture policies (decisions D1/D2/D6)** — a WS upgrade carrying a browser `Origin`
   is refused `403` (no browsers until the web app); beyond loopback every command
   requires a live E2E session (a stolen token alone gets an explicit error, never
   execution); and `/health` on the main listener beyond loopback requires the token.
 - **Adapters** — an attach-only OpenCode adapter (HTTP/SSE to an existing
-  `opencode serve`) plus the in-process `mock` engine. Claude Code / Ollama / Hermes are
-  not wired yet (Phase 7).
+  `opencode serve`), an Ollama model-runtime adapter (attach-only, explicit endpoint),
+  a Claude Code hook ingress (loopback diagnostics POST only), and the in-process
+  `mock` engine. Hermes is deferred by ADR-008 (not installed on this machine —
+  not stubbed). Phase 7 complete.
 
 ### `services/host` — TypeScript reference host (Node + ws)
 
@@ -130,14 +135,15 @@ production backend — use the companion for real connections.
   persistent **"Simulation"** badge while the mock is active so demo data is never
   mistaken for a real agent.
 - **Real agent integration**: the OpenCode adapter is wired end-to-end (attach-only
-  HTTP/SSE to an existing `opencode serve`, no spawned server). Claude Code / Ollama /
-  Hermes adapters are not implemented yet (Phase 7). When no healthy real runtime is
+  HTTP/SSE to an existing `opencode serve`, no spawned server); Ollama (model runtime)
+  and Claude Code (hook ingress) landed in Phase 7; Hermes is deferred (ADR-008 — not
+  installed here, deliberately not stubbed). When no healthy real runtime is
   attached, sessions/agents fall back to the mock seed — the UI must not present that
   as live activity.
-- **E2E pairing is complete on the backend but the phone client is not built yet**
-  (Phase 6). The wire format the phone must implement is documented and frozen in
-  `services/companion-rs/README.md`; the server side is implemented and covered by an
-  adversarial test matrix.
+- **The mobile E2E client is built but never validated on a physical device**
+  (Phase 6 code complete: pure-JS crypto per ADR-012, pairing scan, sealed frames,
+  endpoint-list reconnect). Every row in `docs/validation/PHONE-VALIDATION-CHECKLIST.md`
+  is NOT RUN/BLOCKED until someone scans a QR with a real Android phone.
 - **Notifications are local-only while the app is open.** Backgrounded delivery is
   designed as a persistent WebSocket + Android foreground service posting local
   notifications (ADR-011 — FCM/APNs deliberately dropped). No delivery while the socket
@@ -176,19 +182,17 @@ physical phone validation is tracked in `docs/validation/PHONE-VALIDATION-CHECKL
 
 ## Remaining work (honest status)
 
-The Rust backend, protocol, crypto, pairing, adapters and the Phase 8 operations
-core are implemented and tested (Phases 0–8 mostly complete). What is left:
+The Rust backend, protocol, crypto, pairing, adapters and Phase 8 (ops core,
+packaging, windowless autostart, terminal TUI) are implemented and tested
+(Phases 0–8 complete). What is left:
 
-1. **Phase 8 — terminal TUI.** The ops core (metrics, backup/restore, windowless
-   autostart, packaging) is done; a hand-rolled terminal UI (status, sessions,
-   approvals with keybinds, pairing flow) is the remaining Phase 8 item.
-2. **Physical-device validation** — `docs/validation/PHONE-VALIDATION-CHECKLIST.md`,
+1. **Physical-device validation** — `docs/validation/PHONE-VALIDATION-CHECKLIST.md`,
    all rows NOT RUN/BLOCKED (needs a real Android phone).
-3. **24-hour soak** for the S11 release gate (`npm run soak:long -- --duration 86400`;
+2. **24-hour soak** for the S11 release gate (`npm run soak:long -- --duration 86400`;
    the machine must stay awake).
-4. **Independent security assessment** (S9) — automated tests + review are not a
+3. **Independent security assessment** (S9) — automated tests + review are not a
    substitute for it.
-5. **D4 / S8** — live-session revocation awaits product-owner ratification of the
+4. **D4 / S8** — live-session revocation awaits product-owner ratification of the
    ADR-014 recommendation (terminate-on-revoke via an in-process revoke path).
 
 See `docs/decisions/PHASE5-THREAT-MODEL.md` §6 for the per-gate status and the exact

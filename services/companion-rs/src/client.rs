@@ -17,9 +17,6 @@ impl WsClient {
     /// Connects, performs the WS handshake, and validates the accept key.
     pub fn connect(addr: &str, path: &str, token: Option<&str>) -> Result<WsClient, String> {
         let stream = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|e| e.to_string())?;
         let mut key_src = [0u8; 16];
         // deterministic nonce is fine for a client; servers accept any 16 bytes
         for (i, b) in key_src.iter_mut().enumerate() {
@@ -40,6 +37,15 @@ impl WsClient {
 
         // read the response head
         let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        // Read timeouts must be set on the READING handle: try_clone
+        // duplicates the socket, and the duplicate does not inherit socket
+        // options — a timeout set on the writer never bounded reads through
+        // the reader (found via the Phase 8 TUI, whose reader thread blocked
+        // forever holding the connection lock).
+        reader
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| e.to_string())?;
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         loop {
@@ -118,7 +124,8 @@ impl WsClient {
         pred: impl Fn(&str) -> bool,
         timeout: Duration,
     ) -> Result<String, String> {
-        self.stream
+        self.reader
+            .get_mut()
             .set_read_timeout(Some(timeout))
             .map_err(|e| e.to_string())?;
         let out = loop {
@@ -127,7 +134,8 @@ impl WsClient {
                 break text;
             }
         };
-        self.stream
+        self.reader
+            .get_mut()
             .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|e| e.to_string())?;
         Ok(out)
@@ -142,6 +150,46 @@ impl WsClient {
             return Err(format!("expected hello_ack, got: {ack}"));
         }
         Ok(crate::json::get_i64(&v, "lastSeq").unwrap_or(-1))
+    }
+
+    /// Sets the socket read timeout on the reading handle (see `connect` for
+    /// why it must not be set on the writer handle).
+    pub fn set_read_timeout_ms(&mut self, ms: u64) -> Result<(), String> {
+        self.reader
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(ms)))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Non-blocking-ish read for a poll loop: `Ok(Some(text))` for a text
+    /// frame, `Ok(None)` when no data arrived before the read timeout (the
+    /// caller keeps polling), `Err` on a real disconnect/close/protocol error.
+    /// Answers pings and skips other control frames, like `next_text`.
+    pub fn next_text_timeoutable(&mut self) -> Result<Option<String>, String> {
+        loop {
+            match ws::read_frame(&mut self.reader, false) {
+                Ok(Frame::Text(p)) => {
+                    return String::from_utf8(p)
+                        .map(Some)
+                        .map_err(|_| "text frame was not utf-8".into());
+                }
+                Ok(Frame::Ping(p)) => {
+                    let pong = ws::encode_frame(ws::OP_PONG, &p, true);
+                    self.stream.write_all(&pong).map_err(|e| e.to_string())?;
+                }
+                Ok(Frame::Close(code, reason)) => {
+                    return Err(format!("closed by server: {code:?} {reason}"));
+                }
+                Ok(_) => {}
+                Err(ws::WsError::Io(e))
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(format!("read: {e:?}")),
+            }
+        }
     }
 }
 

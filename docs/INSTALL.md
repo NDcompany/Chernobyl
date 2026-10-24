@@ -48,6 +48,9 @@ on any mismatch or missing file. Do this **before** you run an unsigned binary.
 .\chernobyl-companion.exe                 # loopback ws://127.0.0.1:8787 (+ diag 9487)
 .\chernobyl-companion.exe --token <t>     # require a token (or set HOST_TOKEN)
 .\chernobyl-companion.exe --pair          # print a single-use pairing QR
+.\chernobyl-companion.exe --tui           # boot + terminal UI: sessions & approvals
+                                          # (j/k move, a approve, x reject, r refresh,
+                                          #  ? help, q quit) — loopback operator console
 .\chernobyl-companion.exe --background    # windowless (used by autostart)
 ```
 
