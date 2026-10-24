@@ -134,7 +134,10 @@ impl Companion {
                 // terminated (its read loop closes the socket) and dropped
                 // from the registry; the engine is never parked by a slow
                 // client and no event is silently dropped for healthy ones.
-                clients.retain(|(_, q)| q.enqueue(text.clone().into_bytes()).is_ok());
+                // Events are sealed per connection (wire contract: from hs_ok
+                // on every frame is sealed) — enqueue_sealed seals for session
+                // clients and passes plaintext through for loopback parity.
+                clients.retain(|(_, q)| q.enqueue_sealed(text.clone().into_bytes()).is_ok());
             }),
         );
 

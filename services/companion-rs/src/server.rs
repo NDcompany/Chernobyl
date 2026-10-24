@@ -15,9 +15,9 @@ use crate::storage::DeviceRecord;
 use crate::ws::{self, Frame, Handshake};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -572,6 +572,14 @@ pub struct Outbound {
     queued_bytes: Arc<AtomicUsize>,
     /// set on saturation/disconnect: the read loop must tear this connection down
     terminated: AtomicBool,
+    /// The live E2E session for this connection (ADR-011). Shared with the
+    /// read loop (which installs it on `hs_ok`) and with the engine fan-out
+    /// (which seals events per connection) so that EVERY outbound frame —
+    /// reply, event, or side-channel — is sealed once a session exists, as
+    /// the wire contract requires ("from `hs_ok` on every frame is sealed").
+    /// Seal-then-enqueue happens under this lock so the AEAD counter order
+    /// always matches the FIFO wire order.
+    session: Mutex<Option<e2e::Session>>,
 }
 
 /// Why an outbound message could not be queued. Both variants end the
@@ -592,9 +600,44 @@ impl Outbound {
                 tx,
                 queued_bytes: Arc::new(AtomicUsize::new(0)),
                 terminated: AtomicBool::new(false),
+                session: Mutex::new(None),
             }),
             rx,
         )
+    }
+
+    /// Install the live E2E session (called by the read loop on `hs_ok`).
+    /// From this point every frame this connection sends is sealed.
+    pub(crate) fn set_session(&self, session: e2e::Session) {
+        *self.session.lock().unwrap() = Some(session);
+    }
+
+    /// True once an E2E session is live for this connection.
+    pub(crate) fn has_session(&self) -> bool {
+        self.session.lock().unwrap().is_some()
+    }
+
+    /// Queue one plaintext for this connection, sealing it first when a
+    /// session is live. This is the single outbound sealing point the wire
+    /// contract requires: replies, events, and side-channel frames all pass
+    /// through here (or `enqueue` for the pre-session plaintext phase).
+    /// Seal-then-enqueue is done under the session lock so the AEAD counter
+    /// order always matches the FIFO wire order — the client's strict
+    /// monotonic `open` would otherwise see a reordering as replay/desync.
+    /// With no session the plaintext is enqueued verbatim (loopback parity).
+    pub(crate) fn enqueue_sealed(&self, plaintext: Vec<u8>) -> Result<(), EnqueueError> {
+        let mut guard = self.session.lock().unwrap();
+        let payload = match guard.as_mut() {
+            Some(session) => {
+                // plaintext is always UTF-8 JSON from `to_text()`; seal it.
+                let text = String::from_utf8_lossy(&plaintext);
+                session.seal(&text).into_bytes()
+            }
+            None => plaintext,
+        };
+        // enqueue under the same lock so no other producer can interleave a
+        // frame between this seal and its position on the wire
+        self.enqueue(payload)
     }
 
     /// Reserve payload bytes against the byte bound; fails without side
@@ -714,9 +757,9 @@ fn serve_ws(
         .push((conn_id, outbound.clone()));
 
     let mut misses: u32 = 0;
-    // E2E session (ADR-011): `e2e` is live once a handshake succeeds; `hs`
-    // holds the in-flight handshake between hs_hello and hs_proof.
-    let mut e2e: Option<e2e::Session> = None;
+    // The live E2E session now lives in `outbound.session` (shared with the
+    // fan-out path so events are sealed too). `hs` holds the in-flight
+    // handshake between hs_hello and hs_proof.
     let mut hs: Option<HsPending> = None;
 
     let result: io::Result<()> = loop {
@@ -760,18 +803,21 @@ fn serve_ws(
             Frame::Close(_, _) => break Ok(()),
             Frame::Text(payload) => {
                 // When an E2E session is live the frame is sealed: open it first
-                // and tear the connection down on replay / desync / tamper.
-                let plaintext: String = if let Some(session) = e2e.as_mut() {
-                    let p = match std::str::from_utf8(&payload) {
-                        Ok(s) => s.to_string(),
-                        Err(_) => break Err(io::Error::other("e2e: non-utf8 sealed frame")),
-                    };
-                    match session.open(&p) {
-                        Ok(t) => t,
-                        Err(reason) => break Err(io::Error::other(format!("e2e: {reason}"))),
-                    }
-                } else {
-                    match String::from_utf8(payload) {
+                // and tear the connection down on replay / desync / tamper. The
+                // session lock is released before any path that re-enters it
+                // (send_malformed → enqueue_sealed).
+                let opened: Option<Result<String, String>> = {
+                    let mut guard = outbound.session.lock().unwrap();
+                    guard.as_mut().map(|session| {
+                        std::str::from_utf8(&payload)
+                            .map_err(|_| "non-utf8 sealed frame".to_string())
+                            .and_then(|s| session.open(s))
+                    })
+                };
+                let plaintext: String = match opened {
+                    Some(Ok(t)) => t,
+                    Some(Err(reason)) => break Err(io::Error::other(format!("e2e: {reason}"))),
+                    None => match String::from_utf8(payload) {
                         Ok(s) => s,
                         Err(_) => {
                             if send_malformed(&outbound, &companion).is_err() {
@@ -779,7 +825,7 @@ fn serve_ws(
                             }
                             continue;
                         }
-                    }
+                    },
                 };
                 let Some(msg) = parse_client_message(&plaintext) else {
                     if send_malformed(&outbound, &companion).is_err() {
@@ -788,7 +834,7 @@ fn serve_ws(
                     continue;
                 };
                 // E2E handshake control (plaintext phase only, before a session)
-                if e2e.is_none() {
+                if !outbound.has_session() {
                     match &msg {
                         ClientMsg::HsHello { device_id } => {
                             let (nonce, salt) = e2e::fresh_nonce_salt();
@@ -825,7 +871,7 @@ fn serve_ws(
                                     {
                                         break Err(io::Error::other("outbound queue saturated"));
                                     }
-                                    e2e = Some(session);
+                                    outbound.set_session(session);
                                 }
                                 Err(reason) => {
                                     if hs_err(&outbound, &reason).is_err() {
@@ -847,7 +893,7 @@ fn serve_ws(
                 // else gets an explicit refusal it can recover from by
                 // completing the handshake, never silent execution.
                 if require_e2e
-                    && e2e.is_none()
+                    && !outbound.has_session()
                     && !matches!(msg, ClientMsg::Hello { .. } | ClientMsg::Ping { .. })
                 {
                     let cid = msg.command_id().unwrap_or("unknown").to_string();
@@ -895,11 +941,7 @@ fn serve_ws(
                 };
                 if let Some(reply) = reply {
                     let text = reply.to_text();
-                    let out = match e2e.as_mut() {
-                        Some(session) => session.seal(&text).into_bytes(),
-                        None => text.into_bytes(),
-                    };
-                    if outbound.enqueue(out).is_err() {
+                    if outbound.enqueue_sealed(text.into_bytes()).is_err() {
                         break Err(io::Error::other("outbound queue saturated"));
                     }
                 }
@@ -941,7 +983,8 @@ fn serve_ws(
 
 fn send_malformed(outbound: &Outbound, companion: &Companion) -> Result<(), EnqueueError> {
     companion.malformed_total.fetch_add(1, Ordering::Relaxed);
-    outbound.enqueue(
+    // side-channel frame: sealed when a session is live (wire contract)
+    outbound.enqueue_sealed(
         ServerMsg::ack_err("invalid", "malformed message")
             .to_text()
             .into_bytes(),
@@ -1133,6 +1176,51 @@ mod e2e_tests {
         assert!(
             c.next_text().is_err(),
             "server must close the connection on frame replay"
+        );
+        shutdown(f);
+    }
+
+    /// Post-integration threat-model fix: once a session is live, EVERY
+    /// outbound frame — not just replies but also fan-out events — must be
+    /// sealed. A plaintext event reaching a paired phone makes `handleSealed`
+    /// fail to open it and tear the socket down (the mobile client has no
+    /// plaintext fallback). This pins that an event fanned out to a
+    /// session-bearing connection arrives sealed and openable.
+    #[test]
+    fn fanout_event_to_session_client_is_sealed() {
+        let f = fixture("sealed-event", now_ms() + 60_000, false);
+        let mut actor = connect(&f);
+        let (_r, sess) = attempt(&mut actor, &f.psk, &f.device_id);
+        let mut sess = sess.unwrap();
+        // A second (watcher) connection with its OWN session: the event must
+        // reach it sealed too, proving the fan-out seals per connection.
+        let mut watcher = connect(&f);
+        let (_r2, wsess) = attempt(&mut watcher, &f.psk, &f.device_id);
+        let mut wsess = wsess.unwrap();
+
+        // actor creates a session over its sealed channel → server fans out a
+        // session_created event to BOTH connections.
+        let create = r#"{"type":"create_session","commandId":"fan-1","agentId":"a4","title":"Fanout","prompt":"p"}"#;
+        actor.send_text(&sess.seal(create)).unwrap();
+        // The watcher must receive the event SEALED: it opens cleanly with the
+        // watcher session and parses to a session_created event. A plaintext
+        // event would fail wsess.open (AEAD/counter) — the exact mobile bug.
+        let mut got_sealed_event = false;
+        for _ in 0..32 {
+            let frame = watcher.next_text().unwrap();
+            let inner = match wsess.open(&frame) {
+                Ok(t) => t,
+                Err(e) => panic!("watcher received a non-sealed frame: {e} ({frame})"),
+            };
+            let v = json::parse(&inner).unwrap();
+            if json::get(&v, "type").and_then(json::as_str) == Some("session_created") {
+                got_sealed_event = true;
+                break;
+            }
+        }
+        assert!(
+            got_sealed_event,
+            "watcher never saw a sealed session_created event"
         );
         shutdown(f);
     }
