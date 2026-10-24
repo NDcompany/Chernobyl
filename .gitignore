@@ -34,3 +34,6 @@ coverage/
 
 # Rust
 target/
+
+# Generated packaging checksums (regenerate with scripts/package-release.mjs)
+release/

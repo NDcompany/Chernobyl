@@ -30,6 +30,10 @@ npm run verify       # TS: typecheck + lint + tests + builds + android export
 npm run verify:rust  # Rust runtime: tests + clippy + fmt + self-test
 ```
 
+Building + verifying a release binary, install/autostart, backup/restore, and
+SmartScreen troubleshooting: see [`docs/INSTALL.md`](docs/INSTALL.md) (ADR-007 —
+unsigned binary + published SHA-256 checksums).
+
 Run the pieces:
 
 ```powershell
@@ -172,23 +176,20 @@ physical phone validation is tracked in `docs/validation/PHONE-VALIDATION-CHECKL
 
 ## Remaining work (honest status)
 
-The Rust backend, protocol, crypto, pairing and the OpenCode adapter are implemented and
-tested (Phases 0–5′ complete). What is left:
+The Rust backend, protocol, crypto, pairing, adapters and the Phase 8 operations
+core are implemented and tested (Phases 0–8 mostly complete). What is left:
 
-1. **Phase 6 — mobile E2E/pairing client.** Scan the pairing QR, run the `hs_*` handshake,
-   seal/open frames with the documented wire format, store the per-device PSK in the
-   keystore, reconnect by trying the advertised endpoint list (ADR-011 §2), and add the
-   Android foreground service + persistent WS + local notifications. Blocked on a
-   mobile crypto-stack + native-module decision (pure-JS vs native crypto/camera) and on
-   a physical Android device for validation.
-2. **Phase 7 — additional adapters** (Claude Code, Ollama, Hermes) as Rust modules.
-3. **Phase 8 — terminal TUI + windowless autostart host** (ADR-011 §5).
-4. **Physical-device validation** — `docs/validation/PHONE-VALIDATION-CHECKLIST.md`, all
-   rows NOT RUN/BLOCKED (needs a real Android phone + the Phase 6 client).
-5. **24-hour soak** for the S11 release gate (`npm run soak:long -- --duration 86400`;
-   the machine must stay awake — an earlier attempt died ~4.7 h on PC sleep).
-6. **Independent security assessment** (S9) — automated tests + review are not a
+1. **Phase 8 — terminal TUI.** The ops core (metrics, backup/restore, windowless
+   autostart, packaging) is done; a hand-rolled terminal UI (status, sessions,
+   approvals with keybinds, pairing flow) is the remaining Phase 8 item.
+2. **Physical-device validation** — `docs/validation/PHONE-VALIDATION-CHECKLIST.md`,
+   all rows NOT RUN/BLOCKED (needs a real Android phone).
+3. **24-hour soak** for the S11 release gate (`npm run soak:long -- --duration 86400`;
+   the machine must stay awake).
+4. **Independent security assessment** (S9) — automated tests + review are not a
    substitute for it.
+5. **D4 / S8** — live-session revocation awaits product-owner ratification of the
+   ADR-014 recommendation (terminate-on-revoke via an in-process revoke path).
 
 See `docs/decisions/PHASE5-THREAT-MODEL.md` §6 for the per-gate status and the exact
 evidence each gate is waiting on.
