@@ -713,6 +713,42 @@ fn run_writer(
     }
 }
 
+/// RAII teardown for one live connection (mandate §2): unregister, stop and
+/// join the writer on *every* exit path — normal EOF, protocol violation,
+/// saturation, `?` failure, or an unwind from a poisoned lock — so a panic
+/// can never leak a registry entry, an orphaned `ws-writer` thread, or a
+/// half-open socket. Teardown is idempotent: explicit `teardown()` runs it,
+/// `Drop` runs it again as the unwind safety net and finds nothing to do.
+struct ConnGuard {
+    shared: Arc<crate::companion::Shared>,
+    conn_id: u64,
+    writer_stop: Arc<AtomicBool>,
+    writer: Option<thread::JoinHandle<()>>,
+}
+
+impl ConnGuard {
+    fn teardown(&mut self) {
+        // cleanup must never panic: a poisoned registry lock still has to
+        // yield its contents to the retain below
+        let mut list = match self.shared.clients.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        list.retain(|(id, _)| *id != self.conn_id);
+        drop(list);
+        self.writer_stop.store(true, Ordering::SeqCst);
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
 fn serve_ws(
     mut reader: TcpStream,
     writer: TcpStream,
@@ -755,6 +791,15 @@ fn serve_ws(
         .lock()
         .unwrap()
         .push((conn_id, outbound.clone()));
+    // from here on teardown is owned by the guard: it runs on return, on `?`,
+    // and on unwind (see ConnGuard) — the inline cleanup can no longer be
+    // skipped by a panic above
+    let mut guard = ConnGuard {
+        shared: companion.shared.clone(),
+        conn_id,
+        writer_stop: writer_stop.clone(),
+        writer: Some(writer_thread),
+    };
 
     let mut misses: u32 = 0;
     // The live E2E session now lives in `outbound.session` (shared with the
@@ -964,15 +1009,9 @@ fn serve_ws(
         }
     };
 
-    // teardown: unregister, stop the writer, drop the socket
-    companion
-        .shared
-        .clients
-        .lock()
-        .unwrap()
-        .retain(|(id, _)| *id != conn_id);
-    writer_stop.store(true, Ordering::SeqCst);
-    let _ = writer_thread.join();
+    // teardown: unregister, stop the writer, drop the socket — routed
+    // through the guard so the same three steps also run on unwind
+    guard.teardown();
     // normal client disconnects (FIN/RST) are not worth logging; anything
     // else is a real anomaly worth a line on stderr
     if let Err(e) = &result {
@@ -1900,5 +1939,67 @@ mod e2e_tests {
         assert!(resp.contains("hs_ok"), "got: {resp}");
         assert!(sess.is_some());
         shutdown(f);
+    }
+
+    /* ---- mandate §2: unwind-safe teardown (ConnGuard) -------------- */
+
+    #[test]
+    fn conn_guard_teardown_runs_on_unwind_and_is_idempotent() {
+        // Regression for P1: a panic on the connection thread (e.g. a
+        // poisoned registry/session lock) used to skip the inline teardown,
+        // leaking the registry entry and the ws-writer thread forever.
+        let dir = temp_dir("guard");
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Companion::boot(c).unwrap();
+
+        let (outbound, _rx) = Outbound::new();
+        companion.shared.clients.lock().unwrap().push((7, outbound));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let wstop = stop.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            while !wstop.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let _ = tx.send(());
+        });
+
+        let shared = companion.shared.clone();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut guard = ConnGuard {
+                shared,
+                conn_id: 7,
+                writer_stop: stop,
+                writer: Some(writer),
+            };
+            let _ = &mut guard;
+            panic!("simulated handler panic");
+        }));
+        assert!(panic.is_err(), "the test panic must propagate");
+
+        // the unwind path must have completed BOTH teardown steps
+        assert_eq!(
+            companion.shared.clients.lock().unwrap().len(),
+            0,
+            "registry entry leaked after a panic"
+        );
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("writer thread must be stopped and joined after an unwind");
+
+        // a second teardown (explicit + Drop) must be a harmless no-op
+        let mut again = ConnGuard {
+            shared: companion.shared.clone(),
+            conn_id: 7,
+            writer_stop: Arc::new(AtomicBool::new(false)),
+            writer: None,
+        };
+        again.teardown();
+        drop(again);
+        assert_eq!(companion.shared.clients.lock().unwrap().len(), 0);
+
+        companion.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
