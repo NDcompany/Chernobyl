@@ -1,3 +1,5 @@
+// first: the E2E handshake needs crypto.getRandomValues (Hermes has none)
+import '@/platform/random';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { QueryClientProvider } from '@tanstack/react-query';
