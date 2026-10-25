@@ -25,6 +25,10 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// one long-running process instead of only across restarts.
 const JOURNAL_COMPACT_TRIGGER_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Newest audit records kept (docs/PRIVACY.md): the trail is a few records
+/// per boot, but nothing in the journal may grow without a bound (mandate §4).
+const AUDIT_KEEP: usize = 1000;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandRecord {
     pub command_id: String,
@@ -411,7 +415,7 @@ impl Storage {
                 }
             }
             "audit" => {
-                self.audit.push(AuditRecord {
+                self.push_audit(AuditRecord {
                     ts: gi("ts"),
                     kind: gs("auditKind").unwrap_or_default(),
                     text: gs("text").unwrap_or_default(),
@@ -655,12 +659,21 @@ impl Storage {
             ("text", json::s(text)),
         ]);
         self.append(&record_line("audit", &body))?;
-        self.audit.push(AuditRecord {
+        self.push_audit(AuditRecord {
             ts: now_ms(),
             kind: kind.to_string(),
             text: text.to_string(),
         });
         Ok(())
+    }
+
+    /// Keeps the newest AUDIT_KEEP records; compaction then drops the rest
+    /// from the journal file too.
+    fn push_audit(&mut self, rec: AuditRecord) {
+        self.audit.push(rec);
+        if self.audit.len() > AUDIT_KEEP {
+            self.audit.remove(0);
+        }
     }
 
     pub fn put_kv(&mut self, k: &str, v: &str) -> Result<(), String> {
@@ -815,6 +828,28 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn audit_trail_keeps_the_newest_records_only() {
+        let dir = temp_dir("audit-cap");
+        {
+            let mut s = Storage::open(&dir, 500, 500).unwrap();
+            for i in 0..AUDIT_KEEP + 5 {
+                s.append_audit("t", &format!("a{i}")).unwrap();
+            }
+            assert_eq!(s.audit.len(), AUDIT_KEEP);
+            assert_eq!(s.audit[0].text, "a5");
+            s.compact().unwrap();
+        }
+        let s2 = Storage::open(&dir, 500, 500).unwrap();
+        assert_eq!(s2.audit.len(), AUDIT_KEEP);
+        assert_eq!(
+            s2.audit.last().unwrap().text,
+            format!("a{}", AUDIT_KEEP + 4)
+        );
+        drop(s2);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn command(id: &str, status: &str) -> CommandRecord {
