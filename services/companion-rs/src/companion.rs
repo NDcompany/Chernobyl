@@ -367,6 +367,11 @@ impl Companion {
                 ClientMsg::SubmitPrompt { .. } => "submit_prompt",
                 ClientMsg::Interrupt { .. } => "interrupt",
                 ClientMsg::PermissionDecision { .. } => "permission_decision",
+                ClientMsg::SessionEnd { .. } => "session_end",
+                ClientMsg::SetPermissionMode { .. } => "set_permission_mode",
+                ClientMsg::McpAuth { .. } => "mcp_auth",
+                ClientMsg::McpAuthCallback { .. } => "mcp_auth_callback",
+                ClientMsg::McpReconnect { .. } => "mcp_reconnect",
                 _ => unreachable!(),
             };
             let payload = json_text(&msg);
@@ -412,6 +417,7 @@ impl Companion {
                     permission_id,
                     decision,
                     revision,
+                    ..
                 } => {
                     let verdict = {
                         let mut engine = self.engine.lock().unwrap();
@@ -457,7 +463,9 @@ impl Companion {
 
         // capture the ORIGINAL ack outcome (ok, error, ids) so replays —
         // including after a restart, when the engine's ack cache is gone —
-        // return the very same ack
+        // return the very same ack. Mutating commands only: a non-mutating
+        // ack (session_subscribe) must never rewrite a persisted command
+        // that happens to share its commandId.
         if let (
             Some(ServerMsg::Ack {
                 ok,
@@ -468,7 +476,8 @@ impl Companion {
                 ..
             }),
             Some(cmd_id),
-        ) = (&reply, msg_cmd_id)
+            true,
+        ) = (&reply, msg_cmd_id, msg_mutating)
         {
             let mut store = self.shared.storage.lock().unwrap();
             if let Err(e) = store.update_command_outcome(
@@ -525,6 +534,15 @@ impl Companion {
             | ClientMsg::ListState { .. }
             | ClientMsg::HsHello { .. }
             | ClientMsg::HsProof { .. } => false,
+            // ADR-015: the engine refuses these until the LiveRuntime router
+            // (step 4) hands them to the runtime that owns the session
+            ClientMsg::SessionSubscribe { .. }
+            | ClientMsg::SessionUnsubscribe { .. }
+            | ClientMsg::SessionEnd { .. }
+            | ClientMsg::SetPermissionMode { .. }
+            | ClientMsg::McpAuth { .. }
+            | ClientMsg::McpAuthCallback { .. }
+            | ClientMsg::McpReconnect { .. } => false,
         }
     }
 
@@ -1043,13 +1061,35 @@ fn json_text(msg: &ClientMsg) -> String {
             permission_id,
             decision,
             revision,
-        } => json::obj(vec![
-            ("type", json::s("permission_decision")),
-            ("commandId", json::s(command_id)),
-            ("permissionId", json::s(permission_id)),
-            ("decision", json::s(decision)),
-            ("revision", Json::Int(*revision as i64)),
-        ]),
+            option_id,
+            message,
+            answers,
+        } => {
+            let mut fields = vec![
+                ("type", json::s("permission_decision")),
+                ("commandId", json::s(command_id)),
+                ("permissionId", json::s(permission_id)),
+                ("decision", json::s(decision)),
+                ("revision", Json::Int(*revision as i64)),
+            ];
+            if let Some(o) = option_id {
+                fields.push(("optionId", json::s(o)));
+            }
+            if let Some(m) = message {
+                fields.push(("message", json::s(m)));
+            }
+            if !answers.is_empty() {
+                let answers = answers
+                    .iter()
+                    .map(|(id, list)| {
+                        let list = list.iter().map(|a| json::s(a)).collect();
+                        (id.clone(), Json::Arr(list))
+                    })
+                    .collect();
+                fields.push(("answers", Json::Obj(answers)));
+            }
+            json::obj(fields)
+        }
         ClientMsg::ListState { command_id } => json::obj(vec![
             ("type", json::s("list_state")),
             ("commandId", json::s(command_id)),
@@ -1061,6 +1101,87 @@ fn json_text(msg: &ClientMsg) -> String {
         ClientMsg::HsProof { proof } => json::obj(vec![
             ("type", json::s("hs_proof")),
             ("proof", json::s(proof)),
+        ]),
+        ClientMsg::SessionSubscribe {
+            command_id,
+            session_id,
+            epoch,
+            after_seq,
+        } => {
+            let mut fields = vec![
+                ("type", json::s("session_subscribe")),
+                ("commandId", json::s(command_id)),
+                ("sessionId", json::s(session_id)),
+            ];
+            if let Some(e) = epoch {
+                fields.push(("epoch", json::s(e)));
+            }
+            if let Some(s) = after_seq {
+                fields.push(("afterSeq", Json::Int(*s as i64)));
+            }
+            json::obj(fields)
+        }
+        ClientMsg::SessionUnsubscribe {
+            command_id,
+            session_id,
+        } => json::obj(vec![
+            ("type", json::s("session_unsubscribe")),
+            ("commandId", json::s(command_id)),
+            ("sessionId", json::s(session_id)),
+        ]),
+        ClientMsg::SessionEnd {
+            command_id,
+            session_id,
+        } => json::obj(vec![
+            ("type", json::s("session_end")),
+            ("commandId", json::s(command_id)),
+            ("sessionId", json::s(session_id)),
+        ]),
+        ClientMsg::SetPermissionMode {
+            command_id,
+            session_id,
+            mode,
+        } => json::obj(vec![
+            ("type", json::s("set_permission_mode")),
+            ("commandId", json::s(command_id)),
+            ("sessionId", json::s(session_id)),
+            ("mode", json::s(mode)),
+        ]),
+        ClientMsg::McpAuth {
+            command_id,
+            session_id,
+            server,
+            flow,
+        } => json::obj(vec![
+            ("type", json::s("mcp_auth")),
+            ("commandId", json::s(command_id)),
+            ("sessionId", json::s(session_id)),
+            ("server", json::s(server)),
+            ("flow", json::s(flow)),
+        ]),
+        // ADR-015 §3.2 / T5: the URL carries a one-time OAuth code, so the
+        // journal row records only that a callback was relayed
+        ClientMsg::McpAuthCallback {
+            command_id,
+            session_id,
+            server,
+            ..
+        } => json::obj(vec![
+            ("type", json::s("mcp_auth_callback")),
+            ("commandId", json::s(command_id)),
+            ("sessionId", json::s(session_id)),
+            ("server", json::s(server)),
+            ("callbackUrl", json::s("<redacted>")),
+        ]),
+        ClientMsg::McpReconnect {
+            command_id,
+            session_id,
+            server,
+        } => json::obj(vec![
+            ("type", json::s("mcp_reconnect")),
+            ("commandId", json::s(command_id)),
+            ("sessionId", json::s(session_id)),
+            ("server", json::s(server)),
         ]),
     };
     json::stringify(&v)
@@ -1231,6 +1352,9 @@ mod tests {
             permission_id: "p1".into(),
             decision: "approve-once".into(),
             revision: 1.0,
+            option_id: None,
+            message: None,
+            answers: vec![],
         });
         assert!(matches!(
             decided,
@@ -1268,6 +1392,9 @@ mod tests {
             permission_id: "p1".into(),
             decision: "approve-once".into(),
             revision: 1.0,
+            option_id: None,
+            message: None,
+            answers: vec![],
         });
         match replay_decided {
             Some(ServerMsg::Ack {
@@ -1415,6 +1542,9 @@ mod tests {
             permission_id: "engine-unknown".into(),
             decision: "approve-once".into(),
             revision: 1.0,
+            option_id: None,
+            message: None,
+            answers: vec![],
         });
         assert!(matches!(reply, Some(ServerMsg::Ack { ok: false, .. })));
         assert!(
@@ -1478,6 +1608,9 @@ mod tests {
             permission_id: "per_wire1".into(),
             decision: "approve-once".into(),
             revision: 99.0,
+            option_id: None,
+            message: None,
+            answers: vec![],
         });
         assert!(matches!(reply, Some(ServerMsg::Ack { ok: false, .. })));
         assert!(
@@ -1502,6 +1635,9 @@ mod tests {
             permission_id: "per_wire1".into(),
             decision: "approve-once".into(),
             revision: 1.0,
+            option_id: None,
+            message: None,
+            answers: vec![],
         });
         assert!(matches!(reply, Some(ServerMsg::Ack { ok: true, .. })));
         assert!(
@@ -1570,6 +1706,135 @@ mod tests {
 
         comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// ADR-015 T5: the callback URL carries a one-time OAuth code. The command
+    /// is persisted before execution like every mutating command, but with
+    /// the URL replaced, so the journal file never holds the code.
+    #[test]
+    fn mcp_auth_callback_is_journaled_redacted() {
+        let c = temp_config("mcp-redact");
+        let journal = c.data_dir.join("companion.journal");
+        let comp = Companion::boot(c.clone()).unwrap();
+        let code = "one-time-code-5f2b9d";
+        let msg = ClientMsg::McpAuthCallback {
+            command_id: "cmd-mcp-cb".into(),
+            session_id: "s1".into(),
+            server: "sentry".into(),
+            callback_url: format!("http://localhost:44818/callback?code={code}&state=st-1"),
+        };
+        let reply = comp.handle_client_msg(msg.clone());
+        assert!(matches!(
+            reply,
+            Some(ServerMsg::Ack { ok: false, ref error, .. })
+                if error.as_deref() == Some("not supported by this agent")
+        ));
+        {
+            let store = comp.shared.storage.lock().unwrap();
+            let rec = store.commands.get("cmd-mcp-cb").expect("persisted");
+            assert!(
+                rec.payload.contains(r#""callbackUrl":"<redacted>""#),
+                "{}",
+                rec.payload
+            );
+            assert_eq!(rec.status, "refused");
+        }
+        // still deduplicated by commandId
+        assert!(matches!(
+            comp.handle_client_msg(msg),
+            Some(ServerMsg::Ack {
+                duplicate: true,
+                ..
+            })
+        ));
+        let on_disk = std::fs::read_to_string(&journal).unwrap();
+        assert!(on_disk.contains("<redacted>"));
+        assert!(
+            !on_disk.contains(code),
+            "the OAuth code reached the journal"
+        );
+        // compaction rewrites the journal from memory: still redacted
+        comp.shutdown(true);
+        let on_disk = std::fs::read_to_string(&journal).unwrap();
+        assert!(!on_disk.contains(code) && !on_disk.contains("localhost:44818"));
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    /// ADR-015 step 1: no runtime claims the live messages yet, so the engine
+    /// refuses them all. Subscribe/unsubscribe are non-mutating: no journal
+    /// row, and no rewrite of a persisted command that shares their id.
+    #[test]
+    fn live_messages_are_refused_until_a_runtime_claims_them() {
+        let c = temp_config("live-refused");
+        let comp = Companion::boot(c.clone()).unwrap();
+        let refused = |reply: Option<ServerMsg>| {
+            matches!(
+                reply,
+                Some(ServerMsg::Ack { ok: false, ref error, duplicate: false, .. })
+                    if error.as_deref() == Some("not supported by this agent")
+            )
+        };
+        let subscribe = |command_id: &str| ClientMsg::SessionSubscribe {
+            command_id: command_id.into(),
+            session_id: "s1".into(),
+            epoch: None,
+            after_seq: None,
+        };
+        assert!(refused(comp.handle_client_msg(ClientMsg::SessionEnd {
+            command_id: "cmd-live-1".into(),
+            session_id: "s1".into(),
+        })));
+        assert!(refused(comp.handle_client_msg(subscribe("cmd-live-2"))));
+        assert!(refused(comp.handle_client_msg(
+            ClientMsg::SessionUnsubscribe {
+                command_id: "cmd-live-3".into(),
+                session_id: "s1".into(),
+            }
+        )));
+        assert!(refused(comp.handle_client_msg(
+            ClientMsg::SetPermissionMode {
+                command_id: "cmd-live-4".into(),
+                session_id: "s1".into(),
+                mode: "plan".into(),
+            }
+        )));
+        assert!(refused(comp.handle_client_msg(ClientMsg::McpAuth {
+            command_id: "cmd-live-5".into(),
+            session_id: "s1".into(),
+            server: "sentry".into(),
+            flow: "desktop".into(),
+        })));
+        assert!(refused(comp.handle_client_msg(ClientMsg::McpReconnect {
+            command_id: "cmd-live-7".into(),
+            session_id: "s1".into(),
+            server: "sentry".into(),
+        })));
+        {
+            let store = comp.shared.storage.lock().unwrap();
+            for id in ["cmd-live-1", "cmd-live-4", "cmd-live-5", "cmd-live-7"] {
+                let status = store.commands.get(id).map(|r| r.status.as_str());
+                assert_eq!(status, Some("refused"), "{id}");
+            }
+            for id in ["cmd-live-2", "cmd-live-3"] {
+                assert!(!store.commands.contains_key(id), "{id} is non-mutating");
+            }
+        }
+        let created = comp.handle_client_msg(ClientMsg::CreateSession {
+            command_id: "cmd-live-6".into(),
+            agent_id: "a4".into(),
+            title: "T".into(),
+            prompt: "p".into(),
+            project: None,
+        });
+        assert!(matches!(created, Some(ServerMsg::Ack { ok: true, .. })));
+        assert!(refused(comp.handle_client_msg(subscribe("cmd-live-6"))));
+        {
+            let store = comp.shared.storage.lock().unwrap();
+            let rec = store.commands.get("cmd-live-6").unwrap();
+            assert_eq!((rec.ok, rec.error.as_deref()), (Some(true), None));
+        }
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 
     fn json_len(v: &crate::json::Json, key: &str) -> usize {

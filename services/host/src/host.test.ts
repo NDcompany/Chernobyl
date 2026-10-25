@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import WebSocket from 'ws';
 import {
+  FEATURE_TRANSCRIPT,
   PROTOCOL_VERSION,
   type ClientMessage,
   type ServerMessage,
@@ -79,6 +80,42 @@ test('hello receives the full snapshot', async (t) => {
   assert.equal(ack.protocol, PROTOCOL_VERSION);
   assert.ok(ack.snapshot.hosts.length > 0);
   assert.ok(ack.snapshot.sessions.length > 0);
+});
+
+test('ADR-015: hello_ack advertises transcript.v1; live messages get an error ack', async (t) => {
+  const host = await createHost({ port: 0 });
+  t.after(() => host.close());
+
+  const c = await connect(host.url);
+  const ack = await hello(c);
+  assert.deepEqual(ack.features, [FEATURE_TRANSCRIPT]);
+
+  // the reference host validates them like the companion, then refuses them
+  // honestly (never silence, never a crash)
+  const live: ClientMessage[] = [
+    { type: 'session_subscribe', commandId: 'live-1', sessionId: 's1', epoch: '', afterSeq: 0 },
+    { type: 'session_unsubscribe', commandId: 'live-2', sessionId: 's1' },
+    { type: 'session_end', commandId: 'live-3', sessionId: 's1' },
+    { type: 'set_permission_mode', commandId: 'live-4', sessionId: 's1', mode: 'plan' },
+    { type: 'mcp_auth', commandId: 'live-5', sessionId: 's1', server: 'sentry', flow: 'desktop' },
+    {
+      type: 'mcp_auth_callback',
+      commandId: 'live-6',
+      sessionId: 's1',
+      server: 'sentry',
+      callbackUrl: 'http://localhost:1/callback?code=k',
+    },
+    { type: 'mcp_reconnect', commandId: 'live-7', sessionId: 's1', server: 'sentry' },
+  ];
+  for (const msg of live) {
+    c.send(msg);
+    const reply = await waitFor<Ack>(
+      c.messages,
+      (m) => m.type === 'ack' && m.commandId === (msg as { commandId: string }).commandId,
+    );
+    assert.equal(reply.ok, false, msg.type);
+    assert.equal(reply.error, 'not supported by this agent', msg.type);
+  }
 });
 
 test('HTTP health endpoint reports counters', async (t) => {

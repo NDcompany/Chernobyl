@@ -1,0 +1,66 @@
+[
+  { "type": "session_subscribe", "commandId": "c-sub-1", "sessionId": "ses_live_1" },
+  {
+    "type": "session_subscribe",
+    "commandId": "c-sub-2",
+    "sessionId": "ses_live_1",
+    "epoch": "9f86d081884c7d65",
+    "afterSeq": 42
+  },
+  { "type": "session_subscribe", "commandId": "c-sub-3", "sessionId": "ses_live_1", "epoch": "", "afterSeq": 0 },
+  { "type": "session_unsubscribe", "commandId": "c-unsub", "sessionId": "ses_live_1" },
+  { "type": "session_end", "commandId": "c-end", "sessionId": "ses_live_1" },
+  { "type": "set_permission_mode", "commandId": "c-mode-1", "sessionId": "ses_live_1", "mode": "default" },
+  { "type": "set_permission_mode", "commandId": "c-mode-2", "sessionId": "ses_live_1", "mode": "acceptEdits" },
+  { "type": "set_permission_mode", "commandId": "c-mode-3", "sessionId": "ses_live_1", "mode": "plan" },
+  { "type": "mcp_auth", "commandId": "c-mcp-1", "sessionId": "ses_live_1", "server": "sentry", "flow": "desktop" },
+  {
+    "type": "mcp_auth",
+    "commandId": "c-mcp-2",
+    "sessionId": "ses_live_1",
+    "server": "sentry",
+    "flow": "phone-callback"
+  },
+  {
+    "type": "mcp_auth_callback",
+    "commandId": "c-mcp-3",
+    "sessionId": "ses_live_1",
+    "server": "sentry",
+    "callbackUrl": "http://localhost:44818/callback?code=fixture-code&state=fixture-state"
+  },
+  { "type": "mcp_reconnect", "commandId": "c-mcp-4", "sessionId": "ses_live_1", "server": "sentry" },
+  {
+    "type": "permission_decision",
+    "commandId": "c-dec-1",
+    "permissionId": "claude-1:toolu_01",
+    "decision": "approve-session",
+    "revision": 1,
+    "optionId": "allow-dir"
+  },
+  {
+    "type": "permission_decision",
+    "commandId": "c-dec-2",
+    "permissionId": "claude-1:toolu_01",
+    "decision": "reject",
+    "revision": 1,
+    "optionId": "deny",
+    "message": "Use the staging database instead"
+  },
+  {
+    "type": "permission_decision",
+    "commandId": "c-dec-3",
+    "permissionId": "claude-1:toolu_02",
+    "decision": "approve-once",
+    "revision": 1,
+    "answers": { "q1": ["Postgres"], "q2": ["Unit tests", "Lint"], "q3": [] }
+  },
+  {
+    "type": "permission_decision",
+    "commandId": "c-dec-4",
+    "permissionId": "p1",
+    "decision": "approve-once",
+    "revision": 1,
+    "message": "",
+    "answers": {}
+  }
+]

@@ -1,0 +1,40 @@
+{
+  "type": "permission_requested",
+  "seq": 17,
+  "eventId": "evt_live_1",
+  "occurredAt": 1761436800300,
+  "permission": {
+    "id": "claude-1:toolu_01",
+    "nativeRequestId": "req_7c1e",
+    "sessionId": "ses_live_1",
+    "agentId": "claude-1",
+    "hostId": "claude-1",
+    "action": "file-write",
+    "title": "Claude wants to write a.txt",
+    "command": "a.txt",
+    "args": [],
+    "directory": "C:\\work\\demo",
+    "risk": "medium",
+    "status": "pending",
+    "supportedDecisions": ["approve-once", "reject"],
+    "revision": 1,
+    "requestedAt": 1761436800300,
+    "expiresAt": 1761523200300,
+    "context": "Create a.txt containing hi",
+    "toolItemId": "toolu_01",
+    "options": [
+      { "id": "allow", "decision": "approve-once", "label": "Allow", "scope": "once" },
+      {
+        "id": "allow-dir",
+        "decision": "approve-session",
+        "label": "Always allow edits in this project",
+        "rule": "Edit(./**)",
+        "scope": "persistent",
+        "destination": ".claude/settings.local.json"
+      },
+      { "id": "deny", "decision": "reject", "label": "Deny", "scope": "once", "takesMessage": true },
+      { "id": "deny-stop", "decision": "reject", "label": "Deny and stop", "scope": "once", "stopsTurn": true }
+    ],
+    "detail": { "kind": "edit", "path": "a.txt", "patch": "@@ -0,0 +1 @@\n+hi" }
+  }
+}

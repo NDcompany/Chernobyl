@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PROTOCOL_VERSION: u32 = 2;
+/// ADR-015: the live transcript extension (additive, protocol stays 2).
+pub const FEATURE_TRANSCRIPT: &str = "transcript.v1";
+/// What `hello_ack.features` advertises.
+pub const FEATURES: &[&str] = &[FEATURE_TRANSCRIPT];
 pub const PERMISSION_TTL_MS: i64 = 120_000;
 pub const HEARTBEAT_MS: u64 = 15_000;
 pub const HEARTBEAT_MISS_LIMIT: u32 = 3;
@@ -73,6 +77,8 @@ pub struct Agent {
     pub accepts_new_session: bool,
     /// ADR-009 provenance, same rule as `Host::simulated`.
     pub simulated: bool,
+    /// ADR-015: present only for runtimes that stream a live transcript.
+    pub live: Option<AgentLive>,
 }
 
 impl Agent {
@@ -91,6 +97,64 @@ impl Agent {
         ];
         if self.simulated {
             fields.push(("simulated", Json::Bool(true)));
+        }
+        if let Some(live) = &self.live {
+            fields.push(("live", live.to_json()));
+        }
+        json::obj(fields)
+    }
+}
+
+/// ADR-015 `Agent.live`: what the phone may do with this runtime's sessions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentLive {
+    pub prompt_while_busy: &'static str, // merge | queue | none
+    pub interrupt: bool,
+    /// `session_end` supported (Claude).
+    pub end: bool,
+    /// Claude: default | acceptEdits | plan. Serialized only when non-empty.
+    pub permission_modes: Vec<String>,
+    /// Spawning runtimes only. Serialized only when non-empty.
+    pub workspaces: Vec<LiveWorkspace>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveWorkspace {
+    pub id: String,
+    pub label: String,
+    pub path: String,
+}
+
+impl AgentLive {
+    fn to_json(&self) -> Json {
+        let mut fields = vec![
+            ("transcript", Json::Bool(true)),
+            ("promptWhileBusy", json::s(self.prompt_while_busy)),
+            ("interrupt", Json::Bool(self.interrupt)),
+            ("end", Json::Bool(self.end)),
+        ];
+        if !self.permission_modes.is_empty() {
+            fields.push((
+                "permissionModes",
+                Json::Arr(self.permission_modes.iter().map(|m| json::s(m)).collect()),
+            ));
+        }
+        if !self.workspaces.is_empty() {
+            fields.push((
+                "workspaces",
+                Json::Arr(
+                    self.workspaces
+                        .iter()
+                        .map(|w| {
+                            json::obj(vec![
+                                ("id", json::s(&w.id)),
+                                ("label", json::s(&w.label)),
+                                ("path", json::s(&w.path)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ));
         }
         json::obj(fields)
     }
@@ -166,6 +230,9 @@ pub struct Session {
     pub timeline: Vec<SessionStep>,
     pub output: Vec<OutputLine>,
     pub files: Vec<FileChange>,
+    /// ADR-015: a transcript stream exists for this session. Serialized only
+    /// when true (the `simulated` precedent).
+    pub transcript: bool,
 }
 
 impl Session {
@@ -196,6 +263,9 @@ impl Session {
         if let Some(p) = &self.prompt {
             fields.push(("prompt", json::s(p)));
         }
+        if self.transcript {
+            fields.push(("transcript", Json::Bool(true)));
+        }
         json::obj(fields)
     }
 }
@@ -222,6 +292,13 @@ pub struct PermissionRequest {
     pub context: String,
     pub decided_at: Option<i64>,
     pub decision: Option<String>,
+    /// ADR-015 extras, serialized only when present (the `simulated`
+    /// precedent): the transcript tool item this request belongs to, the
+    /// runtime's own options (never empty when present, always one reject),
+    /// and the request detail (built by the transcript.rs helpers).
+    pub tool_item_id: Option<String>,
+    pub options: Vec<PermissionOption>,
+    pub detail: Option<Json>,
 }
 
 impl PermissionRequest {
@@ -266,6 +343,55 @@ impl PermissionRequest {
         }
         if let Some(d) = &self.decision {
             fields.push(("decision", json::s(d)));
+        }
+        if let Some(t) = &self.tool_item_id {
+            fields.push(("toolItemId", json::s(t)));
+        }
+        if !self.options.is_empty() {
+            fields.push((
+                "options",
+                Json::Arr(self.options.iter().map(|o| o.to_json()).collect()),
+            ));
+        }
+        if let Some(d) = &self.detail {
+            fields.push(("detail", d.clone()));
+        }
+        json::obj(fields)
+    }
+}
+
+/// ADR-015: one of the runtime's own choices for a permission request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionOption {
+    pub id: String,
+    pub decision: String, // approve-once | approve-session | reject
+    pub label: String,
+    pub rule: Option<String>,
+    pub scope: &'static str, // once | session | persistent
+    pub destination: Option<String>,
+    pub takes_message: bool,
+    pub stops_turn: bool,
+}
+
+impl PermissionOption {
+    pub fn to_json(&self) -> Json {
+        let mut fields = vec![
+            ("id", json::s(&self.id)),
+            ("decision", json::s(&self.decision)),
+            ("label", json::s(&self.label)),
+            ("scope", json::s(self.scope)),
+        ];
+        if let Some(r) = &self.rule {
+            fields.push(("rule", json::s(r)));
+        }
+        if let Some(d) = &self.destination {
+            fields.push(("destination", json::s(d)));
+        }
+        if self.takes_message {
+            fields.push(("takesMessage", Json::Bool(true)));
+        }
+        if self.stops_turn {
+            fields.push(("stopsTurn", Json::Bool(true)));
         }
         json::obj(fields)
     }
@@ -365,9 +491,58 @@ pub enum ClientMsg {
         permission_id: String,
         decision: String,
         revision: f64,
+        /// ADR-015: a PermissionOption id; its bucket must equal `decision`.
+        option_id: Option<String>,
+        /// ADR-015: free-text reason the model sees.
+        message: Option<String>,
+        /// ADR-015: question id → chosen labels or free text.
+        answers: Vec<(String, Vec<String>)>,
     },
     ListState {
         command_id: String,
+    },
+    /// ADR-015 live sessions. Subscribe/unsubscribe are non-mutating (no
+    /// journal row); the other five are persisted before execution.
+    SessionSubscribe {
+        command_id: String,
+        session_id: String,
+        epoch: Option<String>,
+        after_seq: Option<u64>,
+    },
+    SessionUnsubscribe {
+        command_id: String,
+        session_id: String,
+    },
+    SessionEnd {
+        command_id: String,
+        session_id: String,
+    },
+    /// `mode` is whitelisted: default | acceptEdits | plan.
+    SetPermissionMode {
+        command_id: String,
+        session_id: String,
+        mode: String,
+    },
+    /// `flow` is whitelisted: desktop | phone-callback.
+    McpAuth {
+        command_id: String,
+        session_id: String,
+        server: String,
+        flow: String,
+    },
+    /// `callback_url` carries a one-time OAuth code: it is journaled as
+    /// "<redacted>" and must never be logged.
+    McpAuthCallback {
+        command_id: String,
+        session_id: String,
+        server: String,
+        callback_url: String,
+    },
+    /// §4.7 "Reconnect a failed server".
+    McpReconnect {
+        command_id: String,
+        session_id: String,
+        server: String,
     },
     /// E2E handshake, step 1 (ADR-011): request to connect as `device_id`.
     /// Plaintext; the server answers with a fresh nonce+salt to bind the proof.
@@ -394,7 +569,14 @@ impl ClientMsg {
             | ClientMsg::SubmitPrompt { command_id, .. }
             | ClientMsg::Interrupt { command_id, .. }
             | ClientMsg::PermissionDecision { command_id, .. }
-            | ClientMsg::ListState { command_id } => Some(command_id),
+            | ClientMsg::ListState { command_id }
+            | ClientMsg::SessionSubscribe { command_id, .. }
+            | ClientMsg::SessionUnsubscribe { command_id, .. }
+            | ClientMsg::SessionEnd { command_id, .. }
+            | ClientMsg::SetPermissionMode { command_id, .. }
+            | ClientMsg::McpAuth { command_id, .. }
+            | ClientMsg::McpAuthCallback { command_id, .. }
+            | ClientMsg::McpReconnect { command_id, .. } => Some(command_id),
         }
     }
 
@@ -405,6 +587,11 @@ impl ClientMsg {
                 | ClientMsg::SubmitPrompt { .. }
                 | ClientMsg::Interrupt { .. }
                 | ClientMsg::PermissionDecision { .. }
+                | ClientMsg::SessionEnd { .. }
+                | ClientMsg::SetPermissionMode { .. }
+                | ClientMsg::McpAuth { .. }
+                | ClientMsg::McpAuthCallback { .. }
+                | ClientMsg::McpReconnect { .. }
         )
     }
 }
@@ -415,6 +602,66 @@ fn is_str(v: &Json) -> Option<&str> {
 
 fn is_num(v: &Json) -> Option<f64> {
     json::as_f64(v)
+}
+
+/// TS `s.length <= max`: UTF-16 code units, so both validators agree on any
+/// text (UTF-8 bytes are never fewer, hence the fast path).
+fn fits(s: &str, max: usize) -> bool {
+    s.len() <= max || s.encode_utf16().count() <= max
+}
+
+/// ADR-015 optional string: absent → `Some(None)`; present but not a string
+/// of at most `max` units → `None` (the whole message is malformed).
+fn opt_str(obj: &Json, key: &str, max: usize) -> Option<Option<String>> {
+    match json::get(obj, key) {
+        None => Some(None),
+        Some(v) => json::as_str(v)
+            .filter(|s| fits(s, max))
+            .map(|s| Some(s.to_string())),
+    }
+}
+
+/// TS `isSeq`: absent, or a non-negative safe integer (`3.0` counts, `3.5`
+/// does not), mirroring `Number.isSafeInteger`.
+fn opt_seq(obj: &Json, key: &str) -> Option<Option<u64>> {
+    const MAX_SAFE: i64 = 9_007_199_254_740_991;
+    match json::get(obj, key) {
+        None => Some(None),
+        Some(Json::Int(n)) if (0..=MAX_SAFE).contains(n) => Some(Some(*n as u64)),
+        Some(Json::Float(f)) if f.fract() == 0.0 && *f >= 0.0 && *f <= MAX_SAFE as f64 => {
+            Some(Some(*f as u64))
+        }
+        Some(_) => None,
+    }
+}
+
+/// ADR-015 §3.4 `answers`: absent → empty; otherwise an object of ≤ 8
+/// question ids, each an array of ≤ 16 strings of ≤ 1,024 units.
+fn opt_answers(obj: &Json) -> Option<Vec<(String, Vec<String>)>> {
+    let Some(v) = json::get(obj, "answers") else {
+        return Some(Vec::new());
+    };
+    let Json::Obj(pairs) = v else {
+        return None;
+    };
+    if pairs.len() > 8 {
+        return None;
+    }
+    pairs
+        .iter()
+        .map(|(id, list)| {
+            let list = json::as_arr(list).filter(|l| l.len() <= 16)?;
+            let answers = list
+                .iter()
+                .map(|a| {
+                    json::as_str(a)
+                        .filter(|s| fits(s, 1024))
+                        .map(str::to_string)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((id.clone(), answers))
+        })
+        .collect()
 }
 
 /// Validates an untrusted payload as a ClientMessage. Mirrors the TS
@@ -453,7 +700,10 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
         "submit_prompt" => Some(ClientMsg::SubmitPrompt {
             command_id: req("commandId")?,
             session_id: req("sessionId")?,
-            text: req("text")?,
+            // ADR-015 §3.4: 32,000 characters. Counting chars keeps the
+            // companion never stricter than the phone, whose zod counts UTF-16
+            // units (an emoji is 2 there, 1 here); bytes ≥ chars, hence the fast path.
+            text: req("text").filter(|t| t.len() <= 32_000 || t.chars().count() <= 32_000)?,
         }),
         "interrupt" => Some(ClientMsg::Interrupt {
             command_id: req("commandId")?,
@@ -474,10 +724,66 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
                 permission_id: req("permissionId")?,
                 decision,
                 revision: is_num(json::get(obj, "revision")?)?,
+                option_id: opt_str(obj, "optionId", 128)?,
+                message: opt_str(obj, "message", 4096)?,
+                answers: opt_answers(obj)?,
             })
         }
         "list_state" => Some(ClientMsg::ListState {
             command_id: req("commandId")?,
+        }),
+        "session_subscribe" => Some(ClientMsg::SessionSubscribe {
+            command_id: req("commandId")?,
+            session_id: req("sessionId")?,
+            // a fresh view's epoch "" is fine: it never matches, so a snapshot follows
+            epoch: opt_str(obj, "epoch", 64)?,
+            after_seq: opt_seq(obj, "afterSeq")?,
+        }),
+        "session_unsubscribe" => Some(ClientMsg::SessionUnsubscribe {
+            command_id: req("commandId")?,
+            session_id: req("sessionId")?,
+        }),
+        "session_end" => Some(ClientMsg::SessionEnd {
+            command_id: req("commandId")?,
+            session_id: req("sessionId")?,
+        }),
+        "set_permission_mode" => {
+            let mode = req("mode")?;
+            // whitelist: bypassPermissions / dontAsk / auto are never
+            // reachable from a phone
+            if !matches!(mode.as_str(), "default" | "acceptEdits" | "plan") {
+                return None;
+            }
+            Some(ClientMsg::SetPermissionMode {
+                command_id: req("commandId")?,
+                session_id: req("sessionId")?,
+                mode,
+            })
+        }
+        "mcp_auth" => {
+            let flow = req("flow")?;
+            if !matches!(flow.as_str(), "desktop" | "phone-callback") {
+                return None;
+            }
+            Some(ClientMsg::McpAuth {
+                command_id: req("commandId")?,
+                session_id: req("sessionId")?,
+                server: req("server").filter(|s| fits(s, 256))?,
+                flow,
+            })
+        }
+        // shape only; host, port, path and state are checked by the adapter (§4.7)
+        "mcp_auth_callback" => Some(ClientMsg::McpAuthCallback {
+            command_id: req("commandId")?,
+            session_id: req("sessionId")?,
+            server: req("server").filter(|s| fits(s, 256))?,
+            callback_url: req("callbackUrl")
+                .filter(|u| u.starts_with("http://") && fits(u, 4096))?,
+        }),
+        "mcp_reconnect" => Some(ClientMsg::McpReconnect {
+            command_id: req("commandId")?,
+            session_id: req("sessionId")?,
+            server: req("server").filter(|s| fits(s, 256))?,
         }),
         "hs_hello" => Some(ClientMsg::HsHello {
             device_id: req("deviceId")?,
@@ -513,6 +819,8 @@ pub enum ServerMsg {
         server_time: i64,
         snapshot: Snapshot,
         last_seq: i64,
+        /// ADR-015: protocol extensions this server understands ([`FEATURES`]).
+        features: &'static [&'static str],
     },
     Pong {
         command_id: String,
@@ -547,6 +855,21 @@ pub enum ServerMsg {
     /// E2E handshake failure (unknown/expired/revoked device, bad proof).
     HsErr {
         reason: String,
+    },
+    /// ADR-015: contiguous transcript ops for one session, sent only to
+    /// subscribers and never journaled. Each op is serialized once when it
+    /// enters the ring; `to_text` splices them verbatim.
+    Transcript {
+        session_id: String,
+        epoch: String,
+        ops: Vec<String>,
+    },
+    /// ADR-015: `body` holds items, truncatedBefore, turns, state and mcp.
+    TranscriptSnapshot {
+        session_id: String,
+        epoch: String,
+        seq: u64,
+        body: Json,
     },
 }
 
@@ -648,12 +971,17 @@ impl ServerMsg {
                 server_time,
                 snapshot,
                 last_seq,
+                features,
             } => json::obj(vec![
                 ("type", json::s("hello_ack")),
                 ("protocol", Json::Int(*protocol as i64)),
                 ("serverTime", Json::Int(*server_time)),
                 ("snapshot", snapshot.to_json()),
                 ("lastSeq", Json::Int(*last_seq)),
+                (
+                    "features",
+                    Json::Arr(features.iter().map(|f| json::s(f)).collect()),
+                ),
             ]),
             ServerMsg::Pong { command_id } => json::obj(vec![
                 ("type", json::s("pong")),
@@ -768,11 +1096,47 @@ impl ServerMsg {
                 ("type", json::s("hs_err")),
                 ("reason", json::s(reason)),
             ]),
+            // the ops are already text: re-parse only here (tests, benches)
+            ServerMsg::Transcript { .. } => json::parse(&self.to_text()).unwrap_or(Json::Null),
+            ServerMsg::TranscriptSnapshot {
+                session_id,
+                epoch,
+                seq,
+                body,
+            } => {
+                let mut fields = vec![
+                    ("type".to_string(), json::s("transcript_snapshot")),
+                    ("sessionId".to_string(), json::s(session_id)),
+                    ("epoch".to_string(), json::s(epoch)),
+                    ("seq".to_string(), Json::Int(*seq as i64)),
+                ];
+                if let Json::Obj(pairs) = body {
+                    fields.extend(pairs.iter().cloned());
+                }
+                Json::Obj(fields)
+            }
         }
     }
 
     pub fn to_text(&self) -> String {
-        json::stringify(&self.to_json())
+        match self {
+            // splice the pre-serialized ops: a fan-out never re-encodes them
+            ServerMsg::Transcript {
+                session_id,
+                epoch,
+                ops,
+            } => {
+                let mut out = String::from("{\"type\":\"transcript\",\"sessionId\":");
+                json::write_str(&mut out, session_id);
+                out.push_str(",\"epoch\":");
+                json::write_str(&mut out, epoch);
+                out.push_str(",\"ops\":[");
+                out.push_str(&ops.join(","));
+                out.push_str("]}");
+                out
+            }
+            _ => json::stringify(&self.to_json()),
+        }
     }
 }
 
@@ -919,6 +1283,7 @@ mod tests {
             server_time: 123,
             snapshot: Snapshot::default(),
             last_seq: 7,
+            features: FEATURES,
         };
         let text = msg.to_text();
         let v: Json = json::parse(&text).unwrap();
@@ -961,9 +1326,8 @@ mod tests {
         assert_eq!(json::get(&v, "state").unwrap(), &json::s("accepted"));
     }
 
-    #[test]
-    fn permission_decision_authority_fail_closed() {
-        let base = PermissionRequest {
+    fn sample_permission() -> PermissionRequest {
+        PermissionRequest {
             id: "p1".into(),
             native_request_id: "p1".into(),
             session_id: "s1".into(),
@@ -988,7 +1352,15 @@ mod tests {
             context: String::new(),
             decided_at: None,
             decision: None,
-        };
+            tool_item_id: None,
+            options: vec![],
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn permission_decision_authority_fail_closed() {
+        let base = sample_permission();
         // ok path
         assert_eq!(
             evaluate_permission_decision(&base, "approve-once", 1.0, 5_000),
@@ -1072,6 +1444,7 @@ mod tests {
             capabilities: vec![],
             accepts_new_session: true,
             simulated: false,
+            live: None,
         };
         assert!(!json::stringify(&h.to_json()).contains("simulated"));
         assert!(!json::stringify(&a.to_json()).contains("simulated"));
@@ -1104,6 +1477,34 @@ mod tests {
         // type must be a non-empty string
         assert!(parse_client_message(r#"{"type":7}"#).is_none());
         assert!(parse_client_message(r#"{"type":""}"#).is_none());
+        // ADR-015: bad afterSeq (2^53 is past Number.isSafeInteger)
+        for seq in ["-1", "1.5", "1e999", "\"3\"", "null", "9007199254740992"] {
+            let msg = format!(
+                r#"{{"type":"session_subscribe","commandId":"c","sessionId":"s","afterSeq":{seq}}}"#
+            );
+            assert!(parse_client_message(&msg).is_none(), "afterSeq {seq}");
+        }
+        // ADR-015: oversize answers (9 ids, 17 answers, a 1,025-unit answer)
+        let decision = |answers: String| {
+            format!(
+                r#"{{"type":"permission_decision","commandId":"c","permissionId":"p","decision":"approve-once","revision":1,"answers":{answers}}}"#
+            )
+        };
+        let nine: Vec<String> = (0..9).map(|i| format!(r#""q{i}":["a"]"#)).collect();
+        for answers in [
+            format!("{{{}}}", nine.join(",")),
+            format!(r#"{{"q":[{}]}}"#, vec![r#""a""#; 17].join(",")),
+            format!(r#"{{"q":["{}"]}}"#, "x".repeat(1025)),
+        ] {
+            assert!(parse_client_message(&decision(answers)).is_none());
+        }
+        // ADR-015: a phone can never select a permission-bypassing mode
+        for mode in ["bypassPermissions", "dontAsk", "auto", "Default", ""] {
+            let msg = format!(
+                r#"{{"type":"set_permission_mode","commandId":"c","sessionId":"s","mode":"{mode}"}}"#
+            );
+            assert!(parse_client_message(&msg).is_none(), "mode {mode}");
+        }
     }
 
     #[test]
@@ -1140,5 +1541,367 @@ mod tests {
         }
         let after = parse_client_message(good);
         assert_eq!(before, after);
+    }
+
+    /* ---- ADR-015: golden fixtures shared with the TS tests ---- */
+
+    macro_rules! fixture {
+        ($name:literal) => {
+            json::parse(include_str!(concat!(
+                "../../../packages/protocol/fixtures/live/",
+                $name
+            )))
+            .unwrap()
+        };
+    }
+
+    /// Key order is not part of the wire contract: compare objects sorted.
+    fn canon(v: &Json) -> Json {
+        match v {
+            Json::Obj(pairs) => {
+                let mut sorted: Vec<(String, Json)> =
+                    pairs.iter().map(|(k, v)| (k.clone(), canon(v))).collect();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                Json::Obj(sorted)
+            }
+            Json::Arr(items) => Json::Arr(items.iter().map(canon).collect()),
+            other => other.clone(),
+        }
+    }
+
+    #[test]
+    fn parses_live_client_messages_and_rejects_bad_fields() {
+        let variant = |m: &ClientMsg| match m {
+            ClientMsg::SessionSubscribe { .. } => "session_subscribe",
+            ClientMsg::SessionUnsubscribe { .. } => "session_unsubscribe",
+            ClientMsg::SessionEnd { .. } => "session_end",
+            ClientMsg::SetPermissionMode { .. } => "set_permission_mode",
+            ClientMsg::McpAuth { .. } => "mcp_auth",
+            ClientMsg::McpAuthCallback { .. } => "mcp_auth_callback",
+            ClientMsg::McpReconnect { .. } => "mcp_reconnect",
+            ClientMsg::PermissionDecision { .. } => "permission_decision",
+            _ => "other",
+        };
+        for case in json::as_arr(&fixture!("client-valid.json")).unwrap() {
+            let text = json::stringify(case);
+            let msg = parse_client_message(&text).unwrap_or_else(|| panic!("rejected {text}"));
+            assert_eq!(Some(variant(&msg)), json::get_str(case, "type"), "{text}");
+        }
+        for case in json::as_arr(&fixture!("client-invalid.json")).unwrap() {
+            let text = json::stringify(json::get(case, "msg").unwrap());
+            let why = json::get_str(case, "why").unwrap();
+            assert!(parse_client_message(&text).is_none(), "{why}: {text}");
+        }
+
+        // field mapping; 3.0 is an integer to JS as well
+        assert_eq!(
+            parse_client_message(
+                r#"{"type":"session_subscribe","commandId":"c","sessionId":"s","epoch":"e1","afterSeq":3.0}"#
+            ),
+            Some(ClientMsg::SessionSubscribe {
+                command_id: "c".into(),
+                session_id: "s".into(),
+                epoch: Some("e1".into()),
+                after_seq: Some(3),
+            })
+        );
+        assert_eq!(
+            parse_client_message(
+                r#"{"type":"mcp_auth_callback","commandId":"c","sessionId":"s","server":"x","callbackUrl":"http://localhost:1/cb?code=k"}"#
+            ),
+            Some(ClientMsg::McpAuthCallback {
+                command_id: "c".into(),
+                session_id: "s".into(),
+                server: "x".into(),
+                callback_url: "http://localhost:1/cb?code=k".into(),
+            })
+        );
+
+        // §3.4 bounds: the maximum passes, one more unit fails
+        let mcp = |server: String| {
+            format!(
+                r#"{{"type":"mcp_auth","commandId":"c","sessionId":"s","server":"{server}","flow":"desktop"}}"#
+            )
+        };
+        assert!(parse_client_message(&mcp("s".repeat(256))).is_some());
+        assert!(parse_client_message(&mcp("s".repeat(257))).is_none());
+        let reconnect = |server: String| {
+            format!(
+                r#"{{"type":"mcp_reconnect","commandId":"c","sessionId":"s","server":"{server}"}}"#
+            )
+        };
+        assert_eq!(
+            parse_client_message(&reconnect("s".repeat(256))),
+            Some(ClientMsg::McpReconnect {
+                command_id: "c".into(),
+                session_id: "s".into(),
+                server: "s".repeat(256),
+            })
+        );
+        assert!(parse_client_message(&reconnect("s".repeat(257))).is_none());
+        let callback = |len: usize| {
+            format!(
+                r#"{{"type":"mcp_auth_callback","commandId":"c","sessionId":"s","server":"x","callbackUrl":"http://{}"}}"#,
+                "a".repeat(len - "http://".len())
+            )
+        };
+        assert!(parse_client_message(&callback(4096)).is_some());
+        assert!(parse_client_message(&callback(4097)).is_none());
+        let epoch = |e: String| {
+            format!(
+                r#"{{"type":"session_subscribe","commandId":"c","sessionId":"s","epoch":"{e}"}}"#
+            )
+        };
+        assert!(parse_client_message(&epoch("e".repeat(64))).is_some());
+        assert!(parse_client_message(&epoch("e".repeat(65))).is_none());
+        // submit_prompt: 32,000 chars. Never stricter than the phone, which
+        // counts UTF-16 units: 2-byte 'é' and 4-byte emoji each count once
+        let prompt = |t: String| {
+            format!(r#"{{"type":"submit_prompt","commandId":"c","sessionId":"s","text":"{t}"}}"#)
+        };
+        assert!(parse_client_message(&prompt("p".repeat(32_000))).is_some());
+        assert!(parse_client_message(&prompt("p".repeat(32_001))).is_none());
+        assert!(parse_client_message(&prompt("\u{e9}".repeat(32_000))).is_some());
+        assert!(parse_client_message(&prompt("\u{1F600}".repeat(32_000))).is_some());
+        assert!(parse_client_message(&prompt("\u{1F600}".repeat(32_001))).is_none());
+    }
+
+    #[test]
+    fn permission_decision_accepts_option_id_message_answers() {
+        assert_eq!(
+            parse_client_message(
+                r#"{"type":"permission_decision","commandId":"c","permissionId":"p","decision":"reject","revision":2,"optionId":"deny","message":"use staging","answers":{"q1":["Postgres"],"q2":["Unit tests","Lint"]}}"#
+            ),
+            Some(ClientMsg::PermissionDecision {
+                command_id: "c".into(),
+                permission_id: "p".into(),
+                decision: "reject".into(),
+                revision: 2.0,
+                option_id: Some("deny".into()),
+                message: Some("use staging".into()),
+                answers: vec![
+                    ("q1".into(), vec!["Postgres".into()]),
+                    ("q2".into(), vec!["Unit tests".into(), "Lint".into()]),
+                ],
+            })
+        );
+        // the legacy v2 shape is unchanged: no extras
+        assert!(matches!(
+            parse_client_message(
+                r#"{"type":"permission_decision","commandId":"c","permissionId":"p","decision":"approve-once","revision":1}"#
+            ),
+            Some(ClientMsg::PermissionDecision { option_id: None, message: None, ref answers, .. })
+                if answers.is_empty()
+        ));
+        // bounds at the limit pass, one past fails
+        let decision = |extra: String| {
+            format!(
+                r#"{{"type":"permission_decision","commandId":"c","permissionId":"p","decision":"approve-once","revision":1,{extra}}}"#
+            )
+        };
+        let option = |n: usize| format!(r#""optionId":"{}""#, "o".repeat(n));
+        assert!(parse_client_message(&decision(option(128))).is_some());
+        assert!(parse_client_message(&decision(option(129))).is_none());
+        let message = |n: usize| format!(r#""message":"{}""#, "m".repeat(n));
+        assert!(parse_client_message(&decision(message(4096))).is_some());
+        assert!(parse_client_message(&decision(message(4097))).is_none());
+        let answer = format!(r#""{}""#, "a".repeat(1024));
+        let ids: Vec<String> = (0..8)
+            .map(|i| format!(r#""q{i}":[{}]"#, vec![answer.as_str(); 16].join(",")))
+            .collect();
+        let full = decision(format!(r#""answers":{{{}}}"#, ids.join(",")));
+        assert!(matches!(
+            parse_client_message(&full),
+            Some(ClientMsg::PermissionDecision { ref answers, .. })
+                if answers.len() == 8 && answers.iter().all(|(_, a)| a.len() == 16)
+        ));
+        // answers must be an object of arrays of strings
+        for bad in [r#"[["a"]]"#, r#"{"q":"a"}"#, r#"{"q":[1]}"#, "null"] {
+            assert!(parse_client_message(&decision(format!(r#""answers":{bad}"#))).is_none());
+        }
+    }
+
+    #[test]
+    fn hello_ack_advertises_transcript_feature() {
+        assert_eq!(FEATURES, ["transcript.v1"]);
+        let msg = ServerMsg::HelloAck {
+            protocol: PROTOCOL_VERSION,
+            server_time: 1_761_436_800_000,
+            snapshot: Snapshot::default(),
+            last_seq: 0,
+            features: FEATURES,
+        };
+        assert_eq!(canon(&msg.to_json()), canon(&fixture!("hello-ack.json")));
+    }
+
+    #[test]
+    fn transcript_messages_match_golden_fixtures() {
+        // the ring keeps each op serialized once; the envelope splices them
+        let golden = fixture!("transcript.json");
+        let ops: Vec<String> = json::as_arr(json::get(&golden, "ops").unwrap())
+            .unwrap()
+            .iter()
+            .map(json::stringify)
+            .collect();
+        assert_eq!(ops.len(), 7);
+        let batch = ServerMsg::Transcript {
+            session_id: "ses_live_1".into(),
+            epoch: "9f86d081884c7d65".into(),
+            ops,
+        };
+        let text = batch.to_text();
+        assert_eq!(canon(&json::parse(&text).unwrap()), canon(&golden));
+        assert_eq!(canon(&batch.to_json()), canon(&golden));
+
+        let golden = fixture!("transcript-snapshot.json");
+        let body = json::obj(
+            ["items", "truncatedBefore", "turns", "state", "mcp"]
+                .into_iter()
+                .map(|k| (k, json::get(&golden, k).unwrap().clone()))
+                .collect(),
+        );
+        let snapshot = ServerMsg::TranscriptSnapshot {
+            session_id: "ses_live_1".into(),
+            epoch: "9f86d081884c7d65".into(),
+            seq: 3,
+            body,
+        };
+        assert_eq!(
+            canon(&json::parse(&snapshot.to_text()).unwrap()),
+            canon(&golden)
+        );
+    }
+
+    #[test]
+    fn permission_extras_serialize_only_when_present() {
+        // without extras: exactly today's keys, so v2 phones see no change
+        let plain = sample_permission().to_json();
+        for key in ["toolItemId", "options", "detail"] {
+            assert!(json::get(&plain, key).is_none(), "{key}");
+        }
+        // with extras: the golden permission_requested frame
+        let option =
+            |id: &str, decision: &str, label: &str, scope: &'static str| PermissionOption {
+                id: id.into(),
+                decision: decision.into(),
+                label: label.into(),
+                rule: None,
+                scope,
+                destination: None,
+                takes_message: false,
+                stops_turn: false,
+            };
+        let pr = PermissionRequest {
+            id: "claude-1:toolu_01".into(),
+            native_request_id: "req_7c1e".into(),
+            session_id: "ses_live_1".into(),
+            agent_id: "claude-1".into(),
+            host_id: "claude-1".into(),
+            action: "file-write".into(),
+            title: "Claude wants to write a.txt".into(),
+            command: "a.txt".into(),
+            args: vec![],
+            directory: Some("C:\\work\\demo".into()),
+            risk: "medium".into(),
+            status: "pending".into(),
+            supported_decisions: vec!["approve-once".into(), "reject".into()],
+            revision: 1,
+            fingerprint: None,
+            requested_at: 1_761_436_800_300,
+            expires_at: 1_761_523_200_300,
+            context: "Create a.txt containing hi".into(),
+            decided_at: None,
+            decision: None,
+            tool_item_id: Some("toolu_01".into()),
+            options: vec![
+                option("allow", "approve-once", "Allow", "once"),
+                PermissionOption {
+                    rule: Some("Edit(./**)".into()),
+                    destination: Some(".claude/settings.local.json".into()),
+                    ..option(
+                        "allow-dir",
+                        "approve-session",
+                        "Always allow edits in this project",
+                        "persistent",
+                    )
+                },
+                PermissionOption {
+                    takes_message: true,
+                    ..option("deny", "reject", "Deny", "once")
+                },
+                PermissionOption {
+                    stops_turn: true,
+                    ..option("deny-stop", "reject", "Deny and stop", "once")
+                },
+            ],
+            detail: Some(json::obj(vec![
+                ("kind", json::s("edit")),
+                ("path", json::s("a.txt")),
+                ("patch", json::s("@@ -0,0 +1 @@\n+hi")),
+            ])),
+        };
+        let msg = ServerMsg::Event {
+            kind: EventKind::PermissionRequested(pr),
+            env: Envelope {
+                seq: 17,
+                event_id: "evt_live_1".into(),
+                occurred_at: 1_761_436_800_300,
+            },
+        };
+        assert_eq!(
+            canon(&msg.to_json()),
+            canon(&fixture!("permission-requested.json"))
+        );
+
+        // Agent.live and Session.transcript follow the same rule
+        let mut agent = Agent {
+            id: "claude-1".into(),
+            host_id: "claude-1".into(),
+            kind: "claude-code".into(),
+            name: "Claude Code".into(),
+            state: "online".into(),
+            capabilities: vec![],
+            accepts_new_session: true,
+            simulated: false,
+            live: None,
+        };
+        assert!(json::get(&agent.to_json(), "live").is_none());
+        agent.live = Some(AgentLive {
+            prompt_while_busy: "merge",
+            interrupt: true,
+            end: true,
+            permission_modes: vec!["default".into(), "acceptEdits".into(), "plan".into()],
+            workspaces: vec![LiveWorkspace {
+                id: "3f2a9c1d0e4b".into(),
+                label: "demo".into(),
+                path: "C:\\work\\demo".into(),
+            }],
+        });
+        assert_eq!(
+            json::stringify(json::get(&agent.to_json(), "live").unwrap()),
+            r#"{"transcript":true,"promptWhileBusy":"merge","interrupt":true,"end":true,"permissionModes":["default","acceptEdits","plan"],"workspaces":[{"id":"3f2a9c1d0e4b","label":"demo","path":"C:\\work\\demo"}]}"#
+        );
+        let mut session = Session {
+            id: "ses_live_1".into(),
+            agent_id: "claude-1".into(),
+            host_id: "claude-1".into(),
+            title: "t".into(),
+            project: "p".into(),
+            status: "idle".into(),
+            progress: 0,
+            created_at: 0,
+            last_activity_at: 0,
+            prompt: None,
+            timeline: vec![],
+            output: vec![],
+            files: vec![],
+            transcript: false,
+        };
+        assert!(json::get(&session.to_json(), "transcript").is_none());
+        session.transcript = true;
+        assert_eq!(
+            json::get(&session.to_json(), "transcript"),
+            Some(&Json::Bool(true))
+        );
     }
 }

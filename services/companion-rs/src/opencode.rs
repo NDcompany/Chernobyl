@@ -284,6 +284,16 @@ impl OpenCodeAdapter {
             | ClientMsg::HsProof { .. } => Err(AdapterError::Unsupported(
                 "session-neutral messages stay with the engine".into(),
             )),
+            // ADR-015 live messages: never routed here yet (rich parts, step 5)
+            ClientMsg::SessionSubscribe { .. }
+            | ClientMsg::SessionUnsubscribe { .. }
+            | ClientMsg::SessionEnd { .. }
+            | ClientMsg::SetPermissionMode { .. }
+            | ClientMsg::McpAuth { .. }
+            | ClientMsg::McpAuthCallback { .. }
+            | ClientMsg::McpReconnect { .. } => Err(AdapterError::Unsupported(
+                "not supported by this agent".into(),
+            )),
         }
     }
 
@@ -588,6 +598,7 @@ impl Inner {
             timeline: vec![],
             output: vec![],
             files: vec![],
+            transcript: false,
         })
     }
 
@@ -607,6 +618,7 @@ impl Inner {
             capabilities: caps,
             accepts_new_session: mode == "primary" && healthy,
             simulated: false,
+            live: None,
         })
     }
 
@@ -1365,6 +1377,9 @@ impl Inner {
                     context,
                     decided_at: None,
                     decision: None,
+                    tool_item_id: None,
+                    options: vec![],
+                    detail: None,
                 };
                 self.state
                     .lock()
@@ -1953,6 +1968,9 @@ pub(crate) mod tests {
                     permission_id: "per_1".into(),
                     decision: decision.into(),
                     revision: 1.0,
+                    option_id: None,
+                    message: None,
+                    answers: vec![],
                 })
                 .unwrap();
             assert!(
@@ -1975,6 +1993,9 @@ pub(crate) mod tests {
                 permission_id: "per_missing".into(),
                 decision: "approve-once".into(),
                 revision: 1.0,
+                option_id: None,
+                message: None,
+                answers: vec![],
             })
             .unwrap();
         match msg {

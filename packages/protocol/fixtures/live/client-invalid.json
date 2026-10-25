@@ -1,0 +1,172 @@
+[
+  { "why": "subscribe without sessionId", "msg": { "type": "session_subscribe", "commandId": "c" } },
+  { "why": "subscribe with empty sessionId", "msg": { "type": "session_subscribe", "commandId": "c", "sessionId": "" } },
+  { "why": "subscribe without commandId", "msg": { "type": "session_subscribe", "sessionId": "s" } },
+  {
+    "why": "afterSeq negative",
+    "msg": { "type": "session_subscribe", "commandId": "c", "sessionId": "s", "afterSeq": -1 }
+  },
+  {
+    "why": "afterSeq fractional",
+    "msg": { "type": "session_subscribe", "commandId": "c", "sessionId": "s", "afterSeq": 1.5 }
+  },
+  {
+    "why": "afterSeq as a string",
+    "msg": { "type": "session_subscribe", "commandId": "c", "sessionId": "s", "afterSeq": "3" }
+  },
+  {
+    "why": "afterSeq null",
+    "msg": { "type": "session_subscribe", "commandId": "c", "sessionId": "s", "afterSeq": null }
+  },
+  {
+    "why": "afterSeq past the safe integer range",
+    "msg": { "type": "session_subscribe", "commandId": "c", "sessionId": "s", "afterSeq": 9007199254740992 }
+  },
+  {
+    "why": "epoch longer than 64 chars",
+    "msg": {
+      "type": "session_subscribe",
+      "commandId": "c",
+      "sessionId": "s",
+      "epoch": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
+    }
+  },
+  {
+    "why": "epoch not a string",
+    "msg": { "type": "session_subscribe", "commandId": "c", "sessionId": "s", "epoch": 7 }
+  },
+  { "why": "unsubscribe without sessionId", "msg": { "type": "session_unsubscribe", "commandId": "c" } },
+  { "why": "unsubscribe with empty commandId", "msg": { "type": "session_unsubscribe", "commandId": "", "sessionId": "s" } },
+  { "why": "end without sessionId", "msg": { "type": "session_end", "commandId": "c" } },
+  {
+    "why": "mode bypassPermissions",
+    "msg": { "type": "set_permission_mode", "commandId": "c", "sessionId": "s", "mode": "bypassPermissions" }
+  },
+  {
+    "why": "mode dontAsk",
+    "msg": { "type": "set_permission_mode", "commandId": "c", "sessionId": "s", "mode": "dontAsk" }
+  },
+  {
+    "why": "mode auto",
+    "msg": { "type": "set_permission_mode", "commandId": "c", "sessionId": "s", "mode": "auto" }
+  },
+  {
+    "why": "mode in the wrong case",
+    "msg": { "type": "set_permission_mode", "commandId": "c", "sessionId": "s", "mode": "Default" }
+  },
+  { "why": "mode missing", "msg": { "type": "set_permission_mode", "commandId": "c", "sessionId": "s" } },
+  {
+    "why": "flow claude-ai is phone-side only",
+    "msg": { "type": "mcp_auth", "commandId": "c", "sessionId": "s", "server": "x", "flow": "claude-ai" }
+  },
+  { "why": "flow missing", "msg": { "type": "mcp_auth", "commandId": "c", "sessionId": "s", "server": "x" } },
+  {
+    "why": "server empty",
+    "msg": { "type": "mcp_auth", "commandId": "c", "sessionId": "s", "server": "", "flow": "desktop" }
+  },
+  {
+    "why": "server longer than 256 chars",
+    "msg": {
+      "type": "mcp_auth",
+      "commandId": "c",
+      "sessionId": "s",
+      "server": "sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+      "flow": "desktop"
+    }
+  },
+  {
+    "why": "callback over https",
+    "msg": {
+      "type": "mcp_auth_callback",
+      "commandId": "c",
+      "sessionId": "s",
+      "server": "x",
+      "callbackUrl": "https://localhost:44818/callback?code=k"
+    }
+  },
+  {
+    "why": "callback without a scheme",
+    "msg": { "type": "mcp_auth_callback", "commandId": "c", "sessionId": "s", "server": "x", "callbackUrl": "localhost:44818/callback" }
+  },
+  {
+    "why": "callback missing",
+    "msg": { "type": "mcp_auth_callback", "commandId": "c", "sessionId": "s", "server": "x" }
+  },
+  {
+    "why": "callback without a server",
+    "msg": { "type": "mcp_auth_callback", "commandId": "c", "sessionId": "s", "callbackUrl": "http://localhost:1/cb" }
+  },
+  { "why": "reconnect without a server", "msg": { "type": "mcp_reconnect", "commandId": "c", "sessionId": "s" } },
+  { "why": "reconnect with an empty server", "msg": { "type": "mcp_reconnect", "commandId": "c", "sessionId": "s", "server": "" } },
+  { "why": "reconnect without sessionId", "msg": { "type": "mcp_reconnect", "commandId": "c", "server": "x" } },
+  {
+    "why": "reconnect server longer than 256 chars",
+    "msg": {
+      "type": "mcp_reconnect",
+      "commandId": "c",
+      "sessionId": "s",
+      "server": "sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+    }
+  },
+  {
+    "why": "optionId longer than 128 chars",
+    "msg": {
+      "type": "permission_decision",
+      "commandId": "c",
+      "permissionId": "p",
+      "decision": "approve-once",
+      "revision": 1,
+      "optionId": "ooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo"
+    }
+  },
+  {
+    "why": "optionId not a string",
+    "msg": { "type": "permission_decision", "commandId": "c", "permissionId": "p", "decision": "reject", "revision": 1, "optionId": 3 }
+  },
+  {
+    "why": "message not a string",
+    "msg": { "type": "permission_decision", "commandId": "c", "permissionId": "p", "decision": "reject", "revision": 1, "message": true }
+  },
+  {
+    "why": "answers as an array",
+    "msg": { "type": "permission_decision", "commandId": "c", "permissionId": "p", "decision": "approve-once", "revision": 1, "answers": [["a"]] }
+  },
+  {
+    "why": "answers null",
+    "msg": { "type": "permission_decision", "commandId": "c", "permissionId": "p", "decision": "approve-once", "revision": 1, "answers": null }
+  },
+  {
+    "why": "answer list not an array",
+    "msg": { "type": "permission_decision", "commandId": "c", "permissionId": "p", "decision": "approve-once", "revision": 1, "answers": { "q1": "a" } }
+  },
+  {
+    "why": "answer not a string",
+    "msg": { "type": "permission_decision", "commandId": "c", "permissionId": "p", "decision": "approve-once", "revision": 1, "answers": { "q1": [1] } }
+  },
+  {
+    "why": "answers with 9 question ids",
+    "msg": {
+      "type": "permission_decision",
+      "commandId": "c",
+      "permissionId": "p",
+      "decision": "approve-once",
+      "revision": 1,
+      "answers": { "q1": [], "q2": [], "q3": [], "q4": [], "q5": [], "q6": [], "q7": [], "q8": [], "q9": [] }
+    }
+  },
+  {
+    "why": "17 answers for one question",
+    "msg": {
+      "type": "permission_decision",
+      "commandId": "c",
+      "permissionId": "p",
+      "decision": "approve-once",
+      "revision": 1,
+      "answers": { "q1": ["a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a"] }
+    }
+  },
+  {
+    "why": "extras do not relax the decision whitelist",
+    "msg": { "type": "permission_decision", "commandId": "c", "permissionId": "p", "decision": "allow", "revision": 1, "optionId": "allow" }
+  }
+]

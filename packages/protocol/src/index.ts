@@ -17,6 +17,8 @@
  *  - Every event message carries an EventEnvelope (per-host monotonic
  *    `seq`, `eventId`, `occurredAt`); snapshot replies carry `lastSeq` so
  *    clients can detect gaps.
+ *  - ADR-015 (additive, still v2): live transcript messages, advertised by
+ *    `hello_ack.features` (FEATURE_TRANSCRIPT); the reducer is ./transcript.
  *
  * All timestamps are epoch milliseconds (UTC). All ids are opaque strings.
  */
@@ -131,6 +133,18 @@ export interface Agent {
   acceptsNewSession: boolean;
   /** ADR-009 provenance, same rule as `Host.simulated`. */
   simulated?: boolean;
+  /** ADR-015: present only for runtimes that stream a live transcript. */
+  live?: {
+    transcript: true;
+    promptWhileBusy: 'merge' | 'queue' | 'none';
+    interrupt: boolean;
+    /** session_end supported (Claude). */
+    end: boolean;
+    /** Claude: ['default', 'acceptEdits', 'plan']. */
+    permissionModes?: string[];
+    /** Spawning runtimes only. */
+    workspaces?: Array<{ id: string; label: string; path: string }>;
+  };
 }
 
 export interface OutputLine {
@@ -169,6 +183,8 @@ export interface Session {
   timeline: SessionStep[];
   output: OutputLine[];
   files: FileChange[];
+  /** ADR-015: present only when a transcript stream exists for this session. */
+  transcript?: true;
 }
 
 export interface PermissionRequest {
@@ -202,6 +218,12 @@ export interface PermissionRequest {
   context: string;
   decidedAt?: number;
   decision?: PermissionDecision;
+  /** ADR-015: transcript tool item this request belongs to. */
+  toolItemId?: string;
+  /** ADR-015: the runtime's own choices; never empty when present, always holds a 'reject'. */
+  options?: PermissionOption[];
+  /** ADR-015: what is being asked (command, diff, questions, plan). */
+  detail?: PermissionDetail;
 }
 
 export interface ActivityEvent {
@@ -221,6 +243,197 @@ export interface Snapshot {
   permissions: PermissionRequest[];
   activity: ActivityEvent[];
 }
+
+/* ---------------- ADR-015 live sessions (additive; protocol stays 2) ---------------- */
+
+// FEATURE_TRANSCRIPT = 'transcript.v1' lives in ./util with the other
+// constants (the engine needs it without importing this module back).
+
+export type ToolStatus =
+  | 'pending'            // announced, input may still be streaming
+  | 'running'
+  | 'awaiting-approval'  // a PermissionRequest with toolItemId === this item is pending
+  | 'completed'
+  | 'failed'
+  | 'denied'             // the user or a rule refused it
+  | 'cancelled';         // interrupted / withdrawn
+
+export interface FileDiff {
+  path: string;
+  status: 'added' | 'modified' | 'deleted' | 'renamed';
+  additions: number;
+  deletions: number;
+  /** Unified diff text (lines starting ' ', '+', '-', '@@'), redacted, at most 64 KiB. */
+  patch: string;
+  truncated?: true;
+}
+
+export interface PlanStep {
+  text: string;
+  status: 'pending' | 'in_progress' | 'completed' | 'cancelled';
+}
+
+export interface ToolCall {
+  /** Runtime tool name, shown verbatim: "Bash", "Edit", "shell", "apply_patch", "sentry_find_issues". */
+  name: string;
+  /** One-line summary: the command, path or URL. */
+  title?: string;
+  status: ToolStatus;
+  /** Final input as pretty JSON or the raw command; while streaming, raw partial JSON. Redacted, at most 16 KiB. */
+  input?: string;
+  /** Redacted; head + tail, at most 32 KiB. */
+  output?: string;
+  outputTruncated?: true;
+  error?: string;
+  diffs?: FileDiff[];
+  /** PermissionRequest.id while or after it was asked. */
+  permissionId?: string;
+  /** Why no prompt appeared: 'rule' | 'mode' | 'read-only' | 'hook' (runtime-reported). */
+  autoApproved?: string;
+  durationMs?: number;
+}
+
+interface ItemBase {
+  id: string;          // stable per session; adapter-defined (§3.6)
+  ts: number;
+  turnId?: string;
+  parentId?: string;   // nested under a subagent / Task tool item
+}
+
+export type TranscriptItem =
+  | (ItemBase & { kind: 'user'; text: string; queued?: true })
+  | (ItemBase & { kind: 'text'; text: string; done: boolean; truncated?: true })
+  | (ItemBase & { kind: 'thinking'; text: string; done: boolean; truncated?: true })
+  | (ItemBase & { kind: 'tool'; tool: ToolCall })
+  | (ItemBase & { kind: 'plan'; steps: PlanStep[] })
+  | (ItemBase & { kind: 'notice'; level: 'info' | 'warning' | 'error'; text: string });
+
+export interface Usage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  reasoningTokens?: number;
+}
+
+export interface TurnState {
+  id: string;
+  status: 'running' | 'completed' | 'interrupted' | 'failed';
+  startedAt: number;
+  endedAt?: number;
+  usage?: Usage;
+  /** Claude only: this turn's share of the CLI's cumulative total_cost_usd. */
+  costUsd?: number;
+  error?: string;
+  /** Per-turn file changes when the runtime reports them (OpenCode summary.diffs, Codex turn diff). */
+  diffs?: FileDiff[];
+}
+
+export type LiveStatus = 'starting' | 'idle' | 'running' | 'waiting' | 'ended';
+
+export interface LiveState {
+  status: LiveStatus;
+  permissionMode?: string;   // Claude: default | acceptEdits | plan | ...
+  model?: string;
+}
+
+export type McpStatus = 'connected' | 'pending' | 'failed' | 'needs-auth' | 'disabled';
+
+export interface McpServerState {
+  /** Untrusted display text (comes from user/plugin config). */
+  name: string;
+  status: McpStatus;
+  error?: string;
+  /** Sign-in flows this server supports from the phone; [] = nothing to do or desktop only. */
+  authFlows: Array<'desktop' | 'phone-callback' | 'claude-ai'>;
+  auth?: {
+    state: 'starting' | 'awaiting-browser' | 'awaiting-callback' | 'completing' | 'failed';
+    /** Only for the phone-callback and claude-ai flows: the URL the phone opens. */
+    url?: string;
+    /** Phone-callback flow: the pasted URL must start with this, e.g. "http://localhost:44818/callback". */
+    callbackPrefix?: string;
+    error?: string;
+  };
+}
+
+export type TranscriptOp =
+  | { seq: number; op: 'item'; item: TranscriptItem }             // insert or replace by item.id
+  | { seq: number; op: 'append'; id: string; field: 'text' | 'input' | 'output'; text: string }
+  | { seq: number; op: 'turn'; turn: TurnState }                    // upsert by turn.id
+  | { seq: number; op: 'state'; state: LiveState }
+  | { seq: number; op: 'mcp'; servers: McpServerState[] };         // full replace
+
+/* Permission additions (all optional; legacy fields stay filled for v2 clients) */
+
+export interface PermissionOption {
+  /** Adapter-defined, stable for this request. */
+  id: string;
+  /** G2 bucket; also what legacy clients send. */
+  decision: PermissionDecision;
+  /** Exact user-facing text built from native data, e.g. "Always allow `npm test` in this project". */
+  label: string;
+  /** Rule text a session or persistent grant adds, shown verbatim. */
+  rule?: string;
+  scope: 'once' | 'session' | 'persistent';
+  /** Where a persistent grant is written, e.g. ".claude/settings.local.json". */
+  destination?: string;
+  /** The phone may attach a free-text reason the model sees. */
+  takesMessage?: true;
+  /** Choosing it also ends the current turn. */
+  stopsTurn?: true;
+}
+
+export type PermissionDetail =
+  | { kind: 'shell'; command: string; cwd?: string; reason?: string }
+  | { kind: 'edit'; path: string; patch?: string }
+  | { kind: 'read'; path: string }
+  | { kind: 'fetch'; url: string }
+  | { kind: 'mcp'; server: string; tool: string; input?: string }
+  | {
+      kind: 'question';
+      questions: Array<{
+        id: string;
+        text: string;
+        header?: string;
+        options: Array<{ label: string; description?: string }>;
+        multiSelect: boolean;
+        allowFreeText: boolean;
+      }>;
+    }
+  | { kind: 'plan'; plan: string }
+  | { kind: 'generic'; tool: string; input?: string };
+
+// PermissionRequest gains toolItemId / options / detail, Agent gains `live`
+// and Session gains `transcript` (declared on those interfaces above).
+
+/* Client → server additions */
+export type LiveClientMessage =
+  | { type: 'session_subscribe'; commandId: string; sessionId: string; epoch?: string; afterSeq?: number }
+  | { type: 'session_unsubscribe'; commandId: string; sessionId: string }
+  | { type: 'session_end'; commandId: string; sessionId: string }
+  | { type: 'set_permission_mode'; commandId: string; sessionId: string; mode: 'default' | 'acceptEdits' | 'plan' }
+  | { type: 'mcp_auth'; commandId: string; sessionId: string; server: string; flow: 'desktop' | 'phone-callback' }
+  | { type: 'mcp_auth_callback'; commandId: string; sessionId: string; server: string; callbackUrl: string }
+  | { type: 'mcp_reconnect'; commandId: string; sessionId: string; server: string }; // §4.7 "Reconnect a failed server"
+// ClientMessage = existing union | LiveClientMessage.
+// permission_decision gains: optionId?: string; message?: string; answers?: Record<string, string[]>
+//   (answers keyed by PermissionDetail.question.questions[].id)
+
+/* Server → client additions */
+export type LiveServerMessage =
+  | { type: 'transcript'; sessionId: string; epoch: string; ops: TranscriptOp[] }
+  | {
+      type: 'transcript_snapshot';
+      sessionId: string;
+      epoch: string;
+      seq: number;               // ops after this seq follow as `transcript`
+      items: TranscriptItem[];
+      truncatedBefore: boolean;  // older items exist only on the desktop
+      turns: TurnState[];        // turns referenced by `items`
+      state: LiveState;
+      mcp: McpServerState[];
+    };
+// ServerMessage = existing union | LiveServerMessage.
+// hello_ack gains: features?: string[]
 
 /* ------------------------------------------------------------------ */
 /* Client → server messages                                            */
@@ -247,8 +460,15 @@ export type ClientMessage =
       decision: PermissionDecision;
       /** Revision the user decided against; mismatch fails closed (G2). */
       revision: number;
+      /** ADR-015: a PermissionOption.id; its `decision` must equal `decision`. */
+      optionId?: string;
+      /** ADR-015: free-text reason the model sees (options with `takesMessage`). */
+      message?: string;
+      /** ADR-015: keyed by PermissionDetail.question.questions[].id. */
+      answers?: Record<string, string[]>;
     }
-  | { type: 'list_state'; commandId: string };
+  | { type: 'list_state'; commandId: string }
+  | LiveClientMessage;
 
 export type ClientMessageType = ClientMessage['type'];
 
@@ -264,6 +484,8 @@ export type ServerMessage =
       snapshot: Snapshot;
       /** Highest envelope seq at reply time; clients use it to detect gaps. */
       lastSeq: number;
+      /** ADR-015: protocol extensions this server understands, e.g. FEATURE_TRANSCRIPT. */
+      features?: string[];
     }
   | { type: 'pong'; commandId: string }
   /**
@@ -320,7 +542,9 @@ export type ServerMessage =
       error?: string;
       sessionId?: string;
       permissionId?: string;
-    } & EventEnvelope);
+    } & EventEnvelope)
+  /** ADR-015: transcript frames reach only connections that subscribed; never journaled. */
+  | LiveServerMessage;
 
 export type ServerMessageType = ServerMessage['type'];
 
@@ -340,6 +564,26 @@ function isNum(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v);
 }
 
+/** At most `max` UTF-16 units (JS length; the Rust validator counts the same units). */
+function fits(v: unknown, max: number): v is string {
+  return typeof v === 'string' && v.length <= max;
+}
+
+/** Non-negative safe integer (transcript seq, afterSeq). */
+function isSeq(v: unknown): v is number {
+  return Number.isSafeInteger(v) && (v as number) >= 0;
+}
+
+/** ADR-015 §3.4: an object of ≤ 8 question ids, each ≤ 16 answers of ≤ 1,024 chars. */
+function isAnswers(v: unknown): boolean {
+  if (!isRecord(v) || Array.isArray(v)) return false;
+  const lists = Object.values(v);
+  return (
+    lists.length <= 8 &&
+    lists.every((a) => Array.isArray(a) && a.length <= 16 && a.every((s) => fits(s, 1024)))
+  );
+}
+
 const CLIENT_TYPES: ReadonlySet<string> = new Set([
   'hello',
   'ping',
@@ -348,6 +592,13 @@ const CLIENT_TYPES: ReadonlySet<string> = new Set([
   'interrupt',
   'permission_decision',
   'list_state',
+  'session_subscribe',
+  'session_unsubscribe',
+  'session_end',
+  'set_permission_mode',
+  'mcp_auth',
+  'mcp_auth_callback',
+  'mcp_reconnect',
 ]);
 
 const SERVER_TYPES: ReadonlySet<string> = new Set([
@@ -365,6 +616,8 @@ const SERVER_TYPES: ReadonlySet<string> = new Set([
   'activity',
   'command_progress',
   'command_result',
+  'transcript',
+  'transcript_snapshot',
 ]);
 
 function hasCommandId(v: Record<string, unknown>): boolean {
@@ -385,8 +638,12 @@ export function isClientMessage(v: unknown): v is ClientMessage {
     case 'create_session':
       return hasCommandId(v) && isStr(v.agentId) && isStr(v.title) && isStr(v.prompt);
     case 'submit_prompt':
-      return hasCommandId(v) && isStr(v.sessionId) && isStr(v.text);
+      // ADR-015 §3.4: 32,000 characters as the phone's zod counts them (UTF-16
+      // units); the Rust companion counts chars, so it is never stricter
+      return hasCommandId(v) && isStr(v.sessionId) && isStr(v.text) && fits(v.text, 32_000);
     case 'interrupt':
+    case 'session_unsubscribe':
+    case 'session_end':
       return hasCommandId(v) && isStr(v.sessionId);
     case 'permission_decision':
       return (
@@ -395,11 +652,49 @@ export function isClientMessage(v: unknown): v is ClientMessage {
         isNum(v.revision) &&
         (v.decision === 'approve-once' ||
           v.decision === 'approve-session' ||
-          v.decision === 'reject')
+          v.decision === 'reject') &&
+        (v.optionId === undefined || fits(v.optionId, 128)) &&
+        (v.message === undefined || fits(v.message, 4096)) &&
+        (v.answers === undefined || isAnswers(v.answers))
       );
     case 'list_state':
     case 'ping':
       return hasCommandId(v);
+    case 'session_subscribe':
+      return (
+        hasCommandId(v) &&
+        isStr(v.sessionId) &&
+        // a fresh view's epoch '' is fine: it never matches, so a snapshot follows
+        (v.epoch === undefined || fits(v.epoch, 64)) &&
+        (v.afterSeq === undefined || isSeq(v.afterSeq))
+      );
+    case 'set_permission_mode':
+      // whitelist: bypassPermissions / dontAsk / auto are never reachable from a phone
+      return (
+        hasCommandId(v) &&
+        isStr(v.sessionId) &&
+        (v.mode === 'default' || v.mode === 'acceptEdits' || v.mode === 'plan')
+      );
+    case 'mcp_auth':
+      return (
+        hasCommandId(v) &&
+        isStr(v.sessionId) &&
+        isStr(v.server) &&
+        fits(v.server, 256) &&
+        (v.flow === 'desktop' || v.flow === 'phone-callback')
+      );
+    case 'mcp_auth_callback':
+      // shape only; host, port, path and state are checked by the adapter (§4.7)
+      return (
+        hasCommandId(v) &&
+        isStr(v.sessionId) &&
+        isStr(v.server) &&
+        fits(v.server, 256) &&
+        fits(v.callbackUrl, 4096) &&
+        v.callbackUrl.startsWith('http://')
+      );
+    case 'mcp_reconnect':
+      return hasCommandId(v) && isStr(v.sessionId) && isStr(v.server) && fits(v.server, 256);
     default:
       return false;
   }
@@ -423,7 +718,12 @@ export function isServerMessage(v: unknown): v is ServerMessage {
   switch (v.type) {
     case 'hello_ack':
       return (
-        isNum(v.protocol) && isNum(v.serverTime) && isNum(v.lastSeq) && hasSnapshot(v)
+        isNum(v.protocol) &&
+        isNum(v.serverTime) &&
+        isNum(v.lastSeq) &&
+        hasSnapshot(v) &&
+        (v.features === undefined ||
+          (Array.isArray(v.features) && v.features.every((f) => typeof f === 'string')))
       );
     case 'pong':
       return isStr(v.commandId);
@@ -467,6 +767,26 @@ export function isServerMessage(v: unknown): v is ServerMessage {
           v.status === 'unknown') &&
         hasEnvelope(v)
       );
+    case 'transcript':
+      // op kinds stay open (a newer companion may add some); applyTranscript
+      // skips what it does not know but still needs every seq
+      return (
+        isStr(v.sessionId) &&
+        isStr(v.epoch) &&
+        Array.isArray(v.ops) &&
+        v.ops.every((o) => isRecord(o) && isSeq(o.seq) && isStr(o.op))
+      );
+    case 'transcript_snapshot':
+      return (
+        isStr(v.sessionId) &&
+        isStr(v.epoch) &&
+        isSeq(v.seq) &&
+        Array.isArray(v.items) &&
+        typeof v.truncatedBefore === 'boolean' &&
+        Array.isArray(v.turns) &&
+        isRecord(v.state) &&
+        Array.isArray(v.mcp)
+      );
     default:
       return false;
   }
@@ -505,5 +825,6 @@ export function isPermissionAction(v: unknown): v is PermissionAction {
 }
 
 export * from './util';
+export * from './transcript';
 export { createSeedSnapshot } from './seed';
 export { MockEngine } from './engine';

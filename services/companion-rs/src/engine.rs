@@ -6,7 +6,7 @@
 //! far-future `now` to fast-forward deterministically.
 
 use crate::protocol::{
-    ActivityEvent, ClientMsg, DecisionError, Envelope, EventKind, FileChange, OutputLine,
+    ActivityEvent, ClientMsg, DecisionError, Envelope, EventKind, FEATURES, FileChange, OutputLine,
     PermissionRequest, ServerMsg, Session, SessionStep, Snapshot, evaluate_permission_decision,
     next_id, now_ms,
 };
@@ -280,6 +280,7 @@ impl Engine {
                 server_time: now_ms(),
                 snapshot: self.state.clone(),
                 last_seq: self.seq,
+                features: FEATURES,
             }),
             ClientMsg::CreateSession { .. } => self.create_session(msg),
             ClientMsg::SubmitPrompt { .. } => self.submit_prompt(msg),
@@ -287,6 +288,19 @@ impl Engine {
             ClientMsg::PermissionDecision { .. } => self.decide(msg),
             // handshake frames are terminated in the server, never the engine
             ClientMsg::HsHello { .. } | ClientMsg::HsProof { .. } => None,
+            // ADR-015: the mock runtime streams no transcript. Everything a
+            // live runtime does not claim lands here and is refused honestly
+            // (parity with the TS MockEngine).
+            ClientMsg::SessionSubscribe { command_id, .. }
+            | ClientMsg::SessionUnsubscribe { command_id, .. }
+            | ClientMsg::SessionEnd { command_id, .. }
+            | ClientMsg::SetPermissionMode { command_id, .. }
+            | ClientMsg::McpAuth { command_id, .. }
+            | ClientMsg::McpAuthCallback { command_id, .. }
+            | ClientMsg::McpReconnect { command_id, .. } => Some(ServerMsg::ack_err(
+                command_id,
+                "not supported by this agent",
+            )),
         };
 
         if let (Some(ServerMsg::Ack { .. }), Some(cmd_id), true) = (&reply, &cmd_id, mutating)
@@ -368,6 +382,7 @@ impl Engine {
             ],
             output: vec![],
             files: vec![],
+            transcript: false,
         };
         self.state.sessions.insert(0, session.clone());
         self.broadcast(EventKind::SessionCreated(session.clone()));
@@ -478,11 +493,14 @@ impl Engine {
     }
 
     fn decide(&mut self, msg: ClientMsg) -> Option<ServerMsg> {
+        // ADR-015 option_id / message / answers are ignored until engine
+        // option validation lands (step 3); mock requests carry no options
         let ClientMsg::PermissionDecision {
             command_id,
             permission_id,
             decision,
             revision,
+            ..
         } = msg
         else {
             return None;
@@ -842,6 +860,9 @@ impl Engine {
             context: spec.context.clone(),
             decided_at: None,
             decision: None,
+            tool_item_id: None,
+            options: vec![],
+            detail: None,
         };
         self.state.permissions.insert(0, permission.clone());
         permission
@@ -1136,6 +1157,9 @@ mod tests {
             permission_id: permission.id.clone(),
             decision: "reject".into(),
             revision: (permission.revision + 1) as f64,
+            option_id: None,
+            message: None,
+            answers: vec![],
         }));
         assert_eq!(
             first.as_ref().map(|a| a.1),
@@ -1149,6 +1173,9 @@ mod tests {
                 permission_id: permission.id.clone(),
                 decision: "reject".into(),
                 revision: (permission.revision + 1) as f64,
+                option_id: None,
+                message: None,
+                answers: vec![],
             });
         }
         let dt = t0.elapsed();
@@ -1244,6 +1271,9 @@ mod tests {
             permission_id: permission.id.clone(),
             decision: "approve-once".into(),
             revision: permission.revision as f64,
+            option_id: None,
+            message: None,
+            answers: vec![],
         }));
         assert_eq!(reply.as_ref().map(|a| a.1), Some(true));
         let p = engine
@@ -1296,6 +1326,9 @@ mod tests {
             permission_id: permission.id.clone(),
             decision: "approve-once".into(),
             revision: revision as f64,
+            option_id: None,
+            message: None,
+            answers: vec![],
         }));
         assert_eq!(reply.map(|a| a.1), Some(false));
         assert_eq!(
@@ -1325,6 +1358,9 @@ mod tests {
             permission_id: permission.id.clone(),
             decision: "reject".into(),
             revision: permission.revision as f64,
+            option_id: None,
+            message: None,
+            answers: vec![],
         }));
         assert_eq!(reply.as_ref().map(|a| a.1), Some(true));
         let p = engine
@@ -1539,6 +1575,9 @@ mod tests {
             permission_id: permission.id.clone(),
             decision: "approve-once".into(),
             revision: (permission.revision + 1) as f64,
+            option_id: None,
+            message: None,
+            answers: vec![],
         }));
         assert_eq!(stale.map(|a| a.1), Some(false));
         assert_eq!(
@@ -1565,6 +1604,9 @@ mod tests {
             permission_id: permission.id.clone(),
             decision: "approve-once".into(),
             revision: permission.revision as f64,
+            option_id: None,
+            message: None,
+            answers: vec![],
         }));
         assert_eq!(unsupported.map(|a| a.1), Some(false));
         assert_eq!(
@@ -1590,6 +1632,9 @@ mod tests {
             permission_id: permission.id.clone(),
             decision: "reject".into(),
             revision: permission.revision as f64,
+            option_id: None,
+            message: None,
+            answers: vec![],
         }));
         assert_eq!(ok.as_ref().map(|a| a.1), Some(true));
         let p = engine
@@ -1648,6 +1693,9 @@ mod tests {
             permission_id: ask.id.clone(),
             decision: "approve-session".into(),
             revision: ask.revision as f64,
+            option_id: None,
+            message: None,
+            answers: vec![],
         });
         // fast-forward to plan completion
         for _ in 0..200 {

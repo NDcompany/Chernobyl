@@ -1,0 +1,72 @@
+{
+  "type": "transcript",
+  "sessionId": "ses_live_1",
+  "epoch": "9f86d081884c7d65",
+  "ops": [
+    {
+      "seq": 4,
+      "op": "item",
+      "item": {
+        "id": "msg_01#0",
+        "ts": 1761436800100,
+        "turnId": "turn_1",
+        "kind": "text",
+        "text": "Creating",
+        "done": false
+      }
+    },
+    { "seq": 5, "op": "append", "id": "msg_01#0", "field": "text", "text": " a.txt now." },
+    {
+      "seq": 6,
+      "op": "item",
+      "item": {
+        "id": "toolu_01",
+        "ts": 1761436800200,
+        "turnId": "turn_1",
+        "kind": "tool",
+        "tool": {
+          "name": "Write",
+          "title": "a.txt",
+          "status": "awaiting-approval",
+          "input": "{\"file_path\":\"a.txt\",\"content\":\"hi\"}",
+          "permissionId": "claude-1:toolu_01"
+        }
+      }
+    },
+    { "seq": 7, "op": "append", "id": "toolu_01", "field": "output", "text": "File created successfully" },
+    {
+      "seq": 8,
+      "op": "turn",
+      "turn": {
+        "id": "turn_1",
+        "status": "completed",
+        "startedAt": 1761436800000,
+        "endedAt": 1761436812400,
+        "usage": { "inputTokens": 4210, "outputTokens": 96, "cacheReadTokens": 3900 },
+        "costUsd": 0.0123,
+        "diffs": [
+          { "path": "a.txt", "status": "added", "additions": 1, "deletions": 0, "patch": "@@ -0,0 +1 @@\n+hi" }
+        ]
+      }
+    },
+    { "seq": 9, "op": "state", "state": { "status": "idle", "permissionMode": "default", "model": "claude-haiku-4-5" } },
+    {
+      "seq": 10,
+      "op": "mcp",
+      "servers": [
+        { "name": "sentry", "status": "needs-auth", "authFlows": ["desktop", "phone-callback"] },
+        {
+          "name": "linear",
+          "status": "pending",
+          "authFlows": ["phone-callback"],
+          "auth": {
+            "state": "awaiting-callback",
+            "url": "https://linear.app/oauth/authorize?client_id=fixture",
+            "callbackPrefix": "http://localhost:44818/callback"
+          }
+        },
+        { "name": "files", "status": "connected", "authFlows": [] }
+      ]
+    }
+  ]
+}

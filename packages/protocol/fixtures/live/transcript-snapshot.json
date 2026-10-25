@@ -1,0 +1,45 @@
+{
+  "type": "transcript_snapshot",
+  "sessionId": "ses_live_1",
+  "epoch": "9f86d081884c7d65",
+  "seq": 3,
+  "items": [
+    {
+      "id": "u_1",
+      "ts": 1761436800000,
+      "turnId": "turn_1",
+      "kind": "user",
+      "text": "Create a.txt containing hi"
+    },
+    {
+      "id": "msg_00#0",
+      "ts": 1761436800050,
+      "turnId": "turn_1",
+      "kind": "thinking",
+      "text": "The user wants one small file.",
+      "done": true
+    },
+    {
+      "id": "plan",
+      "ts": 1761436800060,
+      "turnId": "turn_1",
+      "kind": "plan",
+      "steps": [
+        { "text": "Write a.txt", "status": "in_progress" },
+        { "text": "Confirm the content", "status": "pending" }
+      ]
+    },
+    {
+      "id": "n_1",
+      "ts": 1761436800070,
+      "turnId": "turn_1",
+      "kind": "notice",
+      "level": "warning",
+      "text": "Retrying: overloaded"
+    }
+  ],
+  "truncatedBefore": false,
+  "turns": [{ "id": "turn_1", "status": "running", "startedAt": 1761436800000 }],
+  "state": { "status": "running", "permissionMode": "default", "model": "claude-haiku-4-5" },
+  "mcp": []
+}

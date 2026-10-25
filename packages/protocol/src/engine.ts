@@ -12,7 +12,13 @@
 
 import { evaluatePermissionDecision, PERMISSION_DECISION_ERRORS } from '@chernobyl/domain';
 import { createSeedSnapshot } from './seed';
-import { PERMISSION_TTL_MS, isStalePermission, nextId, unrefTimer } from './util';
+import {
+  FEATURE_TRANSCRIPT,
+  PERMISSION_TTL_MS,
+  isStalePermission,
+  nextId,
+  unrefTimer,
+} from './util';
 import type {
   ActivityEvent,
   Agent,
@@ -67,6 +73,11 @@ const MUTATING: ReadonlySet<ClientMessage['type']> = new Set([
   'submit_prompt',
   'interrupt',
   'permission_decision',
+  'session_end',
+  'set_permission_mode',
+  'mcp_auth',
+  'mcp_auth_callback',
+  'mcp_reconnect',
 ]);
 
 const TICK_MS = 1_000;
@@ -170,7 +181,19 @@ export class MockEngine {
           serverTime: Date.now(),
           snapshot: this.state,
           lastSeq: this.seq,
+          features: [FEATURE_TRANSCRIPT],
         };
+        break;
+      // ADR-015: the mock runtime streams no transcript — refused honestly
+      // (parity with the Rust engine), never left unanswered
+      case 'session_subscribe':
+      case 'session_unsubscribe':
+      case 'session_end':
+      case 'set_permission_mode':
+      case 'mcp_auth':
+      case 'mcp_auth_callback':
+      case 'mcp_reconnect':
+        reply = ackErr(msg.commandId, 'not supported by this agent');
         break;
       default:
         reply = undefined;

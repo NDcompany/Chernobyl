@@ -1,6 +1,6 @@
 # ADR-015: Live agent sessions on the phone (streaming transcript, inline approvals, follow-ups, interrupt, MCP)
 
-**Status:** Proposed 2026-10-26. Design only; nothing in this file is implemented yet. Owner ratification required (same gate as ADR-014).
+**Status:** Accepted 2026-10-26 (ratification delegated by the owner); implementation in progress (step 1 landed).
 **Date:** 2026-10-26
 **Relates to:** PRD §7.2-7.5, §7.8, §12.5, §13, §14.4-14.5; gates G1, G2, G4.3 (amended in §4.2.1); ADR-009 (mock honesty), ADR-010 (std-only Rust), ADR-011 (E2E), ADR-014 (revocation); threat model `PHASE5-THREAT-MODEL.md` §3.1, §3.8, §3.10; `apps/mobile/DESIGN.md`.
 **Research this builds on:** `docs/reverse-engineering/claude-code-streaming.md`, `claude-agent-sdk.md`, `codex-and-antigravity.md`, `opencode-live-events.md` (all 2026-10-26).
@@ -43,7 +43,7 @@ Antigravity (`agy`) streams activity but cannot ask for approval in headless mod
 
 ## 2. Decision summary
 
-1. **Additive protocol, still v2.** Two new server messages (`transcript`, `transcript_snapshot`), six new client messages, optional fields on `Agent`, `Session`, `PermissionRequest` and `permission_decision`, and `hello_ack.features: ["transcript.v1"]` so a new phone can tell whether the companion supports any of it. Old phones never receive transcript frames, because those go only to connections that subscribed.
+1. **Additive protocol, still v2.** Two new server messages (`transcript`, `transcript_snapshot`), seven new client messages, optional fields on `Agent`, `Session`, `PermissionRequest` and `permission_decision`, and `hello_ack.features: ["transcript.v1"]` so a new phone can tell whether the companion supports any of it. Old phones never receive transcript frames, because those go only to connections that subscribed.
 2. **Transcript = per-session item log with five ops** (`item`, `append`, `turn`, `state`, `mcp`). It lives in companion memory only: a bounded ring for replay plus a compacted item list for snapshots, each session with its own `epoch` and `seq`. It is never journaled.
 3. **One code path for live streaming and replay.** Each subscription is `(connection, session, cursor)`. The existing 50 ms scheduler flushes coalesced deltas and sends each subscriber what lies after its cursor. A reconnecting phone re-subscribes with its last `seq`; if that is still in the ring it gets the missing ops, otherwise a snapshot. The pump skips any connection whose bulk queue is over half full, so transcripts can never cause a D8 teardown by themselves.
 4. **Permissions stay engine records (G2)** and gain `toolItemId`, `options` (the runtime's own choices, labelled verbatim) and `detail` (command, diff, questions, plan). A decision may name an `optionId`. Legacy decisions map only to non-persistent options. A request the runtime withdraws or answers elsewhere is resolved `stale` with a revision bump, so a late tap fails closed.
@@ -253,7 +253,8 @@ export type LiveClientMessage =
   | { type: 'session_end'; commandId: string; sessionId: string }
   | { type: 'set_permission_mode'; commandId: string; sessionId: string; mode: 'default' | 'acceptEdits' | 'plan' }
   | { type: 'mcp_auth'; commandId: string; sessionId: string; server: string; flow: 'desktop' | 'phone-callback' }
-  | { type: 'mcp_auth_callback'; commandId: string; sessionId: string; server: string; callbackUrl: string };
+  | { type: 'mcp_auth_callback'; commandId: string; sessionId: string; server: string; callbackUrl: string }
+  | { type: 'mcp_reconnect'; commandId: string; sessionId: string; server: string }; // §4.7 "Reconnect a failed server" (added in step 1)
 // ClientMessage = existing union | LiveClientMessage.
 // permission_decision gains: optionId?: string; message?: string; answers?: Record<string, string[]>
 //   (answers keyed by PermissionDetail.question.questions[].id)
@@ -276,7 +277,7 @@ export type LiveServerMessage =
 // hello_ack gains: features?: string[]
 ```
 
-`session_subscribe` and `session_unsubscribe` are non-mutating: no journal row, answered with an `ack`. `session_end`, `set_permission_mode`, `mcp_auth` and `mcp_auth_callback` are mutating: persisted before execution, deduplicated by `commandId`, and given the full G1 lifecycle (§4.6). `mcp_auth_callback` is persisted with `callbackUrl` replaced by `"<redacted>"`, because it carries a one-time authorization code.
+`session_subscribe` and `session_unsubscribe` are non-mutating: no journal row, answered with an `ack`. `session_end`, `set_permission_mode`, `mcp_auth`, `mcp_auth_callback` and `mcp_reconnect` are mutating: persisted before execution, deduplicated by `commandId`, and given the full G1 lifecycle (§4.6). `mcp_auth_callback` is persisted with `callbackUrl` replaced by `"<redacted>"`, because it carries a one-time authorization code.
 
 The pure reducer `applyTranscript(view, msg) → { view, resubscribe }` lives in a new `packages/protocol/src/transcript.ts`, so the existing TS test runner covers it and the app imports it. Its rules: a snapshot replaces the view; a batch with a different `epoch` returns `resubscribe: true` and is not applied; ops with `seq <= view.seq` are skipped as duplicates, and the first remaining op must be `view.seq + 1`, otherwise `resubscribe: true`; `append` to an unknown item id is ignored (it was trimmed out of a snapshot); unknown item kinds are kept but not rendered.
 
@@ -292,9 +293,10 @@ SessionEnd         { command_id: String, session_id: String },
 SetPermissionMode  { command_id: String, session_id: String, mode: String },   // whitelisted
 McpAuth            { command_id: String, session_id: String, server: String, flow: String }, // whitelisted
 McpAuthCallback    { command_id: String, session_id: String, server: String, callback_url: String },
+McpReconnect       { command_id: String, session_id: String, server: String },
 // PermissionDecision gains:
 //   option_id: Option<String>, message: Option<String>, answers: Vec<(String, Vec<String>)>
-// is_mutating(): SessionEnd | SetPermissionMode | McpAuth | McpAuthCallback = true;
+// is_mutating(): SessionEnd | SetPermissionMode | McpAuth | McpAuthCallback | McpReconnect = true;
 //                SessionSubscribe | SessionUnsubscribe = false.
 
 #[derive(Debug, Clone, PartialEq)]
@@ -431,7 +433,7 @@ pub trait LiveRuntime: Send + Sync {
 | `optionId` | ≤ 128 chars |
 | `message` | ≤ 4,096 chars |
 | `answers` | object, ≤ 8 keys, each an array of ≤ 16 strings of ≤ 1,024 chars |
-| `submit_prompt.text` | ≤ 32 KiB (the phone's zod limit rises from 2,000 to 32,000 chars) |
+| `submit_prompt.text` | ≤ 32,000 characters (TS string length; Rust char count), so the companion is never stricter than the phone (the phone's zod limit rises from 2,000 to 32,000) |
 
 Everything else follows the existing strictness: non-empty required strings, duplicate keys rejected, depth ≤ 32. Hostile-corpus tests extend `protocol.rs`.
 
@@ -700,6 +702,7 @@ The companion TUI's approval keys go through the same `handle_client_msg` path, 
 | `session_end` | accepted | `running` while the process drains | completed on exit |
 | `mcp_auth` | accepted | `running` while awaiting the browser | completed when the server reports `connected`; failed; `expired` after 10 min |
 | `mcp_auth_callback` | validated and forwarded | — | completed on connected; failed otherwise |
+| `mcp_reconnect` | forwarded | — | completed on connected; failed otherwise |
 
 Follow-up behaviour, which the phone shows in the composer through `Agent.live.promptWhileBusy`:
 
@@ -719,7 +722,7 @@ Status per session: Claude polls `mcp_status` after initialize, after each `syst
 | Sign in on the PC (`flow: desktop`) | yes | Claude `mcp_authenticate` → open `authUrl` on the desktop (the CLI's own localhost listener completes it); OpenCode `POST /mcp/{name}/auth/authenticate` (opens the desktop browser itself, run on a thread); Codex `mcpServer/oauth/login` → open `authorizationUrl` → wait for `oauthLogin/completed`. Then poll until connected (Claude also sends `mcp_reconnect`, needed in research run 4) |
 | Finish sign-in away from the PC (`flow: phone-callback`) | Claude, OpenCode | Start as above but return `auth.url` and `auth.callbackPrefix` to the phone. The user signs in in the phone browser, which lands on a dead `http://localhost:<port>/callback?code=…&state=…` page, and pastes that URL. The companion checks scheme `http`, host `localhost` or `127.0.0.1`, the exact port and path from the auth start, and that `state` equals the value it returned (Claude `state`, OpenCode `oauthState`). It then sends Claude `mcp_oauth_callback_url` + `mcp_reconnect`, or OpenCode `POST /mcp/{name}/auth/callback {code}`. One pending auth per server, 10-min lifetime, single use |
 | claude.ai connectors (`config.type: claudeai-proxy`) | open only | `authFlows: ['claude-ai']`, `url: https://claude.ai/customize/connectors`, opened on the phone; the companion is not involved |
-| Reconnect a failed server | yes | Claude `mcp_reconnect`; OpenCode `POST /mcp/{name}/connect`; Codex `config/mcpServer/reload` (its closest equivalent) |
+| Reconnect a failed server | yes (`mcp_reconnect {server}`, §3.2) | Claude `mcp_reconnect`; OpenCode `POST /mcp/{name}/connect`; Codex `config/mcpServer/reload` (its closest equivalent) |
 | Add, remove or toggle servers; clear credentials; Claude or Codex account login; edit workspaces or binaries; bypass permissions | **no, desktop only** | not exposed |
 
 The phone never supplies a URL that the desktop opens. It names a server, and the companion opens only the URL the runtime returned. stdio servers report `authFlows: []`.

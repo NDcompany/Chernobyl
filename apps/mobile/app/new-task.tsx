@@ -28,7 +28,7 @@ const taskSchema = z.object({
     .string()
     .trim()
     .min(10, 'Describe the task in at least 10 characters')
-    .max(2000, 'The prompt is too long'),
+    .max(32000, 'The prompt is too long'),
   project: z.string().trim().max(80, 'Project name is too long'),
 });
 

@@ -1766,6 +1766,7 @@ fn serve_ws(
                         server_time: crate::protocol::now_ms(),
                         snapshot: companion.snapshot(),
                         last_seq: companion.last_seq(),
+                        features: crate::protocol::FEATURES,
                     }),
                     _ => companion.handle_client_msg(msg),
                 };

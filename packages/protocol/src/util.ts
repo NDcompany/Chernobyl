@@ -5,6 +5,9 @@
 /** Protocol version. Bumped to 2 for the command lifecycle + native permissions. */
 export const PROTOCOL_VERSION = 2 as const;
 
+/** ADR-015: `hello_ack.features` entry for the live transcript extension (still v2). */
+export const FEATURE_TRANSCRIPT = 'transcript.v1';
+
 /** Permission requests older than this are stale and must not be decided on. */
 export const PERMISSION_TTL_MS = 2 * 60_000;
 

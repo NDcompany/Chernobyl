@@ -57,6 +57,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             ],
             accepts_new_session: true,
             simulated: true,
+            live: None,
         },
         Agent {
             id: "a2".into(),
@@ -71,6 +72,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             ],
             accepts_new_session: true,
             simulated: true,
+            live: None,
         },
         Agent {
             id: "a3".into(),
@@ -85,6 +87,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             ],
             accepts_new_session: false,
             simulated: true,
+            live: None,
         },
         Agent {
             id: "a4".into(),
@@ -99,6 +102,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             ],
             accepts_new_session: true,
             simulated: true,
+            live: None,
         },
         Agent {
             id: "a5".into(),
@@ -109,6 +113,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             capabilities: vec!["Offline chat".into(), "File summary".into()],
             accepts_new_session: false,
             simulated: true,
+            live: None,
         },
     ];
 
@@ -186,6 +191,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
                 file("src/billing/index.ts", 12, 187, "modified"),
                 file("src/api/routes.ts", 24, 24, "modified"),
             ],
+            transcript: false,
         },
         Session {
             id: "s2".into(),
@@ -218,6 +224,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
                 ),
             ],
             files: vec![],
+            transcript: false,
         },
         Session {
             id: "s3".into(),
@@ -257,6 +264,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
                 ),
             ],
             files: vec![file("tests/retry/rate-limit.test.ts", 8, 3, "modified")],
+            transcript: false,
         },
         Session {
             id: "s4".into(),
@@ -284,6 +292,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
                 ),
             ],
             files: vec![file("work/monitoring/pricing-2026-10.md", 62, 0, "added")],
+            transcript: false,
         },
         Session {
             id: "s5".into(),
@@ -307,6 +316,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
                 "Interrupted by user after 12m",
             )],
             files: vec![],
+            transcript: false,
         },
     ];
 
@@ -348,6 +358,9 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
         context: context.into(),
         decided_at: None,
         decision: None,
+        tool_item_id: None,
+        options: vec![],
+        detail: None,
     };
 
     let permissions = vec![

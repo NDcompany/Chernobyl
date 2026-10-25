@@ -18,6 +18,7 @@ import type { AddressInfo } from 'node:net';
 import type { RawData, WebSocket } from 'ws';
 import { WebSocketServer } from 'ws';
 import {
+  FEATURE_TRANSCRIPT,
   HEARTBEAT_MISS_LIMIT,
   HEARTBEAT_MS,
   MockEngine,
@@ -102,6 +103,9 @@ function handleFrame(
         serverTime: Date.now(),
         snapshot: engine.snapshot(),
         lastSeq: engine.lastSeq(),
+        // same advertisement as the Rust companion (differential parity);
+        // the ADR-015 messages themselves are refused by the engine below
+        features: [FEATURE_TRANSCRIPT],
       } satisfies ServerMessage),
     );
     return;

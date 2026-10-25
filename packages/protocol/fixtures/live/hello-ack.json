@@ -1,0 +1,8 @@
+{
+  "type": "hello_ack",
+  "protocol": 2,
+  "serverTime": 1761436800000,
+  "snapshot": { "hosts": [], "agents": [], "sessions": [], "permissions": [], "activity": [] },
+  "lastSeq": 0,
+  "features": ["transcript.v1"]
+}

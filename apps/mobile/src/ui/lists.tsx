@@ -322,7 +322,7 @@ const promptSchema = z.object({
     .string()
     .trim()
     .min(2, 'Type a message first')
-    .max(2000, 'Message is too long'),
+    .max(32000, 'Message is too long'),
 });
 
 export interface PromptComposerProps {
