@@ -1,8 +1,8 @@
 {
   "1.1": {
     "pass": true,
-    "observed": "home: 2 hosts online; companion clients=1; device 672ade33d0216ce1 registered=true",
-    "at": "2026-10-25T23:03:47.020Z"
+    "observed": "home: 2 hosts online; companion clients=1; device c5ed41aa0d60931e registered=true",
+    "at": "2026-10-25T23:28:33.969Z"
   },
   "6.2": {
     "pass": true,
