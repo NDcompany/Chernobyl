@@ -1,8 +1,9 @@
 /**
- * Sign in — black flowing shape carries the wordmark; the form area below
- * uses the mock auth (no credentials are checked or stored).
+ * Entry screen — black flowing shape carries the wordmark. There are no
+ * accounts (ADR-002, C14): identity is the per-device pairing credential.
+ * "Pair with a host" is the real path; "Explore the demo" enters Simulation
+ * (ADR-009). `signIn()` only records that the user is past this screen.
  */
-import { useState } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Redirect, useRouter } from 'expo-router';
@@ -17,18 +18,17 @@ export default function SignInScreen() {
   const signIn = useAppStore((s) => s.signIn);
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const [busy, setBusy] = useState(false);
 
   if (authed) return <Redirect href="/" />;
 
-  const submit = () => {
-    setBusy(true);
-    // mock auth: no password is checked and nothing leaves the device
-    setTimeout(() => {
-      signIn();
-      setBusy(false);
-      router.replace('/');
-    }, 900);
+  const explore = () => {
+    signIn();
+    router.replace('/');
+  };
+  const pair = () => {
+    signIn();
+    router.replace('/');
+    router.push('/connect-host');
   };
 
   return (
@@ -48,7 +48,7 @@ export default function SignInScreen() {
       >
         <View style={{ gap: spacing.sm }}>
           <Text variant="h1" accessibilityRole="header">
-            Welcome back
+            Welcome
           </Text>
           <Text variant="body" color={colors.text2}>
             One interface for every agent you run — sessions, output and approvals in one place.
@@ -56,18 +56,18 @@ export default function SignInScreen() {
         </View>
 
         <View style={{ gap: spacing.md, marginTop: spacing.lg }}>
-          <Button label="Sign In" onPress={submit} loading={busy} icon="arrow-right" />
+          <Button label="Pair with a host" onPress={pair} icon="arrow-right" />
           <Button
-            label="Connect a Host"
+            label="Explore the demo (Simulation)"
             variant="secondary"
-            onPress={() => router.push('/connect-host')}
+            onPress={explore}
           />
         </View>
 
         <View style={styles.note}>
           <Text variant="xs" color={colors.text3} center>
-            Prototype sign-in — no password is checked and no credentials leave the device. Host
-            tokens, when added, are kept in the device keystore only.
+            No account needed: your phone pairs directly with your desktop companion by QR. The
+            pairing key stays in the keystore on this phone. The demo shows simulated data only.
           </Text>
         </View>
       </ScrollView>
