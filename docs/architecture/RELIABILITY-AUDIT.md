@@ -18,7 +18,7 @@ production behavior. Status is updated once the fix lands (§12 verification per
 
 ## 1. Findings, prioritized by production impact
 
-### P1 — Connection teardown is not unwind-safe (§2 lifecycle) · Status: open — fix next
+### P1 — Connection teardown is not unwind-safe (§2 lifecycle) · Status: fix committed (`6dc66bd`)
 
 - **Where:** `server.rs:716-991`. Teardown is inline code after the read loop
   (`server.rs:967-975`): unregister from `clients`, `writer_stop.store(true)`, join the
@@ -38,7 +38,7 @@ production behavior. Status is updated once the fix lands (§12 verification per
 - **Regression layer:** `server.rs` test — drive a connection whose handler panics, then
   assert `clients.len()` returns to baseline and no `ws-writer` thread survives.
 
-### P2 — One global outbound bound, no per-message-class policy, no saturation visibility (§4) · Status: open — fix next
+### P2 — One global outbound bound, no per-message-class policy, no saturation visibility (§4) · Status: fix committed (`5050b1c`)
 
 - **Where:** `server.rs:39-40` — `OUTBOUND_QUEUE_MAX_MESSAGES = 256`,
   `OUTBOUND_QUEUE_MAX_BYTES = 4 MiB`, applied as a single FIFO in `Outbound::enqueue_sealed`
@@ -60,7 +60,7 @@ production behavior. Status is updated once the fix lands (§12 verification per
 - **Regression layer:** `server.rs` unit tests: control still admitted when bulk is full;
   shed frame consumes no counter; counters increment and appear in `/health`.
 
-### P3 — Mid-file journal corruption is truncated silently (§5) · Status: open — fix next
+### P3 — Mid-file journal corruption is truncated silently (§5) · Status: fix committed (`755f264`)
 
 - **Where:** `storage.rs:261-290` — an unparseable line causes `break` with no log, no
   counter, no audit record; `storage.rs:167-180` then truncates the file at `valid_bytes`.
