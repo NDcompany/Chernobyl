@@ -7,13 +7,21 @@ import { Platform, StyleSheet, Switch, View } from 'react-native';
 import type { StyleProp, ViewStyle } from 'react-native';
 import { Redirect, useLocalSearchParams, useRouter } from 'expo-router';
 import type { AgentKind } from '@chernobyl/protocol';
-import { colors, spacing } from '@/theme/tokens';
+import { colors, radii, spacing } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { useSnapshot } from '@/data/state';
+import { transportKind } from '@/data/transport';
 import { readAudit } from '@/platform/storage';
 import { clearHostToken, clearPairing, readHostToken, readPairing } from '@/platform/secure';
-import { parsePairingPayload } from '@chernobyl/e2e';
-import { agentKindLabel, hostStatusLabel, hostTone, relativeTime } from '@/utils/format';
+import { parsePairingPayload, type PairingCredential } from '@chernobyl/e2e';
+import {
+  agentKindLabel,
+  hostStatusLabel,
+  hostTone,
+  relativeTime,
+  transportStatusLabel,
+  transportTone,
+} from '@/utils/format';
 import { useNow } from '@/hooks/useReducedMotion';
 import { Button, StatusDot, Text } from '@/ui/primitives';
 import { Screen, PageHeader, Card, ConfirmModal, EmptyState } from '@/ui/surface';
@@ -84,7 +92,9 @@ export default function SettingsSectionScreen() {
   const settings = useAppStore((s) => s.settings);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const toggleIntegration = useAppStore((s) => s.toggleIntegration);
+  const connection = useAppStore((s) => s.connection);
   const [hasToken, setHasToken] = useState<boolean | null>(null);
+  const [pairedCredential, setPairedCredential] = useState<PairingCredential | null | undefined>(undefined);
   // paired device id (from the stored pairing), null = not paired, undefined = loading
   const [pairedDevice, setPairedDevice] = useState<string | null | undefined>(undefined);
   const [audit] = useState(() => readAudit(50));
@@ -94,8 +104,16 @@ export default function SettingsSectionScreen() {
     void readHostToken().then((t) => setHasToken(!!t));
     void readPairing().then((json) => {
       try {
-        setPairedDevice(json ? parsePairingPayload(json).deviceId : null);
+        if (json) {
+          const cred = parsePairingPayload(json);
+          setPairedCredential(cred);
+          setPairedDevice(cred.deviceId);
+        } else {
+          setPairedCredential(null);
+          setPairedDevice(null);
+        }
       } catch {
+        setPairedCredential(null);
         setPairedDevice(null); // corrupt payload: TransportProvider already surfaced it
       }
     });
@@ -111,6 +129,7 @@ export default function SettingsSectionScreen() {
   const unpair = () => {
     setConfirmUnpair(false);
     void Promise.all([clearPairing(), clearHostToken()]).then(() => {
+      setPairedCredential(null);
       setPairedDevice(null);
       setHasToken(false);
       useAppStore.getState().bumpTransport();
@@ -121,12 +140,14 @@ export default function SettingsSectionScreen() {
   let body: ReactNode = null;
 
   if (key === 'hosts') {
+    const isMock = transportKind() === 'mock';
+    const hasHosts = Boolean(pairedCredential) || snapshot.hosts.length > 0;
     body = (
       <>
         <Text variant="sm" color={colors.text2}>
           Hosts run your agents and enforce every decision made in this app.
         </Text>
-        {snapshot.hosts.length === 0 ? (
+        {!hasHosts ? (
           <EmptyState
             icon="link"
             title="No hosts yet"
@@ -136,11 +157,62 @@ export default function SettingsSectionScreen() {
           />
         ) : (
           <SectionCard>
+            {pairedCredential ? (
+              <View style={snapshot.hosts.length > 0 ? styles.divider : undefined}>
+                <View style={styles.hostRow}>
+                  <View style={{ flex: 1, gap: 4 }}>
+                    <View style={styles.badgeRow}>
+                      <Text variant="bodyStrong">Paired Host</Text>
+                      <View style={styles.realBadge}>
+                        <Text variant="xs" color={colors.white} style={{ fontWeight: '700' }}>
+                          Real
+                        </Text>
+                      </View>
+                    </View>
+                    <Text variant="mono" color={colors.text2} numberOfLines={1}>
+                      Host ID: {pairedCredential.host}
+                    </Text>
+                    <Text variant="mono" color={colors.text3} numberOfLines={1}>
+                      Device ID: {pairedCredential.deviceId}
+                    </Text>
+                    <View style={{ marginTop: 2, gap: 2 }}>
+                      <Text variant="xs" color={colors.text3} style={{ fontWeight: '600' }}>
+                        Endpoints ({pairedCredential.endpoints.length}):
+                      </Text>
+                      {pairedCredential.endpoints.map((ep, idx) => (
+                        <Text
+                          key={ep}
+                          variant="mono"
+                          color={idx === 0 ? colors.text : colors.text3}
+                          numberOfLines={1}
+                        >
+                          {idx === 0 ? `• ${ep} (primary)` : `• ${ep}`}
+                        </Text>
+                      ))}
+                    </View>
+                  </View>
+                  <StatusDot
+                    tone={transportTone(connection)}
+                    label={transportStatusLabel(connection)}
+                  />
+                </View>
+              </View>
+            ) : null}
+
             {snapshot.hosts.map((h, i) => (
               <View key={h.id} style={i < snapshot.hosts.length - 1 ? styles.divider : undefined}>
                 <View style={styles.hostRow}>
                   <View style={{ flex: 1, gap: 2 }}>
-                    <Text variant="bodyStrong">{h.name}</Text>
+                    <View style={styles.badgeRow}>
+                      <Text variant="bodyStrong">{h.name}</Text>
+                      {isMock ? (
+                        <View style={styles.simBadge}>
+                          <Text variant="xs" color={colors.text2} style={{ fontWeight: '600' }}>
+                            Simulation
+                          </Text>
+                        </View>
+                      ) : null}
+                    </View>
                     <Text variant="mono" color={colors.text3} numberOfLines={1}>
                       {h.address}
                     </Text>
@@ -156,7 +228,9 @@ export default function SettingsSectionScreen() {
         )}
         <Button label="Connect a host" icon="plus" variant="secondary" onPress={() => router.push('/connect-host')} />
         <Text variant="xs" color={colors.text3} center>
-          Prototype: hosts are simulated locally and no WebSocket handshake is performed.
+          {pairedCredential
+            ? 'Paired with a real desktop companion via E2E encrypted WebSocket.'
+            : 'Prototype: hosts are simulated locally and no WebSocket handshake is performed.'}
         </Text>
       </>
     );
@@ -423,6 +497,21 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
   },
   auditHead: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, flexWrap: 'wrap' },
+  badgeRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  realBadge: {
+    backgroundColor: colors.black,
+    borderRadius: radii.pill,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
+  },
+  simBadge: {
+    backgroundColor: colors.surface2,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radii.pill,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
+  },
   divider: {
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: colors.border,

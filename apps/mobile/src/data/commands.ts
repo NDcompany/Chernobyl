@@ -72,8 +72,22 @@ export function useCommands() {
         }
         if (successToast) useAppStore.getState().addToast(successToast, 'success');
         return ack;
-      } catch {
-        useAppStore.getState().addToast('Host unreachable — nothing was sent', 'error');
+      } catch (err) {
+        const isOffline = err instanceof Error && err.message === 'offline';
+        if (isOffline) {
+          // Rejected before send ('offline') is a definite not-sent state
+          useAppStore.getState().addToast('Host unreachable — nothing was sent', 'error');
+        } else {
+          // Mandate section 9: ack timed out, or connection dropped after send.
+          // Outcome is UNKNOWN (the host may have executed it) — never claim failed or not sent.
+          if ('commandId' in msg) {
+            useAppStore.getState().setCommandUnknown(msg.commandId, {
+              sessionId: 'sessionId' in msg ? (msg.sessionId as string) : undefined,
+              permissionId: 'permissionId' in msg ? (msg.permissionId as string) : undefined,
+            });
+          }
+          useAppStore.getState().addToast('Outcome unknown — the host may have run it', 'warning');
+        }
         return null;
       } finally {
         useAppStore.getState().clearInFlight(key);

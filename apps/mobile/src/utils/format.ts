@@ -1,5 +1,6 @@
 /** Display formatting shared across screens. */
 import type { AgentState, HostStatus, SessionStatus } from '@chernobyl/protocol';
+import type { TransportStatus } from '@chernobyl/e2e';
 import type { Tone } from '@/ui/primitives';
 
 export function relativeTime(ts: number, now: number): string {
@@ -42,6 +43,38 @@ export function hostStatusLabel(status: HostStatus): string {
       return 'Connected';
     case 'connecting':
       return 'Connecting…';
+    default:
+      return 'Offline';
+  }
+}
+
+export function transportTone(status: TransportStatus): Tone {
+  switch (status) {
+    case 'connected':
+      return 'success';
+    case 'connecting':
+    case 'handshaking':
+    case 'reconnecting':
+      return 'warning';
+    case 'denied':
+      return 'error';
+    default:
+      return 'neutral';
+  }
+}
+
+export function transportStatusLabel(status: TransportStatus): string {
+  switch (status) {
+    case 'connected':
+      return 'Connected';
+    case 'connecting':
+      return 'Connecting…';
+    case 'handshaking':
+      return 'Authorizing…';
+    case 'reconnecting':
+      return 'Reconnecting…';
+    case 'denied':
+      return 'Denied';
     default:
       return 'Offline';
   }

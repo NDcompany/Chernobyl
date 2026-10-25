@@ -15,7 +15,7 @@ import { useCommands, commands } from '@/data/commands';
 import { activityFor, agentById, hostById, sessionById } from '@/data/selectors';
 import { relativeTime } from '@/utils/format';
 import { useReducedMotion, useNow } from '@/hooks/useReducedMotion';
-import { ProgressBar, StatusPill, Text } from '@/ui/primitives';
+import { ProgressBar, StatusDot, StatusPill, Text } from '@/ui/primitives';
 import { Screen, PageHeader, Card, EmptyState } from '@/ui/surface';
 import {
   ActivityRow,
@@ -52,6 +52,14 @@ export default function SessionScreen() {
   const activity = session
     ? activityFor(snapshot, new Set([session.id, ...sessionPermissions.map((p) => p.id)]))
     : [];
+
+  const commandStates = useAppStore((s) => s.commandStates);
+  const unknownCommand = session
+    ? Object.values(commandStates).find(
+        (c) => c.sessionId === session.id && c.state === 'unknown',
+      )
+    : undefined;
+  const hasUnknown = Boolean(unknownCommand);
 
   const outputCount = session?.output.length ?? 0;
   useEffect(() => {
@@ -106,8 +114,15 @@ export default function SessionScreen() {
       footer={
         <PromptComposer
           busy={busy}
+          disabled={hasUnknown}
           placeholder={`Message ${agentName}…`}
-          hint={busy ? `${agentName} is working…` : undefined}
+          hint={
+            hasUnknown
+              ? 'Outcome unknown — the host may have run it'
+              : busy
+                ? `${agentName} is working…`
+                : undefined
+          }
           onSubmit={(text) => void send(commands.submitPrompt(session.id, text), 'Prompt sent')}
           onInterrupt={() => void send(commands.interrupt(session.id), 'Session interrupted')}
         />
@@ -133,6 +148,20 @@ export default function SessionScreen() {
             </View>
             <Icon name="chevron-right" size={18} color={colors.text3} />
           </View>
+        </Card>
+      ) : null}
+
+      {hasUnknown ? (
+        <Card style={{ borderColor: colors.warning, gap: spacing.xs }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
+            <StatusDot tone="warning" label="Outcome unknown" />
+            <Text variant="bodyStrong" color={colors.warning}>
+              Outcome unknown — the host may have run it
+            </Text>
+          </View>
+          <Text variant="xs" color={colors.text2}>
+            A command was sent to this session, but the acknowledgement timed out or the connection dropped.
+          </Text>
         </Card>
       ) : null}
 

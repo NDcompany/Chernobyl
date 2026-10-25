@@ -73,6 +73,18 @@ transport (commandId dedupe). **ADR-009: mock mode is permanent** — mock-host 
 PromptComposer caption) and the simulation badge must stay honest; never render mock data as live,
 never remove an offline/stale state to make a screen look alive.
 
+**Mandate section 9 (visible uncertainty about command outcomes):** a command whose ack timed out
+or whose connection dropped after send has an UNKNOWN outcome (the host may have executed it). The
+UI shows it as "outcome unknown, will reconcile on reconnect" (not failed, not done), and resolves
+it to the real result when the replayed command's ack/command_result arrives after reconnect.
+Rejected before send ('offline') is a definite not-sent state. Never resubmit with a new
+commandId automatically.
+
+**Phase 6 endpoint-list host records (conflict C14):** in Settings > Connected hosts, a real stored
+pairing is displayed as a real record (host id, device id, ordered endpoint list with primary first,
+and live transport status) labelled Real, visually distinct from mock hosts, which stay labelled
+Simulation. Derived from the keystore pairing and store transport status without new storage.
+
 ## Gotchas (each cost real debugging)
 
 | Rule | Why |

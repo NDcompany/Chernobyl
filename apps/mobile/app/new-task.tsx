@@ -2,7 +2,7 @@
  * New task (modal) — pick an agent, describe the job, start a session.
  * Pre-filled when opened from an agent detail screen (?agent=<id>).
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
 import { Redirect, useLocalSearchParams, useRouter } from 'expo-router';
 import { useForm } from 'react-hook-form';
@@ -13,8 +13,8 @@ import { useSnapshot } from '@/data/state';
 import { useCommands, commands } from '@/data/commands';
 import { agentKindLabel } from '@/utils/format';
 import { zodHandler } from '@/forms/zodBridge';
-import { Button, Chip, Text, TextField } from '@/ui/primitives';
-import { Screen, PageHeader, EmptyState } from '@/ui/surface';
+import { Button, Chip, StatusDot, Text, TextField } from '@/ui/primitives';
+import { Screen, PageHeader, Card, EmptyState } from '@/ui/surface';
 import { AgentIcon } from '@/ui/graphics';
 
 const taskSchema = z.object({
@@ -42,6 +42,11 @@ export default function NewTaskScreen() {
   const router = useRouter();
   const params = useLocalSearchParams<{ agent?: string }>();
   const [busy, setBusy] = useState(false);
+  const [submittedCommandId, setSubmittedCommandId] = useState<string | null>(null);
+  const commandStates = useAppStore((s) => s.commandStates);
+
+  const unknownCommand = submittedCommandId ? commandStates[submittedCommandId] : null;
+  const isUnknown = unknownCommand?.state === 'unknown';
 
   const available = snapshot.agents.filter(
     (a) => a.acceptsNewSession && integrations[a.kind],
@@ -54,14 +59,24 @@ export default function NewTaskScreen() {
   });
   const selectedAgentId = form.watch('agentId');
 
+  // Auto-navigate when reconciled on reconnect
+  useEffect(() => {
+    if (submittedCommandId) {
+      const entry = commandStates[submittedCommandId];
+      if (entry && (entry.state === 'accepted' || entry.state === 'completed') && entry.sessionId) {
+        router.replace(`/session/${entry.sessionId}`);
+      }
+    }
+  }, [submittedCommandId, commandStates, router]);
+
   if (!authed) return <Redirect href="/sign-in" />;
 
   const submit = zodHandler(taskSchema, form, (data) => {
     setBusy(true);
     void (async () => {
-      const ack = await send(
-        commands.createSession(data.agentId, data.title, data.prompt, data.project || undefined),
-      );
+      const msg = commands.createSession(data.agentId, data.title, data.prompt, data.project || undefined);
+      setSubmittedCommandId('commandId' in msg ? msg.commandId : null);
+      const ack = await send(msg);
       setBusy(false);
       if (ack?.ok && ack.sessionId) {
         router.replace(`/session/${ack.sessionId}`);
@@ -140,10 +155,25 @@ export default function NewTaskScreen() {
             autoCapitalize="none"
           />
 
+          {isUnknown ? (
+            <Card style={{ borderColor: colors.warning, gap: spacing.xs }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
+                <StatusDot tone="warning" label="Outcome unknown" />
+                <Text variant="bodyStrong" color={colors.warning}>
+                  Outcome unknown — the host may have run it
+                </Text>
+              </View>
+              <Text variant="xs" color={colors.text2}>
+                Session creation was sent, but confirmation was not received before connection dropped or timed out.
+              </Text>
+            </Card>
+          ) : null}
+
           <Button
             label="Start session"
             icon="arrow-right"
             loading={busy}
+            disabled={isUnknown}
             onPress={submit}
             accessibilityLabel="Start a new agent session"
           />

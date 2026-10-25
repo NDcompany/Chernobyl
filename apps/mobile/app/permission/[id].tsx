@@ -15,7 +15,7 @@ import { useCommands, commands } from '@/data/commands';
 import { agentById, hostById, permissionById, sessionById } from '@/data/selectors';
 import { useNow } from '@/hooks/useReducedMotion';
 import { countdown, relativeTime } from '@/utils/format';
-import { Button, RiskPill, Text } from '@/ui/primitives';
+import { Button, RiskPill, StatusDot, Text } from '@/ui/primitives';
 import { Screen, PageHeader, Card, ConfirmModal, EmptyState } from '@/ui/surface';
 import { MonoBlock } from '@/ui/lists';
 import { AgentIcon } from '@/ui/graphics';
@@ -30,6 +30,7 @@ export default function PermissionScreen() {
   const send = useCommands();
   const [confirmSession, setConfirmSession] = useState(false);
   const [busy, setBusy] = useState<'once' | 'reject' | 'scope' | null>(null);
+  const commandStates = useAppStore((s) => s.commandStates);
 
   if (!authed) return <Redirect href="/sign-in" />;
 
@@ -52,6 +53,11 @@ export default function PermissionScreen() {
   const agent = agentById(snapshot, permission.agentId);
   const host = hostById(snapshot, permission.hostId);
   const session = sessionById(snapshot, permission.sessionId);
+
+  const unknownCommand = Object.values(commandStates).find(
+    (c) => c.permissionId === permission.id && c.state === 'unknown',
+  );
+  const isUnknown = Boolean(unknownCommand);
 
   const decided = permission.status === 'approved' || permission.status === 'rejected';
   const livePending = permission.status === 'pending' && !isStalePermission(permission, now);
@@ -173,6 +179,20 @@ export default function PermissionScreen() {
         </Card>
       ) : null}
 
+      {isUnknown && !decided ? (
+        <Card style={[styles.decidedBox, { borderColor: colors.warning }]}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
+            <StatusDot tone="warning" label="Outcome unknown" />
+            <Text variant="bodyStrong" color={colors.warning}>
+              Outcome unknown — the host may have run it
+            </Text>
+          </View>
+          <Text variant="sm" color={colors.text2}>
+            Your decision was sent, but the acknowledgement timed out or the connection dropped. It may or may not have been applied — the approval list shows the host’s real state once connected.
+          </Text>
+        </Card>
+      ) : null}
+
       {livePending ? (
         <>
           <View style={{ gap: spacing.sm }}>
@@ -203,7 +223,7 @@ export default function PermissionScreen() {
               label="Approve Once"
               icon="check"
               loading={busy === 'once'}
-              disabled={busy !== null && busy !== 'once'}
+              disabled={busy !== null || isUnknown}
               onPress={() => decide('approve-once', 'once')}
             />
             <Button
@@ -211,7 +231,7 @@ export default function PermissionScreen() {
               variant="secondary"
               icon="x"
               loading={busy === 'reject'}
-              disabled={busy !== null && busy !== 'reject'}
+              disabled={busy !== null || isUnknown}
               onPress={() => decide('reject', 'reject')}
             />
           </View>
@@ -232,7 +252,7 @@ export default function PermissionScreen() {
               label="Approve for Session"
               variant="secondary"
               loading={busy === 'scope'}
-              disabled={busy !== null && busy !== 'scope'}
+              disabled={busy !== null || isUnknown}
               onPress={() => setConfirmSession(true)}
               accessibilityLabel="Approve this action for the entire session"
             />

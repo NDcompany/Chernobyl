@@ -5,10 +5,16 @@
  */
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
-import { applyCommandLifecycle, type CommandTracker } from '@chernobyl/domain';
+import { applyCommandLifecycle, type CommandEntry } from '@chernobyl/domain';
 import { nextId, type AgentKind, type ServerMessage } from '@chernobyl/protocol';
 import type { TransportStatus } from '@/data/transport';
 import { sqliteStorage } from '@/platform/storage';
+
+export interface CommandRecord extends CommandEntry {
+  permissionId?: string;
+}
+
+export type CommandRecordTracker = Record<string, CommandRecord>;
 
 export type SessionFilter = 'all' | 'running' | 'waiting' | 'completed';
 /** Mirrors the transport union exactly — includes handshaking/denied (E2E). */
@@ -79,7 +85,7 @@ export interface AppState {
    * distinct, and a terminal state is final. Server messages merge here
    * through the domain FSM — NOT through the ack.
    */
-  commandStates: CommandTracker;
+  commandStates: CommandRecordTracker;
 
   completeOnboarding: () => void;
   signIn: () => void;
@@ -93,7 +99,12 @@ export interface AppState {
   /** returns false when an identical command is already in flight */
   markInFlight: (key: string) => boolean;
   clearInFlight: (key: string) => void;
-  /** feeds command_progress / command_result through the domain FSM */
+  /** records a command with unknown outcome (timed out or dropped after send) */
+  setCommandUnknown: (
+    commandId: string,
+    meta?: { sessionId?: string; permissionId?: string },
+  ) => void;
+  /** feeds command_progress / command_result / ack through the domain FSM and reconciles */
   trackCommand: (msg: ServerMessage) => void;
   updateSettings: (patch: Partial<Settings>) => void;
   toggleIntegration: (kind: AgentKind) => void;
@@ -149,13 +160,98 @@ export const useAppStore = create<AppState>()(
           return { inFlight: next };
         }),
 
+      setCommandUnknown: (commandId, meta) =>
+        set((s) => ({
+          commandStates: {
+            ...s.commandStates,
+            [commandId]: {
+              state: 'unknown',
+              sessionId: meta?.sessionId ?? s.commandStates[commandId]?.sessionId,
+              permissionId: meta?.permissionId ?? s.commandStates[commandId]?.permissionId,
+              error: 'outcome unknown — the host may have run it',
+            },
+          },
+        })),
+
       trackCommand: (msg) => {
-        if (msg.type !== 'command_progress' && msg.type !== 'command_result') return;
+        if (msg.type !== 'command_progress' && msg.type !== 'command_result' && msg.type !== 'ack') {
+          return;
+        }
+
         set((s) => {
-          const commandStates = applyCommandLifecycle(s.commandStates, msg);
-          // applyCommandLifecycle returns the same reference when it ignored
-          // the event (terminal lock / illegal transition) — skip the update
-          return commandStates === s.commandStates ? {} : { commandStates };
+          const current = s.commandStates[msg.commandId];
+
+          // If current command has an UNKNOWN outcome, reconcile to the real result
+          // when replayed command's ack/progress/result arrives after reconnect
+          if (current?.state === 'unknown') {
+            if (msg.type === 'command_result') {
+              return {
+                commandStates: {
+                  ...s.commandStates,
+                  [msg.commandId]: {
+                    state: msg.status,
+                    sessionId: msg.sessionId ?? current.sessionId,
+                    permissionId: msg.permissionId ?? current.permissionId,
+                    error: msg.error,
+                  },
+                },
+              };
+            }
+            if (msg.type === 'command_progress') {
+              return {
+                commandStates: {
+                  ...s.commandStates,
+                  [msg.commandId]: {
+                    state: msg.state,
+                    sessionId: msg.sessionId ?? current.sessionId,
+                    permissionId: current.permissionId,
+                  },
+                },
+              };
+            }
+            if (msg.type === 'ack') {
+              if (msg.ok) {
+                return {
+                  commandStates: {
+                    ...s.commandStates,
+                    [msg.commandId]: {
+                      state: 'accepted',
+                      sessionId: msg.sessionId ?? current.sessionId,
+                      permissionId: msg.permissionId ?? current.permissionId,
+                    },
+                  },
+                };
+              } else {
+                return {
+                  commandStates: {
+                    ...s.commandStates,
+                    [msg.commandId]: {
+                      state: 'failed',
+                      error: msg.error ?? 'Command rejected',
+                      sessionId: msg.sessionId ?? current.sessionId,
+                      permissionId: msg.permissionId ?? current.permissionId,
+                    },
+                  },
+                };
+              }
+            }
+          }
+
+          // Standard lifecycle for non-unknown commands
+          if (msg.type === 'command_progress' || msg.type === 'command_result') {
+            const next = applyCommandLifecycle(s.commandStates, msg);
+            if (next === s.commandStates) return {};
+            const merged: CommandRecordTracker = { ...(next as CommandRecordTracker) };
+            if (current?.permissionId && merged[msg.commandId]) {
+              merged[msg.commandId] = {
+                ...merged[msg.commandId],
+                permissionId: current.permissionId,
+              };
+            }
+            return { commandStates: merged };
+          }
+
+          return {};
         });
       },
 
