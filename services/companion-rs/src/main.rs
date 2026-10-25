@@ -438,6 +438,18 @@ fn control_key(cfg: &config::CompanionConfig) -> String {
 /// Tries the running companion first (loopback POST /pairing/offer); if unreachable,
 /// falls back to offline journal write (restart-scoped).
 fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
+    // With the journal lock free no companion runs, so whatever listens on
+    // the diagnostics port is not ours: never send it the control key
+    // (security review 2026-10-25). The probe lock is released at once.
+    if chernobyl_companion::storage::lock_data_dir(&cfg.data_dir).is_ok() {
+        return match pair_offline(cfg, endpoints) {
+            Ok(b) => print_pairing_block(&b, "pairing offer created (offline journal)"),
+            Err(e) => {
+                eprintln!("[companion] pair: {e}");
+                1
+            }
+        };
+    }
     let url = format!("http://127.0.0.1:{}/pairing/offer", cfg.diagnostics_port);
     let body = json::stringify(&json::obj(vec![(
         "endpoints",
@@ -458,13 +470,13 @@ fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
                 1
             }
         },
-        Err(_) => match pair_offline(cfg, endpoints) {
-            Ok(b) => print_pairing_block(&b, "pairing offer created (offline journal)"),
-            Err(e) => {
-                eprintln!("[companion] pair: {e}");
-                1
-            }
-        },
+        Err(e) => {
+            eprintln!(
+                "[companion] pair: a companion holds the journal but 127.0.0.1:{} did not answer ({e}) — no offer created",
+                cfg.diagnostics_port
+            );
+            1
+        }
     }
 }
 
@@ -499,6 +511,10 @@ fn devices_main(cfg: &config::CompanionConfig) -> i32 {
 /// First tries the running companion via loopback diagnostics POST /devices/revoke;
 /// if unreachable, falls back to offline journal write (restart-scoped, unchanged).
 fn revoke_main(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
+    // same rule as pair_main: only a companion holding the journal is asked
+    if chernobyl_companion::storage::lock_data_dir(&cfg.data_dir).is_ok() {
+        return revoke_offline(cfg, device_id);
+    }
     let url = format!("http://127.0.0.1:{}/devices/revoke", cfg.diagnostics_port);
     let req_body = json::stringify(&json::obj(vec![("deviceId", json::s(device_id))]));
     match server::control_post(&url, &control_key(cfg), &req_body) {
@@ -526,7 +542,13 @@ fn revoke_main(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
                 1
             }
         },
-        Err(_) => revoke_offline(cfg, device_id),
+        Err(e) => {
+            eprintln!(
+                "[companion] revoke: a companion holds the journal but 127.0.0.1:{} did not answer ({e}) — revocation NOT applied",
+                cfg.diagnostics_port
+            );
+            1
+        }
     }
 }
 
@@ -1119,7 +1141,9 @@ mod tests {
             assert!(store.devices["dev-offline"].revoked);
         }
 
-        // 3. Online path: boot a companion + server on this data dir
+        // 3. Online path: boot a companion + server on this data dir, holding
+        // the journal lock like the daemon run path does
+        let _daemon_lock = chernobyl_companion::storage::lock_data_dir(&temp_dir).unwrap();
         let companion = std::sync::Arc::new(
             chernobyl_companion::companion::Companion::boot(cfg.clone()).unwrap(),
         );
@@ -1200,7 +1224,9 @@ mod tests {
             );
         }
 
-        // 2. Online path: boot companion and server
+        // 2. Online path: boot companion and server, holding the journal lock
+        // like the daemon run path does
+        let _daemon_lock = chernobyl_companion::storage::lock_data_dir(&temp_dir).unwrap();
         let companion = std::sync::Arc::new(
             chernobyl_companion::companion::Companion::boot(cfg.clone()).unwrap(),
         );
