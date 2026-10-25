@@ -3,6 +3,7 @@
 //! rejection, control-char rejection. Every wire byte passes through here,
 //! so the whole attack surface of malformed input is this module's tests.
 
+use std::collections::HashSet;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +112,10 @@ impl<'a> Parser<'a> {
     fn object(&mut self, depth: usize) -> Result<Json, JsonError> {
         self.i += 1; // '{'
         let mut out: Vec<(String, Json)> = Vec::new();
+        // security review 2026-10-25: scanning the earlier keys made each
+        // object O(n^2) — one pre-session 256 KB frame of short distinct keys
+        // cost ~5x10^8 compares. A set keeps duplicate detection linear.
+        let mut seen: HashSet<String> = HashSet::new();
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.i += 1;
@@ -122,7 +127,7 @@ impl<'a> Parser<'a> {
                 return Err(JsonError::InvalidString);
             }
             let key = self.string()?;
-            if out.iter().any(|(k, _)| *k == key) {
+            if !seen.insert(key.clone()) {
                 return Err(JsonError::DuplicateKey);
             }
             self.skip_ws();
@@ -619,6 +624,27 @@ mod tests {
             assert!(parse(&prefix).is_err(), "prefix len {cut} must be rejected");
         }
         assert_eq!(parse(doc), parse(doc));
+    }
+
+    #[test]
+    fn many_unique_keys_parse_in_linear_time_and_duplicates_still_fail() {
+        // security review 2026-10-25: the attack shape — one ~250 KB frame
+        // (under the 256,000-byte cap) holding 28k short distinct keys — was
+        // ~4x10^8 key compares with the old scan of earlier keys. The bound is
+        // loose on purpose: this is an unoptimized test build on a busy host.
+        let members: Vec<String> = (0..28_000).map(|i| format!("\"{i:x}\":0")).collect();
+        let doc = format!("{{{}}}", members.join(","));
+        assert!(doc.len() < 256_000);
+        let t0 = std::time::Instant::now();
+        let v = parse(&doc).unwrap();
+        let took = t0.elapsed();
+        assert!(matches!(&v, Json::Obj(p) if p.len() == 28_000));
+        assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+        // a repeat of the first key is still caught, escaped or not
+        let dup = format!("{{{},\"0\":1}}", members.join(","));
+        assert_eq!(parse(&dup), Err(JsonError::DuplicateKey));
+        let escaped = format!("{{{},\"\\u0030\":1}}", members.join(","));
+        assert_eq!(parse(&escaped), Err(JsonError::DuplicateKey));
     }
 
     #[test]

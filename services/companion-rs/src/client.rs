@@ -205,7 +205,7 @@ pub fn http_get(addr: &str, path: &str) -> Result<String, String> {
         .write_all(req.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     let mut reader = BufReader::new(stream);
-    let raw = read_http_response(&mut reader)?;
+    let raw = read_http_response(&mut reader, RESPONSE_DEADLINE)?;
     String::from_utf8(raw).map_err(|_| "response was not utf-8".into())
 }
 
@@ -302,7 +302,7 @@ pub fn http_request(
         .write_all(req.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     let mut reader = BufReader::new(stream);
-    let raw = read_http_response(&mut reader)?;
+    let raw = read_http_response(&mut reader, RESPONSE_DEADLINE)?;
     parse_response(&raw)
 }
 
@@ -321,12 +321,22 @@ fn read_err(e: impl std::fmt::Display, raw: &[u8], started: std::time::Instant) 
     }
 }
 
+/// Overall budget for reading one response (security review 2026-10-25: the
+/// per-read socket timeout alone let a peer trickling a byte per read hold
+/// the caller indefinitely; for adapter probes, the scheduler thread that
+/// also pumps the engine).
+const RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Reads one HTTP/1.1 response: headers until `\r\n\r\n`, then the body per
 /// the framing rules (1xx/204/304 have none, otherwise Content-Length,
 /// chunked, or read-to-close). A self-delimiting body completes WITHOUT
 /// waiting for the peer to close — the Phase-3 live run proved opencode
 /// delivers a full `200 true` abort answer and keeps the socket open.
-fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, String> {
+/// The whole response must arrive within `budget`.
+fn read_http_response(
+    reader: &mut BufReader<TcpStream>,
+    budget: Duration,
+) -> Result<Vec<u8>, String> {
     const MAX_HEAD: usize = 64 * 1024;
     // every body is read into memory: bound it whatever the framing says
     // (adapters reject far smaller bodies; this keeps the read itself bounded)
@@ -334,6 +344,38 @@ fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, Stri
     let started = std::time::Instant::now();
     let mut raw: Vec<u8> = Vec::with_capacity(4096);
     let mut buf = [0u8; 8192];
+
+    // Every read clamps the socket timeout to what is left of `budget`, so
+    // the deadline holds exactly rather than being overshot by up to one
+    // per-read timeout.
+    let per_read = reader.get_ref().read_timeout().map_err(|e| e.to_string())?;
+    let deadline = started + budget;
+    let mut read = |dst: &mut [u8]| -> std::io::Result<usize> {
+        let past_deadline = || {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no complete response within {budget:?}"),
+            )
+        };
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(past_deadline());
+        }
+        let timeout = per_read.map_or(left, |p| p.min(left));
+        reader.get_ref().set_read_timeout(Some(timeout))?;
+        match reader.read(dst) {
+            Err(e)
+                if timeout == left
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                Err(past_deadline())
+            }
+            r => r,
+        }
+    };
 
     // 1) headers
     let head_end = loop {
@@ -343,7 +385,7 @@ fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, Stri
         if raw.len() > MAX_HEAD {
             return Err(format!("response head exceeds {MAX_HEAD} bytes"));
         }
-        match reader.read(&mut buf) {
+        match read(&mut buf) {
             Ok(0) => return Err(read_err("connection closed before headers", &raw, started)),
             Ok(n) => raw.extend_from_slice(&buf[..n]),
             Err(e) => return Err(read_err(e, &raw, started)),
@@ -384,11 +426,19 @@ fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, Stri
     if chunked {
         // shortcut: a 0-chunk followed by trailer headers (RFC-legal, never
         // seen on loopback) is not detected and falls back to read-to-close
+        //
+        // security review 2026-10-25: only bytes not yet checked (plus a
+        // 6-byte overlap for a terminator split across reads) are scanned;
+        // rescanning the whole buffer per read was O(n^2) up to MAX_BODY.
+        let mut scanned = 0usize;
         loop {
-            if raw.ends_with(b"0\r\n\r\n") || raw.windows(7).any(|w| w == b"\r\n0\r\n\r\n") {
+            let from = scanned.saturating_sub(6);
+            if raw.ends_with(b"0\r\n\r\n") || raw[from..].windows(7).any(|w| w == b"\r\n0\r\n\r\n")
+            {
                 return Ok(raw);
             }
-            match reader.read(&mut buf) {
+            scanned = raw.len();
+            match read(&mut buf) {
                 Ok(0) => {
                     return Err(read_err(
                         "connection closed mid chunked body",
@@ -410,7 +460,7 @@ fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, Stri
                 raw.truncate(head_end + len);
                 return Ok(raw);
             }
-            match reader.read(&mut buf) {
+            match read(&mut buf) {
                 Ok(0) => {
                     return Err(read_err(
                         format!(
@@ -431,7 +481,7 @@ fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, Stri
     }
     // HTTP/1.0-style: body delimited by close
     loop {
-        match reader.read(&mut buf) {
+        match read(&mut buf) {
             Ok(0) => return Ok(raw),
             Ok(n) => raw.extend_from_slice(&buf[..n]),
             Err(e) => return Err(read_err(e, &raw, started)),
@@ -503,14 +553,18 @@ pub fn decode_chunked(raw: &[u8]) -> Result<Vec<u8>, String> {
         if size == 0 {
             return Ok(out);
         }
-        if rest.len() < size + 2 {
-            return Err("chunked body: truncated chunk".into());
-        }
+        // security review 2026-10-25: the size is peer-chosen; `size + 2`
+        // near usize::MAX wrapped (release) and the slice below panicked,
+        // aborting the whole companion (panic = "abort").
+        let end = size
+            .checked_add(2)
+            .filter(|&end| end <= rest.len())
+            .ok_or("chunked body: truncated chunk")?;
         out.extend_from_slice(&rest[..size]);
-        if &rest[size..size + 2] != b"\r\n" {
+        if &rest[size..end] != b"\r\n" {
             return Err("chunked body: missing chunk terminator".into());
         }
-        rest = &rest[size + 2..];
+        rest = &rest[end..];
     }
 }
 
@@ -587,6 +641,65 @@ mod http_tests {
         );
         let r = http_request("GET", &url, None, None).unwrap();
         assert_eq!(r.body, "{\"a\":1}");
+    }
+
+    #[test]
+    fn trickling_or_stalled_peers_are_cut_at_the_overall_deadline() {
+        // security review 2026-10-25: each read had a timeout but the response
+        // had none, so a peer trickling one byte at a time held the caller for
+        // as long as it liked. 15 s per read is what http_request sets; a
+        // 300 ms budget stands in for RESPONSE_DEADLINE.
+        fn peer(trickle: bool) -> TcpStream {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ =
+                    s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n100000\r\n");
+                while trickle && s.write_all(b"x").is_ok() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::mem::forget(s); // never FIN: only the deadline can end the read
+            });
+            let stream = TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            stream
+        }
+        // trickling: every byte lands well inside the per-read timeout;
+        // stalled: the last read's timeout must be clamped to the time left
+        for trickle in [true, false] {
+            let t0 = std::time::Instant::now();
+            let e = read_http_response(
+                &mut BufReader::new(peer(trickle)),
+                Duration::from_millis(300),
+            )
+            .unwrap_err();
+            let took = t0.elapsed();
+            assert!(e.contains("no complete response within 300ms"), "{e}");
+            assert!(
+                took >= Duration::from_millis(250) && took < Duration::from_secs(5),
+                "trickle={trickle} took {took:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overflowing_chunk_sizes_are_errors_not_panics() {
+        // security review 2026-10-25: a peer-chosen size near usize::MAX made
+        // `size + 2` wrap and the slice panic, aborting the companion. The
+        // trailing 0-chunk is what let read_http_response hand it over.
+        for size in [
+            "ffffffffffffffff",
+            "fffffffffffffffe",
+            "fffffffffffffffd",
+            "7fffffffffffffff",
+            "1ffffffffffffffff",
+        ] {
+            let body = format!("{size}\r\n0\r\n\r\n");
+            assert!(decode_chunked(body.as_bytes()).is_err(), "{size}");
+        }
     }
 
     #[test]
