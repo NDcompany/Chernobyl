@@ -82,6 +82,13 @@ export interface AuditRow {
 }
 
 const memoryAudit: AuditRow[] = [];
+// newest rows kept on the device; older decisions are dropped (retention)
+const AUDIT_KEEP = 1000;
+
+function rememberInMemory(entry: Omit<AuditRow, 'id'>): void {
+  memoryAudit.unshift({ ...entry, id: memoryAudit.length + 1 });
+  memoryAudit.length = Math.min(memoryAudit.length, AUDIT_KEEP);
+}
 
 function ensureAuditTable(d: SQLite.SQLiteDatabase): void {
   d.execSync(
@@ -92,7 +99,7 @@ function ensureAuditTable(d: SQLite.SQLiteDatabase): void {
 export function recordAudit(entry: Omit<AuditRow, 'id'>): void {
   const d = getDb();
   if (!d) {
-    memoryAudit.unshift({ ...entry, id: memoryAudit.length + 1 });
+    rememberInMemory(entry);
     return;
   }
   try {
@@ -106,8 +113,9 @@ export function recordAudit(entry: Omit<AuditRow, 'id'>): void {
       entry.risk,
       entry.ts,
     );
+    d.runSync('DELETE FROM audit WHERE id <= (SELECT MAX(id) FROM audit) - ?', AUDIT_KEEP);
   } catch {
-    memoryAudit.unshift({ ...entry, id: memoryAudit.length + 1 });
+    rememberInMemory(entry);
   }
 }
 

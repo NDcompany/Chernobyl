@@ -434,3 +434,22 @@ test('connect() during a scheduled retry cancels it: no duplicate socket (sectio
     t.close();
   }
 });
+
+for (const code of [4001, 4002, 4003]) {
+  test(`server close ${code} is terminal: denied, in-flight failed, no retry`, async () => {
+    const { t, socks } = harness();
+    try {
+      t.connect();
+      socks[0].serverOpen();
+      assert.ok(await serverHandshake(socks[0]));
+      const inflight = t.send({ type: 'ping', commandId: `c${code}` });
+      socks[0].serverClose(code);
+      await assert.rejects(inflight);
+      assert.equal(t.status(), 'denied');
+      await sleep(40); // several retry periods
+      assert.equal(socks.length, 1, `close ${code} must not auto-retry`);
+    } finally {
+      t.close();
+    }
+  });
+}

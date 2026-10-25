@@ -7,7 +7,7 @@
  *
  * - authorization is a visible state: `handshaking` between socket-open and
  *   `hs_ok`, `denied` (terminal until an explicit `connect()`) for hs_err /
- *   close 4001 / close 4002 — stale or revoked credentials never spin a
+ *   close 4001 / 4002 / 4003 (revoked live) — stale or revoked credentials never spin a
  *   reconnect loop;
  * - a heartbeat ping every `heartbeatMs` (server's dead-peer window is 3×15 s,
  *   ADR-011 / server.rs) whose missing pong forces a reconnect;
@@ -87,6 +87,13 @@ interface Pending {
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
+
+/** Server close codes that mean the credential or protocol is bad: retrying cannot help. */
+const TERMINAL_CLOSE: Record<number, string> = {
+  4001: 'unauthorized (bad or missing token)',
+  4002: 'protocol version mismatch',
+  4003: 'device revoked',
+};
 
 const DEFAULTS = {
   ackTimeoutMs: 10_000,
@@ -327,7 +334,7 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
       else hsQueue.push(ev.data);
     };
 
-    socket.onclose = () => {
+    socket.onclose = (ev) => {
       if (ws !== socket) return;
       ws = null;
       session = null;
@@ -337,6 +344,8 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
         setStatus('offline');
         return;
       }
+      const terminal = ev?.code !== undefined ? TERMINAL_CLOSE[ev.code] : undefined;
+      if (terminal) deny(terminal);
       if (status === 'denied') return; // terminal — no auto-retry
       // Ordered reconnect over the QR endpoint list (ADR-011 §2 / S10):
       // a cycle that never reached a session advances to the NEXT endpoint

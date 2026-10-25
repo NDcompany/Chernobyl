@@ -92,11 +92,17 @@ export function createWsTransport(url: string): Transport {
       /* onclose always follows */
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (ws !== socket) return;
       ws = null;
       if (stopped) {
         setStatus('offline');
+        return;
+      }
+      // 4001 bad token / 4002 protocol mismatch: retrying cannot succeed
+      if (event.code === 4001 || event.code === 4002) {
+        setStatus('denied');
+        failPending(event.code === 4001 ? 'unauthorized' : 'protocol version mismatch');
         return;
       }
       // pending commands stay queued for replay on the next open
@@ -133,6 +139,7 @@ export function createWsTransport(url: string): Transport {
 
     connect() {
       stopped = false;
+      if (status === 'denied') setStatus('offline'); // explicit retry clears the terminal state
       // supersede a scheduled retry, or its timer would open a second socket
       if (retryTimer) {
         clearTimeout(retryTimer);
