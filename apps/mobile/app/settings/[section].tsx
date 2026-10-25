@@ -11,7 +11,8 @@ import { colors, spacing } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { useSnapshot } from '@/data/state';
 import { readAudit } from '@/platform/storage';
-import { clearHostToken, readHostToken } from '@/platform/secure';
+import { clearHostToken, clearPairing, readHostToken, readPairing } from '@/platform/secure';
+import { parsePairingPayload } from '@chernobyl/e2e';
 import { agentKindLabel, hostStatusLabel, hostTone, relativeTime } from '@/utils/format';
 import { useNow } from '@/hooks/useReducedMotion';
 import { Button, StatusDot, Text } from '@/ui/primitives';
@@ -83,14 +84,21 @@ export default function SettingsSectionScreen() {
   const settings = useAppStore((s) => s.settings);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const toggleIntegration = useAppStore((s) => s.toggleIntegration);
-  const signOut = useAppStore((s) => s.signOut);
-
   const [hasToken, setHasToken] = useState<boolean | null>(null);
+  // paired device id (from the stored pairing), null = not paired, undefined = loading
+  const [pairedDevice, setPairedDevice] = useState<string | null | undefined>(undefined);
   const [audit] = useState(() => readAudit(50));
-  const [confirmAll, setConfirmAll] = useState(false);
+  const [confirmUnpair, setConfirmUnpair] = useState(false);
 
   useEffect(() => {
     void readHostToken().then((t) => setHasToken(!!t));
+    void readPairing().then((json) => {
+      try {
+        setPairedDevice(json ? parsePairingPayload(json).deviceId : null);
+      } catch {
+        setPairedDevice(null); // corrupt payload: TransportProvider already surfaced it
+      }
+    });
   }, []);
 
   if (!authed) return <Redirect href="/sign-in" />;
@@ -98,10 +106,16 @@ export default function SettingsSectionScreen() {
   const title = TITLES[key] ?? 'Settings';
   const known = key in TITLES;
 
-  const signOutEverywhere = () => {
-    setConfirmAll(false);
-    signOut();
-    router.replace('/sign-in');
+  // Local deletion (PRD Phase 9): drop the pairing key and token from the
+  // keystore and rebuild the transport, which falls back to Simulation.
+  const unpair = () => {
+    setConfirmUnpair(false);
+    void Promise.all([clearPairing(), clearHostToken()]).then(() => {
+      setPairedDevice(null);
+      setHasToken(false);
+      useAppStore.getState().bumpTransport();
+      useAppStore.getState().addToast('Host unpaired — keys removed from this device', 'success');
+    });
   };
 
   let body: ReactNode = null;
@@ -260,7 +274,18 @@ export default function SettingsSectionScreen() {
             <StatusDot tone="success" label="Active" />
           </View>
           <View style={styles.divider} />
-          <View style={{ paddingHorizontal: spacing.md, paddingVertical: spacing.md }}>
+          <View style={{ paddingHorizontal: spacing.md, paddingVertical: spacing.md, gap: spacing.sm }}>
+            <DetailRow
+              label="Pairing"
+              value={
+                pairedDevice === undefined
+                  ? 'Checking…'
+                  : pairedDevice
+                    ? `Paired · device ${pairedDevice}`
+                    : 'Not paired'
+              }
+              mono={false}
+            />
             <DetailRow
               label="Host token"
               value={hasToken === null ? 'Checking…' : hasToken ? 'Stored in keystore' : 'Not stored'}
@@ -278,14 +303,18 @@ export default function SettingsSectionScreen() {
             });
           }}
         />
-        <Button
-          label="Sign out on all devices"
-          variant="secondary"
-          icon="logout"
-          onPress={() => setConfirmAll(true)}
-        />
+        {pairedDevice ? (
+          <Button
+            label="Unpair this host"
+            variant="secondary"
+            icon="logout"
+            onPress={() => setConfirmUnpair(true)}
+          />
+        ) : null}
         <Text variant="xs" color={colors.text3} center>
-          Prototype note: session revocation on other devices needs a real account backend.
+          {pairedDevice
+            ? `To cut this phone off from the desktop side, run: chernobyl-companion --revoke ${pairedDevice}`
+            : 'There are no accounts: access is per paired phone, revoked from the desktop companion.'}
         </Text>
       </>
     );
@@ -352,13 +381,13 @@ export default function SettingsSectionScreen() {
       )}
 
       <ConfirmModal
-        visible={confirmAll}
-        title="Sign out everywhere?"
-        message="This device and any other session will need to sign in again."
-        note="Hosts keep enforcing permissions regardless — agents are never left unattended."
-        confirmLabel="Sign out"
-        onConfirm={signOutEverywhere}
-        onCancel={() => setConfirmAll(false)}
+        visible={confirmUnpair}
+        title="Unpair this host?"
+        message="The pairing key and token are deleted from this phone. Pairing again needs a new QR from the host."
+        note="The host keeps enforcing permissions — agents are never left unattended."
+        confirmLabel="Unpair"
+        onConfirm={unpair}
+        onCancel={() => setConfirmUnpair(false)}
       />
     </Screen>
   );
