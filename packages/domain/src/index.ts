@@ -18,9 +18,12 @@ export {
 export {
   PERMISSION_DECISION_ERRORS,
   evaluatePermissionDecision,
+  legacyDecisions,
   type PermissionDecisionCode,
   type PermissionDecisionErrorCode,
   type PermissionDecisionInput,
+  type PermissionDecisionOption,
+  type PermissionDecisionQuestion,
   type PermissionDecisionRequest,
   type PermissionVerdict,
 } from './permission';

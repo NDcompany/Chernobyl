@@ -268,6 +268,23 @@ test('G2: decisions fail closed on revision and on unsupported decisions', () =>
   assert.equal(stale?.ok, false);
   assert.equal(permission.status, 'pending');
 
+  // ADR-015: an option the request never offered, or a message on an
+  // approval, is refused the same way (mock requests carry no options)
+  for (const extra of [{ optionId: 'allow' }, { message: 'why' }]) {
+    const refused = ackOf(
+      engine.handle({
+        type: 'permission_decision',
+        commandId: `d-opt-${'optionId' in extra}`,
+        permissionId: permission.id,
+        decision: 'approve-once',
+        revision: permission.revision,
+        ...extra,
+      }),
+    );
+    assert.equal(refused?.error, 'decision is not supported by this runtime');
+  }
+  assert.equal(permission.status, 'pending');
+
   // a decision the runtime does not offer → refused, never translated
   permission.supportedDecisions = ['reject'];
   const unsupported = ackOf(

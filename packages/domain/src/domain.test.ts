@@ -7,8 +7,11 @@ import {
   isTerminal,
   isUsable,
   isValidCapability,
+  legacyDecisions,
   transitionCommand,
   type CommandTracker,
+  type PermissionDecisionCode,
+  type PermissionDecisionOption,
   type PermissionDecisionRequest,
 } from './index';
 
@@ -123,6 +126,128 @@ test('a decision the runtime never offered is refused, never translated', () => 
   assert.ok(!v.ok && v.code === 'unsupported-decision');
   // even with the right revision, the unsupported decision stays refused
   assert.equal(v.ok, false);
+});
+
+/* ADR-015 options — the same cases as the Rust authority tests */
+
+function opt(
+  id: string,
+  decision: PermissionDecisionCode,
+  scope: PermissionDecisionOption['scope'],
+  takesMessage?: true,
+): PermissionDecisionOption {
+  return takesMessage ? { id, decision, scope, takesMessage } : { id, decision, scope };
+}
+
+/** Codex-shaped: a persistent amendment sits before the session grant; the plain deny takes a message. */
+const CODEX_OPTIONS = [
+  opt('accept', 'approve-once', 'once'),
+  opt('amend', 'approve-session', 'persistent'),
+  opt('session', 'approve-session', 'session'),
+  opt('decline', 'reject', 'once', true),
+  opt('cancel', 'reject', 'once'),
+];
+
+function withOptions(options: readonly PermissionDecisionOption[] = CODEX_OPTIONS) {
+  return pending({ options, supportedDecisions: legacyDecisions(options) });
+}
+
+/** The id of the option a decision selects (undefined: no options), or the refusal code. */
+function pick(
+  request: PermissionDecisionRequest,
+  decision: PermissionDecisionCode,
+  optionId?: string,
+  message?: string,
+): string | undefined {
+  const v = evaluatePermissionDecision(request, { decision, revision: 3, optionId, message });
+  return v.ok ? v.option?.id : v.code;
+}
+
+test('option decision must match its bucket', () => {
+  const p = withOptions();
+  assert.equal(pick(p, 'approve-once', 'accept'), 'accept');
+  // an explicit persistent grant is fine, even outside the legacy buckets
+  const noSession = withOptions(CODEX_OPTIONS.filter((o) => o.id !== 'session'));
+  assert.deepEqual(noSession.supportedDecisions, ['approve-once', 'reject']);
+  assert.equal(pick(noSession, 'approve-session', 'amend'), 'amend');
+  // the option's bucket must equal the decision sent
+  assert.equal(pick(p, 'approve-once', 'decline'), 'unsupported-decision');
+  assert.equal(pick(p, 'reject', 'amend'), 'unsupported-decision');
+  assert.equal(pick(p, 'approve-session', 'accept'), 'unsupported-decision');
+});
+
+test('unknown option is unsupported', () => {
+  assert.equal(pick(withOptions(), 'approve-once', 'nope'), 'unsupported-decision');
+  // a request without options has no option to name
+  assert.equal(pick(pending(), 'approve-once', 'accept'), 'unsupported-decision');
+});
+
+test('legacy decision never selects a persistent option', () => {
+  const p = withOptions();
+  // the first NON-persistent option of the bucket, skipping the amendment
+  assert.equal(pick(p, 'approve-session'), 'session');
+  assert.equal(pick(p, 'approve-once'), 'accept');
+  // takesMessage does not disqualify: the message is optional
+  assert.equal(pick(p, 'reject'), 'decline');
+  // only a persistent grant left: refused even when the record (wrongly) lists approve-session
+  const persistentOnly = pending({ options: CODEX_OPTIONS.filter((o) => o.id !== 'session') });
+  assert.ok(persistentOnly.supportedDecisions?.includes('approve-session'));
+  assert.equal(pick(persistentOnly, 'approve-session'), 'unsupported-decision');
+  // requests without options behave exactly as before
+  assert.equal(pick(pending(), 'approve-session'), undefined);
+});
+
+test('supported decisions are the legacy buckets', () => {
+  assert.deepEqual(legacyDecisions(CODEX_OPTIONS), ['approve-once', 'approve-session', 'reject']);
+  assert.deepEqual(
+    legacyDecisions([
+      opt('allow', 'approve-once', 'once'),
+      opt('always', 'approve-session', 'persistent'),
+      opt('deny', 'reject', 'once', true),
+    ]),
+    ['approve-once', 'reject'],
+  );
+});
+
+test('a message needs an option that takes one, or a plain reject', () => {
+  const p = withOptions();
+  assert.equal(pick(p, 'reject', 'decline', 'use staging'), 'decline');
+  // the legacy reject selects `decline`, which takes the message
+  assert.equal(pick(p, 'reject', undefined, 'why'), 'decline');
+  assert.equal(pick(p, 'reject', 'cancel', 'why'), 'unsupported-decision');
+  assert.equal(pick(p, 'approve-once', undefined, 'why'), 'unsupported-decision');
+  // without options: a reject may carry a message, an approval may not
+  assert.equal(pick(pending(), 'reject', undefined, 'no'), undefined);
+  assert.equal(pick(pending(), 'approve-once', undefined, 'ok'), 'unsupported-decision');
+});
+
+test('answers must fit the question detail', () => {
+  const question = pending({
+    detail: {
+      kind: 'question',
+      questions: [
+        { id: 'q1', options: [{ label: 'Postgres' }, { label: 'SQLite' }], multiSelect: false, allowFreeText: false },
+        { id: 'q2', options: [{ label: 'Unit tests' }, { label: 'Lint' }], multiSelect: true, allowFreeText: true },
+      ],
+    },
+  });
+  const verdict = (request: PermissionDecisionRequest, answers: Record<string, string[]>) =>
+    evaluatePermissionDecision(request, { decision: 'approve-once', revision: 3, answers });
+  const refused = { ok: false, code: 'unsupported-decision' };
+  const ok = { q1: ['Postgres'], q2: ['Unit tests', 'Lint', 'e2e too'] };
+  assert.deepEqual(verdict(question, ok), { ok: true });
+  const bad: Record<string, string[]>[] = [
+    { q3: ['Postgres'] }, // unknown question id
+    { q1: ['MySQL'] }, // not an option, no free text
+    { q1: ['Postgres', 'SQLite'] }, // one answer unless multiSelect
+  ];
+  for (const answers of bad) {
+    assert.deepEqual(verdict(question, answers), refused, JSON.stringify(answers));
+  }
+  // answers only for a question detail
+  assert.deepEqual(verdict(pending(), ok), refused);
+  assert.deepEqual(verdict(pending({ detail: { kind: 'shell' } }), ok), refused);
+  assert.deepEqual(verdict(pending({ detail: { kind: 'shell' } }), {}), { ok: true });
 });
 
 /* ------------------------------------------------------------------ */

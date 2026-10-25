@@ -417,13 +417,18 @@ impl Companion {
                     permission_id,
                     decision,
                     revision,
-                    ..
+                    option_id,
+                    message,
+                    answers,
                 } => {
                     let verdict = {
                         let mut engine = self.engine.lock().unwrap();
                         engine.validate_native_permission_decision(
                             permission_id,
                             decision,
+                            option_id.as_deref(),
+                            message.as_deref(),
+                            answers,
                             *revision,
                         )
                     };

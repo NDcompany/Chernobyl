@@ -303,11 +303,9 @@ export class MockEngine {
     const p = this.findPermission(msg.permissionId);
     if (!p) return ackErr(msg.commandId, 'unknown permission request');
     // Fail-closed authority: native metadata, pending status, expiry,
-    // revision match and supported-decision checks (G2). Never translated.
-    const verdict = evaluatePermissionDecision(p, {
-      decision: msg.decision,
-      revision: msg.revision,
-    });
+    // revision match, supported decision / option bucket, message and
+    // answers (G2, ADR-015). Never translated.
+    const verdict = evaluatePermissionDecision(p, msg);
     if (!verdict.ok) {
       if (verdict.code === 'expired') this.expire(p);
       return ackErr(msg.commandId, PERMISSION_DECISION_ERRORS[verdict.code]);

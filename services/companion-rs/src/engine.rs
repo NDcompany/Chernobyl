@@ -6,9 +6,9 @@
 //! far-future `now` to fast-forward deterministically.
 
 use crate::protocol::{
-    ActivityEvent, ClientMsg, DecisionError, Envelope, EventKind, FEATURES, FileChange, OutputLine,
-    PermissionRequest, ServerMsg, Session, SessionStep, Snapshot, evaluate_permission_decision,
-    next_id, now_ms,
+    ActivityEvent, ClientMsg, DecisionError, Envelope, EventKind, FEATURES, FileChange,
+    LIVE_PERMISSION_TTL_MS, OutputLine, PermissionOption, PermissionRequest, ServerMsg, Session,
+    SessionStep, Snapshot, evaluate_permission_decision, legacy_decisions, next_id, now_ms,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -91,12 +91,22 @@ impl Engine {
     /// SAME seq/envelope/emit path as engine events, so one sequence stays
     /// continuous (C2) across mock and native sources.
     pub fn publish_external(&mut self, kind: EventKind) {
-        if let EventKind::Activity(a) = &kind {
-            // the snapshot must show what the event stream already says
-            self.state.activity.insert(0, a.clone());
-            if self.state.activity.len() > MAX_ACTIVITY {
-                self.state.activity.pop();
+        match &kind {
+            EventKind::Activity(a) => {
+                // the snapshot must show what the event stream already says
+                self.state.activity.insert(0, a.clone());
+                if self.state.activity.len() > MAX_ACTIVITY {
+                    self.state.activity.pop();
+                }
             }
+            // ADR-015: a native resolution (answered in the OpenCode TUI)
+            // resolves the engine's G2 record. Broadcasting the adapter's
+            // copy, with its own revision, left the record pending.
+            EventKind::PermissionResolved(p) => {
+                self.resolve_native(&p.id, &p.status, p.decision.as_deref());
+                return;
+            }
+            _ => {}
         }
         self.broadcast(kind);
     }
@@ -105,7 +115,14 @@ impl Engine {
     /// G2 authority — the native record becomes an ENGINE permission record
     /// (engine revision/expiry policy applies) before anything can decide
     /// it; never a bypass around revision/pending/expiry validation.
-    pub fn ingest_permission(&mut self, pr: PermissionRequest) {
+    /// ADR-015: with options, `supported_decisions` becomes exactly the
+    /// legacy buckets (an old phone never maps a tap to a persistent rule),
+    /// and the expiry is the 24 h runtime TTL.
+    pub fn ingest_permission(&mut self, mut pr: PermissionRequest) {
+        if !pr.options.is_empty() {
+            pr.supported_decisions = legacy_decisions(&pr.options);
+        }
+        pr.expires_at = now_ms() + LIVE_PERMISSION_TTL_MS;
         self.state.permissions.insert(0, pr.clone());
         let agent_name = self
             .find_session(&pr.session_id)
@@ -120,20 +137,33 @@ impl Engine {
     }
 
     /// Phase 3: G2 pre-validation for a decision the NATIVE runtime will
-    /// execute (`routes_to_adapter`). Same fail-closed checks as `decide`
-    /// (unknown, native metadata, pending, expiry, revision, supported
-    /// decision) — the authority never moves with the executor.
+    /// execute (`routes_to_adapter`); `decide` runs the same checks for mock
+    /// records: unknown, native metadata, pending, expiry, revision, then the
+    /// ADR-015 option bucket, `message` and `answers` — the authority never
+    /// moves with the executor. Returns the selected option (None for a
+    /// request without options): the adapter writes THAT option's answer.
     pub fn validate_native_permission_decision(
         &mut self,
         permission_id: &str,
         decision: &str,
+        option_id: Option<&str>,
+        message: Option<&str>,
+        answers: &[(String, Vec<String>)],
         revision: f64,
-    ) -> Result<(), String> {
+    ) -> Result<Option<PermissionOption>, String> {
         let Some(perm) = self.find_permission(permission_id).cloned() else {
             return Err("unknown permission request".into());
         };
-        match evaluate_permission_decision(&perm, decision, revision, now_ms()) {
-            Ok(()) => Ok(()),
+        match evaluate_permission_decision(
+            &perm,
+            decision,
+            option_id,
+            message,
+            answers,
+            revision,
+            now_ms(),
+        ) {
+            Ok(option) => Ok(option.cloned()),
             Err(code) => {
                 if code == DecisionError::Expired {
                     let mut p = perm.clone();
@@ -214,6 +244,40 @@ impl Engine {
             Some(&perm.session_id),
             Some(&perm.id),
         );
+    }
+
+    /// ADR-015: a resolution that happened natively — the runtime withdrew
+    /// the request, it was answered in another UI, or the session ended.
+    /// Bumps the revision so a late phone decision fails closed ("request is
+    /// no longer pending"), stores the outcome and broadcasts
+    /// `permission_resolved` once. Idempotent: an unknown or already
+    /// resolved record is left alone. Only a well-formed approval or a
+    /// rejection is recorded as such; anything else is `stale` (resolved,
+    /// no outcome claimed).
+    pub fn resolve_native(&mut self, permission_id: &str, status: &str, decision: Option<&str>) {
+        let (status, decision) = match (status, decision) {
+            ("approved", Some(d @ ("approve-once" | "approve-session"))) => ("approved", Some(d)),
+            ("rejected", _) => ("rejected", Some("reject")),
+            _ => ("stale", None),
+        };
+        let now = now_ms();
+        let Some(p) = self
+            .find_permission_mut(permission_id)
+            .filter(|p| p.status == "pending")
+        else {
+            return;
+        };
+        p.revision += 1;
+        p.status = status.to_string();
+        p.decided_at = Some(now);
+        p.decision = decision.map(str::to_string);
+        let p = p.clone();
+        self.broadcast(EventKind::PermissionResolved(p.clone()));
+        let text = match status {
+            "stale" => format!("“{}” was withdrawn by the runtime", p.command),
+            s => format!("“{}” was {s} in the runtime", p.command),
+        };
+        self.push_activity("permission", &text, Some(&p.id));
     }
 
     fn broadcast(&mut self, kind: EventKind) {
@@ -493,37 +557,32 @@ impl Engine {
     }
 
     fn decide(&mut self, msg: ClientMsg) -> Option<ServerMsg> {
-        // ADR-015 option_id / message / answers are ignored until engine
-        // option validation lands (step 3); mock requests carry no options
         let ClientMsg::PermissionDecision {
             command_id,
             permission_id,
             decision,
             revision,
-            ..
+            option_id,
+            message,
+            answers,
         } = msg
         else {
             return None;
         };
-        let Some(perm) = self.find_permission(&permission_id).cloned() else {
-            return Some(ServerMsg::ack_err(
-                &command_id,
-                "unknown permission request",
-            ));
-        };
-        // Fail-closed authority: native metadata, pending status, expiry,
-        // revision match, supported-decision (G2). Never translated.
-        let verdict = evaluate_permission_decision(&perm, &decision, revision, now_ms());
-        if let Err(code) = verdict {
-            if code == DecisionError::Expired {
-                let mut p = perm.clone();
-                self.expire(&mut p);
-                if let Some(target) = self.find_permission_mut(&permission_id) {
-                    *target = p;
-                }
-            }
-            return Some(ServerMsg::ack_err(&command_id, code.message()));
+        // Fail-closed authority, the same checks a native decision gets:
+        // native metadata, pending status, expiry, revision, option bucket,
+        // message and answers (G2). Never translated.
+        if let Err(e) = self.validate_native_permission_decision(
+            &permission_id,
+            &decision,
+            option_id.as_deref(),
+            message.as_deref(),
+            &answers,
+            revision,
+        ) {
+            return Some(ServerMsg::ack_err(&command_id, &e));
         }
+        let perm = self.find_permission(&permission_id).cloned()?;
 
         let now = now_ms();
         let session = self.find_session(&perm.session_id).cloned();
@@ -1590,6 +1649,23 @@ mod tests {
                 .status,
             "pending"
         );
+        // ADR-015: an option the request never offered, or a message on an
+        // approval, is refused the same way (mock requests carry no options)
+        for (option_id, message) in [(Some("allow"), None), (None, Some("why"))] {
+            let refused = ack_of(engine.handle(ClientMsg::PermissionDecision {
+                command_id: format!("d-opt-{}", option_id.is_some()),
+                permission_id: permission.id.clone(),
+                decision: "approve-once".into(),
+                revision: permission.revision as f64,
+                option_id: option_id.map(str::to_string),
+                message: message.map(str::to_string),
+                answers: vec![],
+            }));
+            assert_eq!(
+                refused.and_then(|a| a.4).as_deref(),
+                Some("decision is not supported by this runtime")
+            );
+        }
         // a decision the runtime does not offer → refused, never translated
         if let Some(p) = engine
             .state
@@ -1710,5 +1786,213 @@ mod tests {
         assert_eq!(session.status, "completed");
         assert_eq!(session.progress, 100);
         assert!(session.timeline.iter().all(|t| t.status == "done"));
+    }
+
+    /* ---------------- ADR-015 runtime permissions ---------------- */
+
+    fn opt(id: &str, decision: &str, scope: &'static str) -> PermissionOption {
+        PermissionOption {
+            id: id.into(),
+            decision: decision.into(),
+            label: id.into(),
+            rule: None,
+            scope,
+            destination: None,
+            takes_message: false,
+            stops_turn: false,
+        }
+    }
+
+    /// A runtime request as an adapter builds it (120 s expiry, every
+    /// decision claimed); ingest applies the engine's own policy.
+    fn runtime_permission(id: &str, options: Vec<PermissionOption>) -> PermissionRequest {
+        let now = now_ms();
+        PermissionRequest {
+            id: id.into(),
+            native_request_id: id.into(),
+            session_id: "s-live".into(),
+            agent_id: "a-live".into(),
+            host_id: "rt-1".into(),
+            action: "shell".into(),
+            title: "Run shell command".into(),
+            command: "npm test".into(),
+            args: vec![],
+            directory: None,
+            risk: "high".into(),
+            status: "pending".into(),
+            supported_decisions: vec![
+                "approve-once".into(),
+                "approve-session".into(),
+                "reject".into(),
+            ],
+            revision: 1,
+            fingerprint: None,
+            requested_at: now,
+            expires_at: now + 120_000,
+            context: String::new(),
+            decided_at: None,
+            decision: None,
+            tool_item_id: Some("tool-1".into()),
+            options,
+            detail: None,
+        }
+    }
+
+    fn stored(engine: &Engine, id: &str) -> PermissionRequest {
+        engine
+            .snapshot()
+            .permissions
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .unwrap()
+    }
+
+    fn resolved(events: &Arc<Mutex<Vec<ServerMsg>>>, id: &str) -> Vec<PermissionRequest> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                ServerMsg::Event {
+                    kind: EventKind::PermissionResolved(p),
+                    ..
+                } if p.id == id => Some(p.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn supported_decisions_are_the_legacy_buckets() {
+        let (mut engine, events) = make_engine();
+        engine.ingest_permission(runtime_permission(
+            "rt:1",
+            vec![
+                opt("allow", "approve-once", "once"),
+                opt("always", "approve-session", "persistent"),
+                opt("deny", "reject", "once"),
+            ],
+        ));
+        let p = stored(&engine, "rt:1");
+        assert_eq!(p.supported_decisions, ["approve-once", "reject"]);
+        let requested = events.lock().unwrap().iter().find_map(|e| match e {
+            ServerMsg::Event {
+                kind: EventKind::PermissionRequested(p),
+                ..
+            } => Some(p.clone()),
+            _ => None,
+        });
+        assert_eq!(requested.as_ref(), Some(&p), "the broadcast record agrees");
+        // a legacy approve-session has no bucket; naming the option works,
+        // and each path hands back the option the adapter must answer with
+        let mut check = |decision: &str, option_id: Option<&str>| {
+            engine
+                .validate_native_permission_decision("rt:1", decision, option_id, None, &[], 1.0)
+                .map(|o| o.map(|o| o.id))
+        };
+        assert_eq!(
+            check("approve-session", None),
+            Err("decision is not supported by this runtime".into())
+        );
+        assert_eq!(
+            check("approve-session", Some("always")),
+            Ok(Some("always".into()))
+        );
+        assert_eq!(check("approve-once", None), Ok(Some("allow".into())));
+        // without options the adapter's decisions stand
+        engine.ingest_permission(runtime_permission("rt:2", vec![]));
+        assert_eq!(stored(&engine, "rt:2").supported_decisions.len(), 3);
+    }
+
+    #[test]
+    fn resolve_native_bumps_revision_and_refuses_late_decisions() {
+        let (mut engine, events) = make_engine();
+        engine.ingest_permission(runtime_permission("rt:1", vec![]));
+        engine.resolve_native("rt:1", "stale", None);
+        let p = stored(&engine, "rt:1");
+        assert_eq!(
+            (p.status.as_str(), p.revision, p.decision.as_deref()),
+            ("stale", 2, None)
+        );
+        assert!(p.decided_at.is_some());
+        assert_eq!(resolved(&events, "rt:1"), vec![p.clone()]);
+        // idempotent: a second native resolution changes nothing
+        engine.resolve_native("rt:1", "approved", Some("approve-once"));
+        assert_eq!(stored(&engine, "rt:1"), p);
+        assert_eq!(resolved(&events, "rt:1").len(), 1);
+        // the phone's late tap fails closed, whatever revision it holds
+        for revision in [1.0, 2.0] {
+            assert_eq!(
+                engine.validate_native_permission_decision(
+                    "rt:1",
+                    "approve-once",
+                    None,
+                    None,
+                    &[],
+                    revision
+                ),
+                Err("request is no longer pending".into())
+            );
+        }
+        // a well-formed native outcome is kept; anything else is stale
+        engine.ingest_permission(runtime_permission("rt:2", vec![]));
+        engine.resolve_native("rt:2", "approved", Some("approve-session"));
+        let p2 = stored(&engine, "rt:2");
+        assert_eq!(
+            (p2.status.as_str(), p2.decision.as_deref()),
+            ("approved", Some("approve-session"))
+        );
+        engine.ingest_permission(runtime_permission("rt:3", vec![]));
+        engine.resolve_native("rt:3", "approved", None);
+        assert_eq!(stored(&engine, "rt:3").status, "stale");
+    }
+
+    #[test]
+    fn native_resolved_event_resolves_the_engine_record() {
+        // answered in the OpenCode TUI: the adapter publishes its own copy
+        // (revision 1); the engine record must resolve, not stay pending
+        let (mut engine, events) = make_engine();
+        let pr = runtime_permission("per_tui", vec![]);
+        engine.ingest_permission(pr.clone());
+        engine.publish_external(EventKind::PermissionResolved(PermissionRequest {
+            status: "approved".into(),
+            decision: Some("approve-once".into()),
+            ..pr
+        }));
+        let p = stored(&engine, "per_tui");
+        assert_eq!((p.status.as_str(), p.revision), ("approved", 2));
+        assert_eq!(resolved(&events, "per_tui"), vec![p]);
+    }
+
+    #[test]
+    fn runtime_permissions_use_the_long_ttl() {
+        let (mut engine, _events) = make_engine();
+        let before = now_ms();
+        engine.ingest_permission(runtime_permission("rt:1", vec![]));
+        let p = stored(&engine, "rt:1");
+        assert!(p.expires_at >= before + LIVE_PERMISSION_TTL_MS);
+        assert!(p.expires_at <= now_ms() + LIVE_PERMISSION_TTL_MS);
+        // well past the adapter's own 120 s it is still pending...
+        engine.pump(before + 60 * 60_000);
+        assert_eq!(stored(&engine, "rt:1").status, "pending");
+        // ...and the sweep still expires it at 24 h
+        engine.pump(p.expires_at);
+        assert_eq!(stored(&engine, "rt:1").status, "stale");
+        // mock and demo requests keep the short TTL
+        let ask = AskSpec {
+            action: "shell".into(),
+            title: "Run shell command".into(),
+            command: "npm test".into(),
+            args: vec![],
+            directory: None,
+            risk: "low".into(),
+            context: String::new(),
+        };
+        let mock = engine.issue_permission("s1", &ask, before);
+        assert_eq!(
+            mock.expires_at - mock.requested_at,
+            crate::protocol::PERMISSION_TTL_MS
+        );
     }
 }

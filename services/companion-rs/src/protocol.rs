@@ -12,6 +12,9 @@ pub const FEATURE_TRANSCRIPT: &str = "transcript.v1";
 /// What `hello_ack.features` advertises.
 pub const FEATURES: &[&str] = &[FEATURE_TRANSCRIPT];
 pub const PERMISSION_TTL_MS: i64 = 120_000;
+/// ADR-015: presentation expiry of runtime-sourced requests. None of the
+/// runtimes expires a request itself (PRD §13.4); mock and demo keep 120 s.
+pub const LIVE_PERMISSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 pub const HEARTBEAT_MS: u64 = 15_000;
 pub const HEARTBEAT_MISS_LIMIT: u32 = 3;
 
@@ -1166,12 +1169,25 @@ impl DecisionError {
 }
 
 /// The single fail-closed authority (PRD §13, G2). Pure: never mutates.
-pub fn evaluate_permission_decision(
-    request: &PermissionRequest,
+///
+/// ADR-015 options: an explicit `option_id` must name one of the request's
+/// options in the bucket sent (a persistent one included: the phone showed
+/// its rule). Without one, the decision must be supported and, on a request
+/// with options, selects the first non-persistent option of its bucket, so a
+/// legacy decision never lands on a persistent rule. A `message` needs a
+/// selected option that takes one, or a plain reject when there are no
+/// options; `answers` need a `question` detail they fit. All of these refuse
+/// as unsupported. Returns the selected option (None for a request without
+/// options) for the adapter that writes the native answer.
+pub fn evaluate_permission_decision<'a>(
+    request: &'a PermissionRequest,
     decision: &str,
+    option_id: Option<&str>,
+    message: Option<&str>,
+    answers: &[(String, Vec<String>)],
     revision: f64,
     now: i64,
-) -> Result<(), DecisionError> {
+) -> Result<Option<&'a PermissionOption>, DecisionError> {
     if request.native_request_id.is_empty() || request.supported_decisions.is_empty() {
         return Err(DecisionError::IncompleteMetadata);
     }
@@ -1184,10 +1200,79 @@ pub fn evaluate_permission_decision(
     if revision != request.revision as f64 {
         return Err(DecisionError::StaleRevision);
     }
-    if !request.supported_decisions.iter().any(|d| d == decision) {
+    let option = match option_id {
+        Some(id) => request
+            .options
+            .iter()
+            .find(|o| o.id == id && o.decision == decision),
+        None if !request.supported_decisions.iter().any(|d| d == decision) => {
+            return Err(DecisionError::UnsupportedDecision);
+        }
+        None => legacy_option(&request.options, decision),
+    };
+    // an explicit option must exist; a request with options must select one
+    if option.is_none() && (option_id.is_some() || !request.options.is_empty()) {
         return Err(DecisionError::UnsupportedDecision);
     }
-    Ok(())
+    if message.is_some() && !option.map_or(decision == "reject", |o| o.takes_message) {
+        return Err(DecisionError::UnsupportedDecision);
+    }
+    if !answers.is_empty() && !answers_fit(request.detail.as_ref(), answers) {
+        return Err(DecisionError::UnsupportedDecision);
+    }
+    Ok(option)
+}
+
+/// ADR-015: the `supportedDecisions` of a request with options, exactly the
+/// buckets a legacy decision can select, so an old phone never shows a
+/// button that maps to a persistent rule.
+pub fn legacy_decisions(options: &[PermissionOption]) -> Vec<String> {
+    ["approve-once", "approve-session", "reject"]
+        .into_iter()
+        .filter(|d| legacy_option(options, d).is_some())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The option a legacy (option-unaware) decision selects: the first
+/// non-persistent one of its bucket. `takes_message` does not disqualify
+/// it, because the message is optional.
+fn legacy_option<'a>(
+    options: &'a [PermissionOption],
+    decision: &str,
+) -> Option<&'a PermissionOption> {
+    options
+        .iter()
+        .find(|o| o.decision == decision && o.scope != "persistent")
+}
+
+/// `answers` fit a `question` detail: known question ids, at most one answer
+/// unless `multiSelect`, labels from that question's options unless
+/// `allowFreeText`.
+fn answers_fit(detail: Option<&Json>, answers: &[(String, Vec<String>)]) -> bool {
+    let questions = detail
+        .filter(|d| json::get_str(d, "kind") == Some("question"))
+        .and_then(|d| json::get(d, "questions"))
+        .and_then(json::as_arr)
+        .unwrap_or_default();
+    answers.iter().all(|(id, labels)| {
+        questions
+            .iter()
+            .find(|q| json::get_str(q, "id") == Some(id.as_str()))
+            .is_some_and(|q| {
+                let offered = |label: &String| {
+                    json::get(q, "options")
+                        .and_then(json::as_arr)
+                        .is_some_and(|os| {
+                            os.iter()
+                                .any(|o| json::get_str(o, "label") == Some(label.as_str()))
+                        })
+                };
+                (labels.len() <= 1 || json::get_bool(q, "multiSelect") == Some(true))
+                    && (json::get_bool(q, "allowFreeText") == Some(true)
+                        || labels.iter().all(offered))
+            })
+    })
 }
 
 /* ------------------------------------------------------------------ */
@@ -1361,48 +1446,226 @@ mod tests {
     #[test]
     fn permission_decision_authority_fail_closed() {
         let base = sample_permission();
+        let eval = |p: &PermissionRequest, decision: &str, revision: f64, now: i64| {
+            evaluate_permission_decision(p, decision, None, None, &[], revision, now).map(|_| ())
+        };
         // ok path
-        assert_eq!(
-            evaluate_permission_decision(&base, "approve-once", 1.0, 5_000),
-            Ok(())
-        );
+        assert_eq!(eval(&base, "approve-once", 1.0, 5_000), Ok(()));
         // incomplete metadata
         let mut missing = base.clone();
         missing.native_request_id = String::new();
         assert_eq!(
-            evaluate_permission_decision(&missing, "reject", 1.0, 5_000),
+            eval(&missing, "reject", 1.0, 5_000),
             Err(DecisionError::IncompleteMetadata)
         );
         let mut no_decisions = base.clone();
         no_decisions.supported_decisions.clear();
         assert_eq!(
-            evaluate_permission_decision(&no_decisions, "reject", 1.0, 5_000),
+            eval(&no_decisions, "reject", 1.0, 5_000),
             Err(DecisionError::IncompleteMetadata)
         );
         // not pending
         let mut resolved = base.clone();
         resolved.status = "approved".into();
         assert_eq!(
-            evaluate_permission_decision(&resolved, "reject", 1.0, 5_000),
+            eval(&resolved, "reject", 1.0, 5_000),
             Err(DecisionError::NotPending)
         );
         // expired
         assert_eq!(
-            evaluate_permission_decision(&base, "reject", 1.0, 10_000),
+            eval(&base, "reject", 1.0, 10_000),
             Err(DecisionError::Expired)
         );
         // stale revision
         assert_eq!(
-            evaluate_permission_decision(&base, "reject", 3.0, 5_000),
+            eval(&base, "reject", 3.0, 5_000),
             Err(DecisionError::StaleRevision)
         );
         // unsupported decision
         let mut limited = base.clone();
         limited.supported_decisions = vec!["reject".into()];
         assert_eq!(
-            evaluate_permission_decision(&limited, "approve-once", 1.0, 5_000),
+            eval(&limited, "approve-once", 1.0, 5_000),
             Err(DecisionError::UnsupportedDecision)
         );
+    }
+
+    fn opt(id: &str, decision: &str, scope: &'static str) -> PermissionOption {
+        PermissionOption {
+            id: id.into(),
+            decision: decision.into(),
+            label: id.into(),
+            rule: None,
+            scope,
+            destination: None,
+            takes_message: false,
+            stops_turn: false,
+        }
+    }
+
+    /// Codex-shaped options: a persistent amendment sits before the
+    /// session grant, and the plain deny takes a message.
+    fn with_options() -> PermissionRequest {
+        let mut p = sample_permission();
+        p.options = vec![
+            opt("accept", "approve-once", "once"),
+            opt("amend", "approve-session", "persistent"),
+            opt("session", "approve-session", "session"),
+            PermissionOption {
+                takes_message: true,
+                ..opt("decline", "reject", "once")
+            },
+            opt("cancel", "reject", "once"),
+        ];
+        p.supported_decisions = legacy_decisions(&p.options);
+        p
+    }
+
+    /// The id of the option a decision selects (None: no options).
+    fn pick<'a>(
+        p: &'a PermissionRequest,
+        decision: &str,
+        option_id: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<Option<&'a str>, DecisionError> {
+        evaluate_permission_decision(p, decision, option_id, message, &[], 1.0, 5_000)
+            .map(|o| o.map(|o| o.id.as_str()))
+    }
+
+    #[test]
+    fn option_decision_must_match_its_bucket() {
+        let p = with_options();
+        assert_eq!(
+            pick(&p, "approve-once", Some("accept"), None),
+            Ok(Some("accept"))
+        );
+        // an explicit persistent grant is fine, even outside the legacy buckets
+        let mut no_session = with_options();
+        no_session.options.retain(|o| o.id != "session");
+        no_session.supported_decisions = legacy_decisions(&no_session.options);
+        assert_eq!(no_session.supported_decisions, ["approve-once", "reject"]);
+        assert_eq!(
+            pick(&no_session, "approve-session", Some("amend"), None),
+            Ok(Some("amend"))
+        );
+        // the option's bucket must equal the decision sent
+        for (decision, id) in [
+            ("approve-once", "decline"),
+            ("reject", "amend"),
+            ("approve-session", "accept"),
+        ] {
+            assert_eq!(
+                pick(&p, decision, Some(id), None),
+                Err(DecisionError::UnsupportedDecision),
+                "{decision} via {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_option_is_unsupported() {
+        assert_eq!(
+            pick(&with_options(), "approve-once", Some("nope"), None),
+            Err(DecisionError::UnsupportedDecision)
+        );
+        // a request without options has no option to name
+        assert_eq!(
+            pick(&sample_permission(), "approve-once", Some("accept"), None),
+            Err(DecisionError::UnsupportedDecision)
+        );
+    }
+
+    #[test]
+    fn legacy_decision_never_selects_a_persistent_option() {
+        let mut p = with_options();
+        // the first NON-persistent option of the bucket, skipping the amendment
+        assert_eq!(pick(&p, "approve-session", None, None), Ok(Some("session")));
+        assert_eq!(pick(&p, "approve-once", None, None), Ok(Some("accept")));
+        // takesMessage does not disqualify: the message is optional
+        assert_eq!(pick(&p, "reject", None, None), Ok(Some("decline")));
+        // only a persistent grant left: refused even when the record still
+        // (wrongly) lists approve-session as supported
+        p.options.retain(|o| o.id != "session");
+        assert!(p.supported_decisions.iter().any(|d| d == "approve-session"));
+        assert_eq!(
+            pick(&p, "approve-session", None, None),
+            Err(DecisionError::UnsupportedDecision)
+        );
+        // requests without options behave exactly as before
+        assert_eq!(
+            pick(&sample_permission(), "approve-session", None, None),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn message_needs_an_option_that_takes_one_or_a_plain_reject() {
+        let p = with_options();
+        assert_eq!(
+            pick(&p, "reject", Some("decline"), Some("use staging")),
+            Ok(Some("decline"))
+        );
+        // the legacy reject selects `decline`, which takes the message
+        assert_eq!(pick(&p, "reject", None, Some("why")), Ok(Some("decline")));
+        for (decision, id) in [("reject", Some("cancel")), ("approve-once", None)] {
+            assert_eq!(
+                pick(&p, decision, id, Some("why")),
+                Err(DecisionError::UnsupportedDecision),
+                "{decision} {id:?}"
+            );
+        }
+        // without options: a reject may carry a message, an approval may not
+        let plain = sample_permission();
+        assert_eq!(pick(&plain, "reject", None, Some("no")), Ok(None));
+        assert_eq!(
+            pick(&plain, "approve-once", None, Some("ok")),
+            Err(DecisionError::UnsupportedDecision)
+        );
+    }
+
+    #[test]
+    fn answers_must_fit_the_question_detail() {
+        let mut p = sample_permission();
+        p.detail = Some(
+            json::parse(
+                r#"{"kind":"question","questions":[
+                    {"id":"q1","text":"DB?","options":[{"label":"Postgres"},{"label":"SQLite"}],"multiSelect":false,"allowFreeText":false},
+                    {"id":"q2","text":"Checks?","options":[{"label":"Unit tests"},{"label":"Lint"}],"multiSelect":true,"allowFreeText":true}]}"#,
+            )
+            .unwrap(),
+        );
+        fn answer(pairs: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+            pairs
+                .iter()
+                .map(|(id, a)| (id.to_string(), a.iter().map(|s| s.to_string()).collect()))
+                .collect()
+        }
+        let eval = |p: &PermissionRequest, answers: &[(String, Vec<String>)]| {
+            evaluate_permission_decision(p, "approve-once", None, None, answers, 1.0, 5_000)
+                .map(|_| ())
+        };
+        let ok = answer(&[
+            ("q1", &["Postgres"]),
+            ("q2", &["Unit tests", "Lint", "e2e too"]),
+        ]);
+        assert_eq!(eval(&p, &ok), Ok(()));
+        for bad in [
+            answer(&[("q3", &["Postgres"])]),           // unknown question id
+            answer(&[("q1", &["MySQL"])]),              // not an option, no free text
+            answer(&[("q1", &["Postgres", "SQLite"])]), // one answer unless multiSelect
+        ] {
+            assert_eq!(
+                eval(&p, &bad),
+                Err(DecisionError::UnsupportedDecision),
+                "{bad:?}"
+            );
+        }
+        // answers only for a question detail
+        let shell = sample_permission();
+        assert_eq!(eval(&shell, &ok), Err(DecisionError::UnsupportedDecision));
+        p.detail = Some(json::parse(r#"{"kind":"shell","command":"ls"}"#).unwrap());
+        assert_eq!(eval(&p, &ok), Err(DecisionError::UnsupportedDecision));
+        assert_eq!(eval(&p, &[]), Ok(()));
     }
 
     #[test]
