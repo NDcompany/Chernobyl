@@ -92,7 +92,9 @@ production behavior. Status is updated once the fix lands (§12 verification per
   fsync-per-append is a deliberate performance decision, not an audit fix — flagged for the
   owner, not made silently.)
 
-### P5 — Reconnect loops have no jitter and never reset (§2) · Status: open — fix next
+### P5 — Reconnect loops have no jitter and never reset (§2) · Status: fixed (`46bfa9f` TS, Rust next commit)
+
+- **Fix:** TS `retryDelayMs` (equal jitter, `[cap/2, cap]`) shared by the E2E and plaintext transports, backoff reset only after a session stayed up 30 s, and `connect()` now cancels a scheduled retry (it used to open a duplicate socket). Rust `reconnect_delay_ms`: uniform in `[250, ceiling]`, ceiling 500 → 1000 → 1250 ms (pre-P5 bounds kept), CSPRNG-seeded, attempt reset after a stream stayed up 30 s, wait sliced to the exact delay. Tests: `transport.test.ts` (3 new), `reconnect_delay_is_jittered_growing_and_bounded`.
 
 - **Where:** `opencode.rs:896-916` — `backoff = min(backoff+1, 5); step = 250 * backoff`
   → 250…1250 ms, deterministic, and `backoff` never returns to 0 after a *healthy*

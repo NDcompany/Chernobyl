@@ -892,10 +892,30 @@ impl SseBody {
     }
 }
 
+/// SSE reconnect delay (audit P5): the ceiling doubles 500 → 1000 → 1250 ms
+/// and the delay is uniform in [250, ceiling], so companions that lost the
+/// same `opencode serve` spread their retries instead of reconnecting in
+/// lockstep. Bounds are the pre-P5 ones: never below 250, never above 1250.
+fn reconnect_delay_ms(attempt: u32, rand: u64) -> u64 {
+    let ceiling = (250u64 << (attempt.min(3) + 1)).min(1250);
+    250 + rand % (ceiling - 249)
+}
+
+/// OS CSPRNG bytes, xor'd with the clock so a CSPRNG failure still jitters.
+fn jitter_seed() -> u64 {
+    let mut b = [0u8; 8];
+    let _ = crate::ffi::csprng_fill(&mut b);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos() as u64);
+    u64::from_le_bytes(b) ^ nanos
+}
+
 impl Inner {
     fn sse_loop(inner: Arc<Inner>) {
-        let mut backoff: u64 = 0;
+        let mut attempt: u32 = 0;
         while !inner.stop.load(Ordering::SeqCst) {
+            let started = std::time::Instant::now();
             match inner.sse_session() {
                 Ok(()) => {} // clean EOF → reconnect after backoff
                 Err(e) => {
@@ -905,12 +925,18 @@ impl Inner {
                     st.detail = Some(format!("event stream: {e}"));
                 }
             }
-            backoff = backoff.saturating_add(1).min(5);
-            let step = 250 * backoff;
+            // a stream that stayed up 30 s was healthy: the next drop must
+            // not inherit the old penalty (audit P5)
+            if started.elapsed() >= Duration::from_secs(30) {
+                attempt = 0;
+            }
+            let step = reconnect_delay_ms(attempt, jitter_seed());
+            attempt = attempt.saturating_add(1);
             let mut waited: u64 = 0;
             while waited < step && !inner.stop.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(100));
-                waited += 100;
+                let slice = (step - waited).min(100);
+                std::thread::sleep(Duration::from_millis(slice));
+                waited += slice;
             }
         }
     }
@@ -1990,5 +2016,27 @@ pub(crate) mod tests {
             r#"{"payload":{"id":"e","type":"session.created","properties":{"sessionID":"s","info":{"id":"s","title":"t","time":{"created":1,"updated":2}}}}}"#,
         );
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn reconnect_delay_is_jittered_growing_and_bounded() {
+        for attempt in 0..64 {
+            for r in [0, 1, 249, 250, 999, 12_345, u64::MAX / 3, u64::MAX] {
+                let d = reconnect_delay_ms(attempt, r);
+                let ceiling = [500, 1000, 1250][attempt.min(2) as usize];
+                assert!(
+                    (250..=ceiling).contains(&d),
+                    "attempt {attempt} rand {r}: {d}"
+                );
+            }
+        }
+        // jitter: different seeds, different delays (no lockstep)
+        let spread: std::collections::BTreeSet<u64> =
+            (0..100).map(|r| reconnect_delay_ms(2, r * 7_919)).collect();
+        assert!(spread.len() > 50);
+        // the ceiling (rand = ceiling - 250) grows with the attempt, then caps
+        assert_eq!(reconnect_delay_ms(0, 250), 500);
+        assert_eq!(reconnect_delay_ms(1, 750), 1000);
+        assert_eq!(reconnect_delay_ms(9, 1000), 1250);
     }
 }
