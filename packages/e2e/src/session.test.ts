@@ -9,9 +9,10 @@ import { SealedSession, deriveKeys, E2eError, utf8Encode } from './index.js';
 
 const psk = new Uint8Array(32).fill(7);
 const salt = utf8Encode('SALTSALTSALTSALT'); // exactly 16 bytes
+const cnonce = utf8Encode('CNONCNONCNONCNON'); // e2e.rs CNONCE
 
 function pair(): { host: SealedSession; client: SealedSession } {
-  const keys = deriveKeys(psk, salt);
+  const keys = deriveKeys(psk, salt, cnonce);
   return { host: SealedSession.host(keys), client: SealedSession.client(keys) };
 }
 
@@ -29,10 +30,10 @@ function expectCode(code: string, fn: () => unknown): void {
 test('golden frames byte-exact with e2e.rs (golden_sealed_frames_match_the_ts_client)', () => {
   // n=1 pins the nonce byte order: counter 0 is all-zero in any layout
   const { host, client } = pair();
-  assert.equal(client.seal('hello'), '{"n":0,"d":"pHJWBpPogJEypK0zkXSNTZ6RP9ex"}');
-  assert.equal(client.seal('ping'), '{"n":1,"d":"o2o3yaauc3zeHJPBlu6re3PJ/XU="}');
-  assert.equal(host.seal('hello_ack'), '{"n":0,"d":"WiQGjPTOkuC2RIdhMi7W7QfZo2o2B77krQ=="}');
-  assert.equal(host.seal('pong'), '{"n":1,"d":"XlS628RS80APu4NAG+/BcEhrhfE="}');
+  assert.equal(client.seal('hello'), '{"n":0,"d":"r6Rs7v9M2/y/CAkkvJJ+xqHQUhv8"}');
+  assert.equal(client.seal('ping'), '{"n":1,"d":"HSVsxvDYQ7qYlBmBoyBF2XmxHNw="}');
+  assert.equal(host.seal('hello_ack'), '{"n":0,"d":"zLVPpIF5s4rcEesgzm6PwVXf3OuKDblSmQ=="}');
+  assert.equal(host.seal('pong'), '{"n":1,"d":"e6r062GVTFNYUGpBRQ0Ue4hoGLI="}');
 });
 
 test('seal/open round-trips both directions with counters counting up', () => {
@@ -114,12 +115,12 @@ test('hostile envelopes leave rx intact and the next frame still opens', () => {
 });
 
 test('directional keys: client seal opens on host and vice versa', () => {
-  const keys = deriveKeys(psk, salt);
+  const keys = deriveKeys(psk, salt, cnonce);
   const host = SealedSession.host(keys);
   const client = SealedSession.client(keys);
   assert.equal(host.open(client.seal('c->h')), 'c->h');
   assert.equal(client.open(host.seal('h->c')), 'h->c');
   // a session with wrong keys cannot open a fresh frame (tag check fails)
-  const evil = SealedSession.client(deriveKeys(psk, new Uint8Array(16).fill(8)));
+  const evil = SealedSession.client(deriveKeys(psk, new Uint8Array(16).fill(8), cnonce));
   expectCode('aead', () => evil.open(SealedSession.host(keys).seal('nope')));
 });

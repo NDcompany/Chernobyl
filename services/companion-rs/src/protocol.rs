@@ -358,8 +358,12 @@ pub enum ClientMsg {
     },
     /// E2E handshake, step 1 (ADR-011): request to connect as `device_id`.
     /// Plaintext; the server answers with a fresh nonce+salt to bind the proof.
+    /// `cnonce` is the client's fresh 16-byte nonce (base64), bound into both
+    /// proofs and the keys. Optional here so the server can answer a missing
+    /// or malformed one with an explicit `hs_err` (security review 2026-10-25).
     HsHello {
         device_id: String,
+        cnonce: Option<String>,
     },
     /// E2E handshake, step 2: HMAC proof of PSK knowledge over the server's
     /// fresh nonce+salt (base64 of the 32-byte HMAC).
@@ -464,6 +468,9 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
         }),
         "hs_hello" => Some(ClientMsg::HsHello {
             device_id: req("deviceId")?,
+            cnonce: json::get(obj, "cnonce")
+                .and_then(json::as_str)
+                .map(str::to_string),
         }),
         "hs_proof" => Some(ClientMsg::HsProof {
             proof: req("proof")?,

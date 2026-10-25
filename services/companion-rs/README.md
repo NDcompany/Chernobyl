@@ -39,8 +39,9 @@ and prints a terminal QR the phone scans at close physical range. The QR payload
 host id, an endpoint to dial, the PSK and a challenge.
 
 After the phone connects, a handshake (`hs_hello → hs_challenge → hs_proof → hs_ok`) proves
-mutual PSK knowledge — the server answers with a fresh nonce+salt and both sides HMAC it, so
-a captured proof cannot be replayed and a MITM without the PSK is rejected. A pending offer is
+mutual PSK knowledge — the phone sends a fresh client nonce, the server answers with a fresh
+nonce+salt and both sides HMAC all three, so neither a captured proof nor a recorded server
+transcript can be replayed and a MITM without the PSK is rejected. A pending offer is
 redeemed on first connect (single-use consume + device registration); a paired device
 reconnects with its stored PSK. From `hs_ok` on, every frame is ChaCha20-Poly1305-sealed with
 HKDF-SHA-256 directional keys and a monotonic counter nonce, so replay, desync and tampering
@@ -60,12 +61,18 @@ sealed envelope per frame.
 
 Handshake (PSK = the 32 bytes from the QR, base64):
 
-1. C→S `{"type":"hs_hello","deviceId":"<hex>"}`
+1. C→S `{"type":"hs_hello","deviceId":"<hex>","cnonce":"<b64 16B>"}` — `cnonce` fresh per
+   attempt from the OS CSPRNG; a missing or malformed one gets `hs_err`
 2. S→C `{"type":"hs_challenge","nonce":"<b64 16B>","salt":"<b64 16B>"}` — fresh per connection
 3. C→S `{"type":"hs_proof","proof":"<b64 32B>"}`
-   `proof = HMAC-SHA256(psk, "client" ‖ 0x00 ‖ deviceId ‖ 0x00 ‖ nonce ‖ 0x00 ‖ salt)`
+   `proof = HMAC-SHA256(psk, "client" ‖ 0x00 ‖ deviceId ‖ 0x00 ‖ nonce ‖ 0x00 ‖ salt ‖ 0x00 ‖ cnonce)`
 4. S→C `{"type":"hs_ok","serverProof":"<b64 32B>"}` (mutual auth; same HMAC with role
    `"server"`) — or `{"type":"hs_err","reason":"…"}` on rejection.
+
+Both sides contribute freshness (security review 2026-10-25): the server's nonce+salt stop a
+replayed client proof, and the client's `cnonce` makes a recorded server transcript fail the
+client's `serverProof` check and never re-derive an old session's keys. `hs_ok` is the last
+plaintext frame: the server sends no event while a handshake is in flight.
 
 After `hs_ok` both sides switch to sealed frames. Each frame payload is:
 
@@ -73,9 +80,9 @@ After `hs_ok` both sides switch to sealed frames. Each frame payload is:
 {"n": <counter>, "d": "<base64 ChaCha20-Poly1305(ciphertext ‖ 16B tag)>"}
 ```
 
-- **Keys** (per connection, from PSK + the `salt` from step 2): client→host =
-  `HKDF-SHA256(PRK = HMAC(salt, psk), info = "chernobyl-e2e-c2h", 32B)`; host→client uses
-  `"chernobyl-e2e-h2c"`.
+- **Keys** (per connection, from PSK + the `salt` from step 2 + the `cnonce` from step 1):
+  client→host = `HKDF-SHA256(PRK = HMAC(salt ‖ cnonce, psk), info = "chernobyl-e2e-c2h", 32B)`;
+  host→client uses `"chernobyl-e2e-h2c"`.
 - **AEAD nonce** = bytes 0–7 big-endian `n`, bytes 8–11 zero (12 bytes); no AAD. Golden frames at n=0 and n=1 are pinned in both suites (`e2e.rs` `golden_sealed_frames_match_the_ts_client`, `session.test.ts`).
 - **Counter** `n` starts at 0 per direction and increments by exactly 1 per frame. The server
   requires strict sequence: a lower `n` is a replay, a higher one is desync — both close the

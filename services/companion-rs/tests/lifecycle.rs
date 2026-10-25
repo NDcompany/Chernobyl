@@ -76,9 +76,11 @@ fn shutdown_while_client_mid_e2e_handshake() {
     let addr = format!("127.0.0.1:{}", srv.port);
 
     let mut client = WsClient::connect(&addr, "/", None).unwrap();
+    // hs_hello carries the client's 16-byte nonce (security review 2026-10-25)
     client
         .send_text(&format!(
-            "{{\"type\":\"hs_hello\",\"deviceId\":\"{device_id}\"}}"
+            "{{\"type\":\"hs_hello\",\"deviceId\":\"{device_id}\",\"cnonce\":\"{}\"}}",
+            base64::encode(&[9u8; 16])
         ))
         .unwrap();
 

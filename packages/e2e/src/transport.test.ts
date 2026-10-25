@@ -9,12 +9,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  E2eError,
   SealedSession,
+  b64decode,
   b64encode,
   createE2eTransport,
   deriveKeys,
   retryDelayMs,
   handshakeProof,
+  performHandshake,
+  type HandshakeIo,
   type PairingCredential,
   type SocketLike,
 } from './index.js';
@@ -89,12 +93,21 @@ function harness(opts?: {
   return { t, socks };
 }
 
+/** The fresh 16-byte client nonce a client's hs_hello carried. */
+function cnonceOf(hello: string | undefined): Uint8Array {
+  const m = JSON.parse(hello ?? '{}') as { type?: unknown; cnonce?: unknown };
+  assert.equal(m.type, 'hs_hello');
+  const cnonce = typeof m.cnonce === 'string' ? b64decode(m.cnonce) : null;
+  assert.ok(cnonce && cnonce.length === 16, `hs_hello must carry a 16-byte cnonce: ${hello}`);
+  return cnonce;
+}
+
 /** Server half of the handshake (server.rs semantics). */
 async function serverHandshake(
   sock: FakeSocket,
   opts?: { serverProof?: Uint8Array; err?: string },
 ): Promise<SealedSession | null> {
-  assert.match(sock.sent[0] ?? '', /"hs_hello"/);
+  const cnonce = cnonceOf(sock.sent[0]);
   sock.serverSend(JSON.stringify({ type: 'hs_challenge', nonce: b64encode(NONCE), salt: b64encode(SALT) }));
   await tick();
   if (opts?.err !== undefined) {
@@ -103,10 +116,10 @@ async function serverHandshake(
     return null;
   }
   assert.match(sock.sent[1] ?? '', /"hs_proof"/);
-  const serverProof = opts?.serverProof ?? handshakeProof(PSK, 'server', DEVICE, NONCE, SALT);
+  const serverProof = opts?.serverProof ?? handshakeProof(PSK, 'server', DEVICE, NONCE, SALT, cnonce);
   sock.serverSend(JSON.stringify({ type: 'hs_ok', serverProof: b64encode(serverProof) }));
   await tick();
-  return SealedSession.host(deriveKeys(PSK, SALT));
+  return SealedSession.host(deriveKeys(PSK, SALT, cnonce));
 }
 
 test('connect: handshake, sealed hello, ack correlation, ping/pong', async () => {
@@ -142,7 +155,7 @@ test('server proof mismatch is terminal: denied, socket closed, no retry', async
   sock.serverOpen();
   sock.serverSend(JSON.stringify({ type: 'hs_challenge', nonce: b64encode(NONCE), salt: b64encode(SALT) }));
   await tick();
-  const wrong = handshakeProof(new Uint8Array(32).fill(8), 'server', DEVICE, NONCE, SALT);
+  const wrong = handshakeProof(new Uint8Array(32).fill(8), 'server', DEVICE, NONCE, SALT, cnonceOf(sock.sent[0]));
   sock.serverSend(JSON.stringify({ type: 'hs_ok', serverProof: b64encode(wrong) }));
   await tick();
   assert.equal(t.status(), 'denied');
@@ -150,6 +163,39 @@ test('server proof mismatch is terminal: denied, socket closed, no retry', async
   await sleep(40); // several retry periods (5 ms) — no new socket may appear
   assert.equal(socks.length, 1, 'denied must not auto-retry');
   t.close();
+});
+
+test('a replayed server transcript fails as server-proof-mismatch (security review 2026-10-25)', async () => {
+  // attempt 1: the genuine host answers; an on-path attacker records its frames
+  const sent1: string[] = [];
+  const recorded: string[] = [];
+  const genuine: HandshakeIo = {
+    send: (t) => {
+      sent1.push(t);
+      const serverProof = handshakeProof(PSK, 'server', DEVICE, NONCE, SALT, cnonceOf(sent1[0]));
+      recorded.push(
+        JSON.parse(t).type === 'hs_hello'
+          ? JSON.stringify({ type: 'hs_challenge', nonce: b64encode(NONCE), salt: b64encode(SALT) })
+          : JSON.stringify({ type: 'hs_ok', serverProof: b64encode(serverProof) }),
+      );
+    },
+    recv: async () => recorded[recorded.length - 1], // the reply to the frame just sent
+  };
+  await performHandshake(genuine, pairing);
+  // attempt 2: the attacker answers in the host's place with the recording;
+  // the fresh client nonce makes the recorded server proof invalid
+  const sent2: string[] = [];
+  const replay = [...recorded];
+  const attacker: HandshakeIo = { send: (t) => sent2.push(t), recv: async () => replay.shift() ?? '' };
+  await assert.rejects(
+    performHandshake(attacker, pairing),
+    (err) => err instanceof E2eError && err.code === 'server-proof-mismatch',
+  );
+  assert.notEqual(
+    b64encode(cnonceOf(sent2[0])),
+    b64encode(cnonceOf(sent1[0])),
+    'the client nonce must be fresh per attempt',
+  );
 });
 
 test('hs_err (revoked/stale credential) is terminal and not retried', async () => {

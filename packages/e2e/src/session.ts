@@ -11,6 +11,7 @@
 import { chacha20poly1305 } from '@noble/ciphers/chacha.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 } from '@noble/hashes/sha2.js';
+import { concatBytes } from '@noble/hashes/utils.js';
 import { b64decode, b64encode } from './base64.js';
 import { E2eError } from './errors.js';
 import { utf8Decode, utf8Encode } from './utf8.js';
@@ -26,11 +27,16 @@ function hkdf32(psk: Uint8Array, salt: Uint8Array, info: string): Uint8Array {
   return hkdf(sha256, psk, salt, infoBytes, 32);
 }
 
-/** Per-connection directional keys from PSK + the handshake's fresh salt. */
-export function deriveKeys(psk: Uint8Array, salt: Uint8Array): SessionKeys {
+/**
+ * Per-connection directional keys from PSK + the handshake's fresh server salt
+ * and client nonce: HKDF salt = salt ‖ cnonce, so a replayed server salt alone
+ * never reproduces an earlier session's keys (security review 2026-10-25).
+ */
+export function deriveKeys(psk: Uint8Array, salt: Uint8Array, cnonce: Uint8Array): SessionKeys {
+  const s = concatBytes(salt, cnonce);
   return {
-    c2h: hkdf32(psk, salt, 'chernobyl-e2e-c2h'),
-    h2c: hkdf32(psk, salt, 'chernobyl-e2e-h2c'),
+    c2h: hkdf32(psk, s, 'chernobyl-e2e-c2h'),
+    h2c: hkdf32(psk, s, 'chernobyl-e2e-h2c'),
   };
 }
 

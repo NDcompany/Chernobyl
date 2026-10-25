@@ -11,7 +11,7 @@ use crate::companion::Companion;
 use crate::e2e;
 use crate::json;
 use crate::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg, parse_client_message};
-use crate::storage::DeviceRecord;
+use crate::storage::{DeviceRecord, PairingRecord, Storage};
 use crate::ws::{self, Frame, Handshake};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -934,12 +934,14 @@ pub fn control_post(
     })
 }
 
-/// Per-connection handshake state: the device that asked to connect and the
-/// server's fresh nonce+salt its proof must be bound to (ADR-011).
+/// Per-connection handshake state: the device that asked to connect, the
+/// server's fresh nonce+salt and the client's fresh nonce its proof must be
+/// bound to (ADR-011).
 struct HsPending {
     device_id: String,
     nonce: [u8; 16],
     salt: [u8; 16],
+    cnonce: [u8; 16],
 }
 
 fn hs_err(outbound: &Outbound, reason: &str) -> Result<(), EnqueueError> {
@@ -962,58 +964,83 @@ fn unprotect_psk(b64: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "psk must be 32 bytes".to_string())
 }
 
+/// Which stored PSK (its protected form) a handshake for `device_id` must
+/// prove, plus the offer to redeem when this is a first connection. Rejects
+/// expired / spent / revoked / unknown devices.
+fn handshake_candidate(
+    store: &Storage,
+    device_id: &str,
+    now: i64,
+) -> Result<(String, Option<PairingRecord>), String> {
+    match (store.pairings.get(device_id), store.devices.get(device_id)) {
+        // fresh, unexpired offer: first connection (redeemed by `redeem`)
+        (Some(p), _) if !p.consumed && now < p.expires_at => {
+            Ok((p.psk_protected.clone(), Some(p.clone())))
+        }
+        // already-paired device, or an offer whose redemption already ran
+        (_, Some(d)) if d.revoked => Err("device revoked".to_string()),
+        (_, Some(d)) => Ok((d.psk_protected.clone(), None)),
+        (Some(p), None) if p.consumed => Err("pairing offer already used".to_string()),
+        (Some(p), None) if now >= p.expires_at => Err("pairing offer expired".to_string()),
+        _ => Err("unknown device".to_string()),
+    }
+}
+
 /// Resolve + verify a handshake and, for a fresh pairing, redeem it (single-use
 /// consume + device registration). Returns the live session and the server's
 /// mutual-auth proof. Rejects expired / spent / revoked / unknown devices and
 /// any proof that is not a valid HMAC under the device's PSK.
+///
+/// DPAPI (an LSASS round-trip) and the HMAC run with the storage lock released
+/// (security review 2026-10-25): an unauthenticated hs_proof must not hold the
+/// process-wide mutex that event persistence, commands and revocation need.
+/// The PSK is picked under the lock, verified unlocked, and `redeem` decides
+/// again under the lock before anything is committed.
 fn establish_session(
     companion: &Companion,
     pending: &HsPending,
     client_proof: &str,
 ) -> Result<(e2e::Session, String), String> {
     let proof = base64::decode(client_proof).ok_or("bad proof encoding")?;
-    let mut store = companion.shared.storage.lock().unwrap();
-    let now = crate::protocol::now_ms();
-    let pairing = store.pairings.get(&pending.device_id).cloned();
-    let device = store.devices.get(&pending.device_id).cloned();
-
-    let verify = |psk: &[u8; 32]| -> Result<(), String> {
-        let expected = e2e::handshake_proof(
-            psk,
-            "client",
+    let (protected, _) = {
+        let store = companion.shared.storage.lock().unwrap();
+        handshake_candidate(&store, &pending.device_id, crate::protocol::now_ms())?
+    };
+    let psk = unprotect_psk(&protected)?;
+    let proof_as = |role: &str| {
+        e2e::handshake_proof(
+            &psk,
+            role,
             &pending.device_id,
             &pending.nonce,
             &pending.salt,
-        );
-        if e2e::proof_ok(&expected, &proof) {
-            Ok(())
-        } else {
-            Err("proof verification failed".to_string())
-        }
+            &pending.cnonce,
+        )
     };
+    if !e2e::proof_ok(&proof_as("client"), &proof) {
+        return Err("proof verification failed".to_string());
+    }
+    redeem(companion, pending, &protected)?;
+    let keys = e2e::derive_keys(&psk, &pending.salt, &pending.cnonce);
+    Ok((
+        e2e::Session::host(keys),
+        base64::encode(&proof_as("server")),
+    ))
+}
 
-    let (psk, redeem) = match (pairing, device) {
-        // fresh, unexpired offer: first connection (redeemed below)
-        (Some(p), _) if !p.consumed && now < p.expires_at => {
-            let psk = unprotect_psk(&p.psk_protected)?;
-            verify(&psk)?;
-            (psk, Some(p))
-        }
-        // already-paired device, or an offer whose redemption already ran
-        (_, Some(d)) => {
-            if d.revoked {
-                return Err("device revoked".to_string());
-            }
-            let psk = unprotect_psk(&d.psk_protected)?;
-            verify(&psk)?;
-            (psk, None)
-        }
-        (Some(p), None) if p.consumed => return Err("pairing offer already used".to_string()),
-        (Some(p), None) if now >= p.expires_at => return Err("pairing offer expired".to_string()),
-        _ => return Err("unknown device".to_string()),
-    };
-
-    if let Some(mut p) = redeem {
+/// Commit a verified handshake under the storage lock. The records may have
+/// moved while the PSK was verified unlocked (revoked, expired, or redeemed by
+/// a concurrent handshake), so the decision is taken again on the current
+/// records and the verified PSK counts only if it is still the one they name.
+/// A fresh offer is redeemed here, so single use stays atomic.
+fn redeem(companion: &Companion, pending: &HsPending, verified: &str) -> Result<(), String> {
+    let mut store = companion.shared.storage.lock().unwrap();
+    let now = crate::protocol::now_ms();
+    let (current, offer) = handshake_candidate(&store, &pending.device_id, now)?;
+    if current != verified {
+        return Err("device changed during handshake".to_string());
+    }
+    if let Some(mut p) = offer {
         p.consumed = true;
         store
             .put_pairing(&p)
@@ -1028,16 +1055,34 @@ fn establish_session(
             })
             .map_err(|e| format!("register device: {e}"))?;
     }
+    Ok(())
+}
 
-    let keys = e2e::derive_keys(&psk, &pending.salt);
-    let server_proof = e2e::handshake_proof(
-        &psk,
-        "server",
-        &pending.device_id,
-        &pending.nonce,
-        &pending.salt,
-    );
-    Ok((e2e::Session::host(keys), base64::encode(&server_proof)))
+/// Install a verified session, then re-check revocation (security review
+/// 2026-10-25). `revoke_device` persists `revoked` BEFORE it scans live
+/// sessions, so a revocation racing this handshake is caught either by its
+/// scan (the session is already installed) or by this re-check (the flag is
+/// already set). Returns false when the device was revoked meanwhile: the
+/// connection is then closed with 4003.
+fn install_session(
+    companion: &Companion,
+    outbound: &Outbound,
+    device_id: String,
+    session: e2e::Session,
+) -> bool {
+    outbound.set_session(device_id.clone(), session);
+    let revoked = companion
+        .shared
+        .storage
+        .lock()
+        .unwrap()
+        .devices
+        .get(&device_id)
+        .is_some_and(|d| d.revoked);
+    if revoked {
+        outbound.close(CLOSE_DEVICE_REVOKED, "device revoked");
+    }
+    !revoked
 }
 
 /// The live E2E session bound to a verified device (ADR-011 / D4).
@@ -1065,6 +1110,10 @@ pub struct Outbound {
     terminated: AtomicBool,
     /// set on revocation: clean exit without saturation error logging
     revoked: AtomicBool,
+    /// An `hs_*` handshake is in flight (hs_hello accepted, session not yet
+    /// installed): fan-out is dropped instead of sent plaintext (security
+    /// review 2026-10-25), see `enqueue_sealed`.
+    handshaking: AtomicBool,
     /// The live E2E session for this connection (ADR-011). Shared with the
     /// read loop (which installs it on `hs_ok`) and with the engine fan-out
     /// (which seals events per connection) so that EVERY outbound frame —
@@ -1108,6 +1157,7 @@ impl Outbound {
                 depth: Arc::new(Depth::default()),
                 terminated: AtomicBool::new(false),
                 revoked: AtomicBool::new(false),
+                handshaking: AtomicBool::new(false),
                 session: Mutex::new(None),
                 saturation,
                 control: Mutex::new(None),
@@ -1141,6 +1191,15 @@ impl Outbound {
     /// From this point every frame this connection sends is sealed.
     pub(crate) fn set_session(&self, device_id: String, session: e2e::Session) {
         *self.session.lock().unwrap() = Some(LiveSession { device_id, session });
+        // only now: a fan-out frame racing the install is dropped (still
+        // handshaking) or sealed (session live), never plaintext after hs_ok
+        self.set_handshaking(false);
+    }
+
+    /// Mark an `hs_*` handshake as in flight (true when hs_hello is accepted)
+    /// or over (false once the session is installed or the handshake failed).
+    pub(crate) fn set_handshaking(&self, on: bool) {
+        self.handshaking.store(on, Ordering::SeqCst);
     }
 
     /// True once an E2E session is live for this connection.
@@ -1164,7 +1223,8 @@ impl Outbound {
     /// order always matches the FIFO wire order — the client's strict
     /// monotonic `open` would otherwise see a reordering as replay/desync.
     /// With no session the plaintext is enqueued verbatim (loopback parity),
-    /// except an engine event at remote posture, which is dropped.
+    /// except an engine event at remote posture or while a handshake is in
+    /// flight, which is dropped.
     pub(crate) fn enqueue_sealed(
         &self,
         plaintext: Vec<u8>,
@@ -1186,12 +1246,18 @@ impl Outbound {
                 let text = String::from_utf8_lossy(&plaintext);
                 live.session.seal(&text).into_bytes()
             }
-            // Security review 2026-10-25: at remote posture the token alone
-            // must not buy the live stream (D9), so an engine event for a
-            // connection without a session is dropped, not sent in plaintext.
-            // Decided under the session lock, so it cannot race `set_session`;
-            // the client resyncs from the sealed hello snapshot after hs_ok.
-            None if self.require_e2e && class == MsgClass::Bulk => return Ok(()),
+            // Security review 2026-10-25: an engine event for a connection
+            // without a session is dropped, never sent in plaintext, (a) at
+            // remote posture — the token alone must not buy the live stream
+            // (D9) — and (b) mid-handshake, where the phone would read a
+            // plaintext event as a broken handshake. Decided under the session
+            // lock, so it cannot race `set_session`; the client resyncs from
+            // the sealed hello snapshot after hs_ok, so nothing is lost.
+            None if class == MsgClass::Bulk
+                && (self.require_e2e || self.handshaking.load(Ordering::SeqCst)) =>
+            {
+                return Ok(());
+            }
             None => plaintext,
         };
         // enqueue under the same lock so no other producer can interleave a
@@ -1538,13 +1604,32 @@ fn serve_ws(
                 // E2E handshake control (plaintext phase only, before a session)
                 if !outbound.has_session() {
                     match &msg {
-                        ClientMsg::HsHello { device_id } => {
+                        ClientMsg::HsHello { device_id, cnonce } => {
+                            // the client's fresh nonce is mandatory (security
+                            // review 2026-10-25): without it a replayed server
+                            // transcript authenticates an impostor host
+                            let Some(cnonce) = cnonce
+                                .as_deref()
+                                .and_then(base64::decode)
+                                .and_then(|b| <[u8; 16]>::try_from(b).ok())
+                            else {
+                                hs = None;
+                                outbound.set_handshaking(false);
+                                if hs_err(&outbound, "hs_hello needs a 16-byte base64 cnonce")
+                                    .is_err()
+                                {
+                                    break Err(io::Error::other("outbound queue saturated"));
+                                }
+                                continue;
+                            };
                             let (nonce, salt) = e2e::fresh_nonce_salt();
                             hs = Some(HsPending {
                                 device_id: device_id.clone(),
                                 nonce,
                                 salt,
+                                cnonce,
                             });
+                            outbound.set_handshaking(true);
                             let reply = ServerMsg::HsChallenge {
                                 nonce: base64::encode(&nonce),
                                 salt: base64::encode(&salt),
@@ -1566,8 +1651,9 @@ fn serve_ws(
                             };
                             match establish_session(&companion, &pending, proof) {
                                 Ok((session, server_proof)) => {
-                                    // HsOk is plaintext; both sides switch to
-                                    // sealed frames from the next message on.
+                                    // HsOk is the LAST plaintext frame: fan-out
+                                    // stays dropped (handshaking) until the
+                                    // install below, then every frame is sealed.
                                     if outbound
                                         .enqueue(
                                             ServerMsg::HsOk { server_proof }.to_text().into_bytes(),
@@ -1577,9 +1663,17 @@ fn serve_ws(
                                     {
                                         break Err(io::Error::other("outbound queue saturated"));
                                     }
-                                    outbound.set_session(pending.device_id, session);
+                                    if !install_session(
+                                        &companion,
+                                        &outbound,
+                                        pending.device_id,
+                                        session,
+                                    ) {
+                                        break Ok(()); // revoked meanwhile: closed with 4003
+                                    }
                                 }
                                 Err(reason) => {
+                                    outbound.set_handshaking(false);
                                     if hs_err(&outbound, &reason).is_err() {
                                         break Err(io::Error::other("outbound queue saturated"));
                                     }
@@ -1828,25 +1922,44 @@ mod e2e_tests {
         WsClient::connect(&format!("127.0.0.1:{}", f.handle.port), "/", None).unwrap()
     }
 
-    /// Drive one full handshake attempt with `psk`. Returns the server's final
-    /// `hs_ok`/`hs_err` payload and, on success, the client-side session.
-    fn attempt(
-        c: &mut WsClient,
-        psk: &[u8; 32],
-        device_id: &str,
-    ) -> (String, Option<e2e::Session>) {
+    /// The server's challenge for one handshake + the client nonce it answers.
+    struct Challenge {
+        nonce: Vec<u8>,
+        salt: Vec<u8>,
+        cnonce: Vec<u8>,
+    }
+
+    /// Handshake step 1: `hs_hello` with a fresh client nonce → `hs_challenge`.
+    fn begin(c: &mut WsClient, device_id: &str) -> Challenge {
+        let cnonce = crate::ffi::csprng_bytes(16).unwrap();
         c.send_text(&format!(
-            "{{\"type\":\"hs_hello\",\"deviceId\":\"{device_id}\"}}"
+            "{{\"type\":\"hs_hello\",\"deviceId\":\"{device_id}\",\"cnonce\":\"{}\"}}",
+            base64::encode(&cnonce)
         ))
         .unwrap();
         let challenge = c.next_text().unwrap();
         let v = json::parse(&challenge).unwrap();
-        let nonce = base64::decode(json::get_str(&v, "nonce").unwrap()).unwrap();
-        let salt = base64::decode(json::get_str(&v, "salt").unwrap()).unwrap();
-        let proof = e2e::handshake_proof(psk, "client", device_id, &nonce, &salt);
+        Challenge {
+            nonce: base64::decode(json::get_str(&v, "nonce").unwrap()).unwrap(),
+            salt: base64::decode(json::get_str(&v, "salt").unwrap()).unwrap(),
+            cnonce,
+        }
+    }
+
+    /// Handshake step 2: `hs_proof` with `psk`. Returns the server's final
+    /// `hs_ok`/`hs_err` payload and, on success, the client-side session.
+    fn finish(
+        c: &mut WsClient,
+        psk: &[u8; 32],
+        device_id: &str,
+        ch: &Challenge,
+    ) -> (String, Option<e2e::Session>) {
+        let proof_as = |role: &str| {
+            e2e::handshake_proof(psk, role, device_id, &ch.nonce, &ch.salt, &ch.cnonce)
+        };
         c.send_text(&format!(
             "{{\"type\":\"hs_proof\",\"proof\":\"{}\"}}",
-            base64::encode(&proof)
+            base64::encode(&proof_as("client"))
         ))
         .unwrap();
         let resp = c.next_text().unwrap();
@@ -1854,13 +1967,23 @@ mod e2e_tests {
         if json::get_str(&v, "type") == Some("hs_ok") {
             // mutual auth: the server must prove PSK knowledge too
             let sp = base64::decode(json::get_str(&v, "serverProof").unwrap()).unwrap();
-            let expected = e2e::handshake_proof(psk, "server", device_id, &nonce, &salt);
-            assert_eq!(sp.as_slice(), expected.as_slice(), "server must prove PSK");
-            let keys = e2e::derive_keys(psk, &salt);
+            assert_eq!(sp.as_slice(), proof_as("server"), "server must prove PSK");
+            let keys = e2e::derive_keys(psk, &ch.salt, &ch.cnonce);
             (resp, Some(e2e::Session::client(keys)))
         } else {
             (resp, None)
         }
+    }
+
+    /// Drive one full handshake attempt with `psk`. Returns the server's final
+    /// `hs_ok`/`hs_err` payload and, on success, the client-side session.
+    fn attempt(
+        c: &mut WsClient,
+        psk: &[u8; 32],
+        device_id: &str,
+    ) -> (String, Option<e2e::Session>) {
+        let ch = begin(c, device_id);
+        finish(c, psk, device_id, &ch)
     }
 
     #[test]
@@ -3163,6 +3286,170 @@ mod e2e_tests {
         shutdown(f);
     }
 
+    /* ---- security review 2026-10-25: handshake path ---------------- */
+
+    /// hs_hello must carry the client's fresh 16-byte nonce: a missing or
+    /// malformed one is an explicit hs_err (a pre-fix client fails visibly
+    /// instead of handshaking without client freshness), it aborts the
+    /// handshake in progress, and the connection survives.
+    #[test]
+    fn hs_hello_without_a_valid_cnonce_is_rejected_but_connection_survives() {
+        let f = fixture("hs-cnonce", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        let dev = &f.device_id;
+        let abandoned = begin(&mut c, dev);
+        for bad in [
+            format!(r#"{{"type":"hs_hello","deviceId":"{dev}"}}"#),
+            format!(r#"{{"type":"hs_hello","deviceId":"{dev}","cnonce":7}}"#),
+            format!(r#"{{"type":"hs_hello","deviceId":"{dev}","cnonce":"!!"}}"#),
+            format!(
+                r#"{{"type":"hs_hello","deviceId":"{dev}","cnonce":"{}"}}"#,
+                base64::encode(&[1u8; 15])
+            ),
+            format!(
+                r#"{{"type":"hs_hello","deviceId":"{dev}","cnonce":"{}"}}"#,
+                base64::encode(&[1u8; 32])
+            ),
+        ] {
+            c.send_text(&bad).unwrap();
+            let reply = c.next_text().unwrap();
+            assert!(
+                reply.contains("hs_err") && reply.contains("cnonce"),
+                "{bad} -> {reply}"
+            );
+        }
+        // the rejected hello aborted the earlier challenge
+        let (resp, sess) = finish(&mut c, &f.psk, dev, &abandoned);
+        assert!(sess.is_none());
+        assert!(resp.contains("no handshake in progress"), "got: {resp}");
+        // and the same connection still completes a proper handshake
+        let (resp, sess) = attempt(&mut c, &f.psk, dev);
+        assert!(resp.contains("hs_ok"), "got: {resp}");
+        assert!(sess.is_some());
+        shutdown(f);
+    }
+
+    /// Fan-out that lands while a handshake is in flight is dropped, never
+    /// queued plaintext: `hs_ok` follows `hs_challenge` directly and every
+    /// frame after it is sealed (a plaintext event there used to break the
+    /// phone's handshake or its first sealed open). A loopback plaintext
+    /// client keeps receiving events (dev parity).
+    #[test]
+    fn fanout_never_reaches_a_handshaking_client_in_plaintext() {
+        let f = fixture("hs-fanout", now_ms() + 60_000, false);
+        let mut phone = connect(&f);
+        let ch = begin(&mut phone, &f.device_id);
+        let mut plain = connect(&f);
+        let create = |id: &str| {
+            format!(
+                r#"{{"type":"create_session","commandId":"{id}","agentId":"a4","title":"Fanout","prompt":"p"}}"#
+            )
+        };
+        plain.send_text(&create("hs-fanout-1")).unwrap();
+        plain
+            .next_text_matching(|t| t.contains("session_created"), Duration::from_secs(5))
+            .expect("loopback parity: a plaintext client still gets events");
+        // the phone registered first, so the fan-out already offered it that
+        // event (mid-handshake); its next frame must still be hs_ok
+        let (resp, sess) = finish(&mut phone, &f.psk, &f.device_id, &ch);
+        assert!(resp.contains("hs_ok"), "expected hs_ok, got: {resp}");
+        let mut sess = sess.unwrap();
+        // after hs_ok every frame is sealed, and fan-out still reaches it
+        plain.send_text(&create("hs-fanout-2")).unwrap();
+        let mut seen = false;
+        for _ in 0..32 {
+            let frame = phone.next_text().unwrap();
+            let inner = sess
+                .open(&frame)
+                .unwrap_or_else(|e| panic!("non-sealed frame after hs_ok: {e} ({frame})"));
+            if inner.contains("session_created") {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "no sealed session_created reached the phone");
+        shutdown(f);
+    }
+
+    /// Revocation race: `revoke_device` persisted `revoked` and scanned live
+    /// sessions BEFORE this connection installed its session, so the scan
+    /// missed it. The re-check after the install must close it (4003).
+    #[test]
+    fn a_revocation_that_raced_the_handshake_closes_the_new_session() {
+        let f = fixture_paired("revoke-race", false);
+        let session = || e2e::Session::host(e2e::derive_keys(&f.psk, &[9u8; 16], &[3u8; 16]));
+        // control: an unrevoked device keeps its freshly installed session
+        let (live, _rx) = test_outbound();
+        assert!(install_session(
+            &f.companion,
+            &live,
+            f.device_id.clone(),
+            session()
+        ));
+        assert!(live.has_session() && !live.is_revoked());
+        // revoke_device's half: flag persisted, its scan already done
+        {
+            let mut store = f.companion.shared.storage.lock().unwrap();
+            let mut d = store.devices.get(&f.device_id).cloned().unwrap();
+            d.revoked = true;
+            store.put_device(&d).unwrap();
+        }
+        let (raced, _rx2) = test_outbound();
+        assert!(!install_session(
+            &f.companion,
+            &raced,
+            f.device_id.clone(),
+            session()
+        ));
+        assert!(
+            raced.is_revoked() && raced.is_terminated(),
+            "must close with 4003"
+        );
+        shutdown(f);
+    }
+
+    /// DPAPI + HMAC now run with the storage lock released, so `redeem` must
+    /// decide again on the records as they are when it commits: a concurrent
+    /// redemption of the same offer still opens (as the device it registered,
+    /// offer consumed once), while a revocation or a replaced key that landed
+    /// in the meantime is refused.
+    #[test]
+    fn redeem_decides_again_on_records_that_moved_while_unlocked() {
+        let f = fixture("redeem-again", now_ms() + 60_000, false);
+        let pending = HsPending {
+            device_id: f.device_id.clone(),
+            nonce: [1u8; 16],
+            salt: [2u8; 16],
+            cnonce: [3u8; 16],
+        };
+        let offer = f.companion.shared.storage.lock().unwrap().pairings[&f.device_id]
+            .psk_protected
+            .clone();
+        // two handshakes verified the same fresh offer while unlocked
+        redeem(&f.companion, &pending, &offer).unwrap();
+        redeem(&f.companion, &pending, &offer).unwrap();
+        {
+            let store = f.companion.shared.storage.lock().unwrap();
+            assert!(store.pairings[&f.device_id].consumed);
+            assert_eq!(store.devices[&f.device_id].psk_protected, offer);
+        }
+        assert_eq!(
+            redeem(&f.companion, &pending, "replaced").unwrap_err(),
+            "device changed during handshake"
+        );
+        {
+            let mut store = f.companion.shared.storage.lock().unwrap();
+            let mut d = store.devices.get(&f.device_id).cloned().unwrap();
+            d.revoked = true;
+            store.put_device(&d).unwrap();
+        }
+        assert_eq!(
+            redeem(&f.companion, &pending, &offer).unwrap_err(),
+            "device revoked"
+        );
+        shutdown(f);
+    }
+
     /* ---- mandate §2: unwind-safe teardown (ConnGuard) -------------- */
 
     #[test]
@@ -3272,8 +3559,8 @@ mod e2e_tests {
         // spend an AEAD counter, or counter order would diverge from wire
         // order on a session that survives the refusal.
         let (outbound, _rx) = test_outbound();
-        let keys = e2e::derive_keys(&[7u8; 32], &[9u8; 16]);
-        let peer_keys = e2e::derive_keys(&[7u8; 32], &[9u8; 16]);
+        let keys = e2e::derive_keys(&[7u8; 32], &[9u8; 16], &[3u8; 16]);
+        let peer_keys = e2e::derive_keys(&[7u8; 32], &[9u8; 16], &[3u8; 16]);
         outbound.set_session("test-device".into(), e2e::Session::host(keys));
         let mut peer = e2e::Session::client(peer_keys);
         // fill the bulk class to its cap (depth admission only, no sealing)
@@ -3320,7 +3607,7 @@ mod e2e_tests {
             .enqueue_sealed(b"pong".to_vec(), MsgClass::Control)
             .unwrap();
         assert_eq!(rx.try_recv().unwrap().1, b"pong".to_vec());
-        let keys = e2e::derive_keys(&[7u8; 32], &[9u8; 16]);
+        let keys = e2e::derive_keys(&[7u8; 32], &[9u8; 16], &[3u8; 16]);
         remote.set_session("dev".into(), e2e::Session::host(keys.clone()));
         remote
             .enqueue_sealed(event.to_vec(), MsgClass::Bulk)

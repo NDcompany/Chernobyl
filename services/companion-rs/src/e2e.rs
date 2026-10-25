@@ -2,11 +2,14 @@
 //! ChaCha20-Poly1305 frame sealing with monotonic counters (replay-proof).
 //!
 //! Security model: the per-device 256-bit PSK arrives only via the out-of-band
-//! QR (physical proximity). A fresh server nonce binds every handshake — a
-//! captured proof cannot be replayed against a new connection, because the proof
-//! is an HMAC over that connection's server nonce + salt. HKDF derives one key
-//! per direction, and the AEAD nonce is the frame's monotonic counter, so every
-//! sealed frame is tamper-proof (auth tag) and replay-proof (strict counter).
+//! QR (physical proximity). Fresh nonces from BOTH sides bind every handshake:
+//! the server's nonce + salt stop a captured client proof from being replayed
+//! against a new connection, and the client's nonce (`cnonce`) stops a recorded
+//! server transcript from authenticating an impostor host or re-deriving an old
+//! session's keys, which would repeat AEAD key+nonce pairs (security review
+//! 2026-10-25). HKDF derives one key per direction, and the AEAD nonce is the
+//! frame's monotonic counter, so every sealed frame is tamper-proof (auth tag)
+//! and replay-proof (strict counter).
 //!
 //! No X25519 forward secrecy (documented future work, ADR-011 §"future"): PSK +
 //! fresh nonces. Post-compromise secrecy is explicitly not claimed — if the PSK
@@ -21,7 +24,8 @@ use crate::json;
 /// A per-device 256-bit pre-shared key (from a pairing offer).
 pub type Psk = [u8; 32];
 
-/// Directional keys for one connection, derived from the PSK + a fresh salt.
+/// Directional keys for one connection, derived from the PSK + the handshake's
+/// fresh server salt and client nonce.
 #[derive(Clone)]
 pub struct SessionKeys {
     c2h: Psk,
@@ -35,24 +39,28 @@ fn hkdf32(psk: &Psk, salt: &[u8], info: &[u8]) -> Psk {
     okm
 }
 
-/// Derive per-connection directional keys from the PSK and a fresh random salt.
+/// Derive per-connection directional keys from the PSK, the server's fresh salt
+/// and the client's fresh nonce: HKDF salt = `salt ‖ cnonce`, so a replayed
+/// server salt alone never reproduces an earlier session's keys.
 /// `c2h` seals client→host frames, `h2c` seals host→client frames.
-pub fn derive_keys(psk: &Psk, salt: &[u8]) -> SessionKeys {
+pub fn derive_keys(psk: &Psk, salt: &[u8], cnonce: &[u8]) -> SessionKeys {
+    let salt = [salt, cnonce].concat();
     SessionKeys {
-        c2h: hkdf32(psk, salt, b"chernobyl-e2e-c2h"),
-        h2c: hkdf32(psk, salt, b"chernobyl-e2e-h2c"),
+        c2h: hkdf32(psk, &salt, b"chernobyl-e2e-c2h"),
+        h2c: hkdf32(psk, &salt, b"chernobyl-e2e-h2c"),
     }
 }
 
-/// HMAC proof binding a role + device id + the server's fresh nonce/salt to the
-/// PSK. Both sides compute it; constant-time equality proves mutual PSK
-/// knowledge without the PSK ever leaving the process.
+/// HMAC proof binding a role + device id + the server's fresh nonce/salt + the
+/// client's fresh nonce to the PSK. Both sides compute it; constant-time
+/// equality proves mutual PSK knowledge without the PSK ever leaving the process.
 pub fn handshake_proof(
     psk: &Psk,
     role: &str,
     device_id: &str,
     nonce: &[u8],
     salt: &[u8],
+    cnonce: &[u8],
 ) -> [u8; 32] {
     let mut msg = Vec::new();
     msg.extend_from_slice(role.as_bytes());
@@ -62,6 +70,8 @@ pub fn handshake_proof(
     msg.extend_from_slice(nonce);
     msg.push(0);
     msg.extend_from_slice(salt);
+    msg.push(0);
+    msg.extend_from_slice(cnonce);
     hmac_sha256(psk, &msg)
 }
 
@@ -173,18 +183,34 @@ mod tests {
         [7u8; 32]
     }
 
+    /// Client nonce the fixed vectors use (16 bytes, like the salt).
+    const CNONCE: &[u8] = b"CNONCNONCNONCNON";
+
     #[test]
     fn keys_are_deterministic_and_directional() {
         let salt = [9u8; 16];
-        let a = derive_keys(&psk(), &salt);
-        let b = derive_keys(&psk(), &salt);
+        let a = derive_keys(&psk(), &salt, CNONCE);
+        let b = derive_keys(&psk(), &salt, CNONCE);
         // same inputs ⇒ same keys, and the two directions must differ
         assert_eq!(a.c2h, b.c2h);
         assert_eq!(a.h2c, b.h2c);
         assert_ne!(a.c2h, a.h2c, "directions must not share a key");
         // a different salt yields different keys (per-connection freshness)
-        let c = derive_keys(&psk(), &[8u8; 16]);
+        let c = derive_keys(&psk(), &[8u8; 16], CNONCE);
         assert_ne!(a.c2h, c.c2h);
+    }
+
+    /// Security review 2026-10-25: a replayed server transcript repeats the
+    /// salt, so the client's fresh nonce alone must change both keys — else
+    /// the phone re-derives a recorded session's keys and reuses its
+    /// ChaCha20-Poly1305 key+nonce pairs from counter 0.
+    #[test]
+    fn same_server_salt_with_a_new_client_nonce_gives_new_keys() {
+        let salt = [9u8; 16];
+        let a = derive_keys(&psk(), &salt, &[1u8; 16]);
+        let b = derive_keys(&psk(), &salt, &[2u8; 16]);
+        assert_ne!(a.c2h, b.c2h, "c2h must depend on the client nonce");
+        assert_ne!(a.h2c, b.h2c, "h2c must depend on the client nonce");
     }
 
     #[test]
@@ -194,22 +220,33 @@ mod tests {
             b"NONCENONCENONCE".as_slice(),
             b"SALTSALTSALTSALT".as_slice(),
         );
-        let a = handshake_proof(&psk, "client", "dev1", nonce, salt);
-        // any change to role / device / nonce / salt changes the proof
-        assert_ne!(a, handshake_proof(&psk, "server", "dev1", nonce, salt));
-        assert_ne!(a, handshake_proof(&psk, "client", "dev2", nonce, salt));
+        let a = handshake_proof(&psk, "client", "dev1", nonce, salt, CNONCE);
+        // any change to role / device / nonce / salt / cnonce changes the proof
         assert_ne!(
             a,
-            handshake_proof(&psk, "client", "dev1", b"OTHERNONCEOTHER", salt)
+            handshake_proof(&psk, "server", "dev1", nonce, salt, CNONCE)
         );
         assert_ne!(
             a,
-            handshake_proof(&psk, "client", "dev1", nonce, b"OTHERSALTOTHERS")
+            handshake_proof(&psk, "client", "dev2", nonce, salt, CNONCE)
+        );
+        assert_ne!(
+            a,
+            handshake_proof(&psk, "client", "dev1", b"OTHERNONCEOTHER", salt, CNONCE)
+        );
+        assert_ne!(
+            a,
+            handshake_proof(&psk, "client", "dev1", nonce, b"OTHERSALTOTHERS", CNONCE)
+        );
+        // a recorded server proof does not verify for a new client nonce
+        assert_ne!(
+            handshake_proof(&psk, "server", "dev1", nonce, salt, CNONCE),
+            handshake_proof(&psk, "server", "dev1", nonce, salt, b"OTHERCNONCEOTHER")
         );
         // a different PSK cannot forge the same proof
         assert_ne!(
             a,
-            handshake_proof(&[8u8; 32], "client", "dev1", nonce, salt)
+            handshake_proof(&[8u8; 32], "client", "dev1", nonce, salt, CNONCE)
         );
         // proof_ok does constant-time equality
         assert!(proof_ok(&a, &a));
@@ -225,30 +262,30 @@ mod tests {
     /// on its second frame while every counter-0 check still passed.
     #[test]
     fn golden_sealed_frames_match_the_ts_client() {
-        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT");
+        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT", CNONCE);
         let mut client = Session::client(keys.clone());
         let mut host = Session::host(keys);
         assert_eq!(
             client.seal("hello"),
-            r#"{"n":0,"d":"pHJWBpPogJEypK0zkXSNTZ6RP9ex"}"#
+            r#"{"n":0,"d":"r6Rs7v9M2/y/CAkkvJJ+xqHQUhv8"}"#
         );
         assert_eq!(
             client.seal("ping"),
-            r#"{"n":1,"d":"o2o3yaauc3zeHJPBlu6re3PJ/XU="}"#
+            r#"{"n":1,"d":"HSVsxvDYQ7qYlBmBoyBF2XmxHNw="}"#
         );
         assert_eq!(
             host.seal("hello_ack"),
-            r#"{"n":0,"d":"WiQGjPTOkuC2RIdhMi7W7QfZo2o2B77krQ=="}"#
+            r#"{"n":0,"d":"zLVPpIF5s4rcEesgzm6PwVXf3OuKDblSmQ=="}"#
         );
         assert_eq!(
             host.seal("pong"),
-            r#"{"n":1,"d":"XlS628RS80APu4NAG+/BcEhrhfE="}"#
+            r#"{"n":1,"d":"e6r062GVTFNYUGpBRQ0Ue4hoGLI="}"#
         );
     }
 
     #[test]
     fn seal_open_round_trips_and_counts_up() {
-        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT");
+        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT", CNONCE);
         let mut host = Session::host(keys.clone());
         let mut peer = Session::client(keys);
         // host → peer
@@ -263,7 +300,7 @@ mod tests {
 
     #[test]
     fn replayed_frame_is_rejected() {
-        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT");
+        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT", CNONCE);
         let mut host = Session::host(keys.clone());
         let mut peer = Session::client(keys);
         let f0 = peer.seal("once");
@@ -276,7 +313,7 @@ mod tests {
 
     #[test]
     fn skipped_counter_is_desync() {
-        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT");
+        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT", CNONCE);
         let mut host = Session::host(keys.clone());
         let mut peer = Session::client(keys);
         let _ = peer.seal("a"); // counter 0
@@ -288,7 +325,7 @@ mod tests {
 
     #[test]
     fn tampered_body_fails_auth_tag() {
-        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT");
+        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT", CNONCE);
         let mut host = Session::host(keys.clone());
         let mut peer = Session::client(keys);
         let frame = peer.seal("secret message");
@@ -302,7 +339,7 @@ mod tests {
 
     #[test]
     fn open_rejects_garbage_envelope() {
-        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT");
+        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT", CNONCE);
         let mut host = Session::host(keys);
         assert!(host.open("not json").is_err());
         assert!(host.open("{\"n\":0}").is_err()); // missing body
@@ -317,7 +354,7 @@ mod tests {
 
     #[test]
     fn rejected_envelopes_leave_rx_intact_and_next_frame_still_opens() {
-        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT");
+        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT", CNONCE);
         let mut host = Session::host(keys.clone());
         let mut peer = Session::client(keys);
         let f0 = peer.seal("legit-0");

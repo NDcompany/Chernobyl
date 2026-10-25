@@ -16,6 +16,9 @@
  *      restart the device is still refused (hs_err 'device revoked')
  *   8. S10 ordered endpoints -> multi --endpoint payload keeps CLI order, and
  *      the client fails over from a dead first endpoint to the live one
+ *   9. client freshness (security review 2026-10-25) -> an hs_hello without a
+ *      client nonce gets hs_err, and a transcript recorded from the real
+ *      companion replayed to a new client attempt fails server-proof-mismatch
  *
  * No device claim: this is Node-vs-real-companion evidence only.
  */
@@ -373,6 +376,39 @@ async function main() {
     await sleep(600);
     check('S10: session stays on the live endpoint (no churn)', t.status() === 'connected', `status=${t.status()}`);
     t.close();
+  }
+
+  /* 9. client freshness (security review 2026-10-25) */
+  {
+    const legacy = rawClient(url);
+    await legacy.opened;
+    legacy.send(JSON.stringify({ type: 'hs_hello', deviceId: pairA.deviceId }));
+    const reply = JSON.parse(await legacy.recv());
+    check('hs_hello without a client nonce is refused (hs_err)', reply.type === 'hs_err', JSON.stringify(reply));
+    legacy.close();
+
+    // record a real handshake's server frames, then replay them to a new attempt
+    const live = rawClient(url);
+    await live.opened;
+    const recorded = [];
+    const recv = async () => {
+      const t = await live.recv();
+      recorded.push(t);
+      return t;
+    };
+    await performHandshake({ send: live.send, recv }, pairA, { timeoutMs: 5000 });
+    live.close();
+    const err = await performHandshake({ send: () => {}, recv: async () => recorded.shift() ?? '' }, pairA, {
+      timeoutMs: 2000,
+    }).then(
+      () => null,
+      (e) => e,
+    );
+    check(
+      'replayed real server transcript fails mutual auth (server-proof-mismatch)',
+      err?.code === 'server-proof-mismatch',
+      err ? `${err.code}: ${err.message}` : 'replay was accepted',
+    );
   }
 
   for (const t of transports) t.close();

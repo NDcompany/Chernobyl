@@ -72,16 +72,22 @@ test('ChaCha20-Poly1305 AEAD matches RFC 8439 2.8.2 (crypto.rs aead_rfc8439_vect
   assert.equal(hex(chacha20poly1305(key, nonce, aad).decrypt(sealed)), hex(plaintext));
 });
 
-test('handshake_proof binds role, device id, nonce and salt (e2e.rs proof_binds)', () => {
+test('handshake_proof binds role, device id, nonce, salt and cnonce (e2e.rs proof_binds)', () => {
   const psk = new Uint8Array(32).fill(7);
   const nonce = utf8Encode('NONCENONCENONCE');
   const salt = utf8Encode('SALTSALTSALTSALT');
-  const a = handshakeProof(psk, 'client', 'dev1', nonce, salt);
-  assert.notEqual(hex(a), hex(handshakeProof(psk, 'server', 'dev1', nonce, salt)));
-  assert.notEqual(hex(a), hex(handshakeProof(psk, 'client', 'dev2', nonce, salt)));
-  assert.notEqual(hex(a), hex(handshakeProof(psk, 'client', 'dev1', utf8Encode('OTHERNONCEOTHER'), salt)));
-  assert.notEqual(hex(a), hex(handshakeProof(psk, 'client', 'dev1', nonce, utf8Encode('OTHERSALTOTHERS'))));
-  assert.notEqual(hex(a), hex(handshakeProof(new Uint8Array(32).fill(8), 'client', 'dev1', nonce, salt)));
+  const cnonce = utf8Encode('CNONCNONCNONCNON');
+  const a = handshakeProof(psk, 'client', 'dev1', nonce, salt, cnonce);
+  assert.notEqual(hex(a), hex(handshakeProof(psk, 'server', 'dev1', nonce, salt, cnonce)));
+  assert.notEqual(hex(a), hex(handshakeProof(psk, 'client', 'dev2', nonce, salt, cnonce)));
+  assert.notEqual(hex(a), hex(handshakeProof(psk, 'client', 'dev1', utf8Encode('OTHERNONCEOTHER'), salt, cnonce)));
+  assert.notEqual(hex(a), hex(handshakeProof(psk, 'client', 'dev1', nonce, utf8Encode('OTHERSALTOTHERS'), cnonce)));
+  // a recorded server proof does not verify for a new client nonce
+  assert.notEqual(
+    hex(handshakeProof(psk, 'server', 'dev1', nonce, salt, cnonce)),
+    hex(handshakeProof(psk, 'server', 'dev1', nonce, salt, utf8Encode('OTHERCNONCEOTHER'))),
+  );
+  assert.notEqual(hex(a), hex(handshakeProof(new Uint8Array(32).fill(8), 'client', 'dev1', nonce, salt, cnonce)));
   assert.ok(proofOk(a, a));
   const wrong = a.slice();
   wrong[0] ^= 1;
@@ -92,13 +98,26 @@ test('handshake_proof binds role, device id, nonce and salt (e2e.rs proof_binds)
 test('derive_keys is deterministic and directional (e2e.rs keys_are_deterministic)', () => {
   const psk = new Uint8Array(32).fill(7);
   const salt = new Uint8Array(16).fill(9);
-  const a = deriveKeys(psk, salt);
-  const b = deriveKeys(psk, salt);
+  const cnonce = utf8Encode('CNONCNONCNONCNON');
+  const a = deriveKeys(psk, salt, cnonce);
+  const b = deriveKeys(psk, salt, cnonce);
   assert.equal(hex(a.c2h), hex(b.c2h));
   assert.equal(hex(a.h2c), hex(b.h2c));
   assert.notEqual(hex(a.c2h), hex(a.h2c), 'directions must not share a key');
   assert.equal(a.c2h.length, 32);
-  assert.notEqual(hex(a.c2h), hex(deriveKeys(psk, new Uint8Array(16).fill(8)).c2h));
+  assert.notEqual(hex(a.c2h), hex(deriveKeys(psk, new Uint8Array(16).fill(8), cnonce).c2h));
+});
+
+test('same server salt + a new client nonce gives new keys (e2e.rs same_server_salt_with_a_new_client_nonce)', () => {
+  // security review 2026-10-25: a replayed server transcript repeats the salt;
+  // the fresh client nonce alone must change both keys, else the phone would
+  // reuse a recorded session's ChaCha20-Poly1305 key+nonce pairs
+  const psk = new Uint8Array(32).fill(7);
+  const salt = new Uint8Array(16).fill(9);
+  const a = deriveKeys(psk, salt, new Uint8Array(16).fill(1));
+  const b = deriveKeys(psk, salt, new Uint8Array(16).fill(2));
+  assert.notEqual(hex(a.c2h), hex(b.c2h), 'c2h must depend on the client nonce');
+  assert.notEqual(hex(a.h2c), hex(b.h2c), 'h2c must depend on the client nonce');
 });
 
 test('base64 round-trips and rejects malformed input', () => {

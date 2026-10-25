@@ -1,18 +1,23 @@
 /**
  * The `hs_*` handshake (ADR-011/012 wire contract):
  *
- *   C→S {"type":"hs_hello","deviceId":"<hex>"}
+ *   C→S {"type":"hs_hello","deviceId":"<hex>","cnonce":"<b64 16B>"}
  *   S→C {"type":"hs_challenge","nonce":"<b64 16B>","salt":"<b64 16B>"}
  *   C→S {"type":"hs_proof","proof":"<b64 32B>"}
  *   S→C {"type":"hs_ok","serverProof":"<b64 32B>"} | {"type":"hs_err","reason":"…"}
  *
- * with proof = HMAC-SHA256(psk, role ‖ 0x00 ‖ deviceId ‖ 0x00 ‖ nonce ‖ 0x00 ‖ salt)
+ * with proof = HMAC-SHA256(psk, role ‖ 0x00 ‖ deviceId ‖ 0x00 ‖ nonce ‖ 0x00 ‖ salt ‖ 0x00 ‖ cnonce)
  * on both sides (mutual authentication — a MITM without the PSK cannot produce
- * either proof). The PSK never leaves the process; the handshake proves
- * knowledge of it. Byte-identical with services/companion-rs/src/e2e.rs.
+ * either proof). `cnonce` is fresh per attempt from the OS CSPRNG, so a
+ * recorded server transcript replayed to a new attempt fails as
+ * `server-proof-mismatch` and never re-derives an old session's keys
+ * (security review 2026-10-25). The PSK never leaves the process; the
+ * handshake proves knowledge of it. Byte-identical with
+ * services/companion-rs/src/e2e.rs.
  */
 import { hmac } from '@noble/hashes/hmac.js';
 import { sha256 } from '@noble/hashes/sha2.js';
+import { concatBytes, randomBytes } from '@noble/hashes/utils.js';
 import { b64decode, b64encode } from './base64.js';
 import { E2eError } from './errors.js';
 import type { PairingCredential } from './pairing.js';
@@ -20,8 +25,9 @@ import { SealedSession, deriveKeys } from './session.js';
 import { utf8Encode } from './utf8.js';
 
 /**
- * HMAC binding role + device id + the server's fresh nonce/salt to the PSK.
- * Same construction both roles use; the server verifies ours, we verify its.
+ * HMAC binding role + device id + the server's fresh nonce/salt + our fresh
+ * client nonce to the PSK. Same construction both roles use; the server
+ * verifies ours, we verify its.
  */
 export function handshakeProof(
   psk: Uint8Array,
@@ -29,25 +35,10 @@ export function handshakeProof(
   deviceId: string,
   nonce: Uint8Array,
   salt: Uint8Array,
+  cnonce: Uint8Array,
 ): Uint8Array {
-  const roleBytes = utf8Encode(role);
-  const idBytes = utf8Encode(deviceId);
-  const msg = new Uint8Array(roleBytes.length + 1 + idBytes.length + 1 + nonce.length + 1 + salt.length);
-  let o = 0;
-  msg.set(roleBytes, o);
-  o += roleBytes.length;
-  msg[o] = 0;
-  o += 1;
-  msg.set(idBytes, o);
-  o += idBytes.length;
-  msg[o] = 0;
-  o += 1;
-  msg.set(nonce, o);
-  o += nonce.length;
-  msg[o] = 0;
-  o += 1;
-  msg.set(salt, o);
-  return hmac(sha256, psk, msg);
+  const z = new Uint8Array(1);
+  return hmac(sha256, psk, concatBytes(utf8Encode(role), z, utf8Encode(deviceId), z, nonce, z, salt, z, cnonce));
 }
 
 /** Constant-time proof comparison (never short-circuits on the first diff). */
@@ -122,7 +113,10 @@ export async function performHandshake(
 ): Promise<SealedSession> {
   const timeoutMs = opts?.timeoutMs ?? 10_000;
 
-  io.send(JSON.stringify({ type: 'hs_hello', deviceId: pairing.deviceId }));
+  // OS CSPRNG (crypto.getRandomValues); throws rather than fall back to a
+  // weak source when the runtime has none
+  const cnonce = randomBytes(16);
+  io.send(JSON.stringify({ type: 'hs_hello', deviceId: pairing.deviceId, cnonce: b64encode(cnonce) }));
 
   const challenge = readJson(
     await withTimeout(io.recv(), timeoutMs, 'hs_challenge'),
@@ -134,7 +128,7 @@ export async function performHandshake(
   const nonce = expectFixedB64(challenge, 'nonce', 16);
   const salt = expectFixedB64(challenge, 'salt', 16);
 
-  const proof = handshakeProof(pairing.psk, 'client', pairing.deviceId, nonce, salt);
+  const proof = handshakeProof(pairing.psk, 'client', pairing.deviceId, nonce, salt, cnonce);
   io.send(JSON.stringify({ type: 'hs_proof', proof: b64encode(proof) }));
 
   const ok = readJson(await withTimeout(io.recv(), timeoutMs, 'hs_ok'));
@@ -143,10 +137,10 @@ export async function performHandshake(
     throw new E2eError('malformed', `expected hs_ok, got ${JSON.stringify(ok.type)}`);
   }
   const serverProof = expectFixedB64(ok, 'serverProof', 32);
-  const expected = handshakeProof(pairing.psk, 'server', pairing.deviceId, nonce, salt);
+  const expected = handshakeProof(pairing.psk, 'server', pairing.deviceId, nonce, salt, cnonce);
   if (!proofOk(expected, serverProof)) {
     throw new E2eError('server-proof-mismatch', 'server failed mutual authentication');
   }
 
-  return SealedSession.client(deriveKeys(pairing.psk, salt));
+  return SealedSession.client(deriveKeys(pairing.psk, salt, cnonce));
 }

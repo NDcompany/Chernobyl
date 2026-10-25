@@ -1044,7 +1044,7 @@ fn json_text(msg: &ClientMsg) -> String {
             ("type", json::s("list_state")),
             ("commandId", json::s(command_id)),
         ]),
-        ClientMsg::HsHello { device_id } => json::obj(vec![
+        ClientMsg::HsHello { device_id, .. } => json::obj(vec![
             ("type", json::s("hs_hello")),
             ("deviceId", json::s(device_id)),
         ]),
