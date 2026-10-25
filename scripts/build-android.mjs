@@ -13,6 +13,7 @@
 // It is signed with the debug keystore of Expo's template: installable, not a
 // Play Store identity (same disclosure stance as ADR-007).
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,7 +40,16 @@ if (!cmake) fail(`no CMake >= 3.31 under ${sdk}\\cmake — install it: sdkmanage
 // the app bundles the workspace packages from their compiled dist: build
 // them first or the APK ships whatever stale dist is on disk
 run('npm', ['run', 'build:e2e'], root);
-if (!existsSync(android)) run('npx', ['expo', 'prebuild', '--platform', 'android', '--no-install'], mobile);
+// Icons, splash and manifest are baked into the native project at prebuild
+// time, so prebuild again whenever its inputs change (skipping it once shipped
+// the old icon). Non-interactive prebuild recreates android/ from scratch,
+// which throws away the native build cache, hence the input hash.
+const stamp = join(android, '.prebuild-inputs');
+const inputs = prebuildInputs();
+if (!existsSync(android) || !existsSync(stamp) || readFileSync(stamp, 'utf8') !== inputs) {
+  run('npx', ['expo', 'prebuild', '--platform', 'android', '--no-install'], mobile, { CI: '1' });
+  writeFileSync(stamp, inputs);
+}
 
 const esc = (p) => p.replace(/\\/g, '\\\\').replace(/:/g, '\\:');
 writeFileSync(
@@ -62,6 +72,25 @@ const out = join(outDir, `chernobyl-${version}-${abis.replace(/,/g, '+')}.apk`);
 copyFileSync(apk, out);
 console.log(`APK: ${out}`);
 
+/** sha256 over everything prebuild reads: app.json, the assets it names and
+ *  the local native modules' sources. */
+function prebuildInputs() {
+  const h = createHash('sha256');
+  const walk = (dir) => {
+    for (const e of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) {
+        if (e.name !== 'build' && e.name !== '.gradle' && e.name !== 'node_modules') walk(p);
+      } else {
+        h.update(p.slice(mobile.length)).update(readFileSync(p));
+      }
+    }
+  };
+  h.update(readFileSync(join(mobile, 'app.json'))).update(readFileSync(join(mobile, 'package.json')));
+  walk(join(mobile, 'assets'));
+  walk(join(mobile, 'modules'));
+  return h.digest('hex');
+}
 function run(cmd, args, cwd, env = {}) {
   const r = spawnSync(cmd, args, { cwd, stdio: 'inherit', shell: process.platform === 'win32', env: { ...process.env, ...env } });
   if (r.status !== 0) fail(`${cmd} ${args.join(' ')} exited ${r.status}`);

@@ -1,18 +1,18 @@
 {
   "1.1": {
     "pass": true,
-    "observed": "home: 2 hosts online; companion clients=1; device 7e5f4dad37d80f87 registered=true",
-    "at": "2026-10-25T21:03:42.630Z"
+    "observed": "home: 2 hosts online; companion clients=1; device 672ade33d0216ce1 registered=true",
+    "at": "2026-10-25T23:03:47.020Z"
   },
   "6.2": {
     "pass": true,
     "observed": "reconnected without re-pairing in 5 s",
-    "at": "2026-10-25T17:28:03.096Z"
+    "at": "2026-10-25T23:03:53.861Z"
   },
   "6.1": {
     "pass": true,
-    "observed": "showed Reconnecting=true; back online in 3 s=true",
-    "at": "2026-10-25T17:28:10.372Z"
+    "observed": "showed Reconnecting=true; back online in 4 s=true",
+    "at": "2026-10-25T23:04:01.728Z"
   },
   "5.1": {
     "pass": true,
@@ -91,9 +91,9 @@
     "at": "2026-10-25T19:58:04.468Z"
   },
   "2.2": {
-    "pass": false,
-    "observed": "second redemption of one offer -> not denied",
-    "at": "2026-10-25T21:39:19.678Z"
+    "pass": true,
+    "observed": "the same QR re-used after the first phone paired and acked its rotated key -> Access denied (proof verification failed)",
+    "at": "2026-10-25T23:04:55.722Z"
   },
   "2.1": {
     "pass": true,
