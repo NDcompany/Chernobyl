@@ -77,11 +77,36 @@ export async function tap(match, ms = 15_000) {
  * shell (backslash escapes truncated JSON at the first ':'); `input text`
  * still needs spaces as %s.
  */
-export function type(text) {
-  for (let i = 0; i < text.length; i += 120) {
-    const chunk = text.slice(i, i + 120).replace(/ /g, '%s').replace(/'/g, `'\\''`);
+export function type(text, chunkSize = 120) {
+  for (let i = 0; i < text.length; i += chunkSize) {
+    const chunk = text.slice(i, i + chunkSize).replace(/ /g, '%s').replace(/'/g, `'\\''`);
     shell(`input text '${chunk}'`);
   }
+}
+
+/**
+ * Types into the focused field and checks what landed: a busy device drops
+ * `input text` characters, which once corrupted a pairing key mid-run. Retries
+ * with smaller, paced chunks after clearing the field.
+ */
+export async function typeVerified(text, attempts = 3) {
+  for (let n = 0; n < attempts; n++) {
+    if (n > 0) {
+      // select all + delete (two events; one DEL per char timed out adb)
+      shell('input keycombination KEYCODE_CTRL_LEFT KEYCODE_A');
+      key('KEYCODE_DEL');
+      await sleep(300);
+    }
+    const size = n === 0 ? 120 : 24;
+    for (let i = 0; i < text.length; i += size) {
+      type(text.slice(i, i + size), size);
+      if (n > 0) await sleep(250);
+    }
+    await sleep(500);
+    const field = dump().find((x) => x.cls.includes('EditText') && x.text && text.startsWith(x.text.slice(0, 8)));
+    if (field && field.text === text) return true;
+  }
+  throw new Error('typed text did not land intact after retries');
 }
 
 export function key(code) {

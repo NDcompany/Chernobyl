@@ -5,9 +5,9 @@
  *  - Manual form: adds a dashboard host record (prototype simulation);
  *    the token still goes to the keystore only.
  */
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Platform, StyleSheet, TextInput, View } from 'react-native';
-import { Redirect, useRouter } from 'expo-router';
+import { Redirect, useLocalSearchParams, useRouter } from 'expo-router';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 import {
@@ -77,8 +77,6 @@ export default function ConnectHostScreen() {
       (permission.status === PermissionStatus.DENIED || !permission.canAskAgain),
   );
 
-  if (!authed) return <Redirect href="/sign-in" />;
-
   const handlePayload = (text: string): boolean => {
     setQrText(text);
     setPairing(null);
@@ -93,6 +91,21 @@ export default function ConnectHostScreen() {
       return false;
     }
   };
+
+  // Pairing deep link (chernobyl://connect-host?payload=…, e.g. a QR read by
+  // the system camera or a shared link): it only PREFILLS the confirm step —
+  // pairing still needs the explicit "Pair with this host" tap and the step
+  // lists every endpoint, exactly as for a scanned QR. Arriving through it
+  // counts as choosing "Pair with a host" on the entry screen.
+  const params = useLocalSearchParams<{ payload?: string }>();
+  const linkPayload = typeof params.payload === 'string' ? params.payload : undefined;
+  useEffect(() => {
+    if (!linkPayload) return;
+    if (!useAppStore.getState().authed) useAppStore.getState().signIn();
+    handlePayload(linkPayload);
+  }, [linkPayload]);
+
+  if (!authed && !linkPayload) return <Redirect href="/sign-in" />;
 
   const openScanner = async () => {
     setPairErr(null);
