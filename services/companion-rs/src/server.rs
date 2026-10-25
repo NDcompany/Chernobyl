@@ -141,6 +141,19 @@ fn authorized(h: &Handshake, token: &str) -> bool {
     false
 }
 
+/// Header carrying the companion's control key on the loopback control
+/// routes (lower-case: `Handshake` lower-cases header names).
+pub const CONTROL_KEY_HEADER: &str = "x-chernobyl-control";
+
+/// Security review 2026-10-25: any local process — any Windows user, any
+/// service account — reaches 127.0.0.1, so POST /pairing/offer (mints a PSK)
+/// and POST /devices/revoke (cuts a phone off) also require the control key,
+/// which only an account that can read the user-private data dir has.
+fn has_control_key(h: &Handshake, companion: &Companion) -> bool {
+    h.header(CONTROL_KEY_HEADER)
+        .is_some_and(|k| ct_eq(k, companion.control_key()))
+}
+
 /// Maximum concurrent connections on the main listener (mandate §2, audit P7).
 pub const MAIN_CONNECTION_CAP: usize = 1024;
 /// Maximum concurrent connections on the loopback diagnostics listener (mandate §2, audit P7).
@@ -488,22 +501,23 @@ fn handle_conn(
     // inherit nonblocking mode — force blocking or every idle read "fails".
     stream.set_nonblocking(false).ok();
     stream.set_nodelay(true).ok();
-    // the upgrade request gets 30 s in total (slowloris bound), read through
-    // the short poll so a shutdown is not stuck behind a half-sent request
+    // the request head AND any POST body share one 30 s deadline (slowloris
+    // bound; security review 2026-10-25: bodies used to get a fresh 30 s per
+    // read), read through the short poll so a shutdown is not stuck behind a
+    // half-sent request
     stream.set_read_timeout(Some(IDLE_POLL))?;
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
 
-    let handshake = match ws::read_handshake(&mut StopAwareReader {
+    let mut request = StopAwareReader {
         inner: &mut reader,
         stop: &stop,
         deadline: Instant::now() + HTTP_REQUEST_DEADLINE,
-    }) {
+    };
+    let handshake = match ws::read_handshake(&mut request) {
         Ok(h) => h,
         Err(_) => return Ok(()), // hostile/garbage/shutdown: drop the connection
     };
-    // HTTP routes read their (capped) bodies with plain blocking reads
-    reader.set_read_timeout(Some(HTTP_REQUEST_DEADLINE))?;
 
     // HTTP routes (non-upgrade) -------------------------------------------
     if !handshake.is_websocket_upgrade() {
@@ -518,22 +532,27 @@ fn handle_conn(
                 // Drain the (capped) body before refusing so the close is a
                 // graceful FIN, not a RST racing the client's read of our 404
                 // (Windows resets a socket closed with an unread body).
-                drain_body(&mut reader, &handshake);
+                drain_body(&mut request, &handshake);
                 let _ = ws::write_http_error(&mut writer, 404, "Not Found", "");
                 return Ok(());
             }
             match path {
                 "/hooks/claude" => {
-                    return hook_ingress(&mut reader, &mut writer, &handshake, &companion);
+                    return hook_ingress(&mut request, &mut writer, &handshake, &companion);
                 }
                 "/pairing/offer" => {
-                    return pairing_offer_ingress(&mut reader, &mut writer, &handshake, &companion);
+                    return pairing_offer_ingress(
+                        &mut request,
+                        &mut writer,
+                        &handshake,
+                        &companion,
+                    );
                 }
                 "/devices/revoke" => {
-                    return revoke_ingress(&mut reader, &mut writer, &handshake, &companion);
+                    return revoke_ingress(&mut request, &mut writer, &handshake, &companion);
                 }
                 _ => {
-                    drain_body(&mut reader, &handshake);
+                    drain_body(&mut request, &handshake);
                     let _ = ws::write_http_error(&mut writer, 404, "Not Found", "");
                     return Ok(());
                 }
@@ -671,8 +690,9 @@ fn http_route(
 /// closes with a graceful FIN rather than a RST (Windows resets a socket that
 /// is closed while a request body is still unread in the receive buffer, which
 /// can race the client's read of our refusal). Bounded and non-fatal: if the
-/// peer lies about Content-Length we simply stop reading.
-fn drain_body(reader: &mut TcpStream, h: &Handshake) {
+/// peer lies about Content-Length, or trickles it past the request deadline,
+/// we simply stop reading.
+fn drain_body(reader: &mut StopAwareReader<'_>, h: &Handshake) {
     let n = h
         .header("content-length")
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -689,13 +709,21 @@ fn drain_body(reader: &mut TcpStream, h: &Handshake) {
 /// at `MAX_HOOK_BODY_BYTES`) and route it into the engine pipeline. Returns the
 /// adapter's verdict as an HTTP status: 200 accepted, 400 malformed, 507 when
 /// no Claude adapter is mounted. The body read fails closed on a missing or
-/// oversized Content-Length.
+/// oversized Content-Length. Rejects requests with an Origin header (403).
 fn hook_ingress(
-    reader: &mut TcpStream,
+    reader: &mut StopAwareReader<'_>,
     writer: &mut TcpStream,
     h: &Handshake,
     companion: &Companion,
 ) -> io::Result<()> {
+    // Security review 2026-10-25: the same browser guard as the sibling
+    // routes. A text/plain POST needs no CORS preflight, so without it any
+    // web page could forge hook activity into the persisted event pipeline.
+    if h.header("origin").is_some() {
+        drain_body(reader, h);
+        let _ = ws::write_http_error(writer, 403, "Forbidden", "");
+        return Ok(());
+    }
     let clen = h
         .header("content-length")
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -729,14 +757,15 @@ fn hook_ingress(
 /// listener. Rejects requests with an Origin header (403), requires a valid JSON body
 /// with `{"deviceId":"<id>"}`, marks the device revoked in the companion's store,
 /// appends an audit record, and terminates every live connection for that device with
-/// WebSocket close code 4003 ("device revoked").
+/// WebSocket close code 4003 ("device revoked"). A request without the control key is
+/// refused like one with an Origin header.
 fn revoke_ingress(
-    reader: &mut TcpStream,
+    reader: &mut StopAwareReader<'_>,
     writer: &mut TcpStream,
     h: &Handshake,
     companion: &Companion,
 ) -> io::Result<()> {
-    if h.header("origin").is_some() {
+    if h.header("origin").is_some() || !has_control_key(h, companion) {
         drain_body(reader, h);
         let _ = ws::write_http_error(writer, 403, "Forbidden", "");
         return Ok(());
@@ -794,13 +823,14 @@ fn revoke_ingress(
 /// listener. Rejects requests with an Origin header (403), requires a valid JSON body with
 /// optional `{"endpoints":["ws://..."]}`, creates the pairing offer in the companion's
 /// own store, and returns HTTP 200 with the pairing payload JSON string the phone parses.
+/// A request without the control key is refused like one with an Origin header.
 fn pairing_offer_ingress(
-    reader: &mut TcpStream,
+    reader: &mut StopAwareReader<'_>,
     writer: &mut TcpStream,
     h: &Handshake,
     companion: &Companion,
 ) -> io::Result<()> {
-    if h.header("origin").is_some() {
+    if h.header("origin").is_some() || !has_control_key(h, companion) {
         drain_body(reader, h);
         let _ = ws::write_http_error(writer, 403, "Forbidden", "");
         return Ok(());
@@ -863,6 +893,45 @@ fn pairing_offer_ingress(
         }
     }
     Ok(())
+}
+
+/// Client side of the loopback control routes (the CLI's `--pair` and
+/// `--revoke`, and tests): POST a JSON `body` to `url` carrying the control
+/// `key`. `client::http_request` takes no custom header; the companion closes
+/// after every answer, so the response is read to EOF. `content_type` is not
+/// parsed (left empty).
+pub fn control_post(
+    url: &str,
+    key: &str,
+    body: &str,
+) -> Result<crate::client::HttpResponse, String> {
+    let (authority, path) = crate::client::split_url(url)?;
+    let mut s =
+        TcpStream::connect(authority.as_str()).map_err(|e| format!("connect {authority}: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(|e| e.to_string())?;
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nContent-Type: application/json\r\n{CONTROL_KEY_HEADER}: {key}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .map_err(|e| format!("write: {e}"))?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw)
+        .map_err(|e| format!("read: {e}"))?;
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or("response has no header terminator")?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| format!("bad status line: {head}"))?;
+    Ok(crate::client::HttpResponse {
+        status,
+        content_type: String::new(),
+        body: body.to_string(),
+    })
 }
 
 /// Per-connection handshake state: the device that asked to connect and the
@@ -1011,6 +1080,9 @@ pub struct Outbound {
     saturation: Arc<crate::companion::Saturation>,
     /// Dedicated handle to write control/close frames directly (D4 revocation).
     control: Mutex<Option<TcpStream>>,
+    /// Remote posture (D2): until a session is live, engine events are
+    /// dropped instead of sent in plaintext (see `enqueue_sealed`).
+    require_e2e: bool,
 }
 
 /// Why an outbound message could not be queued. Both variants end the
@@ -1026,6 +1098,7 @@ pub enum EnqueueError {
 impl Outbound {
     fn new(
         saturation: Arc<crate::companion::Saturation>,
+        require_e2e: bool,
     ) -> (Arc<Outbound>, Receiver<(MsgClass, Vec<u8>)>) {
         let (tx, rx) = sync_channel(CHANNEL_CAPACITY);
         (
@@ -1038,6 +1111,7 @@ impl Outbound {
                 session: Mutex::new(None),
                 saturation,
                 control: Mutex::new(None),
+                require_e2e,
             }),
             rx,
         )
@@ -1089,7 +1163,8 @@ impl Outbound {
     /// Seal-then-enqueue is done under the session lock so the AEAD counter
     /// order always matches the FIFO wire order — the client's strict
     /// monotonic `open` would otherwise see a reordering as replay/desync.
-    /// With no session the plaintext is enqueued verbatim (loopback parity).
+    /// With no session the plaintext is enqueued verbatim (loopback parity),
+    /// except an engine event at remote posture, which is dropped.
     pub(crate) fn enqueue_sealed(
         &self,
         plaintext: Vec<u8>,
@@ -1111,6 +1186,12 @@ impl Outbound {
                 let text = String::from_utf8_lossy(&plaintext);
                 live.session.seal(&text).into_bytes()
             }
+            // Security review 2026-10-25: at remote posture the token alone
+            // must not buy the live stream (D9), so an engine event for a
+            // connection without a session is dropped, not sent in plaintext.
+            // Decided under the session lock, so it cannot race `set_session`;
+            // the client resyncs from the sealed hello snapshot after hs_ok.
+            None if self.require_e2e && class == MsgClass::Bulk => return Ok(()),
             None => plaintext,
         };
         // enqueue under the same lock so no other producer can interleave a
@@ -1265,10 +1346,13 @@ fn is_timeout(e: &io::Error) -> bool {
     )
 }
 
-/// A read that must not be split (an HTTP upgrade request, the rest of a WS
-/// frame) over a socket with the short IDLE_POLL timeout: timeouts are
+/// A read that must not be split (an HTTP request head or body, the rest of
+/// a WS frame) over a socket with the short IDLE_POLL timeout: timeouts are
 /// retried — bytes `read_exact` already consumed must not be lost — until
 /// shutdown (audit P6) or `deadline`, after which the peer counts as dead.
+/// The deadline bounds the WHOLE read: it is checked before every socket
+/// read, data or not (security review 2026-10-25 — checked only on a
+/// timeout, a peer trickling a byte per poll never hit it: slowloris).
 struct StopAwareReader<'a> {
     inner: &'a mut TcpStream,
     stop: &'a AtomicBool,
@@ -1278,11 +1362,11 @@ struct StopAwareReader<'a> {
 impl Read for StopAwareReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
+            if Instant::now() >= self.deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "read deadline"));
+            }
             match self.inner.read(buf) {
-                Err(e)
-                    if is_timeout(&e)
-                        && !self.stop.load(Ordering::SeqCst)
-                        && Instant::now() < self.deadline => {}
+                Err(e) if is_timeout(&e) && !self.stop.load(Ordering::SeqCst) => {}
                 r => return r,
             }
         }
@@ -1312,7 +1396,7 @@ fn serve_ws(
     // longer park the writer forever and teardown's join() is always bounded
     writer.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
-    let (outbound, rx) = Outbound::new(companion.shared.saturation.clone());
+    let (outbound, rx) = Outbound::new(companion.shared.saturation.clone(), require_e2e);
     outbound.set_control(reader.try_clone()?);
     let conn_id = companion
         .shared
@@ -1385,10 +1469,13 @@ fn serve_ws(
             }
             Err(e) => break Err(e),
         }
+        // a whole frame must land within the dead-peer window from its
+        // first byte: now that the deadline counts trickled bytes too, one
+        // beat could cut a legitimate max-size frame on a slow link
         let mut frame_reader = StopAwareReader {
             inner: &mut reader,
             stop,
-            deadline: Instant::now() + beat,
+            deadline: Instant::now() + beat * crate::protocol::HEARTBEAT_MISS_LIMIT,
         };
         let frame = match ws::read_frame(&mut frame_reader, true) {
             Ok(f) => f,
@@ -2097,6 +2184,48 @@ mod e2e_tests {
         shutdown(f);
     }
 
+    /// Security review 2026-10-25: at remote posture a token-only connection
+    /// that never handshakes receives NO engine event — it used to get the
+    /// whole live stream (prompts, output, approvals) in plaintext — while a
+    /// sessioned connection on the same server still gets every event sealed.
+    #[test]
+    fn remote_posture_fanout_skips_sessionless_connections() {
+        let f = fixture_remote("fanout-remote");
+        // the lurker holds only the token; its ping round trip proves it is
+        // registered for fan-out (ahead of the phone) before the phone acts
+        let mut lurker = connect_remote(&f);
+        lurker
+            .send_text(r#"{"type":"ping","commandId":"lurk-1"}"#)
+            .unwrap();
+        assert!(lurker.next_text().unwrap().contains("pong"));
+        let mut phone = connect_remote(&f);
+        let (resp, sess) = attempt(&mut phone, &f.psk, &f.device_id);
+        assert!(resp.contains("hs_ok"), "got: {resp}");
+        let mut sess = sess.unwrap();
+        let create = r#"{"type":"create_session","commandId":"fan-r1","agentId":"a4","title":"Remote","prompt":"secret prompt"}"#;
+        phone.send_text(&sess.seal(create)).unwrap();
+        let mut phone_saw_event = false;
+        for _ in 0..32 {
+            let inner = sess.open(&phone.next_text().unwrap()).unwrap();
+            if inner.contains("\"session_created\"") {
+                phone_saw_event = true;
+                break;
+            }
+        }
+        assert!(phone_saw_event, "the sessioned phone must get the event");
+        // one fan-out pass serves every registered connection, lurker first:
+        // a leaked event would already sit ahead of this pong in its FIFO
+        lurker
+            .send_text(r#"{"type":"ping","commandId":"lurk-2"}"#)
+            .unwrap();
+        let next = lurker.next_text().unwrap();
+        assert!(
+            next.contains("pong") && next.contains("lurk-2"),
+            "a sessionless remote peer got: {next}"
+        );
+        shutdown(f);
+    }
+
     #[test]
     fn loopback_posture_still_accepts_plaintext_commands() {
         // parity control: the flag is what changes — plain loopback keeps
@@ -2221,6 +2350,47 @@ mod e2e_tests {
         shutdown(f);
     }
 
+    /// Security review 2026-10-25: /hooks/claude refuses a browser-originated
+    /// POST like its sibling routes. The request is the exact shape any web
+    /// page can send with no CORS preflight (text/plain).
+    #[test]
+    fn claude_hook_ingress_refuses_an_origin_header() {
+        use std::io::Read;
+        let f = fixture_claude("cc-origin");
+        let body =
+            r#"{"hook_event_name":"Notification","session_id":"x","message":"forged approve-me"}"#;
+        let mut s =
+            std::net::TcpStream::connect(format!("127.0.0.1:{}", f.handle.diagnostics_port))
+                .unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let req = format!(
+            "POST /hooks/claude HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        let mut buf = [0u8; 512];
+        while !resp.contains("\r\n") {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed before status line");
+            resp.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        let forged = |c: &Companion| {
+            c.snapshot()
+                .activity
+                .iter()
+                .any(|a| a.text.contains("forged approve-me"))
+        };
+        assert!(!forged(&f.companion), "a refused hook must not surface");
+        // control: the same payload without Origin is accepted and surfaces
+        let diag = format!("http://127.0.0.1:{}", f.handle.diagnostics_port);
+        let ok = http_request("POST", &format!("{diag}/hooks/claude"), None, Some(body)).unwrap();
+        assert_eq!(ok.status, 200);
+        assert!(forged(&f.companion));
+        shutdown(f);
+    }
+
     /* D8: bounded outbound queue — count + byte caps, explicit overload
     teardown, writer lifecycle. All deterministic: no sleeps in the
     assertions, real sockets only where the writer's wire behavior is
@@ -2237,7 +2407,7 @@ mod e2e_tests {
     /// Fresh Outbound with its own saturation counters (class-policy tests
     /// that read the counters back build theirs via `Outbound::new` directly).
     fn test_outbound() -> (Arc<Outbound>, Receiver<(MsgClass, Vec<u8>)>) {
-        Outbound::new(Arc::new(crate::companion::Saturation::default()))
+        Outbound::new(Arc::new(crate::companion::Saturation::default()), false)
     }
 
     #[test]
@@ -2599,7 +2769,7 @@ mod e2e_tests {
             f.handle.diagnostics_port
         );
         let req_body = format!("{{\"deviceId\":\"{dev1}\"}}");
-        let resp = http_request("POST", &diag_url, None, Some(&req_body)).unwrap();
+        let resp = control_post(&diag_url, f.companion.control_key(), &req_body).unwrap();
         assert_eq!(resp.status, 200, "revoke response: {resp:?}");
         assert!(
             resp.body.contains("\"revoked\":true"),
@@ -2666,8 +2836,10 @@ mod e2e_tests {
                 .unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let body = format!("{{\"deviceId\":\"{}\"}}", f.device_id);
+        // a valid control key: the 403 must come from the Origin rule alone
         let req = format!(
-            "POST /devices/revoke HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /devices/revoke HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            f.companion.control_key(),
             body.len()
         );
         s.write_all(req.as_bytes()).unwrap();
@@ -2715,25 +2887,26 @@ mod e2e_tests {
             "http://127.0.0.1:{}/devices/revoke",
             f.handle.diagnostics_port
         );
+        let key = f.companion.control_key();
 
         // Unknown device -> 404
         let unknown_body = r#"{"deviceId":"unknown-device-xyz"}"#;
-        let resp_404 = http_request("POST", &diag_url, None, Some(unknown_body)).unwrap();
+        let resp_404 = control_post(&diag_url, key, unknown_body).unwrap();
         assert_eq!(resp_404.status, 404, "got: {resp_404:?}");
 
         // Missing deviceId -> 400
         let bad_body = r#"{"wrongKey":"foo"}"#;
-        let resp_400a = http_request("POST", &diag_url, None, Some(bad_body)).unwrap();
+        let resp_400a = control_post(&diag_url, key, bad_body).unwrap();
         assert_eq!(resp_400a.status, 400, "got: {resp_400a:?}");
 
         // Empty deviceId -> 400
         let empty_body = r#"{"deviceId":""}"#;
-        let resp_400b = http_request("POST", &diag_url, None, Some(empty_body)).unwrap();
+        let resp_400b = control_post(&diag_url, key, empty_body).unwrap();
         assert_eq!(resp_400b.status, 400, "got: {resp_400b:?}");
 
         // Malformed JSON -> 400
         let invalid_json = "{not json";
-        let resp_400c = http_request("POST", &diag_url, None, Some(invalid_json)).unwrap();
+        let resp_400c = control_post(&diag_url, key, invalid_json).unwrap();
         assert_eq!(resp_400c.status, 400, "got: {resp_400c:?}");
 
         shutdown(f);
@@ -2751,7 +2924,7 @@ mod e2e_tests {
         let req_body = format!(r#"{{"endpoints":["{ep}"]}}"#);
 
         // 1. POST /pairing/offer creates the offer in the companion's store and returns 200
-        let resp = http_request("POST", &diag_url, None, Some(&req_body)).unwrap();
+        let resp = control_post(&diag_url, companion.control_key(), &req_body).unwrap();
         assert_eq!(resp.status, 200, "expected 200, got: {resp:?}");
 
         // 2. Parse the payload JSON string
@@ -2802,8 +2975,10 @@ mod e2e_tests {
             std::net::TcpStream::connect(format!("127.0.0.1:{}", handle.diagnostics_port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let body = r#"{"endpoints":["ws://127.0.0.1:8787"]}"#;
+        // a valid control key: the 403 must come from the Origin rule alone
         let req = format!(
-            "POST /pairing/offer HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /pairing/offer HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            companion.control_key(),
             body.len()
         );
         s.write_all(req.as_bytes()).unwrap();
@@ -2850,22 +3025,56 @@ mod e2e_tests {
         let companion = Arc::new(Companion::boot(c).unwrap());
         let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
         let diag_url = format!("http://127.0.0.1:{}/pairing/offer", handle.diagnostics_port);
+        let key = companion.control_key();
 
         // Non-JSON
-        let resp = http_request("POST", &diag_url, None, Some("not json")).unwrap();
+        let resp = control_post(&diag_url, key, "not json").unwrap();
         assert_eq!(resp.status, 400);
 
         // Non-object
-        let resp = http_request("POST", &diag_url, None, Some("[1, 2, 3]")).unwrap();
+        let resp = control_post(&diag_url, key, "[1, 2, 3]").unwrap();
         assert_eq!(resp.status, 400);
 
         // Non-string in endpoints array
-        let resp = http_request("POST", &diag_url, None, Some(r#"{"endpoints":[123]}"#)).unwrap();
+        let resp = control_post(&diag_url, key, r#"{"endpoints":[123]}"#).unwrap();
         assert_eq!(resp.status, 400);
 
         let clean = handle.stop();
         companion.shutdown(clean);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Security review 2026-10-25: any local process reaches the loopback
+    /// diagnostics listener, so minting a PSK or revoking a phone takes the
+    /// control key; a missing or wrong one is refused (403) and changes
+    /// nothing, the right one is accepted.
+    #[test]
+    fn control_routes_refuse_a_missing_or_wrong_control_key() {
+        let f = fixture_paired("control-key", false);
+        let diag = format!("http://127.0.0.1:{}", f.handle.diagnostics_port);
+        let revoke_body = format!(r#"{{"deviceId":"{}"}}"#, f.device_id);
+        let wrong = "0".repeat(64);
+        for (route, body) in [
+            ("/pairing/offer", "{}"),
+            ("/devices/revoke", revoke_body.as_str()),
+        ] {
+            let url = format!("{diag}{route}");
+            let missing = http_request("POST", &url, None, Some(body)).unwrap();
+            assert_eq!(missing.status, 403, "{route} without the key: {missing:?}");
+            let refused = control_post(&url, &wrong, body).unwrap();
+            assert_eq!(refused.status, 403, "{route} with a wrong key: {refused:?}");
+        }
+        {
+            let store = f.companion.shared.storage.lock().unwrap();
+            assert!(store.pairings.is_empty(), "a refused offer minted a PSK");
+            assert!(!store.devices[&f.device_id].revoked);
+        }
+        let key = f.companion.control_key();
+        let offer = control_post(&format!("{diag}/pairing/offer"), key, "{}").unwrap();
+        assert_eq!(offer.status, 200, "got: {offer:?}");
+        let revoke = control_post(&format!("{diag}/devices/revoke"), key, &revoke_body).unwrap();
+        assert_eq!(revoke.status, 200, "got: {revoke:?}");
+        shutdown(f);
     }
 
     #[test]
@@ -2966,7 +3175,7 @@ mod e2e_tests {
         c.data_dir = dir.clone();
         let companion = Companion::boot(c).unwrap();
 
-        let (outbound, _rx) = Outbound::new(companion.shared.saturation.clone());
+        let (outbound, _rx) = Outbound::new(companion.shared.saturation.clone(), false);
         companion.shared.clients.lock().unwrap().push((7, outbound));
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -3092,6 +3301,41 @@ mod e2e_tests {
         );
     }
 
+    /// Security review 2026-10-25: at remote posture an engine event (Bulk)
+    /// for a connection without a session is dropped, not queued in
+    /// plaintext and not a saturation teardown; replies (Control) still flow
+    /// so the peer can handshake, and once the session is live events are
+    /// queued sealed. Loopback posture keeps the plaintext parity path.
+    #[test]
+    fn remote_posture_drops_sessionless_events_but_not_replies() {
+        let event = br#"{"type":"event"}"#;
+        let sat = Arc::new(crate::companion::Saturation::default());
+        let (remote, rx) = Outbound::new(sat.clone(), true);
+        remote
+            .enqueue_sealed(event.to_vec(), MsgClass::Bulk)
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "no event without a session");
+        assert!(!remote.is_terminated());
+        remote
+            .enqueue_sealed(b"pong".to_vec(), MsgClass::Control)
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap().1, b"pong".to_vec());
+        let keys = e2e::derive_keys(&[7u8; 32], &[9u8; 16]);
+        remote.set_session("dev".into(), e2e::Session::host(keys.clone()));
+        remote
+            .enqueue_sealed(event.to_vec(), MsgClass::Bulk)
+            .unwrap();
+        let sealed = String::from_utf8(rx.try_recv().unwrap().1).unwrap();
+        let mut peer = e2e::Session::client(keys);
+        assert_eq!(peer.open(&sealed).unwrap().as_bytes(), event);
+
+        let (local, rx) = Outbound::new(sat, false);
+        local
+            .enqueue_sealed(event.to_vec(), MsgClass::Bulk)
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap().1, event.to_vec());
+    }
+
     #[test]
     fn saturation_counters_surface_in_health_and_metrics() {
         // Regression for P2: production overload must be readable from
@@ -3100,7 +3344,7 @@ mod e2e_tests {
         let mut c = default_config();
         c.data_dir = dir.clone();
         let companion = Companion::boot(c).unwrap();
-        let (outbound, _rx) = Outbound::new(companion.shared.saturation.clone());
+        let (outbound, _rx) = Outbound::new(companion.shared.saturation.clone(), false);
         for _ in 0..BULK_QUEUE_MAX_MESSAGES {
             outbound.enqueue(vec![b'b'; 8], MsgClass::Bulk).unwrap();
         }
@@ -3149,6 +3393,59 @@ mod e2e_tests {
         assert!(srv.stop());
         companion.shutdown(true);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Security review 2026-10-25 (slowloris): the deadline bounds the WHOLE
+    /// read. A peer trickling a byte every 20 ms never lets a read time out,
+    /// which used to be the only moment the deadline was checked, so it held
+    /// the slot until the 16 KiB head cap (~55 min) — or, for a POST body
+    /// read with per-read timeouts, for days. Head and body are cut at it.
+    #[test]
+    fn a_trickling_peer_is_cut_at_the_deadline() {
+        let (mut server, mut client) = tcp_pair();
+        server.set_read_timeout(Some(IDLE_POLL)).unwrap();
+        // never completes a head or body; capped so a regression fails in
+        // seconds (EOF) instead of hanging
+        let trickle = thread::spawn(move || {
+            for _ in 0..250 {
+                if client.write_all(b"a").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let stop = AtomicBool::new(false);
+        let deadline = Duration::from_millis(500);
+
+        let started = Instant::now();
+        let head = ws::read_handshake(&mut StopAwareReader {
+            inner: &mut server,
+            stop: &stop,
+            deadline: started + deadline,
+        });
+        assert!(
+            matches!(&head, Err(ws::WsError::Io(e)) if e.kind() == io::ErrorKind::TimedOut),
+            "got: {head:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "head cut late");
+
+        let post = Handshake {
+            method: "POST".into(),
+            target: "/hooks/claude".into(),
+            headers: vec![("content-length".into(), "65536".into())],
+        };
+        let started = Instant::now();
+        drain_body(
+            &mut StopAwareReader {
+                inner: &mut server,
+                stop: &stop,
+                deadline: started + deadline,
+            },
+            &post,
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "body cut late");
+        drop(server);
+        trickle.join().unwrap();
     }
 
     /* ---- mandate §2: ordered shutdown (audit P6) -------------------- */

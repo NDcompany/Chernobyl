@@ -24,7 +24,7 @@
 //!                            sessions, approvals, pairing, keybinds) on loopback
 //!   --version                print version and exit
 
-use chernobyl_companion::client::{WsClient, http_get, http_request};
+use chernobyl_companion::client::{WsClient, http_get};
 use chernobyl_companion::companion::Companion;
 use chernobyl_companion::config;
 use chernobyl_companion::json;
@@ -421,6 +421,19 @@ fn print_pairing_block(b: &PairingBlock, path_msg: &str) -> i32 {
     }
 }
 
+/// The running companion's loopback control key, read from the data dir it
+/// booted on (security review 2026-10-25). Empty when none booted there; the
+/// control routes refuse that like any wrong key.
+fn control_key(cfg: &config::CompanionConfig) -> String {
+    let path = cfg
+        .data_dir
+        .join(chernobyl_companion::companion::CONTROL_KEY_FILE);
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 /// `companion pair` — create a pairing offer and print the terminal QR the phone scans.
 /// Tries the running companion first (loopback POST /pairing/offer); if unreachable,
 /// falls back to offline journal write (restart-scoped).
@@ -431,7 +444,7 @@ fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
         json::Json::Arr(endpoints.iter().map(|e| json::s(e)).collect()),
     )]));
 
-    match http_request("POST", &url, None, Some(&body)) {
+    match server::control_post(&url, &control_key(cfg), &body) {
         Ok(resp) => match resp.status {
             200 => {
                 let b = pairing_block_from_payload(resp.body);
@@ -488,7 +501,7 @@ fn devices_main(cfg: &config::CompanionConfig) -> i32 {
 fn revoke_main(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
     let url = format!("http://127.0.0.1:{}/devices/revoke", cfg.diagnostics_port);
     let req_body = json::stringify(&json::obj(vec![("deviceId", json::s(device_id))]));
-    match http_request("POST", &url, None, Some(&req_body)) {
+    match server::control_post(&url, &control_key(cfg), &req_body) {
         Ok(resp) => match resp.status {
             200 => {
                 let terminated = json::parse(&resp.body)

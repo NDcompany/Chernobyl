@@ -31,6 +31,33 @@ pub struct Saturation {
     pub teardowns: std::sync::atomic::AtomicU64,
 }
 
+/// File in the data dir holding the loopback control key (security review
+/// 2026-10-25): 64 lowercase hex chars from the OS CSPRNG, minted on first
+/// boot. POST /pairing/offer and /devices/revoke require it, so only an
+/// account that can read the data dir (user-private under %APPDATA%, the
+/// ACL the journal already relies on) — the operator and their CLI — can
+/// mint a PSK or revoke a phone.
+pub const CONTROL_KEY_FILE: &str = "control.key";
+
+/// Reads the control key, minting it when absent. Anything but 64 lowercase
+/// hex chars (a torn first write, a hand edit) is replaced: an empty or short
+/// key must never be what a request is compared against.
+fn load_control_key(dir: &std::path::Path) -> Result<String, String> {
+    let path = dir.join(CONTROL_KEY_FILE);
+    if let Ok(key) = std::fs::read_to_string(&path)
+        && key.len() == 64
+        && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Ok(key);
+    }
+    let key: String = ffi::csprng_bytes(32)?
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(&path, &key).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(key)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum RevokeResult {
     NotFound,
@@ -77,11 +104,14 @@ pub struct Companion {
     last_probe: Mutex<i64>,
     pub events_total: Arc<std::sync::atomic::AtomicU64>,
     pub malformed_total: std::sync::atomic::AtomicU64,
+    /// See [`CONTROL_KEY_FILE`].
+    control_key: String,
 }
 
 impl Companion {
     pub fn boot(config: CompanionConfig) -> Result<Companion, String> {
         let storage = Storage::open(&config.data_dir, config.events_cap, config.commands_cap)?;
+        let control_key = load_control_key(&config.data_dir)?;
         // C2: the engine continues the event sequence from the journal
         let start_seq = storage.last_seq;
 
@@ -169,7 +199,8 @@ impl Companion {
                 // client and no event is silently dropped for healthy ones.
                 // Events are sealed per connection (wire contract: from hs_ok
                 // on every frame is sealed) - enqueue_sealed seals for session
-                // clients and passes plaintext through for loopback parity.
+                // clients and passes plaintext through for loopback parity; at
+                // remote posture a sessionless client gets no events at all.
                 // Classed Bulk (mandate §4): fan-out gets its own, lower bound
                 // so it can never starve reply/ack frames.
                 clients.retain(|(_, q)| {
@@ -185,6 +216,7 @@ impl Companion {
             last_probe: Mutex::new(now_ms()),
             events_total,
             malformed_total: std::sync::atomic::AtomicU64::new(0),
+            control_key,
         };
 
         // Boot reconciliation: unresolved commands → unknown (never re-run),
@@ -936,6 +968,11 @@ impl Companion {
         let mut store = self.shared.storage.lock().unwrap();
         crate::pairing::create_pairing_offer(&mut store, &eps)
     }
+
+    /// The loopback control key (see [`CONTROL_KEY_FILE`]).
+    pub fn control_key(&self) -> &str {
+        &self.control_key
+    }
 }
 
 fn json_text(msg: &ClientMsg) -> String {
@@ -1035,6 +1072,36 @@ mod tests {
         let mut c = default_config();
         c.data_dir = dir;
         c
+    }
+
+    /// Security review 2026-10-25: the control key is minted once into the
+    /// data dir (the CLI reads it there) and kept across restarts; a torn or
+    /// empty file is replaced, never compared against.
+    #[test]
+    fn control_key_is_minted_once_and_an_empty_file_is_replaced() {
+        let c = temp_config("control-key");
+        let path = c.data_dir.join(CONTROL_KEY_FILE);
+        let comp = Companion::boot(c.clone()).unwrap();
+        let key = comp.control_key().to_string();
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), key);
+        comp.shutdown(true);
+        drop(comp);
+        let comp = Companion::boot(c.clone()).unwrap();
+        assert_eq!(comp.control_key(), key, "kept across restarts");
+        comp.shutdown(true);
+        drop(comp);
+        std::fs::write(&path, "").unwrap();
+        let comp = Companion::boot(c.clone()).unwrap();
+        assert_eq!(
+            comp.control_key().len(),
+            64,
+            "an empty key file is replaced"
+        );
+        assert_ne!(comp.control_key(), key);
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 
     #[test]
