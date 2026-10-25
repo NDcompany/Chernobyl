@@ -322,14 +322,28 @@ const promptSchema = z.object({
     .string()
     .trim()
     .min(2, 'Type a message first')
-    .max(32000, 'Message is too long'),
+    // ADR-015 §3.4: submit_prompt.text limit
+    .max(32_000, 'Message is too long (32,000 characters at most)'),
 });
+
+const BUSY_CAPTION = {
+  merge: 'Joins the current turn',
+  queue: 'Runs after this turn',
+  none: 'Agent is working…',
+} as const;
 
 export interface PromptComposerProps {
   onSubmit: (text: string) => void;
+  /** shows Stop while busy */
   onInterrupt?: () => void;
-  /** session is running or waiting — sending is blocked meanwhile */
+  /** a turn is running (or the session waits) */
   busy?: boolean;
+  /**
+   * ADR-015 `Agent.live.promptWhileBusy`: 'merge' and 'queue' keep sending
+   * enabled while busy and say where the prompt goes; 'none' (default)
+   * blocks sending meanwhile.
+   */
+  promptWhileBusy?: 'merge' | 'queue' | 'none';
   disabled?: boolean;
   hint?: string;
   placeholder?: string;
@@ -339,6 +353,7 @@ export function PromptComposer({
   onSubmit,
   onInterrupt,
   busy = false,
+  promptWhileBusy = 'none',
   disabled = false,
   hint,
   placeholder = 'Ask the agent…',
@@ -368,17 +383,17 @@ export function PromptComposer({
       />
       <View style={styles.composerRow}>
         <Text variant="xs" color={colors.text3} style={{ flex: 1 }} numberOfLines={1}>
-          {busy ? hint ?? 'Agent is working…' : hint ?? idleCaption}
+          {hint ?? (busy ? BUSY_CAPTION[promptWhileBusy] : idleCaption)}
         </Text>
         {busy && onInterrupt ? (
           <Button
-            label="Interrupt"
+            label="Stop"
             variant="secondary"
             size="sm"
             icon="stop"
             fullWidth={false}
             onPress={onInterrupt}
-            accessibilityLabel="Interrupt the running task"
+            accessibilityLabel="Stop"
           />
         ) : null}
         <Button
@@ -386,7 +401,7 @@ export function PromptComposer({
           size="sm"
           icon="send"
           fullWidth={false}
-          disabled={busy || disabled}
+          disabled={disabled || (busy && promptWhileBusy === 'none')}
           onPress={submit}
           accessibilityLabel="Send prompt to agent"
         />

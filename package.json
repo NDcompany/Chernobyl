@@ -16,7 +16,7 @@
     "build": "npm run build:protocol && npm run build:e2e && npm run build:host",
     "typecheck": "npm run build:protocol && npm run typecheck -w @chernobyl/e2e && npm run typecheck -w @chernobyl/host && npm run typecheck -w @chernobyl/adapter-sdk && npm run typecheck -w @chernobyl/mobile",
     "lint": "npm run lint -w @chernobyl/mobile",
-    "test": "npm run test -w @chernobyl/domain && npm run test -w @chernobyl/protocol && npm run test -w @chernobyl/host && npm run test -w @chernobyl/adapter-sdk && npm run test -w @chernobyl/e2e",
+    "test": "npm run test -w @chernobyl/domain && npm run test -w @chernobyl/protocol && npm run test -w @chernobyl/host && npm run test -w @chernobyl/adapter-sdk && npm run test -w @chernobyl/e2e && npm run test -w @chernobyl/mobile",
     "dev:host": "npm run dev -w @chernobyl/host",
     "dev:mobile": "npm run start -w @chernobyl/mobile",
     "verify": "npm run typecheck && npm run lint && npm run test && npm run build && npm run build:mobile",

@@ -40,7 +40,11 @@ export type IconName =
   | 'grid'
   | 'globe'
   | 'chip'
-  | 'sliders';
+  | 'sliders'
+  | 'chevron-down'
+  | 'thinking'
+  | 'plug'
+  | 'diff';
 
 const PATHS: Record<IconName, readonly string[]> = {
   home: ['M4 10.6 12 4l8 6.6V19a1.5 1.5 0 0 1-1.5 1.5H15V15H9v5.5H5.5A1.5 1.5 0 0 1 4 19z'],
@@ -105,6 +109,17 @@ const PATHS: Record<IconName, readonly string[]> = {
     'M15.5 5.6v4.8',
     'M10.8 13.6v4.8',
   ],
+  'chevron-down': ['M5.5 9.5 12 16l6.5-6.5'],
+  /** thought cloud with an ellipsis */
+  thinking: [
+    'M7.5 18H16a4 4 0 0 0 .6-7.95A5 5 0 0 0 7 10.5a3.75 3.75 0 0 0 .5 7.5z',
+    'M9.5 14.2h.01',
+    'M12 14.2h.01',
+    'M14.5 14.2h.01',
+  ],
+  plug: ['M9 3.5v4', 'M15 3.5v4', 'M6.5 7.5h11v3a5.5 5.5 0 0 1-11 0z', 'M12 16v4.5'],
+  /** file with + and − */
+  diff: ['M7 3.5h7l4 4v13H7z', 'M10 11h5', 'M12.5 8.5v5', 'M10 16.5h5'],
 };
 
 export interface IconProps {

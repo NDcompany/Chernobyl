@@ -40,11 +40,31 @@ button; `dark` variant for black headers), `Card` (`strong` = black outline), `E
 root layout), `ConfirmModal` (destructive confirmations; `note` = scope/safety line).
 
 **`lists.tsx`** — `AgentCard` (tile|row), `SessionRow`, `MonoBlock` (command on black), `PermissionCard`
-(compact|full, `resolved` dims), `ActivityRow`, `PromptComposer` (RHF+zod, shows Interrupt when
-`busy`), `Timeline`, `OutputBlock` (stderr→error color, system→italic), `FileRow` (+add/−del),
-`DetailRow`, `SegmentedTabs`.
+(compact|full, `resolved` dims), `ActivityRow`, `PromptComposer` (RHF+zod, 32,000-char limit, Stop
+while `busy`; `promptWhileBusy` `merge`|`queue` keeps Send enabled mid-turn with "Joins the current
+turn" / "Runs after this turn", `none` blocks it), `Timeline`, `OutputBlock` (stderr→error color,
+system→italic), `FileRow` (+add/−del), `DetailRow`, `SegmentedTabs`.
 
-**`icons.tsx`** — `Icon` + `IconName` (34 names, 24×24 stroke grid, `strokeWidth` prop). New icon =
+**`transcript.tsx`** — ADR-015 conversation view, presentational only (data + callbacks as props;
+pure logic in `src/utils/transcript.ts`, unit-tested by `npm test -w @chernobyl/mobile`).
+`TranscriptList` (FlatList keyed by item id; footer after each ended turn; standalone approval
+cards at the end for pending requests whose tool item is not in view; sticks to the bottom while
+the user is there, else a "Jump to latest" pill; announces turn ends only, never deltas),
+`MessageText` (markdown subset: paragraphs, headings, bold, italic, inline code, fenced code mono on
+black with sideways scroll, lists, rules; no HTML, images or remote loads; links show the full URL
+and open only after a `ConfirmModal`; streaming-safe: unclosed syntax renders as if closed and
+dangling markers wait, so text only grows), `UserBubble` (`surface2`; "Queued" / "Joins the current
+turn"), `ThinkingRow` (collapsed one-line preview → `text2` italic), `ToolCard` (name verbatim, title,
+a status mark per `ToolStatus`; expands to input `MonoBlock`, output with truncated marker, `DiffView`,
+"Auto-approved (…)", nested subagent items; a pending approval outlines it black and keeps it open;
+`awaiting-approval` without a record shows "Waiting for approval…"), `DiffView` (+/− in
+`success`/`error`, hunks `text3`, first 200 lines then "Show more"), `InlineApproval` /
+`StandaloneApproval` (detail by kind; primary + secondary + "More…" with session/persistent grants and
+"Deny and tell <agent> why"; persistent grants confirm the exact rule and file), `PlanCard`,
+`NoticeRow`, `TurnFooter`, `McpChip` ("MCP 4/5" + warning dot), `McpSheet` (status + §4.7 sign-in
+actions), `ModeChip` (Claude permission mode picker; `dark` variant for the black header).
+
+**`icons.tsx`** — `Icon` + `IconName` (38 names, 24×24 stroke grid, `strokeWidth` prop). New icon =
 add path to `PATHS`, never inline Svg in a screen.
 
 **`graphics.tsx`** — `Contours` (frame|top|bottom|ambient — decorative, clipped, never touchable,
@@ -103,6 +123,10 @@ carry a `SimulatedTag`. Derived from the keystore pairing and store transport st
 | Back button on dark headers | `PageHeader dark` renders its own; a ghost `Button` is black-on-black → use `variant="primary"` + `ringColor={colors.white}` if a custom dark-surface button is unavoidable |
 | `Text` roles are RN-limited | only text/header/button/none/alert |
 | Status/risk pills take protocol types | `StatusPill status={session.status}` — don't stringify your own labels |
+| Approval buttons come only from the `PermissionRequest` record | `options` (labels verbatim) or legacy `supportedDecisions`, never transcript text (ADR-015 T3); a persistent option is never primary |
+| Nested markdown spans use RN `Text`, not the `Text` primitive | the primitive's default `body` variant would override the heading size it sits in |
+| A text block containing a link is not `selectable` | Android's selectable TextView swallows the nested link's `onPress` |
+| Unit tests run on Node's type stripping | test files import with `.ts` extensions and only `import type` from packages; they are excluded from the app tsconfig (no Node globals in a Hermes app) and typechecked by `tsconfig.test.json` |
 
 ## Routes (`app/`)
 
