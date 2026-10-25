@@ -10,12 +10,15 @@
 //! terminal UI), ffi (Windows console/memory).
 //! runtime_io: ADR-015 child process IO, env scrub, redaction, desktop
 //! opener and OAuth callback check.
+//! codex: ADR-015 step 7 Codex app-server adapter core (JSON-RPC client,
+//! notification decoder, approvals).
 
 pub mod adapters;
 pub mod backup;
 pub mod base64;
 pub mod claude;
 pub mod client;
+pub mod codex;
 pub mod companion;
 pub mod config;
 pub mod crypto;
