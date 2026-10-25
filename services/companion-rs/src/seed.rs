@@ -18,6 +18,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             address: "192.168.1.14".into(),
             status: "connected".into(),
             last_seen_at: now,
+            simulated: true,
         },
         Host {
             id: "h2".into(),
@@ -27,6 +28,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             address: "10.0.4.21".into(),
             status: "connected".into(),
             last_seen_at: now - 4_000,
+            simulated: true,
         },
         Host {
             id: "h3".into(),
@@ -36,6 +38,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             address: "192.168.1.90".into(),
             status: "offline".into(),
             last_seen_at: now - 42 * MIN,
+            simulated: true,
         },
     ];
 
@@ -53,6 +56,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
                 "Plan mode".into(),
             ],
             accepts_new_session: true,
+            simulated: true,
         },
         Agent {
             id: "a2".into(),
@@ -66,6 +70,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
                 "MCP tools".into(),
             ],
             accepts_new_session: true,
+            simulated: true,
         },
         Agent {
             id: "a3".into(),
@@ -79,6 +84,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
                 "Patch application".into(),
             ],
             accepts_new_session: false,
+            simulated: true,
         },
         Agent {
             id: "a4".into(),
@@ -92,6 +98,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
                 "Screenshots".into(),
             ],
             accepts_new_session: true,
+            simulated: true,
         },
         Agent {
             id: "a5".into(),
@@ -101,6 +108,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             state: "offline".into(),
             capabilities: vec!["Offline chat".into(), "File summary".into()],
             accepts_new_session: false,
+            simulated: true,
         },
     ];
 
@@ -492,5 +500,16 @@ mod tests {
             assert!(p.status == "pending");
             assert!(p.expires_at > p.requested_at);
         }
+    }
+
+    #[test]
+    fn seed_hosts_and_agents_are_simulated() {
+        // ADR-009: provenance travels with the data, so a real paired phone
+        // can tell demo entities from live ones
+        let s = create_seed_snapshot(0);
+        assert!(s.hosts.iter().all(|h| h.simulated));
+        assert!(s.agents.iter().all(|a| a.simulated));
+        let json = crate::json::stringify(&s.to_json());
+        assert_eq!(json.matches("\"simulated\":true").count(), 8);
     }
 }

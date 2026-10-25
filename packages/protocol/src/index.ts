@@ -112,6 +112,11 @@ export interface Host {
   address: string;
   status: HostStatus;
   lastSeenAt: number;
+  /**
+   * ADR-009 provenance: demo data from a mock seed/engine, never a live
+   * runtime. Present only when true (real adapters omit it).
+   */
+  simulated?: boolean;
 }
 
 export interface Agent {
@@ -124,6 +129,8 @@ export interface Agent {
   capabilities: string[];
   /** True when the agent accepts new prompts right now. */
   acceptsNewSession: boolean;
+  /** ADR-009 provenance, same rule as `Host.simulated`. */
+  simulated?: boolean;
 }
 
 export interface OutputLine {

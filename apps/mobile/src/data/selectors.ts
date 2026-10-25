@@ -34,6 +34,11 @@ export function decidedPermissions(s: Snapshot): PermissionRequest[] {
     .sort((a, b) => (b.decidedAt ?? b.requestedAt) - (a.decidedAt ?? a.requestedAt));
 }
 
+/** ADR-009: the companion is serving demo data (its mock adapter) somewhere in this snapshot. */
+export function hasSimulatedData(s: Snapshot): boolean {
+  return s.hosts.some((h) => h.simulated) || s.agents.some((a) => a.simulated);
+}
+
 export function hostById(s: Snapshot, id: string): Host | undefined {
   return s.hosts.find((h) => h.id === id);
 }

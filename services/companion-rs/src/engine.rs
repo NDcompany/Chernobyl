@@ -77,6 +77,12 @@ impl Engine {
         &self.state
     }
 
+    /// ADR-009: no enabled mock adapter → no demo data. Drops the seed so the
+    /// snapshot only ever carries what real adapters add.
+    pub fn drop_seed(&mut self) {
+        self.state = Snapshot::default();
+    }
+
     pub fn last_seq(&self) -> i64 {
         self.seq
     }

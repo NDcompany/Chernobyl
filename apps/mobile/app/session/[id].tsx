@@ -15,7 +15,7 @@ import { useCommands, commands } from '@/data/commands';
 import { activityFor, agentById, hostById, sessionById } from '@/data/selectors';
 import { relativeTime } from '@/utils/format';
 import { useReducedMotion, useNow } from '@/hooks/useReducedMotion';
-import { ProgressBar, StatusDot, StatusPill, Text } from '@/ui/primitives';
+import { ProgressBar, SimulatedTag, StatusDot, StatusPill, Text } from '@/ui/primitives';
 import { Screen, PageHeader, Card, EmptyState } from '@/ui/surface';
 import {
   ActivityRow,
@@ -130,6 +130,9 @@ export default function SessionScreen() {
       contentStyle={{ gap: spacing.xl }}
     >
       <StatusBar style="light" />
+
+      {/* ADR-009: a session on a demo agent/host never reads as live */}
+      {agent?.simulated || host?.simulated ? <SimulatedTag /> : null}
 
       {pendingPermission ? (
         <Card

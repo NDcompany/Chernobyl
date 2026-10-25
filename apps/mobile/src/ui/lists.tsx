@@ -20,6 +20,7 @@ import { colors, spacing, radii, typography } from '@/theme/tokens';
 import {
   Button,
   RiskPill,
+  SimulatedTag,
   StatusDot,
   StatusPill,
   Text,
@@ -55,6 +56,8 @@ export interface AgentCardProps {
 
 export function AgentCard({ agent, host, activeCount = 0, totalCount, onPress, variant = 'row' }: AgentCardProps) {
   const status = `${agentStatusLabel(agent.state)}`;
+  // ADR-009: demo entities never read as live
+  const simulated = Boolean(agent.simulated || host?.simulated);
   const countLabel =
     activeCount > 0 ? `${activeCount} active` : totalCount ? `${totalCount} total` : 'no sessions';
 
@@ -68,7 +71,10 @@ export function AgentCard({ agent, host, activeCount = 0, totalCount, onPress, v
           {host?.name ?? 'Unknown host'} · {countLabel}
         </Text>
       ) : null}
-      <StatusDot tone={agentTone(agent.state)} label={status} />
+      <View style={styles.markers}>
+        <StatusDot tone={agentTone(agent.state)} label={status} />
+        {simulated ? <SimulatedTag /> : null}
+      </View>
     </View>
   );
 
@@ -96,7 +102,7 @@ export function AgentCard({ agent, host, activeCount = 0, totalCount, onPress, v
       focusable
       accessible
       accessibilityRole="button"
-      accessibilityLabel={`${agent.name}, ${status}, ${countLabel}`}
+      accessibilityLabel={`${agent.name}, ${status}, ${countLabel}${simulated ? ', simulated' : ''}`}
       style={({ pressed }) => [
         variant === 'tile' ? styles.tileWrap : undefined,
         pressed && { opacity: 0.85, transform: [{ scale: 0.99 }] },
@@ -121,10 +127,11 @@ export interface SessionRowProps {
 
 export function SessionRow({ session, agent, host, onPress, style }: SessionRowProps) {
   const now = useNow(60_000);
+  const simulated = Boolean(agent?.simulated || host?.simulated);
   return (
     <Card
       onPress={onPress}
-      accessibilityLabel={`${session.title}, ${session.status}, ${agent?.name ?? ''}`}
+      accessibilityLabel={`${session.title}, ${session.status}, ${agent?.name ?? ''}${simulated ? ', simulated' : ''}`}
       style={[styles.sessionRow, style]}
     >
       <View style={{ flexDirection: 'row', gap: spacing.sm, alignItems: 'flex-start' }}>
@@ -135,6 +142,7 @@ export function SessionRow({ session, agent, host, onPress, style }: SessionRowP
           <Text variant="xs" color={colors.text2} numberOfLines={1}>
             {agent?.name ?? 'Agent'} · {host?.name ?? 'host'}
           </Text>
+          {simulated ? <SimulatedTag /> : null}
         </View>
         <StatusPill status={session.status} />
       </View>
@@ -202,12 +210,14 @@ export function PermissionCard({
   const nowMs = now ?? mountedAt;
   const countdownText =
     permission.status === 'pending' ? countdown(permission.expiresAt, nowMs) : '';
+  const simulated = Boolean(agent?.simulated || host?.simulated);
+  const simLabel = simulated ? ', simulated' : '';
 
   if (variant === 'compact') {
     return (
       <Card
         onPress={onPress}
-        accessibilityLabel={`${permission.title}: ${permission.command}, risk ${permission.risk}`}
+        accessibilityLabel={`${permission.title}: ${permission.command}, risk ${permission.risk}${simLabel}`}
         style={[styles.permCompact, resolved && { opacity: 0.6 }]}
       >
         <View style={{ flex: 1, gap: 3 }}>
@@ -220,6 +230,7 @@ export function PermissionCard({
           <Text variant="xs" color={colors.text3} numberOfLines={1}>
             {agent?.name ?? 'Agent'} · {host?.name ?? 'host'}
           </Text>
+          {simulated ? <SimulatedTag /> : null}
         </View>
         <View style={{ alignItems: 'flex-end', gap: 6 }}>
           <RiskPill risk={permission.risk} />
@@ -232,7 +243,7 @@ export function PermissionCard({
   return (
     <Card
       onPress={onPress}
-      accessibilityLabel={`${permission.title}: ${permission.command}`}
+      accessibilityLabel={`${permission.title}: ${permission.command}${simLabel}`}
       style={[styles.permFull, resolved && { opacity: 0.65 }]}
     >
       <View style={styles.permHead}>
@@ -245,6 +256,7 @@ export function PermissionCard({
             {agent?.name ?? 'Agent'} · {host?.name ?? 'host'}
             {session ? ` · ${session.title}` : ''}
           </Text>
+          {simulated ? <SimulatedTag /> : null}
         </View>
         <RiskPill risk={permission.risk} />
       </View>
@@ -556,6 +568,7 @@ export function SegmentedTabs({ tabs, active, onChange }: SegmentedTabsProps) {
 
 const styles = StyleSheet.create({
   tileWrap: { width: 158 },
+  markers: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: spacing.sm },
   tile: {
     width: 158,
     gap: 8,

@@ -25,6 +25,7 @@ export function createSeedSnapshot(now: number = Date.now()): Snapshot {
       address: '192.168.1.14',
       status: 'connected',
       lastSeenAt: now,
+      simulated: true,
     },
     {
       id: 'h2',
@@ -34,6 +35,7 @@ export function createSeedSnapshot(now: number = Date.now()): Snapshot {
       address: '10.0.4.21',
       status: 'connected',
       lastSeenAt: now - 4_000,
+      simulated: true,
     },
     {
       id: 'h3',
@@ -43,6 +45,7 @@ export function createSeedSnapshot(now: number = Date.now()): Snapshot {
       address: '192.168.1.90',
       status: 'offline',
       lastSeenAt: now - 42 * MIN,
+      simulated: true,
     },
   ];
 
@@ -55,6 +58,7 @@ export function createSeedSnapshot(now: number = Date.now()): Snapshot {
       state: 'online',
       capabilities: ['Read & edit files', 'Shell commands', 'Search codebase', 'Plan mode'],
       acceptsNewSession: true,
+      simulated: true,
     },
     {
       id: 'a2',
@@ -64,6 +68,7 @@ export function createSeedSnapshot(now: number = Date.now()): Snapshot {
       state: 'online',
       capabilities: ['Multi-file edits', 'Terminal tools', 'MCP tools'],
       acceptsNewSession: true,
+      simulated: true,
     },
     {
       id: 'a3',
@@ -73,6 +78,7 @@ export function createSeedSnapshot(now: number = Date.now()): Snapshot {
       state: 'busy',
       capabilities: ['Code review', 'Test generation', 'Patch application'],
       acceptsNewSession: false,
+      simulated: true,
     },
     {
       id: 'a4',
@@ -82,6 +88,7 @@ export function createSeedSnapshot(now: number = Date.now()): Snapshot {
       state: 'idle',
       capabilities: ['Navigation', 'Form filling', 'Screenshots'],
       acceptsNewSession: true,
+      simulated: true,
     },
     {
       id: 'a5',
@@ -91,6 +98,7 @@ export function createSeedSnapshot(now: number = Date.now()): Snapshot {
       state: 'offline',
       capabilities: ['Offline chat', 'File summary'],
       acceptsNewSession: false,
+      simulated: true,
     },
   ];
 

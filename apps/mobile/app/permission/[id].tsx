@@ -15,7 +15,7 @@ import { useCommands, commands } from '@/data/commands';
 import { agentById, hostById, permissionById, sessionById } from '@/data/selectors';
 import { useNow } from '@/hooks/useReducedMotion';
 import { countdown, relativeTime } from '@/utils/format';
-import { Button, RiskPill, StatusDot, Text } from '@/ui/primitives';
+import { Button, RiskPill, SimulatedTag, StatusDot, Text } from '@/ui/primitives';
 import { Screen, PageHeader, Card, ConfirmModal, EmptyState } from '@/ui/surface';
 import { MonoBlock } from '@/ui/lists';
 import { AgentIcon } from '@/ui/graphics';
@@ -103,6 +103,7 @@ export default function PermissionScreen() {
             {agent?.name ?? 'Agent'} · {host?.name ?? 'host'}
             {session ? ` · ${session.title}` : ''}
           </Text>
+          {agent?.simulated || host?.simulated ? <SimulatedTag /> : null}
         </View>
         <RiskPill risk={permission.risk} />
       </Card>

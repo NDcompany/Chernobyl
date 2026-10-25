@@ -23,7 +23,7 @@ import {
   transportTone,
 } from '@/utils/format';
 import { useNow } from '@/hooks/useReducedMotion';
-import { Button, StatusDot, Text } from '@/ui/primitives';
+import { Button, SimulatedTag, StatusDot, Text } from '@/ui/primitives';
 import { Screen, PageHeader, Card, ConfirmModal, EmptyState } from '@/ui/surface';
 import { DetailRow } from '@/ui/lists';
 import { Icon } from '@/ui/icons';
@@ -205,13 +205,8 @@ export default function SettingsSectionScreen() {
                   <View style={{ flex: 1, gap: 2 }}>
                     <View style={styles.badgeRow}>
                       <Text variant="bodyStrong">{h.name}</Text>
-                      {isMock ? (
-                        <View style={styles.simBadge}>
-                          <Text variant="xs" color={colors.text2} style={{ fontWeight: '600' }}>
-                            Simulation
-                          </Text>
-                        </View>
-                      ) : null}
+                      {/* ADR-009: mock transport, or demo data served by a real companion */}
+                      {isMock || h.simulated ? <SimulatedTag /> : null}
                     </View>
                     <Text variant="mono" color={colors.text3} numberOfLines={1}>
                       {h.address}
@@ -229,7 +224,11 @@ export default function SettingsSectionScreen() {
         <Button label="Connect a host" icon="plus" variant="secondary" onPress={() => router.push('/connect-host')} />
         <Text variant="xs" color={colors.text3} center>
           {pairedCredential
-            ? 'Paired with a real desktop companion via E2E encrypted WebSocket.'
+            ? `Paired with a real desktop companion via E2E encrypted WebSocket.${
+                snapshot.hosts.some((h) => h.simulated)
+                  ? ' Hosts marked Simulated come from its demo adapter.'
+                  : ''
+              }`
             : 'Prototype: hosts are simulated locally and no WebSocket handshake is performed.'}
         </Text>
       </>
@@ -501,14 +500,6 @@ const styles = StyleSheet.create({
   badgeRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   realBadge: {
     backgroundColor: colors.black,
-    borderRadius: radii.pill,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 2,
-  },
-  simBadge: {
-    backgroundColor: colors.surface2,
-    borderWidth: 1,
-    borderColor: colors.border,
     borderRadius: radii.pill,
     paddingHorizontal: spacing.sm,
     paddingVertical: 2,

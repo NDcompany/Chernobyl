@@ -140,6 +140,13 @@ impl Companion {
             .find(|e| e.enabled && e.kind == "claude")
             .map(|e| e.id.clone());
 
+        // ADR-009: the demo seed exists only while a mock adapter is enabled
+        // (`"enabled": false` in companion.json turns the demo data off).
+        let demo_seed = config
+            .adapters
+            .iter()
+            .any(|e| e.enabled && e.kind == "mock");
+
         let shared = Arc::new(Shared {
             storage: Mutex::new(storage),
             clients: Mutex::new(Vec::new()),
@@ -163,7 +170,7 @@ impl Companion {
         let emit_shared = shared.clone();
         let events_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let events_counter = events_total.clone();
-        let engine = Engine::new(
+        let mut engine = Engine::new(
             start_seq,
             Box::new(move |msg: ServerMsg| {
                 let text = msg.to_text();
@@ -209,6 +216,9 @@ impl Companion {
                 });
             }),
         );
+        if !demo_seed {
+            engine.drop_seed();
+        }
 
         let companion = Companion {
             shared,
@@ -1271,6 +1281,21 @@ mod tests {
             other => panic!("expected stored permission ack, got {other:?}"),
         }
         comp2.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    #[test]
+    fn disabled_mock_adapter_serves_no_demo_data() {
+        // INSTALL.md promise: `"enabled": false` on the mock entry removes the
+        // demo seed itself, not just the adapter's status row
+        let mut c = temp_config("no-mock");
+        c.adapters[0].enabled = false;
+        let comp = Companion::boot(c.clone()).unwrap();
+        let snap = comp.snapshot();
+        assert!(snap.hosts.is_empty() && snap.agents.is_empty());
+        assert!(snap.sessions.is_empty() && snap.permissions.is_empty());
+        assert!(snap.activity.is_empty());
+        comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 

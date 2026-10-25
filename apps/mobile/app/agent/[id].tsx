@@ -18,7 +18,7 @@ import {
 } from '@/data/selectors';
 import { agentKindLabel, agentStatusLabel, agentTone, relativeTime } from '@/utils/format';
 import { useNow } from '@/hooks/useReducedMotion';
-import { Button, Chip, StatusDot, Text } from '@/ui/primitives';
+import { Button, Chip, SimulatedTag, StatusDot, Text } from '@/ui/primitives';
 import { Screen, Card, EmptyState, PageHeader } from '@/ui/surface';
 import { ActivityRow, DetailRow, SessionRow } from '@/ui/lists';
 import { AgentIcon, BlackShape } from '@/ui/graphics';
@@ -67,6 +67,7 @@ export default function AgentDetailScreen() {
               <Text variant="xs" color="rgba(255,255,255,0.72)" numberOfLines={1}>
                 {agentKindLabel(agent.kind)} · {host?.name ?? 'unknown host'}
               </Text>
+              {agent.simulated || host?.simulated ? <SimulatedTag /> : null}
             </View>
           </View>
         </View>

@@ -144,6 +144,8 @@ export default function ConnectHostScreen() {
       address: data.address,
       status: 'connecting',
       lastSeenAt: Date.now(),
+      // ADR-009: added by the simulated handshake below, never a live host
+      simulated: true,
     };
     if (data.token) void saveHostToken(data.token);
     applyMessage(localEvent({ type: 'host_updated', host }));

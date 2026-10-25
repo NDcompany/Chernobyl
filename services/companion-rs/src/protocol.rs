@@ -39,11 +39,14 @@ pub struct Host {
     pub address: String,
     pub status: String, // connected | connecting | offline
     pub last_seen_at: i64,
+    /// ADR-009 provenance: demo data from the mock seed/engine. Serialized
+    /// only when true, so real-adapter output stays byte-identical.
+    pub simulated: bool,
 }
 
 impl Host {
     pub fn to_json(&self) -> Json {
-        json::obj(vec![
+        let mut fields = vec![
             ("id", json::s(&self.id)),
             ("name", json::s(&self.name)),
             ("kind", json::s(&self.kind)),
@@ -51,7 +54,11 @@ impl Host {
             ("address", json::s(&self.address)),
             ("status", json::s(&self.status)),
             ("lastSeenAt", Json::Int(self.last_seen_at)),
-        ])
+        ];
+        if self.simulated {
+            fields.push(("simulated", Json::Bool(true)));
+        }
+        json::obj(fields)
     }
 }
 
@@ -64,11 +71,13 @@ pub struct Agent {
     pub state: String, // online | busy | idle | offline
     pub capabilities: Vec<String>,
     pub accepts_new_session: bool,
+    /// ADR-009 provenance, same rule as `Host::simulated`.
+    pub simulated: bool,
 }
 
 impl Agent {
     pub fn to_json(&self) -> Json {
-        json::obj(vec![
+        let mut fields = vec![
             ("id", json::s(&self.id)),
             ("hostId", json::s(&self.host_id)),
             ("kind", json::s(&self.kind)),
@@ -79,7 +88,11 @@ impl Agent {
                 Json::Arr(self.capabilities.iter().map(|c| json::s(c)).collect()),
             ),
             ("acceptsNewSession", Json::Bool(self.accepts_new_session)),
-        ])
+        ];
+        if self.simulated {
+            fields.push(("simulated", Json::Bool(true)));
+        }
+        json::obj(fields)
     }
 }
 
@@ -1030,10 +1043,42 @@ mod tests {
             address: "127.0.0.1".into(),
             status: "connected".into(),
             last_seen_at: 42,
+            simulated: false,
         };
         let text = json::stringify(&h.to_json());
         let v = json::parse(&text).unwrap();
         assert_eq!(json::get(&v, "lastSeenAt").unwrap(), &Json::Int(42));
+    }
+
+    #[test]
+    fn simulated_key_is_serialized_only_when_true() {
+        // real-adapter entities (simulated: false) keep today's exact bytes
+        let mut h = Host {
+            id: "h1".into(),
+            name: "n".into(),
+            kind: "local".into(),
+            platform: "win".into(),
+            address: "127.0.0.1".into(),
+            status: "connected".into(),
+            last_seen_at: 42,
+            simulated: false,
+        };
+        let mut a = Agent {
+            id: "build".into(),
+            host_id: "oc-1".into(),
+            kind: "opencode".into(),
+            name: "build".into(),
+            state: "online".into(),
+            capabilities: vec![],
+            accepts_new_session: true,
+            simulated: false,
+        };
+        assert!(!json::stringify(&h.to_json()).contains("simulated"));
+        assert!(!json::stringify(&a.to_json()).contains("simulated"));
+        h.simulated = true;
+        a.simulated = true;
+        assert!(json::stringify(&h.to_json()).ends_with(",\"simulated\":true}"));
+        assert!(json::stringify(&a.to_json()).ends_with(",\"simulated\":true}"));
     }
 
     #[test]

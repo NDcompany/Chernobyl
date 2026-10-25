@@ -273,6 +273,15 @@ export function RiskPill({ risk }: { risk: Risk }) {
   );
 }
 
+/** ADR-009 provenance marker: the entity is demo data (`simulated` on the wire), not a live runtime. */
+export function SimulatedTag() {
+  return (
+    <View style={[styles.pill, styles.simTag]} accessible accessibilityLabel="Simulated: demo data, not a real agent">
+      <RNText style={[typography.xs, { color: colors.text2, fontWeight: '700' }]}>Simulated</RNText>
+    </View>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* Progress                                                            */
 /* ------------------------------------------------------------------ */
@@ -573,6 +582,11 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     borderRadius: radii.pill,
     alignSelf: 'flex-start',
+  },
+  simTag: {
+    backgroundColor: colors.surface2,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
   },
 
   track: {

@@ -606,6 +606,7 @@ impl Inner {
             state: if healthy { "online" } else { "offline" }.to_string(),
             capabilities: caps,
             accepts_new_session: mode == "primary" && healthy,
+            simulated: false,
         })
     }
 
@@ -1769,6 +1770,10 @@ pub(crate) mod tests {
         let explore = agents.iter().find(|a| a.name == "explore").unwrap();
         assert!(!explore.accepts_new_session);
         assert_eq!(explore.capabilities, vec!["subagent".to_string()]);
+        // ADR-009: a real runtime's agents never carry the demo marker
+        for a in &agents {
+            assert!(!json::stringify(&a.to_json()).contains("simulated"));
+        }
     }
 
     #[test]

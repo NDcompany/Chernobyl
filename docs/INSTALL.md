@@ -54,6 +54,8 @@ on any mismatch or missing file. Do this **before** you run an unsigned binary.
 .\chernobyl-companion.exe --background    # windowless (used by autostart)
 ```
 
+The default `companion.json` (in `%APPDATA%\CHERNOBYL`, or `CHERNOBYL_HOME`) enables a demo `mock` adapter whose hosts, agents, sessions and approvals the app marks **Simulated**; set `"enabled": false` on that adapter entry to boot without any demo data.
+
 Start-on-login (user-level, no elevation):
 
 ```powershell

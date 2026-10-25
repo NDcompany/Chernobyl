@@ -28,7 +28,8 @@ number, radius, or font size — import from `@/theme/tokens`. Borders are hairl
 **`primitives.tsx`** — `Text` (variant/color/center/accessibilityRole ∈ text|header|button|none|alert),
 `Button` (variant primary|secondary|ghost, size md|sm, loading, icon, fullWidth, `ringColor` focus
 ring), `Chip` (active/count filter), `StatusDot` (tone), `StatusPill` (protocol `SessionStatus` →
-label/colors), `RiskPill` (low|medium|high), `ProgressBar`, `StatCard`, `SearchField`, `SectionTitle`,
+label/colors), `RiskPill` (low|medium|high), `SimulatedTag` (grey "Simulated" provenance pill, ADR-009),
+`ProgressBar`, `StatCard`, `SearchField`, `SectionTitle`,
 `TextField` (RHF-backed — takes `form` + `name`, renders label/error/hint itself).
 
 **`surface.tsx`** — `Screen` (layout shell: safe-area + scroll + `header`/`footer` slots +
@@ -73,6 +74,12 @@ transport (commandId dedupe). **ADR-009: mock mode is permanent** — mock-host 
 PromptComposer caption) and the simulation badge must stay honest; never render mock data as live,
 never remove an offline/stale state to make a screen look alive.
 
+**Provenance travels with the data:** `Host`/`Agent` carry `simulated: true` when they come from a
+mock seed/engine (the app's offline mock or a companion's demo `mock` adapter); real adapters omit the
+key. `SimulationBadge` shows while the transport is the app's mock OR the snapshot has any simulated
+host/agent (`hasSimulatedData`). Host/agent rows and cards, and sessions/approvals whose agent or
+host is simulated, carry a `SimulatedTag` (and ", simulated" in their accessibility label).
+
 **Mandate section 9 (visible uncertainty about command outcomes):** a command whose ack timed out
 or whose connection dropped after send has an UNKNOWN outcome (the host may have executed it). The
 UI shows it as "outcome unknown, will reconcile on reconnect" (not failed, not done), and resolves
@@ -82,8 +89,8 @@ commandId automatically.
 
 **Phase 6 endpoint-list host records (conflict C14):** in Settings > Connected hosts, a real stored
 pairing is displayed as a real record (host id, device id, ordered endpoint list with primary first,
-and live transport status) labelled Real, visually distinct from mock hosts, which stay labelled
-Simulation. Derived from the keystore pairing and store transport status without new storage.
+and live transport status) labelled Real, visually distinct from mock or `simulated` hosts, which
+carry a `SimulatedTag`. Derived from the keystore pairing and store transport status without new storage.
 
 ## Gotchas (each cost real debugging)
 

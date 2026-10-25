@@ -53,6 +53,13 @@ export default function DashboardScreen() {
   const waiting = snapshot.sessions.filter((s) => s.status === 'waiting');
   const connectedHosts = snapshot.hosts.filter((h) => h.status === 'connected');
   const offlineHosts = snapshot.hosts.length - connectedHosts.length;
+  const offlineCaption = offlineHosts > 0 ? `${offlineHosts} offline` : 'all online';
+  // ADR-009: a hosts summary built from demo data says so
+  const simulatedHosts = snapshot.hosts.filter((h) => h.simulated).length;
+  const hostsCaption =
+    simulatedHosts === 0
+      ? offlineCaption
+      : `${simulatedHosts === snapshot.hosts.length ? 'Simulated' : `${simulatedHosts} simulated`} · ${offlineCaption}`;
 
   const searching = query.trim().length > 0;
   const foundAgents = searching ? searchAgents(snapshot, query) : [];
@@ -158,7 +165,7 @@ export default function DashboardScreen() {
                 style={styles.statCell}
                 label="Connected hosts"
                 value={String(c.hosts)}
-                caption={offlineHosts > 0 ? `${offlineHosts} offline` : 'all online'}
+                caption={hostsCaption}
                 onPress={() => router.push('/settings/hosts')}
               />
               <StatCard

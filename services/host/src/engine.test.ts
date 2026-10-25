@@ -337,3 +337,31 @@ test('boundary validation rejects stale-shaped v2 messages', () => {
     null,
   );
 });
+
+test('ADR-009: mock seed/engine hosts and agents carry simulated provenance', () => {
+  const { engine, events } = makeEngine();
+  const snap = engine.snapshot();
+  assert.ok(snap.hosts.length > 0 && snap.hosts.every((h) => h.simulated === true));
+  assert.ok(snap.agents.length > 0 && snap.agents.every((a) => a.simulated === true));
+  // byte parity with seed.rs: the key is serialized last
+  assert.ok(JSON.stringify(snap.hosts[0]).endsWith(',"simulated":true}'));
+  assert.ok(JSON.stringify(snap.agents[0]).endsWith(',"simulated":true}'));
+
+  // engine-emitted agent updates keep the marker on the wire
+  engine.handle({ type: 'create_session', commandId: 'sim-1', agentId: 'a4', title: 'Sim', prompt: 'p' });
+  const update = events.find((m) => m.type === 'agent_updated');
+  assert.ok(update?.type === 'agent_updated' && update.agent.simulated === true);
+  engine.dispose();
+});
+
+test('ADR-009: the boundary validator accepts simulated and real (unmarked) entities', () => {
+  const env = '"seq":1,"eventId":"e","occurredAt":1';
+  const sim = parseServerMessage(
+    `{"type":"host_updated","host":{"id":"h1","name":"n","kind":"local","platform":"p","address":"a","status":"connected","lastSeenAt":1,"simulated":true},${env}}`,
+  );
+  assert.ok(sim?.type === 'host_updated' && sim.host.simulated === true);
+  const real = parseServerMessage(
+    `{"type":"agent_updated","agent":{"id":"build","hostId":"oc-1","kind":"opencode","name":"build","state":"online","capabilities":[],"acceptsNewSession":true},${env}}`,
+  );
+  assert.ok(real?.type === 'agent_updated' && !('simulated' in real.agent));
+});

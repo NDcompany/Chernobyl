@@ -13,7 +13,7 @@ import { useSnapshot } from '@/data/state';
 import { useCommands, commands } from '@/data/commands';
 import { agentKindLabel } from '@/utils/format';
 import { zodHandler } from '@/forms/zodBridge';
-import { Button, Chip, StatusDot, Text, TextField } from '@/ui/primitives';
+import { Button, Chip, SimulatedTag, StatusDot, Text, TextField } from '@/ui/primitives';
 import { Screen, PageHeader, Card, EmptyState } from '@/ui/surface';
 import { AgentIcon } from '@/ui/graphics';
 
@@ -131,6 +131,7 @@ export default function NewTaskScreen() {
                     <Text variant="xs" color={colors.text2} numberOfLines={1}>
                       {agent.capabilities.slice(0, 3).join(' · ') || agentKindLabel(agent.kind)}
                     </Text>
+                    {agent.simulated ? <SimulatedTag /> : null}
                   </View>
                 </>
               );

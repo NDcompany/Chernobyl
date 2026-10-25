@@ -15,6 +15,7 @@
 
 use crate::client::WsClient;
 use crate::json::{self, Json};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -125,6 +126,8 @@ pub struct SessRow {
     pub id: String,
     pub title: String,
     pub status: String,
+    /// ADR-009: belongs to a simulated agent/host (rendered with `[sim]`).
+    pub sim: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +137,7 @@ pub struct PermRow {
     pub title: String,
     pub command: String,
     pub risk: String,
+    pub sim: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -158,6 +162,9 @@ pub struct TuiState {
     /// When set, the screen renders the pairing overlay (payload + QR) instead
     /// of the dashboard; `p`/Esc closes it.
     pub pairing: Option<String>,
+    /// Ids the last snapshot marked `simulated` (ADR-009 provenance).
+    pub sim_agents: HashSet<String>,
+    pub sim_hosts: HashSet<String>,
 }
 
 impl TuiState {
@@ -205,9 +212,29 @@ impl TuiState {
         self.approvals.get(self.selected)
     }
 
+    /// True when a session/permission belongs to an agent or host the last
+    /// snapshot marked `simulated` (demo data, not a live runtime).
+    fn is_sim(&self, v: &Json) -> bool {
+        json::get_str(v, "agentId").is_some_and(|id| self.sim_agents.contains(id))
+            || json::get_str(v, "hostId").is_some_and(|id| self.sim_hosts.contains(id))
+    }
+
     /// Rebuilds the model from a full `state`/`hello_ack` snapshot. Only
     /// `pending` permissions become actionable rows.
     pub fn apply_snapshot(&mut self, snap: &Json) {
+        let simulated_ids = |key: &str| -> HashSet<String> {
+            json::get(snap, key)
+                .and_then(json::as_arr)
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|e| json::get_bool(e, "simulated") == Some(true))
+                        .filter_map(|e| json::get_str(e, "id").map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        self.sim_hosts = simulated_ids("hosts");
+        self.sim_agents = simulated_ids("agents");
         self.sessions = json::get(snap, "sessions")
             .and_then(json::as_arr)
             .map(|arr| {
@@ -217,6 +244,7 @@ impl TuiState {
                             id: json::get_str(s, "id")?.to_string(),
                             title: json::get_str(s, "title").unwrap_or("").to_string(),
                             status: json::get_str(s, "status").unwrap_or("").to_string(),
+                            sim: self.is_sim(s),
                         })
                     })
                     .collect()
@@ -227,7 +255,7 @@ impl TuiState {
             .map(|arr| {
                 arr.iter()
                     .filter(|p| json::get_str(p, "status") == Some("pending"))
-                    .filter_map(perm_from_json)
+                    .filter_map(|p| perm_from_json(p, self.is_sim(p)))
                     .collect()
             })
             .unwrap_or_default();
@@ -241,14 +269,17 @@ impl TuiState {
         };
         let title = json::get_str(s, "title").unwrap_or("");
         let status = json::get_str(s, "status").unwrap_or("");
+        let sim = self.is_sim(s);
         if let Some(row) = self.sessions.iter_mut().find(|r| r.id == id) {
             row.title = title.to_string();
             row.status = status.to_string();
+            row.sim = sim;
         } else {
             self.sessions.push(SessRow {
                 id: id.to_string(),
                 title: title.to_string(),
                 status: status.to_string(),
+                sim,
             });
         }
     }
@@ -262,7 +293,9 @@ impl TuiState {
 
     /// Upserts a `permission_requested`; a non-pending permission is dropped.
     pub fn upsert_permission(&mut self, p: &Json) {
-        let Some(row) = perm_from_json(p) else { return };
+        let Some(row) = perm_from_json(p, self.is_sim(p)) else {
+            return;
+        };
         if json::get_str(p, "status") != Some("pending") {
             self.remove_permission(&row.id);
             return;
@@ -282,14 +315,20 @@ impl TuiState {
     }
 }
 
-fn perm_from_json(p: &Json) -> Option<PermRow> {
+fn perm_from_json(p: &Json, sim: bool) -> Option<PermRow> {
     Some(PermRow {
         id: json::get_str(p, "id")?.to_string(),
         revision: json::get_i64(p, "revision").unwrap_or(1),
         title: json::get_str(p, "title").unwrap_or("").to_string(),
         command: json::get_str(p, "command").unwrap_or("").to_string(),
         risk: json::get_str(p, "risk").unwrap_or("").to_string(),
+        sim,
     })
+}
+
+/// ADR-009: demo rows never read as live work.
+fn sim_tag(sim: bool) -> &'static str {
+    if sim { "[sim] " } else { "" }
 }
 
 /* ------------------------------------------------------------------ */
@@ -346,7 +385,8 @@ pub fn render(state: &TuiState) -> String {
     }
     for s in &state.sessions {
         out.push_str(&format!(
-            "  \u{2022} {} [\x1b[0m{}{}{}\x1b[0m]\r\n",
+            "  \u{2022} {}{} [\x1b[0m{}{}{}\x1b[0m]\r\n",
+            sim_tag(s.sim),
             s.title,
             status_ansi(&s.status),
             s.status,
@@ -364,11 +404,12 @@ pub fn render(state: &TuiState) -> String {
         let selected = i == state.selected;
         let marker = if selected { "\x1b[7m>" } else { " " };
         let line = format!(
-            "{} [{}{}{}] {}  $ {}",
+            "{} [{}{}{}] {}{}  $ {}",
             marker,
             risk_ansi(&a.risk),
             a.risk,
             "\x1b[0m",
+            sim_tag(a.sim),
             a.title,
             a.command
         );
@@ -882,6 +923,46 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn render_marks_sessions_and_approvals_from_simulated_sources() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(
+            &json::parse(
+                r#"{
+                  "hosts": [{"id":"h1","simulated":true},{"id":"oc-1"}],
+                  "agents": [
+                    {"id":"a1","hostId":"h1","simulated":true},
+                    {"id":"build","hostId":"oc-1"}
+                  ],
+                  "sessions": [
+                    {"id":"s1","agentId":"a1","hostId":"h1","title":"Demo work","status":"running"},
+                    {"id":"ses_1","agentId":"build","hostId":"oc-1","title":"Real work","status":"running"}
+                  ],
+                  "permissions": [
+                    {"id":"p1","agentId":"a1","hostId":"h1","revision":1,"title":"Demo ask","command":"npm i","risk":"low","status":"pending"},
+                    {"id":"p2","agentId":"build","hostId":"oc-1","revision":1,"title":"Real ask","command":"ls","risk":"low","status":"pending"}
+                  ]
+                }"#,
+            )
+            .unwrap(),
+        );
+        let frame = render(&s);
+        assert!(frame.contains("[sim] Demo work"));
+        assert!(frame.contains("[sim] Demo ask"));
+        // real-runtime rows stay unmarked
+        assert!(frame.contains("\u{2022} Real work"));
+        assert!(frame.contains("] Real ask"));
+        assert_eq!(frame.matches("[sim]").count(), 2);
+        // a live event for a simulated agent keeps the marker
+        s.upsert_session(
+            &json::parse(
+                r#"{"id":"s9","agentId":"a1","hostId":"h1","title":"New demo","status":"running"}"#,
+            )
+            .unwrap(),
+        );
+        assert!(render(&s).contains("[sim] New demo"));
     }
 
     #[test]

@@ -21,6 +21,8 @@ import { Contours, type ContourVariant } from '@/ui/graphics';
 import { Icon, type IconName } from '@/ui/icons';
 import { useAppStore } from '@/store/appStore';
 import { transportKind } from '@/data/transport';
+import { useSnapshot } from '@/data/state';
+import { hasSimulatedData } from '@/data/selectors';
 
 /* ------------------------------------------------------------------ */
 /* Screen                                                              */
@@ -369,11 +371,12 @@ export function ConfirmModal({
 /* Simulation badge (ADR-009)                                          */
 /*                                                                     */
 /* Persistent, visible "Simulation" indication wherever state or       */
-/* approvals are shown. Hidden on onboarding (the demo is the point)   */
-/* and when a real companion transport is active. Uses a render-time   */
-/* read of the active transport (set once at boot, before any screen   */
-/* renders) — not a reactive subscription — so it stays a leaf with no */
-/* re-render coupling.                                                 */
+/* approvals are shown. Hidden on onboarding (the demo is the point).  */
+/* Shown while the app's own mock transport is active OR while the     */
+/* snapshot carries any `simulated` host/agent — a real companion      */
+/* serving its demo adapter is still a simulation (provenance travels  */
+/* with the data). The transport is a render-time read (set at boot);  */
+/* the snapshot subscription keeps the provenance check current.       */
 /* ------------------------------------------------------------------ */
 
 const SIMULATION_PATHS = new Set([
@@ -386,12 +389,13 @@ const SIMULATION_PATHS = new Set([
 export function SimulationBadge() {
   const segments = useSegments();
   // Re-render when the transport lifecycle changes: pairing swaps mock →
-  // live mid-session, and the badge must never show "Simulation" over a
-  // real connection (ADR-009).
+  // live mid-session. Over a real connection the badge shows only while the
+  // data itself is marked simulated (ADR-009).
   useAppStore((s) => s.connection);
+  const simulatedData = hasSimulatedData(useSnapshot());
   const top = segments[segments.length - 1];
   if (typeof top === 'string' && SIMULATION_PATHS.has(top)) return null;
-  if (transportKind() !== 'mock') return null;
+  if (transportKind() !== 'mock' && !simulatedData) return null;
   return (
     <View
       pointerEvents="none"
