@@ -328,6 +328,9 @@ fn read_err(e: impl std::fmt::Display, raw: &[u8], started: std::time::Instant) 
 /// delivers a full `200 true` abort answer and keeps the socket open.
 fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, String> {
     const MAX_HEAD: usize = 64 * 1024;
+    // every body is read into memory: bound it whatever the framing says
+    // (adapters reject far smaller bodies; this keeps the read itself bounded)
+    const MAX_BODY: usize = 16 * 1024 * 1024;
     let started = std::time::Instant::now();
     let mut raw: Vec<u8> = Vec::with_capacity(4096);
     let mut buf = [0u8; 8192];
@@ -374,6 +377,10 @@ fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, Stri
         raw.truncate(head_end);
         return Ok(raw);
     }
+    let too_big = |raw: &[u8]| raw.len() - head_end > MAX_BODY;
+    if content_length.is_some_and(|len| len > MAX_BODY) {
+        return Err(format!("response body exceeds {MAX_BODY} bytes"));
+    }
     if chunked {
         // shortcut: a 0-chunk followed by trailer headers (RFC-legal, never
         // seen on loopback) is not detected and falls back to read-to-close
@@ -391,6 +398,9 @@ fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, Stri
                 }
                 Ok(n) => raw.extend_from_slice(&buf[..n]),
                 Err(e) => return Err(read_err(e, &raw, started)),
+            }
+            if too_big(&raw) {
+                return Err(format!("response body exceeds {MAX_BODY} bytes"));
             }
         }
     }
@@ -414,6 +424,9 @@ fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, Stri
                 Ok(n) => raw.extend_from_slice(&buf[..n]),
                 Err(e) => return Err(read_err(e, &raw, started)),
             }
+            if too_big(&raw) {
+                return Err(format!("response body exceeds {MAX_BODY} bytes"));
+            }
         }
     }
     // HTTP/1.0-style: body delimited by close
@@ -422,6 +435,9 @@ fn read_http_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, Stri
             Ok(0) => return Ok(raw),
             Ok(n) => raw.extend_from_slice(&buf[..n]),
             Err(e) => return Err(read_err(e, &raw, started)),
+        }
+        if too_big(&raw) {
+            return Err(format!("response body exceeds {MAX_BODY} bytes"));
         }
     }
 }
@@ -525,6 +541,28 @@ mod http_tests {
             }
         });
         format!("http://{addr}/probe")
+    }
+
+    #[test]
+    fn oversized_bodies_are_refused_not_buffered() {
+        // declared too large: refused before reading the body
+        let url = serve_once_without_fin(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n");
+        let e = http_request("GET", &url, None, None).unwrap_err();
+        assert!(e.contains("exceeds"), "{e}");
+
+        // read-to-close body that never ends: cut at the cap
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+            let chunk = vec![b'x'; 64 * 1024];
+            while s.write_all(&chunk).is_ok() {}
+        });
+        let e = http_request("GET", &format!("http://{addr}/x"), None, None).unwrap_err();
+        assert!(e.contains("exceeds"), "{e}");
     }
 
     #[test]
