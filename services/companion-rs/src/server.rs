@@ -211,7 +211,8 @@ pub fn start(
 ) -> Result<ServerHandle, String> {
     // Remote posture (D2/D6): binding beyond loopback hardens the server —
     // same predicate as main.rs's "non-loopback requires a token" check.
-    let remote_posture = bind != "127.0.0.1" && bind != "localhost";
+    let remote_posture =
+        (bind != "127.0.0.1" && bind != "localhost") || companion.shared.config.server_require_e2e;
     start_with_posture(
         bind,
         port,
@@ -525,6 +526,9 @@ fn handle_conn(
                 "/hooks/claude" => {
                     return hook_ingress(&mut reader, &mut writer, &handshake, &companion);
                 }
+                "/pairing/offer" => {
+                    return pairing_offer_ingress(&mut reader, &mut writer, &handshake, &companion);
+                }
                 "/devices/revoke" => {
                     return revoke_ingress(&mut reader, &mut writer, &handshake, &companion);
                 }
@@ -773,6 +777,81 @@ fn revoke_ingress(
         }
         Ok(crate::companion::RevokeResult::Revoked { terminated }) => {
             let resp_body = format!("{{\"revoked\":true,\"terminated\":{terminated}}}");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            writer.write_all(resp.as_bytes())?;
+        }
+        Err(_) => {
+            let _ = ws::write_http_error(writer, 500, "Internal Server Error", "");
+        }
+    }
+    Ok(())
+}
+
+/// In-process pairing offer ingress: reachable ONLY on the loopback diagnostics
+/// listener. Rejects requests with an Origin header (403), requires a valid JSON body with
+/// optional `{"endpoints":["ws://..."]}`, creates the pairing offer in the companion's
+/// own store, and returns HTTP 200 with the pairing payload JSON string the phone parses.
+fn pairing_offer_ingress(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    h: &Handshake,
+    companion: &Companion,
+) -> io::Result<()> {
+    if h.header("origin").is_some() {
+        drain_body(reader, h);
+        let _ = ws::write_http_error(writer, 403, "Forbidden", "");
+        return Ok(());
+    }
+    let clen = h
+        .header("content-length")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n <= ws::MAX_HOOK_BODY_BYTES);
+    let Some(clen) = clen else {
+        drain_body(reader, h);
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    };
+    let mut body = vec![0u8; clen];
+    if reader.read_exact(&mut body).is_err() {
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    }
+    let Ok(payload) = String::from_utf8(body) else {
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    };
+    let Ok(json_val) = json::parse(&payload) else {
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    };
+    let json::Json::Obj(_) = json_val else {
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    };
+    let endpoints = match json::get(&json_val, "endpoints") {
+        Some(json::Json::Arr(arr)) => {
+            let mut eps = Vec::new();
+            for item in arr {
+                if let Some(s) = json::as_str(item) {
+                    eps.push(s.to_string());
+                } else {
+                    let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+                    return Ok(());
+                }
+            }
+            eps
+        }
+        None => Vec::new(),
+        _ => {
+            let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+            return Ok(());
+        }
+    };
+    match companion.create_pairing_offer(&endpoints) {
+        Ok(resp_body) => {
             let resp = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{resp_body}",
                 resp_body.len()
@@ -2658,6 +2737,181 @@ mod e2e_tests {
         assert_eq!(resp_400c.status, 400, "got: {resp_400c:?}");
 
         shutdown(f);
+    }
+
+    #[test]
+    fn pairing_offer_route_creates_offer_redeemable_by_running_server() {
+        let dir = temp_dir("pairing-route-redeem");
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        let diag_url = format!("http://127.0.0.1:{}/pairing/offer", handle.diagnostics_port);
+        let ep = format!("ws://127.0.0.1:{}", handle.port);
+        let req_body = format!(r#"{{"endpoints":["{ep}"]}}"#);
+
+        // 1. POST /pairing/offer creates the offer in the companion's store and returns 200
+        let resp = http_request("POST", &diag_url, None, Some(&req_body)).unwrap();
+        assert_eq!(resp.status, 200, "expected 200, got: {resp:?}");
+
+        // 2. Parse the payload JSON string
+        let payload = json::parse(&resp.body).expect("payload must be valid JSON");
+        let dev = json::get_str(&payload, "dev").expect("dev must be present");
+        let psk_b64 = json::get_str(&payload, "psk").expect("psk must be present");
+        let psk_bytes = base64::decode(psk_b64).expect("psk must decode");
+        let psk: [u8; 32] = psk_bytes.try_into().expect("psk must be 32 bytes");
+
+        // Verify the offer is indeed in the companion's in-memory store
+        {
+            let store = companion.shared.storage.lock().unwrap();
+            assert!(
+                store.pairings.contains_key(dev),
+                "offer must be in companion store"
+            );
+        }
+
+        // 3. Connect to the running server and complete a real handshake
+        let mut client =
+            WsClient::connect(&format!("127.0.0.1:{}", handle.port), "/", None).unwrap();
+        let (hs_resp, session) = attempt(&mut client, &psk, dev);
+        assert!(hs_resp.contains("hs_ok"), "expected hs_ok, got: {hs_resp}");
+        assert!(session.is_some(), "session must be established");
+
+        // 4. Sealed ping round-trip proves live session works
+        let mut session = session.unwrap();
+        let ping = r#"{"type":"ping","commandId":"p-route-1"}"#;
+        client.send_text(&session.seal(ping)).unwrap();
+        let sealed_pong = client.next_text().unwrap();
+        let pong = session.open(&sealed_pong).expect("pong must open");
+        assert!(pong.contains("p-route-1"), "got: {pong}");
+
+        let clean = handle.stop();
+        companion.shutdown(clean);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pairing_offer_route_rejects_origin_header_with_403() {
+        use std::io::Read;
+        let dir = temp_dir("pairing-origin-403");
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        let mut s =
+            std::net::TcpStream::connect(format!("127.0.0.1:{}", handle.diagnostics_port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body = r#"{"endpoints":["ws://127.0.0.1:8787"]}"#;
+        let req = format!(
+            "POST /pairing/offer HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+
+        let mut resp = String::new();
+        let mut buf = [0u8; 512];
+        while !resp.contains("\r\n") {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed before status line");
+            resp.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+
+        let clean = handle.stop();
+        companion.shutdown(clean);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pairing_offer_route_is_absent_on_main_listener() {
+        let dir = temp_dir("pairing-main-404");
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        let main_url = format!("http://127.0.0.1:{}/pairing/offer", handle.port);
+        let req_body = r#"{"endpoints":["ws://127.0.0.1:8787"]}"#;
+        let resp = http_request("POST", &main_url, None, Some(req_body)).unwrap();
+        assert_eq!(
+            resp.status, 404,
+            "main listener must return 404 for /pairing/offer, got: {resp:?}"
+        );
+
+        let clean = handle.stop();
+        companion.shutdown(clean);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pairing_offer_route_returns_400_for_malformed_body() {
+        let dir = temp_dir("pairing-400");
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        let diag_url = format!("http://127.0.0.1:{}/pairing/offer", handle.diagnostics_port);
+
+        // Non-JSON
+        let resp = http_request("POST", &diag_url, None, Some("not json")).unwrap();
+        assert_eq!(resp.status, 400);
+
+        // Non-object
+        let resp = http_request("POST", &diag_url, None, Some("[1, 2, 3]")).unwrap();
+        assert_eq!(resp.status, 400);
+
+        // Non-string in endpoints array
+        let resp = http_request("POST", &diag_url, None, Some(r#"{"endpoints":[123]}"#)).unwrap();
+        assert_eq!(resp.status, 400);
+
+        let clean = handle.stop();
+        companion.shutdown(clean);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loopback_bind_with_require_e2e_forces_remote_posture() {
+        let dir = temp_dir("require-e2e-loopback");
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        c.server_require_e2e = true;
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        // start() on loopback, but companion config has server_require_e2e = true
+        let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        let addr = format!("127.0.0.1:{}", handle.port);
+
+        let mut client = WsClient::connect(&addr, "/", None).unwrap();
+
+        // 1. Pre-session hello gets no snapshot (refused with e2e session required)
+        client
+            .send_text(r#"{"type":"hello","clientId":"test-e2e","protocol":2}"#)
+            .unwrap();
+        let hello_ack = client.next_text().unwrap();
+        assert!(
+            hello_ack.contains("e2e session required"),
+            "pre-session hello must be refused with e2e session required, got: {hello_ack}"
+        );
+        assert!(
+            !hello_ack.contains("snapshot"),
+            "pre-session hello must NOT carry snapshot: {hello_ack}"
+        );
+
+        // 2. Plaintext command is refused with "e2e session required"
+        client
+            .send_text(r#"{"type":"list_state","commandId":"cmd-e2e-2"}"#)
+            .unwrap();
+        let cmd_ack = client.next_text().unwrap();
+        assert!(
+            cmd_ack.contains("e2e session required"),
+            "plaintext command must be refused with e2e session required, got: {cmd_ack}"
+        );
+        assert!(
+            cmd_ack.contains("cmd-e2e-2"),
+            "commandId must survive: {cmd_ack}"
+        );
+
+        let clean = handle.stop();
+        companion.shutdown(clean);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

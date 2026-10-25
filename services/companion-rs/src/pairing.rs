@@ -85,6 +85,51 @@ impl PairingOffer {
     }
 }
 
+/// Creates a fresh single-use pairing offer, persists it to `store` (with the
+/// PSK DPAPI-protected so it is never plaintext on disk), ensures a stable
+/// `hostId` exists in `store.kv`, and returns the QR payload JSON string the
+/// phone client parses.
+pub fn create_pairing_offer(
+    store: &mut crate::storage::Storage,
+    endpoints: &[String],
+) -> Result<String, String> {
+    // Stable host id, created on first pairing.
+    let host_id = match store.kv.get("hostId") {
+        Some(h) => h.clone(),
+        None => {
+            let id = ffi::csprng_bytes(8)
+                .map_err(|e| format!("RNG failed: {e}"))?
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect::<String>();
+            store
+                .put_kv("hostId", &id)
+                .map_err(|e| format!("cannot persist hostId: {e}"))?;
+            id
+        }
+    };
+
+    // Fresh single-use offer, PSK protected at rest before it touches disk.
+    let offer =
+        PairingOffer::new(crate::protocol::now_ms()).map_err(|e| format!("offer failed: {e}"))?;
+    let psk_protected = ffi::dpapi_protect(&offer.psk)
+        .map(|c| base64::encode(&c))
+        .map_err(|e| format!("cannot protect PSK: {e}"))?;
+    let rec = crate::storage::PairingRecord {
+        device_id: offer.device_id.clone(),
+        psk_protected,
+        challenge: base64::encode(&offer.challenge),
+        created_at: offer.created_at,
+        expires_at: offer.expires_at,
+        consumed: false,
+    };
+    store
+        .put_pairing(&rec)
+        .map_err(|e| format!("cannot persist offer: {e}"))?;
+
+    Ok(offer.payload_json(&host_id, endpoints))
+}
+
 /// Bounds pairing attempts to `max` offers per `window_ms` (ADR-011:
 /// rate-limited pairing). Sliding window of offer-creation timestamps.
 pub struct RateLimiter {

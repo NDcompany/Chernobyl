@@ -20,7 +20,7 @@ idempotent; carries `--config` when given, console window at login — packaging
 `TODO.md`) · `--pair` (create a pairing offer, print its terminal QR, exit) ·
 `--endpoint <ws-url>` (address embedded in the QR, default `ws://bind:port`) ·
 `--devices` (list the paired-device registry) · `--revoke <device-id>` (revoke a paired
-device). `CHERNOBYL_HOME` selects the data directory (config, journal).
+device) · `--require-e2e` (force remote E2E session posture on any bind, e.g. for tunnels). `CHERNOBYL_HOME` selects the data directory (config, journal).
 
 **Secure-by-default:** a non-loopback bind without `--token`/`HOST_TOKEN` is refused.
 Loopback with no token keeps Node-parity behavior (dev/demo). Three posture policies layer on

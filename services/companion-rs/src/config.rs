@@ -37,6 +37,7 @@ pub struct CompanionConfig {
     /// Node host default.
     pub server_port: u16,
     pub server_bind: String,
+    pub server_require_e2e: bool,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -71,6 +72,7 @@ pub fn default_config() -> CompanionConfig {
         probe_interval_ms: 15_000,
         server_port: 8787,
         server_bind: "127.0.0.1".into(),
+        server_require_e2e: false,
     }
 }
 
@@ -207,6 +209,13 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
         })
         .transpose()?
         .unwrap_or_else(|| "127.0.0.1".into());
+    let server_require_e2e = json::get(raw, "server")
+        .and_then(|sv| json::get(sv, "requireE2e"))
+        .map(|v| {
+            json::as_bool(v).ok_or_else(|| "'server.requireE2e' must be a boolean".to_string())
+        })
+        .transpose()?
+        .unwrap_or(false);
 
     Ok(CompanionConfig {
         name,
@@ -219,6 +228,7 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
         probe_interval_ms,
         server_port,
         server_bind,
+        server_require_e2e,
     })
 }
 
@@ -267,6 +277,7 @@ pub fn config_to_json(c: &CompanionConfig) -> Json {
             json::obj(vec![
                 ("port", Json::Int(c.server_port as i64)),
                 ("bind", json::s(&c.server_bind)),
+                ("requireE2e", Json::Bool(c.server_require_e2e)),
             ]),
         ),
     ])
@@ -308,6 +319,7 @@ mod tests {
         assert_eq!(parsed.events_cap, 5_000);
         assert_eq!(parsed.commands_cap, 5_000);
         assert_eq!(parsed.server_port, 8787);
+        assert!(!parsed.server_require_e2e);
     }
 
     #[test]

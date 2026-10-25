@@ -921,6 +921,21 @@ impl Companion {
         }
         Ok(RevokeResult::Revoked { terminated })
     }
+
+    /// Creates a fresh pairing offer in the companion's durable store and returns
+    /// the QR payload JSON string the phone client parses.
+    pub fn create_pairing_offer(&self, endpoints: &[String]) -> Result<String, String> {
+        let eps = if endpoints.is_empty() {
+            vec![format!(
+                "ws://{}:{}",
+                self.shared.config.server_bind, self.shared.config.server_port
+            )]
+        } else {
+            endpoints.to_vec()
+        };
+        let mut store = self.shared.storage.lock().unwrap();
+        crate::pairing::create_pairing_offer(&mut store, &eps)
+    }
 }
 
 fn json_text(msg: &ClientMsg) -> String {

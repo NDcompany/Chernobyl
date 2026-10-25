@@ -19,6 +19,7 @@
 //!                             CLI order; default ws://bind:port when none given)
 //!   --devices                list the paired-device registry, exit
 //!   --revoke <device-id>     revoke a paired device (blocks future E2E handshakes), exit
+//!   --require-e2e            force remote E2E session posture on any bind (e.g. tunnels)
 //!   --tui                    boot the daemon and open the terminal UI (status,
 //!                            sessions, approvals, pairing, keybinds) on loopback
 //!   --version                print version and exit
@@ -27,7 +28,7 @@ use chernobyl_companion::client::{WsClient, http_get, http_request};
 use chernobyl_companion::companion::Companion;
 use chernobyl_companion::config;
 use chernobyl_companion::json;
-use chernobyl_companion::{ffi, server};
+use chernobyl_companion::{ffi, pairing, qr, server};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -59,6 +60,7 @@ fn run(args: &[String]) -> i32 {
     let mut restore_path: Option<String> = None;
     let mut background = false;
     let mut tui = false;
+    let mut require_e2e = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -91,6 +93,7 @@ fn run(args: &[String]) -> i32 {
             "--restore" => restore_path = take(&mut i),
             "--background" => background = true,
             "--tui" => tui = true,
+            "--require-e2e" => require_e2e = true,
             "--config" => config_path = take(&mut i),
             "--port" => port_override = take(&mut i).and_then(|v| v.parse().ok()),
             "--bind" => bind_override = take(&mut i),
@@ -147,6 +150,9 @@ fn run(args: &[String]) -> i32 {
     }
     if let Some(n) = diag_override {
         cfg.diagnostics_port = n as u16;
+    }
+    if require_e2e {
+        cfg.server_require_e2e = true;
     }
 
     // `companion pair` — create + persist a pairing offer and print its QR.
@@ -239,8 +245,13 @@ fn run(args: &[String]) -> i32 {
     // handshake, which the TUI surfaces verbatim rather than pretending to work.
     if tui {
         let addr = format!("127.0.0.1:{}", srv.port);
-        let res = chernobyl_companion::tui::run_tui(&addr, token_override.as_deref(), || {
-            pairing_block(&cfg, &endpoint_override).map(|b| b.render())
+        let comp_for_tui = companion.clone();
+        let endpoints = endpoint_override.clone();
+        let res = chernobyl_companion::tui::run_tui(&addr, token_override.as_deref(), move || {
+            comp_for_tui
+                .create_pairing_offer(&endpoints)
+                .map(pairing_block_from_payload)
+                .map(|b| b.render())
         });
         if let Err(e) = res {
             eprintln!("[companion] tui error: {e}");
@@ -326,109 +337,96 @@ impl PairingBlock {
     }
 }
 
-/// Creates + persists a single-use pairing offer and renders it. Shared by
-/// `companion pair` (stdout) and the `--tui` pairing overlay; the running
-/// daemon redeems the offer when the phone proves PSK knowledge in the E2E
-/// handshake. Opens the same journal a running daemon uses, so the offer is
-/// visible to it (the documented `--pair`-against-a-running-daemon pattern).
-fn pairing_block(
-    cfg: &config::CompanionConfig,
-    endpoints: &[String],
-) -> Result<PairingBlock, String> {
-    use chernobyl_companion::{base64, pairing, protocol, qr, storage};
-
-    let mut store = storage::Storage::open(&cfg.data_dir, cfg.events_cap, cfg.commands_cap)
-        .map_err(|e| format!("cannot open store: {e}"))?;
-
-    // Stable host id, created on first pairing.
-    let host_id = match store.kv.get("hostId") {
-        Some(h) => h.clone(),
-        None => {
-            let id = ffi::csprng_bytes(8)
-                .map_err(|e| format!("RNG failed: {e}"))?
-                .iter()
-                .map(|x| format!("{x:02x}"))
-                .collect::<String>();
-            store
-                .put_kv("hostId", &id)
-                .map_err(|e| format!("cannot persist hostId: {e}"))?;
-            id
-        }
-    };
-
-    // Fresh single-use offer, PSK protected at rest before it touches disk.
-    let offer =
-        pairing::PairingOffer::new(protocol::now_ms()).map_err(|e| format!("offer failed: {e}"))?;
-    let psk_protected = ffi::dpapi_protect(&offer.psk)
-        .map(|c| base64::encode(&c))
-        .map_err(|e| format!("cannot protect PSK: {e}"))?;
-    let rec = storage::PairingRecord {
-        device_id: offer.device_id.clone(),
-        psk_protected,
-        challenge: base64::encode(&offer.challenge),
-        created_at: offer.created_at,
-        expires_at: offer.expires_at,
-        consumed: false,
-    };
-    store
-        .put_pairing(&rec)
-        .map_err(|e| format!("cannot persist offer: {e}"))?;
-
-    // Endpoint list for the QR (ADR-011 §2 / S10): every --endpoint flag is
-    // advertised in CLI order; with none given, the bind address stands alone
-    // (bind is not dialable from a phone — pass `--endpoint ws://<lan-ip>:<port>`,
-    // repeatable for LAN + tailnet + tunnel in one payload).
-    let eps: Vec<String> = if endpoints.is_empty() {
-        vec![format!("ws://{}:{}", cfg.server_bind, cfg.server_port)]
-    } else {
-        endpoints.to_vec()
-    };
-    let payload = offer.payload_json(&host_id, &eps);
+fn pairing_block_from_payload(payload: String) -> PairingBlock {
+    let dev = json::parse(&payload)
+        .ok()
+        .as_ref()
+        .and_then(|v| json::get_str(v, "dev").map(str::to_string))
+        .unwrap_or_else(|| "unknown".into());
     let qr = qr::encode(payload.as_bytes())
         .map(|q| qr::render_terminal(&q))
         .map_err(|e| e.to_string());
     let device_line = format!(
         "device {} — valid {}s, single-use (scan with the phone)",
-        offer.device_id,
+        dev,
         pairing::PAIRING_TTL_MS / 1000
     );
-    Ok(PairingBlock {
+    PairingBlock {
         payload,
         qr,
         device_line,
-    })
+    }
 }
 
-/// `companion pair` — create a pairing offer, persist it to the shared journal
-/// (PSK DPAPI-protected so the on-disk record never holds it plaintext), and
-/// print the terminal QR the phone scans. The running daemon redeems the offer
-/// when the phone proves knowledge of the PSK during the E2E handshake.
-fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
-    match pairing_block(cfg, endpoints) {
+fn pair_offline(
+    cfg: &config::CompanionConfig,
+    endpoints: &[String],
+) -> Result<PairingBlock, String> {
+    use chernobyl_companion::{pairing, storage};
+
+    let mut store = storage::Storage::open(&cfg.data_dir, cfg.events_cap, cfg.commands_cap)
+        .map_err(|e| format!("cannot open store: {e}"))?;
+
+    let eps: Vec<String> = if endpoints.is_empty() {
+        vec![format!("ws://{}:{}", cfg.server_bind, cfg.server_port)]
+    } else {
+        endpoints.to_vec()
+    };
+    let payload = pairing::create_pairing_offer(&mut store, &eps)?;
+    Ok(pairing_block_from_payload(payload))
+}
+
+fn print_pairing_block(b: &PairingBlock, path_msg: &str) -> i32 {
+    println!("payload: {}", b.payload);
+    match &b.qr {
+        Ok(q) => {
+            println!("{q}");
+            println!();
+            println!("{}", b.device_line);
+            println!("{path_msg}");
+            0
+        }
         Err(e) => {
-            eprintln!("[companion] pair: {e}");
+            eprintln!(
+                "[companion] pair: payload too large for QR ({e}) — paste the payload line instead"
+            );
+            println!("{path_msg}");
             1
         }
-        Ok(b) => {
-            // The payload prints BEFORE the QR: a long endpoint list that
-            // outruns QR capacity still yields a pasteable credential
-            // (QR failure = warning + exit 1).
-            println!("payload: {}", b.payload);
-            match &b.qr {
-                Ok(q) => {
-                    println!("{q}");
-                    println!();
-                    println!("{}", b.device_line);
-                    0
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[companion] pair: payload too large for QR ({e}) — paste the payload line instead"
-                    );
-                    1
-                }
+    }
+}
+
+/// `companion pair` — create a pairing offer and print the terminal QR the phone scans.
+/// Tries the running companion first (loopback POST /pairing/offer); if unreachable,
+/// falls back to offline journal write (restart-scoped).
+fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
+    let url = format!("http://127.0.0.1:{}/pairing/offer", cfg.diagnostics_port);
+    let body = json::stringify(&json::obj(vec![(
+        "endpoints",
+        json::Json::Arr(endpoints.iter().map(|e| json::s(e)).collect()),
+    )]));
+
+    match http_request("POST", &url, None, Some(&body)) {
+        Ok(resp) => match resp.status {
+            200 => {
+                let b = pairing_block_from_payload(resp.body);
+                print_pairing_block(&b, "pairing offer created via running companion")
             }
-        }
+            other => {
+                eprintln!(
+                    "[companion] pair: server returned HTTP {other}: {}",
+                    resp.body
+                );
+                1
+            }
+        },
+        Err(_) => match pair_offline(cfg, endpoints) {
+            Ok(b) => print_pairing_block(&b, "pairing offer created (offline journal)"),
+            Err(e) => {
+                eprintln!("[companion] pair: {e}");
+                1
+            }
+        },
     }
 }
 
@@ -1100,6 +1098,117 @@ mod tests {
 
         let clean = handle.stop();
         companion.shutdown(clean);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn cli_pair_offline_falls_back_and_online_routes_to_running_companion() {
+        use super::run;
+        use chernobyl_companion::config::default_config;
+        use chernobyl_companion::protocol::now_ms;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "chernobyl-cli-pair-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut cfg = default_config();
+        cfg.data_dir = temp_dir.clone();
+        cfg.diagnostics_port = 0; // offline initially
+        let cfg_path = temp_dir.join("companion.json");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cfg_json = chernobyl_companion::json::stringify(
+            &chernobyl_companion::config::config_to_json(&cfg),
+        );
+        std::fs::write(&cfg_path, cfg_json).unwrap();
+        let cfg_str = cfg_path.to_str().unwrap().to_string();
+
+        // 1. Offline path: companion not running -> writes to journal, exits 0
+        let exit_offline = run(&["--config".into(), cfg_str.clone(), "--pair".into()]);
+        assert_eq!(exit_offline, 0);
+
+        // Verify offer exists in offline journal
+        {
+            let store = chernobyl_companion::storage::Storage::open(
+                &temp_dir,
+                cfg.events_cap,
+                cfg.commands_cap,
+            )
+            .unwrap();
+            assert_eq!(
+                store.pairings.len(),
+                1,
+                "offline pairing must persist offer"
+            );
+        }
+
+        // 2. Online path: boot companion and server
+        let companion = std::sync::Arc::new(
+            chernobyl_companion::companion::Companion::boot(cfg.clone()).unwrap(),
+        );
+        let srv =
+            chernobyl_companion::server::start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+
+        let diag_port_str = srv.diagnostics_port.to_string();
+        let exit_online = run(&[
+            "--config".into(),
+            cfg_str.clone(),
+            "--diagnostics-port".into(),
+            diag_port_str,
+            "--pair".into(),
+        ]);
+        assert_eq!(exit_online, 0);
+
+        // Verify companion's in-memory store has the offer
+        {
+            let store = companion.shared.storage.lock().unwrap();
+            // It had 1 from boot (the offline one), now it has 2!
+            assert_eq!(
+                store.pairings.len(),
+                2,
+                "running companion must have both offers"
+            );
+        }
+
+        let clean = srv.stop();
+        companion.shutdown(clean);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn cli_require_e2e_flag_forces_remote_posture() {
+        use super::run;
+        use chernobyl_companion::config::default_config;
+        use chernobyl_companion::protocol::now_ms;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "chernobyl-cli-e2e-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut cfg = default_config();
+        cfg.data_dir = temp_dir.clone();
+        cfg.server_port = 0;
+        cfg.diagnostics_port = 0;
+        let cfg_path = temp_dir.join("companion.json");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cfg_json = chernobyl_companion::json::stringify(
+            &chernobyl_companion::config::config_to_json(&cfg),
+        );
+        std::fs::write(&cfg_path, cfg_json).unwrap();
+        let cfg_str = cfg_path.to_str().unwrap().to_string();
+
+        // Run with --require-e2e and --exit-after 50ms smoke
+        let exit = run(&[
+            "--config".into(),
+            cfg_str,
+            "--require-e2e".into(),
+            "--exit-after".into(),
+            "50".into(),
+        ]);
+        assert_eq!(exit, 0);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
