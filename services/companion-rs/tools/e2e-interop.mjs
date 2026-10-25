@@ -19,6 +19,10 @@
  *   9. client freshness (security review 2026-10-25) -> an hs_hello without a
  *      client nonce gets hs_err, and a transcript recorded from the real
  *      companion replayed to a new client attempt fails server-proof-mismatch
+ *  10. device key rotation at first use (ADR-011 addendum, checklist row 2.2)
+ *      -> a client that ignores hs_rekey keeps connecting on the QR key; once
+ *      a client stores the rotated key and acks, the QR key is refused and
+ *      the rotated key connects
  *
  * No device claim: this is Node-vs-real-companion evidence only.
  */
@@ -31,6 +35,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
 import {
+  b64decode,
   createE2eTransport,
   parsePairingPayload,
   performHandshake,
@@ -201,6 +206,7 @@ async function main() {
   // (the running store is loaded once at startup — see establish_session).
   const pairA = runPair(home, { endpoints: [url] });
   const pairB = runPair(home, { endpoints: [url] });
+  const pairD = runPair(home, { endpoints: [url] }); // scenario 10 (key rotation)
   // S10: dead endpoint FIRST (a second 4-digit port — two 4-digit entries =
   // exactly 213 bytes = QR v10-M capacity), live second. Distinct from the
   // server port or the "dead" dial would hit the live daemon.
@@ -409,6 +415,51 @@ async function main() {
       err?.code === 'server-proof-mismatch',
       err ? `${err.code}: ${err.message}` : 'replay was accepted',
     );
+  }
+
+  /* 10. device key rotation at first use (ADR-011 addendum, checklist row 2.2) */
+  {
+    // a client without onRekey drops hs_rekey and never acks: the QR key stays valid
+    for (const round of [1, 2]) {
+      const old = createE2eTransport({ url, pairing: pairD, retryBaseMs: 200, retryMaxMs: 400 });
+      transports.push(old);
+      old.connect();
+      const ok = await waitFor(() => old.status() === 'connected', 6000);
+      check(`rotation: a client that ignores hs_rekey keeps the QR key (connection ${round})`, ok, `status=${old.status()}`);
+      old.close();
+    }
+    let stored = null;
+    const t = createE2eTransport({
+      url,
+      pairing: pairD,
+      retryBaseMs: 200,
+      retryMaxMs: 400,
+      onRekey: async (psk) => {
+        stored = psk;
+      },
+    });
+    transports.push(t);
+    t.connect();
+    check('rotation: a rotating client is offered and stores a new key', await waitFor(() => stored !== null, 6000));
+    // frames are handled in order: this command's ack proves the hs_rekey_ack
+    // the transport sent before it was processed
+    const barrier = await t.send({ type: 'interrupt', commandId: 'rekey-barrier', sessionId: 'none' }).then(
+      () => true,
+      () => false,
+    );
+    t.close();
+    const handshake = (cred) =>
+      rawSession(url, cred).then(
+        ({ c }) => {
+          c.close();
+          return 'connected';
+        },
+        (e) => e?.code ?? String(e),
+      );
+    const replay = await handshake(pairD);
+    check('rotation: the QR key is refused once the rotated key was acked (row 2.2)', barrier && replay === 'handshake-rejected', `barrier=${barrier} replay=${replay}`);
+    const rotated = stored ? await handshake({ ...pairD, psk: b64decode(stored) }) : 'no key';
+    check('rotation: the rotated key connects', rotated === 'connected', rotated);
   }
 
   for (const t of transports) t.close();

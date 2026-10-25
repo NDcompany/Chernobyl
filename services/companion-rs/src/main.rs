@@ -1124,6 +1124,7 @@ mod tests {
                     device_id: "dev-offline".into(),
                     name: "offline-phone".into(),
                     psk_protected: prot.clone(),
+                    psk_next_protected: None,
                     paired_at: now_ms(),
                     revoked: false,
                 })
@@ -1133,6 +1134,7 @@ mod tests {
                     device_id: "dev-online".into(),
                     name: "online-phone".into(),
                     psk_protected: prot,
+                    psk_next_protected: None,
                     paired_at: now_ms(),
                     revoked: false,
                 })
@@ -1414,6 +1416,7 @@ mod tests {
                     device_id: "dev-1".into(),
                     name: "phone".into(),
                     psk_protected: "P".into(),
+                    psk_next_protected: None,
                     paired_at: 1,
                     revoked: false,
                 })

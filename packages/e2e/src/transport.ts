@@ -16,10 +16,15 @@
  * - ordered reconnect over the QR's endpoint list (ADR-011 §2 / S10): each
  *   failed attempt advances to the next endpoint in the advertised order, a
  *   successful handshake resets to the first. The list is dial order only —
- *   endpoints are not credentials (see docs/decisions/PHASE5-THREAT-MODEL.md §3.9).
+ *   endpoints are not credentials (see docs/decisions/PHASE5-THREAT-MODEL.md §3.9);
+ * - device key rotation at first use (ADR-011 addendum): the sealed
+ *   transport-level `hs_rekey` is persisted through `onRekey`, then acked
+ *   (`hs_rekey_ack`), then used from the next handshake on. It never reaches
+ *   subscribers.
  */
 import { PROTOCOL_VERSION, nextId, parseServerMessage } from '@chernobyl/protocol';
 import type { ClientMessage, ServerMessage } from '@chernobyl/protocol';
+import { b64decode, b64encode } from './base64.js';
 import { E2eError } from './errors.js';
 import { performHandshake } from './handshake.js';
 import type { PairingCredential } from './pairing.js';
@@ -69,6 +74,14 @@ export interface E2eTransportOptions {
   /** App-level ping interval; 0 disables the heartbeat. */
   heartbeatMs?: number;
   pongTimeoutMs?: number;
+  /**
+   * Stores the device key (base64, 32 bytes) the companion replaces the QR's
+   * PSK with at first use. Only after it resolves does the transport ack and
+   * prove the new key from the next handshake on; when it rejects, or is not
+   * given, nothing is acked and the old key stays in use (the companion
+   * offers the same key again on the next connection).
+   */
+  onRekey?: (pskB64: string) => Promise<void>;
 }
 
 export interface E2eTransport {
@@ -149,7 +162,8 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
   const heartbeatMs = opts.heartbeatMs ?? DEFAULTS.heartbeatMs;
   const pongTimeoutMs = opts.pongTimeoutMs ?? DEFAULTS.pongTimeoutMs;
   const openSocket = opts.openSocket ?? defaultOpenSocket;
-  const { pairing } = opts;
+  // reassigned once a rotated device key is stored (see `rekey`)
+  let { pairing } = opts;
   const endpoints: string[] = opts.endpoints ?? (opts.url ? [opts.url] : pairing.endpoints);
   if (endpoints.length === 0) throw new Error('e2e transport: no endpoint to dial');
   const clientId = nextId('app');
@@ -171,8 +185,6 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let stopped = true;
-  // frames that arrive before/while the handshake coroutine awaits recv()
-  const hsQueue: string[] = [];
 
   const setStatus = (s: TransportStatus): void => {
     if (status === s) return;
@@ -246,7 +258,12 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
       return;
     }
     const msg = parseServerMessage(inner);
-    if (!msg) return; // unknown message types are ignored (parity with wsTransport)
+    if (!msg) {
+      // transport-level hs_rekey is handled here; any other unknown message
+      // type is ignored (parity with wsTransport)
+      rekey(socket, s, inner);
+      return;
+    }
     if (msg.type === 'pong') {
       // heartbeat bookkeeping only — not surfaced to subscribers
       const t = pendingPongs.get(msg.commandId);
@@ -267,6 +284,40 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
     emit(msg);
   }
 
+  /**
+   * `hs_rekey` (ADR-011 addendum): the companion replaces the QR's PSK with
+   * a device key at first use, two-phase so a lost frame never locks the
+   * phone out — persist, then ack and switch. Not persisted: no ack, the old
+   * key stays, and the companion offers the same key next connection; a lost
+   * ack is fine too, the next handshake proves the new key and promotes it.
+   */
+  function rekey(socket: SocketLike, s: SealedSession, inner: string): void {
+    let psk: Uint8Array | null = null;
+    try {
+      const m = JSON.parse(inner) as { type?: unknown; psk?: unknown };
+      if (m.type === 'hs_rekey' && typeof m.psk === 'string') psk = b64decode(m.psk);
+    } catch {
+      return;
+    }
+    const persist = opts.onRekey;
+    if (!psk || psk.length !== 32 || !persist) return;
+    const key = psk;
+    void (async () => {
+      try {
+        await persist(b64encode(key));
+      } catch {
+        return;
+      }
+      pairing = { ...pairing, psk: key };
+      if (ws !== socket || session !== s) return; // gone: the next handshake proves the key
+      try {
+        socket.send(s.seal(JSON.stringify({ type: 'hs_rekey_ack' })));
+      } catch {
+        socket.close();
+      }
+    })();
+  }
+
   function open(): void {
     if (stopped || status === 'denied') return;
     setStatus(attempts === 0 ? 'connecting' : 'reconnecting');
@@ -281,6 +332,11 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
     ws = socket;
 
     let handshakeDone = false;
+    // frames that arrive before/while the handshake coroutine awaits recv(),
+    // per connection: ones still here when it finishes raced its last await
+    // (one socket read can deliver hs_ok and the sealed hs_rekey behind it in
+    // the same tick) and are this session's first sealed frames
+    const hsQueue: string[] = [];
     const hsWaiters: Array<{ resolve: (t: string) => void; reject: (e: Error) => void }> = [];
 
     socket.onopen = () => {
@@ -316,6 +372,8 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
             return;
           }
           startHeartbeat(socket, s);
+          // in arrival order, before any later frame (all synchronous since the await)
+          for (const early of hsQueue.splice(0)) handleSealed(socket, early);
         } catch (err) {
           if (ws !== socket) return;
           if (

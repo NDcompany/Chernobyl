@@ -8,7 +8,7 @@ import { createSeedSnapshot, type ServerMessage, type Snapshot } from '@chernoby
 import { createE2eTransport, parsePairingPayload } from '@chernobyl/e2e';
 import { getTransport, hostUrl, resetTransport, setTransport, type Transport } from './transport';
 import { createWsTransport } from './wsTransport';
-import { readHostToken, readPairing } from '@/platform/secure';
+import { readHostToken, readPairing, rotatePairingPsk } from '@/platform/secure';
 import { applyMessage, queryClient, STATE_KEY } from './state';
 import { useAppStore, type Settings } from '@/store/appStore';
 import { initNotifications, notify } from '@/platform/notify';
@@ -134,6 +134,9 @@ export function TransportProvider({ children }: { children: ReactNode }) {
           active = createE2eTransport({
             endpoints: cred.endpoints.map(withToken),
             pairing: cred,
+            // the companion replaces the QR's key with a device key at first
+            // use; the transport acks only once the keystore holds it
+            onRekey: (psk) => rotatePairingPsk(cred.deviceId, psk),
           });
           setTransport(active);
           e2e = true;

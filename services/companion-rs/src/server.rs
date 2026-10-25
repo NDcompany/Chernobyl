@@ -973,52 +973,79 @@ fn unprotect_psk(b64: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "psk must be 32 bytes".to_string())
 }
 
-/// Which stored PSK (its protected form) a handshake for `device_id` must
-/// prove, plus the offer to redeem when this is a first connection. Rejects
-/// expired / spent / revoked / unknown devices.
+/// Which stored PSKs (protected forms) a handshake for `device_id` may prove:
+/// the current one, the rotated device key still awaiting the phone's ack
+/// (ADR-011 addendum), and the offer to redeem when this is a first
+/// connection. Rejects expired / spent / revoked / unknown devices.
 fn handshake_candidate(
     store: &Storage,
     device_id: &str,
     now: i64,
-) -> Result<(String, Option<PairingRecord>), String> {
+) -> Result<(String, Option<String>, Option<PairingRecord>), String> {
     match (store.pairings.get(device_id), store.devices.get(device_id)) {
         // fresh, unexpired offer: first connection (redeemed by `redeem`)
         (Some(p), _) if !p.consumed && now < p.expires_at => {
-            Ok((p.psk_protected.clone(), Some(p.clone())))
+            Ok((p.psk_protected.clone(), None, Some(p.clone())))
         }
         // already-paired device, or an offer whose redemption already ran
         (_, Some(d)) if d.revoked => Err("device revoked".to_string()),
-        (_, Some(d)) => Ok((d.psk_protected.clone(), None)),
+        (_, Some(d)) => Ok((d.psk_protected.clone(), d.psk_next_protected.clone(), None)),
         (Some(p), None) if p.consumed => Err("pairing offer already used".to_string()),
         (Some(p), None) if now >= p.expires_at => Err("pairing offer expired".to_string()),
         _ => Err("unknown device".to_string()),
     }
 }
 
+/// A fresh device key, DPAPI-protected like every stored PSK.
+fn mint_protected_psk() -> Result<String, String> {
+    let key = crate::ffi::csprng_bytes(32)?;
+    crate::ffi::dpapi_protect(&key)
+        .map(|c| base64::encode(&c))
+        .map_err(|e| format!("protect device key: {e}"))
+}
+
+/// Make a device's rotated key its only key (ADR-011 addendum): from here on
+/// the QR's PSK fails the handshake. The caller holds the storage lock. A
+/// revoked device, or one with nothing pending, is left as it is.
+fn promote_next_psk(store: &mut Storage, device_id: &str) -> Result<(), String> {
+    if let Some(mut d) = store.devices.get(device_id).cloned()
+        && !d.revoked
+        && let Some(next) = d.psk_next_protected.take()
+    {
+        d.psk_protected = next;
+        store
+            .put_device(&d)
+            .map_err(|e| format!("rotate device key: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Resolve + verify a handshake and, for a fresh pairing, redeem it (single-use
-/// consume + device registration). Returns the live session and the server's
-/// mutual-auth proof. Rejects expired / spent / revoked / unknown devices and
-/// any proof that is not a valid HMAC under the device's PSK.
+/// consume + device registration). Returns the live session, the server's
+/// mutual-auth proof, and the rotated device key this connection must be
+/// offered (`hs_rekey`, ADR-011 addendum). Rejects expired / spent / revoked /
+/// unknown devices and any proof that is not a valid HMAC under the device's
+/// current PSK or its pending rotated key.
 ///
 /// DPAPI (an LSASS round-trip) and the HMAC run with the storage lock released
 /// (security review 2026-10-25): an unauthenticated hs_proof must not hold the
 /// process-wide mutex that event persistence, commands and revocation need.
-/// The PSK is picked under the lock, verified unlocked, and `redeem` decides
-/// again under the lock before anything is committed.
+/// The PSKs are picked under the lock, verified (and a first connection's
+/// device key minted) unlocked, and `redeem` decides again under the lock
+/// before anything is committed.
 fn establish_session(
     companion: &Companion,
     pending: &HsPending,
     client_proof: &str,
-) -> Result<(e2e::Session, String), String> {
+) -> Result<(e2e::Session, String, Option<e2e::Psk>), String> {
     let proof = base64::decode(client_proof).ok_or("bad proof encoding")?;
-    let (protected, _) = {
+    let (current, next, offer) = {
         let store = companion.shared.storage.lock().unwrap();
         handshake_candidate(&store, &pending.device_id, crate::protocol::now_ms())?
     };
-    let psk = unprotect_psk(&protected)?;
-    let proof_as = |role: &str| {
+    let proof_as = |psk: &e2e::Psk, role: &str| {
         e2e::handshake_proof(
-            &psk,
+            psk,
             role,
             &pending.device_id,
             &pending.nonce,
@@ -1026,45 +1053,73 @@ fn establish_session(
             &pending.cnonce,
         )
     };
-    if !e2e::proof_ok(&proof_as("client"), &proof) {
-        return Err("proof verification failed".to_string());
+    // the current key first; the rotated one only for a phone that already
+    // stored it (its ack never arrived)
+    let mut psk = unprotect_psk(&current)?;
+    let mut verified = current;
+    if !e2e::proof_ok(&proof_as(&psk, "client"), &proof) {
+        verified = next.ok_or("proof verification failed")?;
+        psk = unprotect_psk(&verified)?;
+        if !e2e::proof_ok(&proof_as(&psk, "client"), &proof) {
+            return Err("proof verification failed".to_string());
+        }
     }
-    redeem(companion, pending, &protected)?;
+    let minted = offer.map(|_| mint_protected_psk()).transpose()?;
+    let rekey = redeem(companion, pending, &verified, minted)?
+        .map(|next| unprotect_psk(&next))
+        .transpose()?;
     let keys = e2e::derive_keys(&psk, &pending.salt, &pending.cnonce);
     Ok((
         e2e::Session::host(keys),
-        base64::encode(&proof_as("server")),
+        base64::encode(&proof_as(&psk, "server")),
+        rekey,
     ))
 }
 
 /// Commit a verified handshake under the storage lock. The records may have
-/// moved while the PSK was verified unlocked (revoked, expired, or redeemed by
-/// a concurrent handshake), so the decision is taken again on the current
-/// records and the verified PSK counts only if it is still the one they name.
-/// A fresh offer is redeemed here, so single use stays atomic.
-fn redeem(companion: &Companion, pending: &HsPending, verified: &str) -> Result<(), String> {
+/// moved while the PSK was verified unlocked (revoked, expired, redeemed by a
+/// concurrent handshake, or rotated), so the decision is taken again on the
+/// current records and the verified PSK counts only if it is still one they
+/// name. A fresh offer is redeemed here, so single use stays atomic: the
+/// device is registered under the offer's PSK with `minted` queued as its
+/// rotated key (ADR-011 addendum). A proof under the queued key promotes it.
+/// Returns the queued key (protected) this connection must be offered: the
+/// same one on every connection until the phone acks it, never a new mint.
+fn redeem(
+    companion: &Companion,
+    pending: &HsPending,
+    verified: &str,
+    minted: Option<String>,
+) -> Result<Option<String>, String> {
     let mut store = companion.shared.storage.lock().unwrap();
     let now = crate::protocol::now_ms();
-    let (current, offer) = handshake_candidate(&store, &pending.device_id, now)?;
+    let (current, next, offer) = handshake_candidate(&store, &pending.device_id, now)?;
+    if next.as_deref() == Some(verified) {
+        promote_next_psk(&mut store, &pending.device_id)?;
+        return Ok(None);
+    }
     if current != verified {
         return Err("device changed during handshake".to_string());
     }
-    if let Some(mut p) = offer {
-        p.consumed = true;
-        store
-            .put_pairing(&p)
-            .map_err(|e| format!("redeem pairing: {e}"))?;
-        store
-            .put_device(&DeviceRecord {
-                device_id: pending.device_id.clone(),
-                name: pending.device_id.clone(),
-                psk_protected: p.psk_protected.clone(),
-                paired_at: now,
-                revoked: false,
-            })
-            .map_err(|e| format!("register device: {e}"))?;
-    }
-    Ok(())
+    let Some(mut p) = offer else {
+        return Ok(next); // paired already: re-offer the pending key, if any
+    };
+    let next = minted.ok_or("device changed during handshake")?;
+    p.consumed = true;
+    store
+        .put_pairing(&p)
+        .map_err(|e| format!("redeem pairing: {e}"))?;
+    store
+        .put_device(&DeviceRecord {
+            device_id: pending.device_id.clone(),
+            name: pending.device_id.clone(),
+            psk_protected: p.psk_protected.clone(),
+            psk_next_protected: Some(next.clone()),
+            paired_at: now,
+            revoked: false,
+        })
+        .map_err(|e| format!("register device: {e}"))?;
+    Ok(Some(next))
 }
 
 /// Install a verified session, then re-check revocation (security review
@@ -1605,6 +1660,18 @@ fn serve_ws(
                     },
                 };
                 let Some(msg) = parse_client_message(&plaintext) else {
+                    // the rotation ack is transport-level like hs_* (never a
+                    // ClientMsg) and counts only sealed: the phone has stored
+                    // the rotated key. A failed write leaves it pending; the
+                    // phone's next handshake proves it and `redeem` promotes it.
+                    if let Some(device_id) = outbound.device_id()
+                        && json::parse(&plaintext)
+                            .is_ok_and(|v| json::get_str(&v, "type") == Some("hs_rekey_ack"))
+                    {
+                        let mut store = companion.shared.storage.lock().unwrap();
+                        let _ = promote_next_psk(&mut store, &device_id);
+                        continue;
+                    }
                     if send_malformed(&outbound, &companion).is_err() {
                         break Err(io::Error::other("outbound queue saturated"));
                     }
@@ -1659,7 +1726,7 @@ fn serve_ws(
                                 continue;
                             };
                             match establish_session(&companion, &pending, proof) {
-                                Ok((session, server_proof)) => {
+                                Ok((session, server_proof, rekey)) => {
                                     // HsOk is the LAST plaintext frame: fan-out
                                     // stays dropped (handshaking) until the
                                     // install below, then every frame is sealed.
@@ -1679,6 +1746,23 @@ fn serve_ws(
                                         session,
                                     ) {
                                         break Ok(()); // revoked meanwhile: closed with 4003
+                                    }
+                                    // ADR-011 addendum: offer the rotated device
+                                    // key, sealed, until the phone acks it (a
+                                    // phone that ignores it keeps the QR's key)
+                                    if let Some(key) = rekey {
+                                        let frame = format!(
+                                            r#"{{"type":"hs_rekey","psk":"{}"}}"#,
+                                            base64::encode(&key)
+                                        );
+                                        if outbound
+                                            .enqueue_sealed(frame.into_bytes(), MsgClass::Control)
+                                            .is_err()
+                                        {
+                                            break Err(io::Error::other(
+                                                "outbound queue saturated",
+                                            ));
+                                        }
                                     }
                                 }
                                 Err(reason) => {
@@ -1913,6 +1997,7 @@ mod e2e_tests {
                     device_id: device_id.clone(),
                     name: "phone".into(),
                     psk_protected: protected,
+                    psk_next_protected: None,
                     paired_at: now_ms(),
                     revoked,
                 })
@@ -1956,14 +2041,41 @@ mod e2e_tests {
         }
     }
 
+    /// Round-trips a sealed ping and returns the key of any `hs_rekey` seen
+    /// before its pong. Frames are handled in order, so the pong also proves
+    /// that everything this client sent earlier (an `hs_rekey_ack`) was
+    /// processed and that the server's `hs_ok`-time frames were all read.
+    fn ping_barrier(c: &mut WsClient, sess: &mut e2e::Session) -> Option<[u8; 32]> {
+        c.send_text(&sess.seal(r#"{"type":"ping","commandId":"barrier"}"#))
+            .unwrap();
+        let mut rekey = None;
+        loop {
+            let frame = c.next_text().unwrap();
+            let inner = sess
+                .open(&frame)
+                .unwrap_or_else(|e| panic!("non-sealed frame after hs_ok: {e} ({frame})"));
+            let v = json::parse(&inner).unwrap();
+            match json::get_str(&v, "type") {
+                Some("pong") => return rekey,
+                Some("hs_rekey") => {
+                    let key = base64::decode(json::get_str(&v, "psk").unwrap()).unwrap();
+                    rekey = Some(key.try_into().expect("hs_rekey carries 32 bytes"));
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Handshake step 2: `hs_proof` with `psk`. Returns the server's final
-    /// `hs_ok`/`hs_err` payload and, on success, the client-side session.
-    fn finish(
+    /// `hs_ok`/`hs_err` payload and, on success, the client-side session and
+    /// the rotated key the server offered on it (ADR-011 addendum), which the
+    /// session has already read past (`ping_barrier`).
+    fn finish_rekey(
         c: &mut WsClient,
         psk: &[u8; 32],
         device_id: &str,
         ch: &Challenge,
-    ) -> (String, Option<e2e::Session>) {
+    ) -> (String, Option<e2e::Session>, Option<[u8; 32]>) {
         let proof_as = |role: &str| {
             e2e::handshake_proof(psk, role, device_id, &ch.nonce, &ch.salt, &ch.cnonce)
         };
@@ -1979,10 +2091,34 @@ mod e2e_tests {
             let sp = base64::decode(json::get_str(&v, "serverProof").unwrap()).unwrap();
             assert_eq!(sp.as_slice(), proof_as("server"), "server must prove PSK");
             let keys = e2e::derive_keys(psk, &ch.salt, &ch.cnonce);
-            (resp, Some(e2e::Session::client(keys)))
+            let mut sess = e2e::Session::client(keys);
+            let rekey = ping_barrier(c, &mut sess);
+            (resp, Some(sess), rekey)
         } else {
-            (resp, None)
+            (resp, None, None)
         }
+    }
+
+    /// `finish_rekey` for callers that ignore the rotation offer (as a phone
+    /// without rotation support does).
+    fn finish(
+        c: &mut WsClient,
+        psk: &[u8; 32],
+        device_id: &str,
+        ch: &Challenge,
+    ) -> (String, Option<e2e::Session>) {
+        let (resp, sess, _) = finish_rekey(c, psk, device_id, ch);
+        (resp, sess)
+    }
+
+    /// Drive one full handshake attempt with `psk`; see `finish_rekey`.
+    fn attempt_rekey(
+        c: &mut WsClient,
+        psk: &[u8; 32],
+        device_id: &str,
+    ) -> (String, Option<e2e::Session>, Option<[u8; 32]>) {
+        let ch = begin(c, device_id);
+        finish_rekey(c, psk, device_id, &ch)
     }
 
     /// Drive one full handshake attempt with `psk`. Returns the server's final
@@ -2263,6 +2399,7 @@ mod e2e_tests {
                     device_id: device_id.clone(),
                     name: "phone".into(),
                     psk_protected: protected,
+                    psk_next_protected: None,
                     paired_at: now_ms(),
                     revoked: false,
                 })
@@ -2792,6 +2929,9 @@ mod e2e_tests {
         shutdown(f);
     }
 
+    /// A consumed offer with no device behind it (a redemption whose device
+    /// write failed). The realistic replay, the QR scanned again after a
+    /// phone paired, is `replayed_qr_after_pairing_is_refused`.
     #[test]
     fn spent_pairing_cannot_be_reused() {
         let f = fixture("spent", now_ms() + 60_000, true); // already redeemed
@@ -2815,7 +2955,8 @@ mod e2e_tests {
     #[test]
     fn paired_device_can_reconnect_after_redemption() {
         // full lifecycle: redeem a fresh offer (registers the device), then
-        // reconnect using the device registry with the same PSK.
+        // reconnect using the device registry with the same PSK (no rotation
+        // ack sent, so the QR's PSK is still the device key; see below).
         let f = fixture("lifecycle", now_ms() + 60_000, false);
         let mut c1 = connect(&f);
         let (r1, _s1) = attempt(&mut c1, &f.psk, &f.device_id);
@@ -2825,6 +2966,175 @@ mod e2e_tests {
         let (r2, s2) = attempt(&mut c2, &f.psk, &f.device_id);
         assert!(r2.contains("hs_ok"), "paired device must reconnect: {r2}");
         assert!(s2.is_some());
+        shutdown(f);
+    }
+
+    /* ---- ADR-011 addendum: device key rotation at first use --------- */
+
+    /// Sends the sealed `hs_rekey_ack` and waits until the server handled it.
+    fn ack_rekey(c: &mut WsClient, sess: &mut e2e::Session) {
+        c.send_text(&sess.seal(r#"{"type":"hs_rekey_ack"}"#))
+            .unwrap();
+        assert_eq!(ping_barrier(c, sess), None, "one offer per connection");
+    }
+
+    fn device(f: &Fixture) -> DeviceRecord {
+        f.companion.shared.storage.lock().unwrap().devices[&f.device_id].clone()
+    }
+
+    /// Stop the server and companion, keep the data dir, boot both again.
+    fn restart(f: Fixture) -> Fixture {
+        let Fixture {
+            companion,
+            handle,
+            psk,
+            device_id,
+            data_dir,
+        } = f;
+        companion.shutdown(handle.stop());
+        drop(companion);
+        let mut c = default_config();
+        c.data_dir = data_dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        Fixture {
+            companion,
+            handle,
+            psk,
+            device_id,
+            data_dir,
+        }
+    }
+
+    /// Row 2.2 (emulator, 2026-10-25): the QR payload stayed a credential
+    /// after pairing, so a wiped or second phone scanning it again connected
+    /// as the device. Now the first redemption queues a fresh device key, the
+    /// phone stores and acks it, and the QR's PSK is refused from then on.
+    #[test]
+    fn replayed_qr_after_pairing_is_refused() {
+        let f = fixture("rekey-replay", now_ms() + 60_000, false);
+        let mut phone = connect(&f);
+        let (resp, sess, rekey) = attempt_rekey(&mut phone, &f.psk, &f.device_id);
+        assert!(resp.contains("hs_ok"), "first connect must redeem: {resp}");
+        let mut sess = sess.unwrap();
+        let key = rekey.expect("the first connection must be offered hs_rekey");
+        assert_ne!(key, f.psk, "the device key is fresh, not the QR's");
+        assert!(
+            device(&f).psk_next_protected.is_some(),
+            "pending until acked"
+        );
+        ack_rekey(&mut phone, &mut sess);
+        let d = device(&f);
+        assert_eq!(d.psk_next_protected, None);
+        assert_eq!(unprotect_psk(&d.psk_protected).unwrap(), key, "promoted");
+        // the QR replayed later: the existing terminal deny, no session
+        let (resp, sess) = attempt(&mut connect(&f), &f.psk, &f.device_id);
+        assert!(sess.is_none());
+        assert!(resp.contains("proof verification failed"), "got: {resp}");
+        // the phone that stored the device key reconnects and is offered nothing
+        let (resp, sess, rekey) = attempt_rekey(&mut connect(&f), &key, &f.device_id);
+        assert!(resp.contains("hs_ok") && sess.is_some(), "got: {resp}");
+        assert_eq!(rekey, None);
+        shutdown(f);
+    }
+
+    /// The ack is lost (the connection died after `hs_rekey`) but the phone
+    /// had stored the key: its next handshake proves the rotated key, which
+    /// promotes it. The phone is never locked out, and the QR is dead after.
+    #[test]
+    fn lost_rekey_ack_promotes_on_next_handshake_with_new_key() {
+        let f = fixture("rekey-lost-ack", now_ms() + 60_000, false);
+        let (_, _, rekey) = attempt_rekey(&mut connect(&f), &f.psk, &f.device_id);
+        let key = rekey.expect("the first connection must be offered hs_rekey");
+        let (resp, sess, rekey) = attempt_rekey(&mut connect(&f), &key, &f.device_id);
+        assert!(
+            resp.contains("hs_ok") && sess.is_some(),
+            "stored key: {resp}"
+        );
+        assert_eq!(rekey, None, "a promoted key is not offered again");
+        let d = device(&f);
+        assert_eq!(d.psk_next_protected, None);
+        assert_eq!(unprotect_psk(&d.psk_protected).unwrap(), key);
+        let (resp, sess) = attempt(&mut connect(&f), &f.psk, &f.device_id);
+        assert!(sess.is_none());
+        assert!(resp.contains("proof verification failed"), "got: {resp}");
+        shutdown(f);
+    }
+
+    /// A phone without rotation support drops the unknown sealed frame and
+    /// never acks: it keeps working on the QR's PSK and is offered the SAME
+    /// key every time. A fresh mint per connection would orphan the key a
+    /// phone stored before its ack was lost.
+    #[test]
+    fn client_ignoring_rekey_keeps_working_and_is_offered_the_same_key() {
+        let f = fixture("rekey-ignored", now_ms() + 60_000, false);
+        let (r1, s1, k1) = attempt_rekey(&mut connect(&f), &f.psk, &f.device_id);
+        let queued = device(&f).psk_next_protected;
+        let (r2, s2, k2) = attempt_rekey(&mut connect(&f), &f.psk, &f.device_id);
+        assert!(r1.contains("hs_ok") && r2.contains("hs_ok"), "{r1} / {r2}");
+        // both sessions carried a sealed ping/pong (`ping_barrier`)
+        assert!(s1.is_some() && s2.is_some());
+        assert!(k1.is_some());
+        assert_eq!(k1, k2, "the same device key on every connection");
+        assert_eq!(device(&f).psk_next_protected, queued, "nothing re-minted");
+        shutdown(f);
+    }
+
+    /// The pending rotation and its promotion are journaled, the key only in
+    /// its DPAPI-protected form: a restart offers the same key, and after the
+    /// ack and another restart only the device key connects.
+    #[test]
+    fn rekey_state_survives_restart() {
+        let f = fixture("rekey-restart", now_ms() + 60_000, false);
+        let (_, _, rekey) = attempt_rekey(&mut connect(&f), &f.psk, &f.device_id);
+        let key = rekey.expect("the first connection must be offered hs_rekey");
+        let f = restart(f);
+        let mut phone = connect(&f);
+        let (resp, sess, rekey) = attempt_rekey(&mut phone, &f.psk, &f.device_id);
+        assert!(resp.contains("hs_ok"), "got: {resp}");
+        assert_eq!(rekey, Some(key), "the pending key survives a restart");
+        ack_rekey(&mut phone, &mut sess.unwrap());
+        drop(phone);
+        let f = restart(f);
+        let (resp, sess) = attempt(&mut connect(&f), &f.psk, &f.device_id);
+        assert!(sess.is_none(), "QR after promotion + restart: {resp}");
+        assert!(resp.contains("proof verification failed"), "got: {resp}");
+        let (resp, sess) = attempt(&mut connect(&f), &key, &f.device_id);
+        assert!(resp.contains("hs_ok") && sess.is_some(), "got: {resp}");
+        let journal = std::fs::read(f.data_dir.join("companion.journal")).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&journal).contains(&base64::encode(&key)),
+            "the plaintext device key reached the journal"
+        );
+        shutdown(f);
+    }
+
+    /// Revocation does not care about a pending rotation: the live session
+    /// closes with 4003, neither the QR's PSK nor the queued key opens a new
+    /// one, and nothing promotes the key of a revoked device.
+    #[test]
+    fn revoked_device_with_pending_rekey_is_refused() {
+        let f = fixture("rekey-revoked", now_ms() + 60_000, false);
+        let mut phone = connect(&f);
+        let (_, _, rekey) = attempt_rekey(&mut phone, &f.psk, &f.device_id);
+        let key = rekey.expect("the first connection must be offered hs_rekey");
+        assert!(matches!(
+            f.companion.revoke_device(&f.device_id),
+            Ok(crate::companion::RevokeResult::Revoked { terminated: 1 })
+        ));
+        match phone.read_frame().unwrap() {
+            Frame::Close(code, _) => assert_eq!(code, Some(CLOSE_DEVICE_REVOKED)),
+            other => panic!("expected close 4003, got {other:?}"),
+        }
+        for psk in [f.psk, key] {
+            let (resp, sess) = attempt(&mut connect(&f), &psk, &f.device_id);
+            assert!(sess.is_none());
+            assert!(resp.contains("device revoked"), "got: {resp}");
+        }
+        let mut store = f.companion.shared.storage.lock().unwrap();
+        promote_next_psk(&mut store, &f.device_id).unwrap();
+        assert!(store.devices[&f.device_id].psk_next_protected.is_some());
+        drop(store);
         shutdown(f);
     }
 
@@ -2873,6 +3183,7 @@ mod e2e_tests {
                     device_id: dev1.clone(),
                     name: "phone1".into(),
                     psk_protected: prot1,
+                    psk_next_protected: None,
                     paired_at: now_ms(),
                     revoked: false,
                 })
@@ -2882,6 +3193,7 @@ mod e2e_tests {
                     device_id: dev2.clone(),
                     name: "phone2".into(),
                     psk_protected: prot2,
+                    psk_next_protected: None,
                     paired_at: now_ms(),
                     revoked: false,
                 })
@@ -3444,8 +3756,8 @@ mod e2e_tests {
     /// DPAPI + HMAC now run with the storage lock released, so `redeem` must
     /// decide again on the records as they are when it commits: a concurrent
     /// redemption of the same offer still opens (as the device it registered,
-    /// offer consumed once), while a revocation or a replaced key that landed
-    /// in the meantime is refused.
+    /// offer consumed once, one device key queued), while a revocation, a
+    /// replaced key or a rotation that landed in the meantime is refused.
     #[test]
     fn redeem_decides_again_on_records_that_moved_while_unlocked() {
         let f = fixture("redeem-again", now_ms() + 60_000, false);
@@ -3458,16 +3770,29 @@ mod e2e_tests {
         let offer = f.companion.shared.storage.lock().unwrap().pairings[&f.device_id]
             .psk_protected
             .clone();
-        // two handshakes verified the same fresh offer while unlocked
-        redeem(&f.companion, &pending, &offer).unwrap();
-        redeem(&f.companion, &pending, &offer).unwrap();
+        // two handshakes verified the same fresh offer while unlocked and each
+        // minted a device key: only the first is queued, both are offered it
+        let first = redeem(&f.companion, &pending, &offer, Some("minted-1".into())).unwrap();
+        let second = redeem(&f.companion, &pending, &offer, Some("minted-2".into())).unwrap();
+        assert_eq!(first.as_deref(), Some("minted-1"));
+        assert_eq!(
+            second, first,
+            "a second redemption never queues a second key"
+        );
         {
             let store = f.companion.shared.storage.lock().unwrap();
             assert!(store.pairings[&f.device_id].consumed);
             assert_eq!(store.devices[&f.device_id].psk_protected, offer);
         }
         assert_eq!(
-            redeem(&f.companion, &pending, "replaced").unwrap_err(),
+            redeem(&f.companion, &pending, "replaced", None).unwrap_err(),
+            "device changed during handshake"
+        );
+        // a proof under the queued key promotes it; the offer's PSK, verified
+        // just before that, no longer counts
+        assert_eq!(redeem(&f.companion, &pending, "minted-1", None), Ok(None));
+        assert_eq!(
+            redeem(&f.companion, &pending, &offer, None).unwrap_err(),
             "device changed during handshake"
         );
         {
@@ -3477,7 +3802,7 @@ mod e2e_tests {
             store.put_device(&d).unwrap();
         }
         assert_eq!(
-            redeem(&f.companion, &pending, &offer).unwrap_err(),
+            redeem(&f.companion, &pending, "minted-1", None).unwrap_err(),
             "device revoked"
         );
         shutdown(f);

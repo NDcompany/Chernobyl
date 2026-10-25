@@ -130,3 +130,60 @@ app reuses this same E2E session layer.
 - iOS: foreground works over the same WS; background push deferred (APNs is Apple
   infrastructure — a future decision if iOS ships).
 - The web app (future feature) inherits E2E for free — same frames, same keys.
+
+## Addendum 2026-10-26: device key rotation at first use
+
+**Problem.** §3 promises a single-use QR, but redemption registered the device under the PSK
+the QR carries, so the QR stayed a credential for as long as the device stayed paired. Found on
+the emulator (checklist row 2.2): a wiped phone given the same payload again connected as the
+device. A photo or screenshot of the QR taken during its 5-minute display, or the payload found
+later, gave persistent access.
+
+**Decision.** The QR's PSK only bootstraps the first session. At first redemption the companion
+mints a fresh 256-bit device key (CSPRNG FFI) and hands it to the phone inside that sealed
+session. Once the phone confirms it stored the key, the device key is the only key and the
+QR's PSK fails the handshake.
+
+Wire: two transport-level frames, sealed like everything after `hs_ok`. Like the `hs_*` frames
+they are not protocol messages, so they are not in `ClientMessage`/`ServerMessage`.
+
+- S→C `{"type":"hs_rekey","psk":"<b64 32B>"}`, right after `hs_ok` while the device's key
+  rotation is pending. Every connection gets the same key until it is promoted; the companion
+  never mints a second one.
+- C→S `{"type":"hs_rekey_ack"}`, sent only after the phone persisted the key. It is accepted
+  any time after `hs_ok`, including before `hello`.
+
+State per device (journal `device` record, both keys DPAPI-protected): `psk` (current) and an
+optional `pskNext` (pending).
+
+| State | Handshake accepts | After `hs_ok` | Leaves by |
+|---|---|---|---|
+| Offer (unredeemed) | the QR's PSK | — | first handshake: device registered with `psk` = QR PSK, `pskNext` = new key |
+| Pending | the QR's PSK, or the new key | `hs_rekey` (when proved with the QR's PSK) | `hs_rekey_ack`, or a proof under the new key (its ack was lost): promote |
+| Rotated | the device key only | — | (the QR's PSK gets `hs_err`, the app's terminal deny) |
+
+A revoked device is refused in every state, under either key. Promotion (`psk` = `pskNext`,
+`pskNext` cleared, persisted) runs under the storage lock, and the handshake keeps verifying
+unlocked and deciding again under the lock.
+
+The commit is two-phase, so no single lost frame or failed write locks the phone out. A lost
+`hs_rekey` means the phone keeps the QR's PSK and is offered the same key next time. When the
+keystore write fails, the app sends no ack and keeps the old key. A lost ack is harmless: the
+phone has switched to the new key, and its next handshake proves that key and promotes it.
+
+**Compatibility.** An app without rotation support drops the unknown sealed frame
+(`parseServerMessage` returns null) and keeps working on the QR's PSK; it never acks, so for it
+the QR stays a credential until the phone is re-paired with a rotating app. Devices paired
+before this change have no pending key and are not rotated. `pskNext` is optional in the
+journal, so older journals load unchanged.
+
+**Residuals** (threat model §3.11): until the paired phone's first ack, anyone holding the QR
+connects as the device and receives the same key; an attacker who redeems and acks first leaves
+the real phone with a visible terminal deny. With no forward secrecy (§1), a passive observer
+who also holds the QR and records the first session can derive the device key.
+
+**Evidence:** `server.rs` `replayed_qr_after_pairing_is_refused`,
+`lost_rekey_ack_promotes_on_next_handshake_with_new_key`,
+`client_ignoring_rekey_keeps_working_and_is_offered_the_same_key`,
+`rekey_state_survives_restart`, `revoked_device_with_pending_rekey_is_refused`; the `hs_rekey`
+transport tests in `packages/e2e`; interop scenario 10 in `tools/e2e-interop.mjs`.

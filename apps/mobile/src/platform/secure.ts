@@ -47,7 +47,8 @@ export async function clearHostToken(): Promise<void> {
 /**
  * The pairing payload (QR JSON) IS the credential — it carries the PSK, so it
  * lives in the keystore exactly like the host token, never in SQLite or plain
- * state (ADR-002/012). Stored as the raw scanned/pasted text; validated by
+ * state (ADR-002/012). Stored as the raw scanned/pasted text (its `psk` later
+ * replaced by the rotated device key, see rotatePairingPsk); validated by
  * parsePairingPayload on every read.
  */
 const PAIRING_KEY = 'chernobyl_pairing';
@@ -74,6 +75,27 @@ export async function readPairing(): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Swaps the stored pairing's PSK for the device key the companion rotated it
+ * to at first use (ADR-011 addendum); the rest of the payload is kept. Rejects
+ * when the stored pairing is no longer this device's (re-paired meanwhile) or
+ * the keystore write fails: the transport then withholds its ack and keeps the
+ * old key, so a failed write can never lock the phone out. Unlike savePairing
+ * there is no in-memory fallback, since the ack must mean "stored".
+ */
+export async function rotatePairingPsk(deviceId: string, pskB64: string): Promise<void> {
+  const payload = JSON.parse((await readPairing()) ?? 'null') as Record<string, unknown> | null;
+  if (payload?.dev !== deviceId) throw new Error('stored pairing changed');
+  const rotated = JSON.stringify({ ...payload, psk: pskB64 });
+  if (Platform.OS === 'web') {
+    webPairing = rotated;
+    return;
+  }
+  await SecureStore.setItemAsync(PAIRING_KEY, rotated, {
+    keychainAccessible: SecureStore.WHEN_UNLOCKED,
+  });
 }
 
 export async function clearPairing(): Promise<void> {

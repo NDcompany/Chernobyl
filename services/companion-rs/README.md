@@ -47,8 +47,10 @@ After the phone connects, a handshake (`hs_hello → hs_challenge → hs_proof �
 mutual PSK knowledge — the phone sends a fresh client nonce, the server answers with a fresh
 nonce+salt and both sides HMAC all three, so neither a captured proof nor a recorded server
 transcript can be replayed and a MITM without the PSK is rejected. A pending offer is
-redeemed on first connect (single-use consume + device registration); a paired device
-reconnects with its stored PSK. From `hs_ok` on, every frame is ChaCha20-Poly1305-sealed with
+redeemed on first connect (single-use consume + device registration), and that first session
+hands the phone a fresh device key that replaces the QR's PSK once the phone confirms it
+stored it, so a re-used QR is refused from then on (see "Device key rotation" below); a paired
+device reconnects with its stored key. From `hs_ok` on, every frame is ChaCha20-Poly1305-sealed with
 HKDF-SHA-256 directional keys and a monotonic counter nonce, so replay, desync and tampering
 all tear the connection down. Revocation (`companion revoke <device-id>`) terminates any
 live session with close code 4003 ("device revoked") via an in-process diagnostics route
@@ -92,7 +94,23 @@ After `hs_ok` both sides switch to sealed frames. Each frame payload is:
 - **Counter** `n` starts at 0 per direction and increments by exactly 1 per frame. The server
   requires strict sequence: a lower `n` is a replay, a higher one is desync — both close the
   connection. A bad tag (tamper) also closes it.
-- The **inner plaintext** is the normal protocol JSON (`hello`, `ping`, `create_session`, …).
+- The **inner plaintext** is the normal protocol JSON (`hello`, `ping`, `create_session`, …),
+  plus the two transport-level rotation frames below.
+
+**Device key rotation** (ADR-011 addendum). These frames are transport-level like the `hs_*`
+frames, always sealed, and not protocol messages:
+
+- S→C `{"type":"hs_rekey","psk":"<b64 32B>"}` comes right after `hs_ok` while the device's
+  rotated key is pending, i.e. from its first redemption until the phone confirms the key. Every
+  connection gets the same key until then.
+- C→S `{"type":"hs_rekey_ack"}` is sent only after the phone persisted the key, and from its
+  next handshake on the phone proves that key. The server accepts it any time after `hs_ok`
+  (also before `hello`).
+
+The ack makes the new key the device's only key, and the QR's PSK then gets `hs_err`. A proof
+under the pending key (the phone stored it but the ack was lost) promotes it the same way. A
+client that ignores `hs_rekey` keeps working on the QR's PSK and is offered the same key on
+each connection.
 
 ## Verify
 

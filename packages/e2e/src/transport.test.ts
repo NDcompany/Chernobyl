@@ -4,7 +4,8 @@
  * exact sequences the real companion produces (server.rs handshake tests).
  * Covers: happy path, mutual-auth failure, hs_err denial, unexpected-close
  * reconnect, in-flight command replay, sealed-violation teardown, heartbeat,
- * and single-subscriber semantics across reconnects.
+ * single-subscriber semantics across reconnects, and the two-phase device key
+ * rotation (hs_rekey → persist → hs_rekey_ack).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -74,6 +75,7 @@ function harness(opts?: {
   retryBaseMs?: number;
   retryMaxMs?: number;
   stableMs?: number;
+  onRekey?: (pskB64: string) => Promise<void>;
 }) {
   const socks: FakeSocket[] = [];
   const t = createE2eTransport({
@@ -84,6 +86,7 @@ function harness(opts?: {
     stableMs: opts?.stableMs,
     heartbeatMs: opts?.heartbeatMs ?? 0,
     pongTimeoutMs: opts?.pongTimeoutMs ?? 50,
+    onRekey: opts?.onRekey,
     openSocket: () => {
       const s = new FakeSocket();
       socks.push(s);
@@ -102,11 +105,12 @@ function cnonceOf(hello: string | undefined): Uint8Array {
   return cnonce;
 }
 
-/** Server half of the handshake (server.rs semantics). */
+/** Server half of the handshake (server.rs semantics), keyed by `psk` (default: the QR's). */
 async function serverHandshake(
   sock: FakeSocket,
-  opts?: { serverProof?: Uint8Array; err?: string },
+  opts?: { serverProof?: Uint8Array; err?: string; psk?: Uint8Array },
 ): Promise<SealedSession | null> {
+  const psk = opts?.psk ?? PSK;
   const cnonce = cnonceOf(sock.sent[0]);
   sock.serverSend(JSON.stringify({ type: 'hs_challenge', nonce: b64encode(NONCE), salt: b64encode(SALT) }));
   await tick();
@@ -115,11 +119,13 @@ async function serverHandshake(
     await tick();
     return null;
   }
-  assert.match(sock.sent[1] ?? '', /"hs_proof"/);
-  const serverProof = opts?.serverProof ?? handshakeProof(PSK, 'server', DEVICE, NONCE, SALT, cnonce);
+  const proof = JSON.parse(sock.sent[1] ?? '{}') as { type?: unknown; proof?: unknown };
+  assert.equal(proof.type, 'hs_proof');
+  assert.equal(proof.proof, b64encode(handshakeProof(psk, 'client', DEVICE, NONCE, SALT, cnonce)), 'client must prove psk');
+  const serverProof = opts?.serverProof ?? handshakeProof(psk, 'server', DEVICE, NONCE, SALT, cnonce);
   sock.serverSend(JSON.stringify({ type: 'hs_ok', serverProof: b64encode(serverProof) }));
   await tick();
-  return SealedSession.host(deriveKeys(PSK, SALT, cnonce));
+  return SealedSession.host(deriveKeys(psk, SALT, cnonce));
 }
 
 test('connect: handshake, sealed hello, ack correlation, ping/pong', async () => {
@@ -476,6 +482,102 @@ test('connect() during a scheduled retry cancels it: no duplicate socket (sectio
     await sleep(80); // well past the old timer
     assert.equal(socks.length, 2, 'the superseded retry must not open a second socket');
     assert.equal(socks[1].closedWith, null, 'the live dial is not orphaned');
+  } finally {
+    t.close();
+  }
+});
+
+/* ADR-011 addendum: the companion rotates the QR's PSK to a device key at first use. */
+const NEW_PSK = new Uint8Array(32).fill(9);
+
+test('hs_rekey: stored first, acked only after, new key from the next handshake, never surfaced', async () => {
+  const stored: string[] = [];
+  let release: () => void = () => {};
+  const { t, socks } = harness({
+    onRekey: (psk) => {
+      stored.push(psk);
+      return new Promise<void>((r) => {
+        release = () => r();
+      });
+    },
+  });
+  const seen: string[] = [];
+  t.subscribe((m) => seen.push(m.type));
+  try {
+    t.connect();
+    const s1 = socks[0];
+    s1.serverOpen();
+    const h1 = await serverHandshake(s1);
+    assert.ok(h1);
+    h1.open(s1.sent[2]); // the sealed hello (client counter 0)
+    s1.serverSend(h1.seal(JSON.stringify({ type: 'hs_rekey', psk: b64encode(NEW_PSK) })));
+    await tick();
+    assert.deepEqual(stored, [b64encode(NEW_PSK)], 'the hook gets the new key');
+    assert.equal(s1.sent.length, 3, 'no ack before the key is stored');
+    release();
+    await tick();
+    assert.equal(h1.open(s1.sent[3]), '{"type":"hs_rekey_ack"}');
+    assert.deepEqual(seen, [], 'hs_rekey never reaches subscribers');
+    // the next connection proves the new key (serverHandshake checks the proof)
+    s1.serverClose(1006);
+    await sleep(40);
+    socks[1].serverOpen();
+    assert.ok(await serverHandshake(socks[1], { psk: NEW_PSK }));
+    assert.equal(t.status(), 'connected');
+  } finally {
+    t.close();
+  }
+});
+
+test('sealed frames delivered in the same tick as hs_ok reach the session in order', async () => {
+  // one socket read can carry hs_ok and the frames the companion sends right
+  // behind it; they used to stay in the handshake queue, never opened, and the
+  // next sealed frame then failed as a counter desync
+  const stored: string[] = [];
+  const { t, socks } = harness({ onRekey: async (psk) => void stored.push(psk) });
+  const seen: string[] = [];
+  t.subscribe((m) => seen.push(m.type));
+  try {
+    t.connect();
+    const s = socks[0];
+    s.serverOpen();
+    const cnonce = cnonceOf(s.sent[0]);
+    s.serverSend(JSON.stringify({ type: 'hs_challenge', nonce: b64encode(NONCE), salt: b64encode(SALT) }));
+    await tick();
+    const host = SealedSession.host(deriveKeys(PSK, SALT, cnonce));
+    const serverProof = handshakeProof(PSK, 'server', DEVICE, NONCE, SALT, cnonce);
+    s.serverSend(JSON.stringify({ type: 'hs_ok', serverProof: b64encode(serverProof) }));
+    s.serverSend(host.seal(JSON.stringify({ type: 'hs_rekey', psk: b64encode(NEW_PSK) })));
+    s.serverSend(host.seal(JSON.stringify({ type: 'ack', commandId: 'c1', ok: true })));
+    await tick();
+    assert.equal(t.status(), 'connected');
+    assert.deepEqual(stored, [b64encode(NEW_PSK)], 'hs_rekey was opened');
+    assert.deepEqual(seen, ['ack'], 'the frame behind it was delivered');
+    s.serverSend(host.seal(JSON.stringify({ type: 'ack', commandId: 'c2', ok: true })));
+    assert.equal(s.closedWith, null, 'counters stay in step: no desync teardown');
+    assert.deepEqual(seen, ['ack', 'ack']);
+  } finally {
+    t.close();
+  }
+});
+
+test('hs_rekey: a key that could not be stored is not acked and the old key stays', async () => {
+  const { t, socks } = harness({ onRekey: () => Promise.reject(new Error('keystore write failed')) });
+  try {
+    t.connect();
+    const s1 = socks[0];
+    s1.serverOpen();
+    const h1 = await serverHandshake(s1);
+    assert.ok(h1);
+    s1.serverSend(h1.seal(JSON.stringify({ type: 'hs_rekey', psk: b64encode(NEW_PSK) })));
+    await sleep(5);
+    assert.equal(s1.sent.length, 3, 'no ack for an unstored key');
+    assert.equal(s1.closedWith, null, 'the session stays up');
+    s1.serverClose(1006);
+    await sleep(40);
+    socks[1].serverOpen();
+    assert.ok(await serverHandshake(socks[1]), 'the QR key still proves');
+    assert.equal(t.status(), 'connected');
   } finally {
     t.close();
   }

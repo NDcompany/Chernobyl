@@ -90,6 +90,11 @@ pub struct DeviceRecord {
     pub device_id: String,
     pub name: String,
     pub psk_protected: String, // base64 of DPAPI-protected 32-byte PSK
+    /// The device key minted at first redemption that replaces the QR's PSK
+    /// once the phone confirms it stored it (ADR-011 addendum), protected
+    /// like `psk_protected`. `None` when no rotation is pending (and for
+    /// records written before rotation existed).
+    pub psk_next_protected: Option<String>,
     pub paired_at: i64,
     pub revoked: bool,
 }
@@ -502,6 +507,7 @@ impl Storage {
                             device_id: id,
                             name: gs("name").unwrap_or_default(),
                             psk_protected: gs("psk").unwrap_or_default(),
+                            psk_next_protected: gs("pskNext"),
                             paired_at: gi("pairedAt"),
                             revoked: json::as_bool(&g("revoked")).unwrap_or(false),
                         },
@@ -686,16 +692,20 @@ impl Storage {
     }
 
     fn device_body(rec: &DeviceRecord) -> Json {
-        json::obj(vec![
+        let mut fields = vec![
             ("deviceId", json::s(&rec.device_id)),
             ("name", json::s(&rec.name)),
             ("psk", json::s(&rec.psk_protected)),
             ("pairedAt", Json::Int(rec.paired_at)),
             ("revoked", Json::Bool(rec.revoked)),
-        ])
+        ];
+        if let Some(next) = &rec.psk_next_protected {
+            fields.push(("pskNext", json::s(next)));
+        }
+        json::obj(fields)
     }
 
-    /// Persists a paired-device registry entry (PSK already DPAPI-protected).
+    /// Persists a paired-device registry entry (PSKs already DPAPI-protected).
     pub fn put_device(&mut self, rec: &DeviceRecord) -> Result<(), String> {
         self.append(&record_line("device", &Self::device_body(rec)))?;
         self.devices.insert(rec.device_id.clone(), rec.clone());
@@ -1207,6 +1217,7 @@ mod tests {
                 device_id: "d1".into(),
                 name: "phone".into(),
                 psk_protected: "PROTECTED_PSK".into(),
+                psk_next_protected: Some("PROTECTED_NEXT".into()),
                 paired_at: 200,
                 revoked: false,
             })
@@ -1228,6 +1239,8 @@ mod tests {
             .expect("device survives reopen+compact");
         assert_eq!(d.name, "phone");
         assert!(!d.revoked);
+        // a pending key rotation survives too (ADR-011 addendum)
+        assert_eq!(d.psk_next_protected.as_deref(), Some("PROTECTED_NEXT"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1325,6 +1338,8 @@ mod tests {
             device_id: "d1".into(),
             name: "phone".into(),
             psk_protected: "P".into(),
+            // no pskNext key on the line: the pre-rotation format still parses
+            psk_next_protected: None,
             paired_at: 1,
             revoked: false,
         };

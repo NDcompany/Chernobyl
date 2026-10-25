@@ -170,6 +170,7 @@ mod tests {
             device_id: id.into(),
             name: "phone".into(),
             psk_protected: "P".into(),
+            psk_next_protected: None,
             paired_at: 1,
             revoked,
         };
