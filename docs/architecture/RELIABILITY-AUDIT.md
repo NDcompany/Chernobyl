@@ -238,3 +238,36 @@ production behavior. Status is updated once the fix lands (§12 verification per
 ### Section 8/10 integration coverage (`tests/lifecycle.rs`)
 
 `shutdown_while_client_mid_http_upgrade`, `shutdown_while_client_mid_e2e_handshake`, `shutdown_during_active_command_and_fanout_reconciles_at_reboot` (graceful line last; after reboot every command keeps its outcome or is reconciled `unknown`, never success), `resource_cleanup_after_repeated_failure_cycles` (200 garbage cycles, `connectionsActive` back to 0), `multi_client_isolation_malformed_flood_does_not_break_ping_pong`.
+
+---
+
+## 6. Section 6 adapter resilience (§6 mandate)
+
+Status note on adapter resilience gaps addressed in `opencode.rs`, `ollama.rs`, and `claude.rs`:
+
+1. **Bounded output:**
+   - In `opencode.rs`, SSE lines are capped at `MAX_SSE_LINE_BYTES` (1 MiB) and event data at `MAX_SSE_EVENT_BYTES` (1 MiB). When an oversize line/payload is encountered, the event is dropped, incoming bytes are drained in 4 KiB chunks without unbounded allocation, the adapter detail is set to a truthful message, and the stream stays alive.
+   - HTTP response bodies in `opencode.rs` and `ollama.rs` are capped at 4 MiB (`MAX_HTTP_BODY_BYTES` / `MAX_OLLAMA_BODY_BYTES`) in `validate_json`; oversize bodies reject cleanly as `InvalidResponse`.
+   - In `claude.rs`, hook payloads are capped at `MAX_HOOK_PAYLOAD_BYTES` (1 MiB) in `ingest`.
+   - `client.rs` reads HTTP bodies under a 16 MiB cap (follow-up commit), so the 4 MiB adapter checks no longer sit behind an unbounded read.
+2. **Stalled stream:**
+   - `opencode.rs` sets read timeouts on both socket handles (`stream` and `reader_stream`, default 90 s via `sse_read_timeout`). If the SSE connection delivers nothing (no keep-alive) within the read timeout, the read times out, marks the adapter unhealthy (`st.healthy = false`), and reconnects through the jittered backoff.
+3. **Malformed output:**
+   - Non-JSON or wrong-shape SSE data in `opencode.rs` is ignored without panicking, incrementing `malformed_events: AtomicU64` and noting the failure in `st.detail`.
+   - In `ollama.rs` and `claude.rs`, malformed payloads are safely rejected as `InvalidResponse`, never panicking.
+4. **Crash/restart:**
+   - Mid-stream server termination in `opencode.rs` marks the adapter unhealthy (`st.healthy = false`). When the server restarts on the same port, the single `sse_loop` thread reconnects, refreshes state, and restores health with exactly one subscription delivery (no duplicate threads or callbacks).
+5. **Secret redaction:**
+   - `split_url` strips `user:pass@` credentials from authorities, ensuring adapter error/detail strings never leak credentials. Pinned with adapter-level fault tests in both `opencode.rs` and `ollama.rs`.
+
+**New tests added (§6 suite):**
+- `opencode::tests::oversize_sse_line_and_event_are_dropped_without_unbounded_memory`
+- `opencode::tests::oversize_http_body_is_rejected_as_invalid_response`
+- `opencode::tests::stalled_sse_stream_times_out_and_reconnects`
+- `opencode::tests::malformed_sse_data_is_ignored_with_counter_and_detail_no_panic`
+- `opencode::tests::crash_midstream_goes_unhealthy_and_recovers_on_restart_single_thread`
+- `opencode::tests::credentials_in_endpoint_are_never_leaked_in_detail_or_errors`
+- `ollama::tests::oversize_body_is_rejected_as_invalid_response`
+- `ollama::tests::malformed_json_and_wrong_shape_are_rejected_without_panic`
+- `ollama::tests::credentials_in_endpoint_are_never_leaked_in_detail_or_errors`
+- `claude::tests::oversize_payload_is_rejected`

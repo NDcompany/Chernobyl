@@ -108,6 +108,8 @@ struct Inner {
     /// The live SSE socket, kept so `dispose()` can unblock the reader.
     killer: Mutex<Option<TcpStream>>,
     started: AtomicBool,
+    sse_read_timeout: Mutex<Duration>,
+    malformed_events: AtomicU64,
 }
 
 pub struct OpenCodeAdapter {
@@ -139,8 +141,20 @@ impl OpenCodeAdapter {
                 stop: AtomicBool::new(false),
                 killer: Mutex::new(None),
                 started: AtomicBool::new(false),
+                sse_read_timeout: Mutex::new(Duration::from_secs(90)),
+                malformed_events: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Total malformed/corrupted SSE events ignored since boot.
+    pub fn malformed_events(&self) -> u64 {
+        self.inner.malformed_events.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub fn set_sse_read_timeout(&self, timeout: Duration) {
+        *self.inner.sse_read_timeout.lock().unwrap() = timeout;
     }
 
     /// PRD §7.3 honest capability declaration. Structural rules (tested):
@@ -380,9 +394,18 @@ fn ack(
     }
 }
 
+/// Maximum HTTP response body size accepted from OpenCode REST endpoints (audit §6 bounded output).
+pub const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
 /// G4.2: content-type first, then shape — an HTML page with HTTP 200 (the
 /// live SPA fallback) must never parse as success.
 fn validate_json(resp: &HttpResponse) -> Result<Json, AdapterError> {
+    if resp.body.len() > MAX_HTTP_BODY_BYTES {
+        return Err(AdapterError::InvalidResponse(format!(
+            "response body exceeds {MAX_HTTP_BODY_BYTES} byte limit (was {})",
+            resp.body.len()
+        )));
+    }
     if !resp.content_type.contains("application/json") {
         let ct = if resp.content_type.is_empty() {
             "(no content-type)".to_string()
@@ -773,9 +796,21 @@ impl Inner {
 /* SSE stream                                                          */
 /* ------------------------------------------------------------------ */
 
+/// Maximum length of a single SSE line (audit §6 bounded output). Oversize
+/// lines are dropped without accumulating unbounded memory.
+pub const MAX_SSE_LINE_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Maximum length of an accumulated SSE event payload (audit §6 bounded output).
+pub const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024; // 1 MiB
+
 enum BodyMode {
     Raw,
     Chunked { remaining: usize },
+}
+
+enum SseLine {
+    Line(String),
+    Oversize,
 }
 
 /// Incremental response body: raw-until-close or chunked (HTTP/1.1 servers
@@ -786,6 +821,7 @@ struct SseBody {
     mode: BodyMode,
     buf: Vec<u8>,
     eof: bool,
+    oversize_discarding: bool,
 }
 
 impl SseBody {
@@ -802,18 +838,37 @@ impl SseBody {
                     self.eof = true;
                     return Ok(false);
                 }
-                self.buf.extend_from_slice(&tmp[..n]);
+                if self.oversize_discarding {
+                    if let Some(pos) = tmp[..n].iter().position(|b| *b == b'\n') {
+                        self.oversize_discarding = false;
+                        self.buf.extend_from_slice(&tmp[pos + 1..n]);
+                    }
+                } else {
+                    self.buf.extend_from_slice(&tmp[..n]);
+                }
                 Ok(true)
             }
             BodyMode::Chunked { remaining } => {
                 if *remaining == 0 {
-                    // size line (blocks until complete — read_until handles
-                    // partial arrivals)
+                    // size line (blocks until complete — bounded to 1024 bytes)
                     let mut line = Vec::new();
-                    let n = self.reader.read_until(b'\n', &mut line)?;
-                    if n == 0 {
-                        self.eof = true;
-                        return Ok(false);
+                    let mut b = [0u8; 1];
+                    while line.len() < 1024 {
+                        let n = self.reader.read(&mut b)?;
+                        if n == 0 {
+                            self.eof = true;
+                            return Ok(false);
+                        }
+                        line.push(b[0]);
+                        if b[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    if !line.ends_with(b"\n") {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "chunk size line exceeded 1024 bytes",
+                        ));
                     }
                     let text = String::from_utf8_lossy(&line);
                     let size_hex = text
@@ -829,11 +884,23 @@ impl SseBody {
                         )
                     })?;
                     if size == 0 {
-                        // drain optional trailers up to the blank line
+                        // drain optional trailers up to the blank line (bounded)
+                        let mut trailer_bytes = 0usize;
                         loop {
                             let mut t = Vec::new();
-                            let n = self.reader.read_until(b'\n', &mut t)?;
-                            if n == 0 || t == b"\r\n" || t == b"\n" {
+                            let mut tb = [0u8; 1];
+                            while t.len() < 1024 && trailer_bytes < 8192 {
+                                let n = self.reader.read(&mut tb)?;
+                                if n == 0 {
+                                    break;
+                                }
+                                t.push(tb[0]);
+                                trailer_bytes += 1;
+                                if tb[0] == b'\n' {
+                                    break;
+                                }
+                            }
+                            if t.is_empty() || t == b"\r\n" || t == b"\n" || trailer_bytes >= 8192 {
                                 break;
                             }
                         }
@@ -852,7 +919,14 @@ impl SseBody {
                     ));
                 }
                 *remaining -= n;
-                self.buf.extend_from_slice(&tmp[..n]);
+                if self.oversize_discarding {
+                    if let Some(pos) = tmp[..n].iter().position(|b| *b == b'\n') {
+                        self.oversize_discarding = false;
+                        self.buf.extend_from_slice(&tmp[pos + 1..n]);
+                    }
+                } else {
+                    self.buf.extend_from_slice(&tmp[..n]);
+                }
                 if *remaining == 0 {
                     // consume the chunk's CRLF terminator
                     let mut term = [0u8; 2];
@@ -870,23 +944,37 @@ impl SseBody {
     }
 
     /// Next SSE line (`\n`- or `\r\n`-terminated), `None` at EOF.
-    fn next_line(&mut self) -> std::io::Result<Option<String>> {
+    /// Oversize lines (> MAX_SSE_LINE_BYTES) return `Ok(Some(SseLine::Oversize))`
+    /// and discard bytes until the next newline without allocating unbounded memory.
+    fn next_line(&mut self) -> std::io::Result<Option<SseLine>> {
         loop {
             if let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = self.buf.drain(..=pos).collect();
+                if line.len() > MAX_SSE_LINE_BYTES {
+                    return Ok(Some(SseLine::Oversize));
+                }
                 let mut s = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
                 if s.ends_with('\r') {
                     s.pop();
                 }
-                return Ok(Some(s));
+                return Ok(Some(SseLine::Line(s)));
+            }
+            if self.buf.len() > MAX_SSE_LINE_BYTES {
+                self.buf.clear();
+                self.oversize_discarding = true;
+                return Ok(Some(SseLine::Oversize));
             }
             if !self.fill()? {
                 if self.buf.is_empty() {
                     return Ok(None);
                 }
-                let s = String::from_utf8_lossy(&self.buf.clone()).into_owned();
+                if self.buf.len() > MAX_SSE_LINE_BYTES {
+                    self.buf.clear();
+                    return Ok(Some(SseLine::Oversize));
+                }
+                let s = String::from_utf8_lossy(&self.buf).into_owned();
                 self.buf.clear();
-                return Ok(Some(s));
+                return Ok(Some(SseLine::Line(s)));
             }
         }
     }
@@ -917,11 +1005,14 @@ impl Inner {
         while !inner.stop.load(Ordering::SeqCst) {
             let started = std::time::Instant::now();
             match inner.sse_session() {
-                Ok(()) => {} // clean EOF → reconnect after backoff
-                Err(e) => {
-                    // healthy stays governed by the HTTP probe; the detail
-                    // line is where the app sees the stream problem.
+                Ok(()) => {
                     let mut st = inner.state.lock().unwrap();
+                    st.healthy = false;
+                    st.detail = Some("event stream: connection closed by peer".into());
+                }
+                Err(e) => {
+                    let mut st = inner.state.lock().unwrap();
+                    st.healthy = false;
                     st.detail = Some(format!("event stream: {e}"));
                 }
             }
@@ -948,12 +1039,21 @@ impl Inner {
         // replaced by the fresh snapshot (restart/recovery criterion).
         self.refresh()?;
         let mut data = String::new();
+        let mut event_oversize = false;
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 return Ok(());
             }
             let line = match body.next_line() {
-                Ok(Some(l)) => l,
+                Ok(Some(SseLine::Line(l))) => l,
+                Ok(Some(SseLine::Oversize)) => {
+                    data.clear();
+                    event_oversize = true;
+                    let mut st = self.state.lock().unwrap();
+                    st.detail =
+                        Some("event stream: dropped oversize event line (> 1 MiB cap)".into());
+                    continue;
+                }
                 Ok(None) => return Ok(()),
                 Err(e) => {
                     return Err(AdapterError::RuntimeUnavailable(format!(
@@ -962,15 +1062,28 @@ impl Inner {
                 }
             };
             if line.is_empty() {
-                if !data.is_empty() {
+                if event_oversize {
+                    event_oversize = false;
+                    data.clear();
+                } else if !data.is_empty() {
                     self.on_sse_data(&data);
                     data.clear();
                 }
-            } else if let Some(d) = line.strip_prefix("data:").map(str::trim_start) {
-                if !data.is_empty() {
-                    data.push('\n');
+            } else if !event_oversize
+                && let Some(d) = line.strip_prefix("data:").map(str::trim_start)
+            {
+                if data.len() + d.len() + 1 > MAX_SSE_EVENT_BYTES {
+                    data.clear();
+                    event_oversize = true;
+                    let mut st = self.state.lock().unwrap();
+                    st.detail =
+                        Some("event stream: dropped oversize event payload (> 1 MiB cap)".into());
+                } else {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(d);
                 }
-                data.push_str(d);
             }
             // event:/id:/retry:/comments carry nothing we normalize
         }
@@ -986,12 +1099,16 @@ impl Inner {
             .ok_or_else(|| AdapterError::Unknown(format!("no addresses for {authority}")))?;
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
             .map_err(|e| AdapterError::RuntimeUnavailable(format!("connect {addr}: {e}")))?;
+        let timeout = *self.sse_read_timeout.lock().unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(90)))
+            .set_read_timeout(Some(timeout))
             .map_err(|e| AdapterError::Unknown(e.to_string()))?;
         let _ = stream.set_nodelay(true);
         let reader_stream = stream
             .try_clone()
+            .map_err(|e| AdapterError::Unknown(e.to_string()))?;
+        reader_stream
+            .set_read_timeout(Some(timeout))
             .map_err(|e| AdapterError::Unknown(e.to_string()))?;
 
         let mut req =
@@ -1066,15 +1183,36 @@ impl Inner {
             },
             buf: Vec::new(),
             eof: false,
+            oversize_discarding: false,
         })
     }
 
     fn on_sse_data(&self, raw: &str) {
-        let Ok(v) = json::parse(raw) else { return };
+        let Ok(v) = json::parse(raw) else {
+            self.malformed_events.fetch_add(1, Ordering::SeqCst);
+            let mut st = self.state.lock().unwrap();
+            st.detail = Some(format!(
+                "ignored malformed SSE event (non-JSON; total: {})",
+                self.malformed_events.load(Ordering::SeqCst)
+            ));
+            return;
+        };
         let Some(payload) = json::get(&v, "payload") else {
+            self.malformed_events.fetch_add(1, Ordering::SeqCst);
+            let mut st = self.state.lock().unwrap();
+            st.detail = Some(format!(
+                "ignored malformed SSE event (missing payload; total: {})",
+                self.malformed_events.load(Ordering::SeqCst)
+            ));
             return;
         };
         let Some(etype) = json::get_str(payload, "type") else {
+            self.malformed_events.fetch_add(1, Ordering::SeqCst);
+            let mut st = self.state.lock().unwrap();
+            st.detail = Some(format!(
+                "ignored malformed SSE event (missing type string; total: {})",
+                self.malformed_events.load(Ordering::SeqCst)
+            ));
             return;
         };
         let props = json::get(payload, "properties");
@@ -1346,6 +1484,8 @@ pub(crate) mod tests {
         /// Hold the SSE connection open after the script (else close it,
         /// which drives the adapter's reconnect loop).
         pub sse_hold: bool,
+        /// Serve an oversize (> 4 MiB) response body on /session.
+        pub oversize_http: bool,
     }
 
     impl Default for Opts {
@@ -1355,6 +1495,7 @@ pub(crate) mod tests {
                 sse: None,
                 chunked_sse: false,
                 sse_hold: true,
+                oversize_http: false,
             }
         }
     }
@@ -1366,6 +1507,12 @@ pub(crate) mod tests {
         pub sse_conns: Arc<AtomicU64>,
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Fake {
+        pub fn port(&self) -> u16 {
+            self.addr.rsplit_once(':').unwrap().1.parse().unwrap()
+        }
     }
 
     impl Drop for Fake {
@@ -1392,7 +1539,17 @@ pub(crate) mod tests {
     const AGENTS: &str = r#"[{"name":"build","mode":"primary","model":null,"tools":0},{"name":"explore","mode":"subagent","model":null,"tools":0}]"#;
 
     pub fn start(opts: Opts) -> Fake {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        start_on_listener(TcpListener::bind("127.0.0.1:0").unwrap(), opts)
+    }
+
+    pub fn start_on_port(port: u16, opts: Opts) -> Fake {
+        start_on_listener(
+            TcpListener::bind(format!("127.0.0.1:{port}")).unwrap(),
+            opts,
+        )
+    }
+
+    fn start_on_listener(listener: TcpListener, opts: Opts) -> Fake {
         let port = listener.local_addr().unwrap().port();
         let addr = format!("http://127.0.0.1:{port}");
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1453,12 +1610,23 @@ pub(crate) mod tests {
                             "application/json",
                             r#"{"healthy":true,"version":"1.17.7"}"#,
                         ),
-                        ("GET", "/session") => respond(
-                            &mut stream,
-                            "200 OK",
-                            "application/json",
-                            &format!("[{SESSION_INFO}]"),
-                        ),
+                        ("GET", "/session") => {
+                            if o.oversize_http {
+                                let huge = format!(
+                                    r#"[{},{{"padding":"{}"}}]"#,
+                                    SESSION_INFO,
+                                    "x".repeat(MAX_HTTP_BODY_BYTES + 1024)
+                                );
+                                respond(&mut stream, "200 OK", "application/json", &huge);
+                            } else {
+                                respond(
+                                    &mut stream,
+                                    "200 OK",
+                                    "application/json",
+                                    &format!("[{SESSION_INFO}]"),
+                                )
+                            }
+                        }
                         ("GET", "/agent") => {
                             respond(&mut stream, "200 OK", "application/json", AGENTS)
                         }
@@ -2038,5 +2206,209 @@ pub(crate) mod tests {
         assert_eq!(reconnect_delay_ms(0, 250), 500);
         assert_eq!(reconnect_delay_ms(1, 750), 1000);
         assert_eq!(reconnect_delay_ms(9, 1000), 1250);
+    }
+
+    #[test]
+    fn oversize_sse_line_and_event_are_dropped_without_unbounded_memory() {
+        let ev1 = r#"data: {"payload":{"id":"e1","type":"session.created","properties":{"sessionID":"ses_o1","info":{"id":"ses_o1","title":"O1","time":{"created":1,"updated":2}}}}}"#;
+        let big_line = format!("data: {}\n\n", "x".repeat(MAX_SSE_LINE_BYTES + 2048));
+        let ev2 = r#"data: {"payload":{"id":"e2","type":"session.created","properties":{"sessionID":"ses_o2","info":{"id":"ses_o2","title":"O2","time":{"created":1,"updated":2}}}}}"#;
+        let big_payload = format!(
+            "data: {}\ndata: {}\n\n",
+            "y".repeat(600 * 1024),
+            "z".repeat(600 * 1024)
+        );
+        let ev3 = r#"data: {"payload":{"id":"e3","type":"session.created","properties":{"sessionID":"ses_o3","info":{"id":"ses_o3","title":"O3","time":{"created":1,"updated":2}}}}}"#;
+        let script = format!("{ev1}\n\n{big_line}{ev2}\n\n{big_payload}{ev3}\n\n");
+
+        let f = start(Opts {
+            sse: Some(script),
+            ..Default::default()
+        });
+        let ad = adapter(&f);
+        let (tx, rx) = mpsc::channel();
+        ad.subscribe(move |k| {
+            let _ = tx.send(k);
+        });
+        ad.start_events().unwrap();
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(rx.recv_timeout(Duration::from_secs(5)).expect("event"));
+        }
+        assert_eq!(seen.len(), 3);
+        match &seen[0] {
+            EventKind::SessionCreated(s) => assert_eq!(s.id, "ses_o1"),
+            other => panic!("expected session_created(ses_o1), got {other:?}"),
+        }
+        match &seen[1] {
+            EventKind::SessionCreated(s) => assert_eq!(s.id, "ses_o2"),
+            other => panic!("expected session_created(ses_o2), got {other:?}"),
+        }
+        match &seen[2] {
+            EventKind::SessionCreated(s) => assert_eq!(s.id, "ses_o3"),
+            other => panic!("expected session_created(ses_o3), got {other:?}"),
+        }
+        assert!(
+            ad.detail()
+                .unwrap_or_default()
+                .contains("dropped oversize event"),
+            "detail was: {:?}",
+            ad.detail()
+        );
+        ad.dispose();
+    }
+
+    #[test]
+    fn oversize_http_body_is_rejected_as_invalid_response() {
+        let f = start(Opts {
+            oversize_http: true,
+            ..Default::default()
+        });
+        let ad = adapter(&f);
+        let err = ad.refresh().unwrap_err();
+        assert_eq!(err.code(), "invalid-response");
+        assert!(!ad.is_healthy());
+        assert!(ad.detail().unwrap().contains("byte limit"));
+    }
+
+    #[test]
+    fn stalled_sse_stream_times_out_and_reconnects() {
+        let f = start(Opts {
+            sse: None,
+            sse_hold: true,
+            ..Default::default()
+        });
+        let ad = adapter(&f);
+        ad.set_sse_read_timeout(Duration::from_millis(100));
+        ad.start_events().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while f.sse_conns.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            f.sse_conns.load(Ordering::SeqCst) >= 2,
+            "stalled stream did not trigger reconnect (conns={})",
+            f.sse_conns.load(Ordering::SeqCst)
+        );
+        ad.dispose();
+    }
+
+    #[test]
+    fn malformed_sse_data_is_ignored_with_counter_and_detail_no_panic() {
+        let script = concat!(
+            "data: {not json\n\n",
+            "data: {\"missing\":\"payload\"}\n\n",
+            "data: {\"payload\":{\"missing\":\"type\"}}\n\n",
+            "data: {\"payload\":{\"id\":\"evt_ok\",\"type\":\"session.created\",\"properties\":{\"sessionID\":\"ses_mal1\",\"info\":{\"id\":\"ses_mal1\",\"title\":\"M\",\"time\":{\"created\":1,\"updated\":2}}}}}\n\n",
+        );
+        let f = start(Opts {
+            sse: Some(script.to_string()),
+            ..Default::default()
+        });
+        let ad = adapter(&f);
+        let (tx, rx) = mpsc::channel();
+        ad.subscribe(move |k| {
+            let _ = tx.send(k);
+        });
+        ad.start_events().unwrap();
+        let kind = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("event arrived");
+        match kind {
+            EventKind::SessionCreated(s) => assert_eq!(s.id, "ses_mal1"),
+            other => panic!("expected session_created, got {other:?}"),
+        }
+        assert_eq!(ad.malformed_events(), 3);
+        assert!(
+            ad.detail()
+                .unwrap_or_default()
+                .contains("ignored malformed SSE event"),
+            "detail was: {:?}",
+            ad.detail()
+        );
+        ad.dispose();
+    }
+
+    #[test]
+    fn crash_midstream_goes_unhealthy_and_recovers_on_restart_single_thread() {
+        let f1 = start(Opts::default());
+        let port = f1.port();
+        let ad = adapter(&f1);
+        let hits = Arc::new(AtomicU64::new(0));
+        let h = hits.clone();
+        ad.subscribe(move |_| {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        ad.start_events().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while !ad.is_healthy() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            ad.is_healthy(),
+            "adapter failed to connect to initial server"
+        );
+
+        // Crash: drop fake server mid-stream
+        drop(f1);
+
+        // Adapter must detect failure and mark itself unhealthy
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while ad.is_healthy() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !ad.is_healthy(),
+            "adapter must become unhealthy when server dies"
+        );
+        assert!(
+            ad.detail().unwrap_or_default().contains("event stream"),
+            "detail was: {:?}",
+            ad.detail()
+        );
+
+        // Duplicate start_events is a no-op (no duplicate sse_loop thread)
+        assert!(ad.start_events().is_ok());
+
+        // Restart fake server on the same port
+        let script = concat!(
+            r#"data: {"payload":{"id":"evt_rec","type":"session.created","properties":{"sessionID":"ses_rec","info":{"id":"ses_rec","title":"R","time":{"created":1,"updated":2}}}}}"#,
+            "\n\n"
+        );
+        let f2 = start_on_port(
+            port,
+            Opts {
+                sse: Some(script.to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Adapter recovers to healthy state
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        while !ad.is_healthy() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ad.is_healthy(), "adapter did not recover after restart");
+
+        // Exactly one event delivery (single thread, no duplicate subscription)
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while hits.load(Ordering::SeqCst) < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        ad.dispose();
+        drop(f2);
+    }
+
+    #[test]
+    fn credentials_in_endpoint_are_never_leaked_in_detail_or_errors() {
+        let ad = OpenCodeAdapter::new("oc-sec", "http://user:supersecretpass@127.0.0.1:1", None);
+        let err = ad.refresh().unwrap_err();
+        assert!(!err.to_string().contains("supersecretpass"));
+        assert!(!err.to_string().contains("user:"));
+        assert!(!ad.detail().unwrap().contains("supersecretpass"));
+        assert!(!ad.detail().unwrap().contains("user:"));
     }
 }

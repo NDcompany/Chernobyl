@@ -169,10 +169,21 @@ impl ClaudeAdapter {
         }
     }
 
+    /// Hard cap on ingested hook payloads (audit §6 bounded output). Oversize
+    /// payloads are rejected immediately to protect against unbounded memory growth.
+    pub const MAX_HOOK_PAYLOAD_BYTES: usize = 1024 * 1024; // 1 MiB
+
     /// Accept one hook payload (already read off the wire). Returns the
     /// normalized event to publish, or `None` for an ignorable/unknown hook
     /// (counted but never surfaced as a fake). Errors are malformed payloads.
     pub fn ingest(&self, payload: &str) -> Result<Option<EventKind>, AdapterError> {
+        if payload.len() > Self::MAX_HOOK_PAYLOAD_BYTES {
+            return Err(AdapterError::InvalidResponse(format!(
+                "hook payload exceeds {} byte limit (was {})",
+                Self::MAX_HOOK_PAYLOAD_BYTES,
+                payload.len()
+            )));
+        }
         let v = json::parse(payload).map_err(|e| {
             AdapterError::InvalidResponse(format!("hook body is not valid JSON: {e:?}"))
         })?;
@@ -364,6 +375,19 @@ mod tests {
         // missing hook_event_name
         assert!(ad.ingest(r#"{"session_id":"s1"}"#).is_err());
         assert_eq!(ad.received(), 0); // nothing accepted
+    }
+
+    #[test]
+    fn oversize_payload_is_rejected() {
+        let ad = ClaudeAdapter::new("cc-1");
+        let payload = format!(
+            r#"{{"session_id":"s1","hook_event_name":"SessionStart","pad":"{}"}}"#,
+            "x".repeat(ClaudeAdapter::MAX_HOOK_PAYLOAD_BYTES + 10)
+        );
+        let err = ad.ingest(&payload).unwrap_err();
+        assert_eq!(err.code(), "invalid-response");
+        assert!(err.to_string().contains("byte limit"));
+        assert_eq!(ad.received(), 0);
     }
 
     #[test]

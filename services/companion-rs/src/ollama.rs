@@ -320,9 +320,19 @@ fn parse_model(m: &Json) -> Result<OllamaModel, AdapterError> {
     })
 }
 
+/// Hard cap on HTTP response bodies read from Ollama (audit §6 bounded output).
+/// Bounded to 4 MiB to protect against unbounded memory allocation on model inventory.
+pub const MAX_OLLAMA_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
 /// G4.2: content-type first, then shape — an HTML page with HTTP 200 must
 /// never parse as success (status alone proves nothing).
 fn validate_json(resp: &HttpResponse) -> Result<Json, AdapterError> {
+    if resp.body.len() > MAX_OLLAMA_BODY_BYTES {
+        return Err(AdapterError::InvalidResponse(format!(
+            "response body exceeds {MAX_OLLAMA_BODY_BYTES} byte limit (was {})",
+            resp.body.len()
+        )));
+    }
     if !resp.content_type.contains("application/json") {
         let ct = if resp.content_type.is_empty() {
             "(no content-type)".to_string()
@@ -380,7 +390,22 @@ pub(crate) mod tests {
 
     const TAGS: &str = r#"{"models":[{"name":"qwen3.5:4b","model":"qwen3.5:4b","modified_at":"2026-03-24T03:36:46.9011567+05:30","size":3389983735,"digest":"2a654d98e6fba55d452b7043684e9b57a947e393bbffa62485a7aac05ee4eefd","details":{"parent_model":"","format":"gguf","family":"qwen35","families":["qwen35"],"parameter_size":"4.7B","quantization_level":"Q4_K_M","context_length":262144,"embedding_length":2560,"runner":"ggml"},"capabilities":["completion","vision","tools","thinking"]}]}"#;
 
+    #[derive(Clone, Default)]
+    struct Opts {
+        html: bool,
+        oversize: bool,
+        malformed_json: bool,
+        wrong_shape: bool,
+    }
+
     fn start(html: bool) -> Fake {
+        start_opts(Opts {
+            html,
+            ..Default::default()
+        })
+    }
+
+    fn start_opts(opts: Opts) -> Fake {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let addr = format!("http://127.0.0.1:{port}");
@@ -392,7 +417,7 @@ pub(crate) mod tests {
                     break;
                 }
                 let Ok(mut stream) = stream else { continue };
-                let s = s.clone();
+                let (s, opts) = (s.clone(), opts.clone());
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(match stream.try_clone() {
                         Ok(c) => c,
@@ -417,8 +442,29 @@ pub(crate) mod tests {
                     if s.load(Ordering::SeqCst) {
                         return;
                     }
-                    if html {
+                    if opts.html {
                         respond(&mut stream, "200 OK", "text/html", "<html>app shell</html>");
+                        return;
+                    }
+                    if opts.oversize {
+                        let huge = format!(
+                            r#"{{"models":[],"padding":"{}"}}"#,
+                            "x".repeat(MAX_OLLAMA_BODY_BYTES + 1024)
+                        );
+                        respond(&mut stream, "200 OK", "application/json", &huge);
+                        return;
+                    }
+                    if opts.malformed_json {
+                        respond(&mut stream, "200 OK", "application/json", "{not json");
+                        return;
+                    }
+                    if opts.wrong_shape {
+                        respond(
+                            &mut stream,
+                            "200 OK",
+                            "application/json",
+                            r#"{"models":"not an array"}"#,
+                        );
                         return;
                     }
                     match path.as_str() {
@@ -532,6 +578,52 @@ pub(crate) mod tests {
         assert!(text.starts_with('['));
         assert!(text.contains("\"name\":\"qwen3.5:4b\""));
         assert!(text.contains("\"loaded\":true"));
+    }
+
+    #[test]
+    fn oversize_body_is_rejected_as_invalid_response() {
+        let f = start_opts(Opts {
+            oversize: true,
+            ..Default::default()
+        });
+        let ad = adapter(&f);
+        let err = ad.refresh().expect_err("oversize body must be rejected");
+        assert_eq!(err.code(), "invalid-response");
+        assert!(!ad.is_healthy());
+        assert!(ad.detail().unwrap().contains("byte limit"));
+    }
+
+    #[test]
+    fn malformed_json_and_wrong_shape_are_rejected_without_panic() {
+        let f_bad = start_opts(Opts {
+            malformed_json: true,
+            ..Default::default()
+        });
+        let ad_bad = adapter(&f_bad);
+        let err = ad_bad.refresh().expect_err("bad json must fail");
+        assert_eq!(err.code(), "invalid-response");
+        assert!(!ad_bad.is_healthy());
+        assert!(ad_bad.detail().unwrap().contains("not valid JSON"));
+
+        let f_shape = start_opts(Opts {
+            wrong_shape: true,
+            ..Default::default()
+        });
+        let ad_shape = adapter(&f_shape);
+        let err = ad_shape.refresh().expect_err("wrong shape must fail");
+        assert_eq!(err.code(), "invalid-response");
+        assert!(!ad_shape.is_healthy());
+        assert!(ad_shape.detail().unwrap().contains("no `models` array"));
+    }
+
+    #[test]
+    fn credentials_in_endpoint_are_never_leaked_in_detail_or_errors() {
+        let ad = OllamaAdapter::new("ol-sec", "http://user:supersecretpass@127.0.0.1:1");
+        let err = ad.refresh().expect_err("dead port must fail");
+        assert!(!err.to_string().contains("supersecretpass"));
+        assert!(!err.to_string().contains("user:"));
+        assert!(!ad.detail().unwrap().contains("supersecretpass"));
+        assert!(!ad.detail().unwrap().contains("user:"));
     }
 
     /// Opt-in live probe against a real local Ollama (PRD §7.7). Only runs
