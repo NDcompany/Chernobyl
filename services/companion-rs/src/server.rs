@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 pub const CLOSE_UNAUTHORIZED: u16 = 4001;
 pub const CLOSE_PROTOCOL_MISMATCH: u16 = 4002;
+pub const CLOSE_DEVICE_REVOKED: u16 = 4003;
 
 const AUTH_FAILURE_LIMIT: u32 = 5;
 
@@ -504,7 +505,7 @@ fn handle_conn(
         // a plain HTTP request.
         if handshake.method == "POST" {
             let path = handshake.target.split('?').next().unwrap_or("/");
-            if !diagnostics_only || path != "/hooks/claude" {
+            if !diagnostics_only {
                 // Drain the (capped) body before refusing so the close is a
                 // graceful FIN, not a RST racing the client's read of our 404
                 // (Windows resets a socket closed with an unread body).
@@ -512,7 +513,19 @@ fn handle_conn(
                 let _ = ws::write_http_error(&mut writer, 404, "Not Found", "");
                 return Ok(());
             }
-            return hook_ingress(&mut reader, &mut writer, &handshake, &companion);
+            match path {
+                "/hooks/claude" => {
+                    return hook_ingress(&mut reader, &mut writer, &handshake, &companion);
+                }
+                "/devices/revoke" => {
+                    return revoke_ingress(&mut reader, &mut writer, &handshake, &companion);
+                }
+                _ => {
+                    drain_body(&mut reader, &handshake);
+                    let _ = ws::write_http_error(&mut writer, 404, "Not Found", "");
+                    return Ok(());
+                }
+            }
         }
         // D6: on a non-loopback main listener /health joins the token gate.
         let require_health_auth = !diagnostics_only && remote_posture && token.is_some();
@@ -700,6 +713,71 @@ fn hook_ingress(
     writer.write_all(resp.as_bytes())
 }
 
+/// In-process device revocation ingress (D4): reachable ONLY on the loopback diagnostics
+/// listener. Rejects requests with an Origin header (403), requires a valid JSON body
+/// with `{"deviceId":"<id>"}`, marks the device revoked in the companion's store,
+/// appends an audit record, and terminates every live connection for that device with
+/// WebSocket close code 4003 ("device revoked").
+fn revoke_ingress(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    h: &Handshake,
+    companion: &Companion,
+) -> io::Result<()> {
+    if h.header("origin").is_some() {
+        drain_body(reader, h);
+        let _ = ws::write_http_error(writer, 403, "Forbidden", "");
+        return Ok(());
+    }
+    let clen = h
+        .header("content-length")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n <= ws::MAX_HOOK_BODY_BYTES);
+    let Some(clen) = clen else {
+        drain_body(reader, h);
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    };
+    let mut body = vec![0u8; clen];
+    if reader.read_exact(&mut body).is_err() {
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    }
+    let Ok(payload) = String::from_utf8(body) else {
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    };
+    let Ok(json_val) = json::parse(&payload) else {
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    };
+    let Some(device_id) = json::get_str(&json_val, "deviceId") else {
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    };
+    if device_id.is_empty() {
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    }
+    match companion.revoke_device(device_id) {
+        Ok(crate::companion::RevokeResult::NotFound) => {
+            let _ = ws::write_http_error(writer, 404, "Not Found", "");
+        }
+        Ok(crate::companion::RevokeResult::Revoked { terminated }) => {
+            let resp_body = format!("{{\"revoked\":true,\"terminated\":{terminated}}}");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            writer.write_all(resp.as_bytes())?;
+        }
+        Err(_) => {
+            let _ = ws::write_http_error(writer, 500, "Internal Server Error", "");
+        }
+    }
+    Ok(())
+}
+
 /// Per-connection handshake state: the device that asked to connect and the
 /// server's fresh nonce+salt its proof must be bound to (ADR-011).
 struct HsPending {
@@ -806,6 +884,12 @@ fn establish_session(
     Ok((e2e::Session::host(keys), base64::encode(&server_proof)))
 }
 
+/// The live E2E session bound to a verified device (ADR-011 / D4).
+pub struct LiveSession {
+    pub device_id: String,
+    pub session: e2e::Session,
+}
+
 /// Per-connection outbound queue (D8): bounded by message count AND total
 /// payload bytes — payload sizes vary by orders of magnitude, so a
 /// count-only bound still allows unbounded memory. Saturation is never a
@@ -821,19 +905,25 @@ pub struct Outbound {
     queued_bytes: Arc<AtomicUsize>,
     /// per-class in-queue depth; released by the writer on dequeue
     depth: Arc<Depth>,
-    /// set on saturation/disconnect: the read loop must tear this connection down
+    /// set on saturation/disconnect/revocation: the read loop must tear this connection down
     terminated: AtomicBool,
+    /// set on revocation: clean exit without saturation error logging
+    revoked: AtomicBool,
     /// The live E2E session for this connection (ADR-011). Shared with the
     /// read loop (which installs it on `hs_ok`) and with the engine fan-out
     /// (which seals events per connection) so that EVERY outbound frame —
     /// reply, event, or side-channel — is sealed once a session exists, as
     /// the wire contract requires ("from `hs_ok` on every frame is sealed").
+    /// Stores the device id alongside the session (D4) so live sessions can
+    /// be revoked by device id.
     /// Seal-then-enqueue happens under this lock so the AEAD counter order
     /// always matches the FIFO wire order.
-    session: Mutex<Option<e2e::Session>>,
+    session: Mutex<Option<LiveSession>>,
     /// Process-wide saturation counters (mandate §4): shared so /health and
     /// /metrics describe overload on any connection, including one already gone.
     saturation: Arc<crate::companion::Saturation>,
+    /// Dedicated handle to write control/close frames directly (D4 revocation).
+    control: Mutex<Option<TcpStream>>,
 }
 
 /// Why an outbound message could not be queued. Both variants end the
@@ -857,22 +947,52 @@ impl Outbound {
                 queued_bytes: Arc::new(AtomicUsize::new(0)),
                 depth: Arc::new(Depth::default()),
                 terminated: AtomicBool::new(false),
+                revoked: AtomicBool::new(false),
                 session: Mutex::new(None),
                 saturation,
+                control: Mutex::new(None),
             }),
             rx,
         )
     }
 
-    /// Install the live E2E session (called by the read loop on `hs_ok`).
+    pub(crate) fn set_control(&self, stream: TcpStream) {
+        *self.control.lock().unwrap() = Some(stream);
+    }
+
+    pub(crate) fn close(&self, code: u16, reason: &str) {
+        self.revoked.store(true, Ordering::SeqCst);
+        self.terminated.store(true, Ordering::SeqCst);
+        if let Ok(mut guard) = self.control.lock()
+            && let Some(mut stream) = guard.take()
+        {
+            let close = ws::encode_frame(ws::OP_CLOSE, &close_payload(code, reason), false);
+            let _ = write_frame(&mut stream, &close);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::SeqCst)
+    }
+
+    /// Install the live E2E session and device id (called by the read loop on `hs_ok`).
     /// From this point every frame this connection sends is sealed.
-    pub(crate) fn set_session(&self, session: e2e::Session) {
-        *self.session.lock().unwrap() = Some(session);
+    pub(crate) fn set_session(&self, device_id: String, session: e2e::Session) {
+        *self.session.lock().unwrap() = Some(LiveSession { device_id, session });
     }
 
     /// True once an E2E session is live for this connection.
     pub(crate) fn has_session(&self) -> bool {
         self.session.lock().unwrap().is_some()
+    }
+
+    pub(crate) fn device_id(&self) -> Option<String> {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.device_id.clone())
     }
 
     /// Queue one plaintext for this connection, sealing it first when a
@@ -899,10 +1019,10 @@ impl Outbound {
         }
         let mut guard = self.session.lock().unwrap();
         let payload = match guard.as_mut() {
-            Some(session) => {
+            Some(live) => {
                 // plaintext is always UTF-8 JSON from `to_text()`; seal it.
                 let text = String::from_utf8_lossy(&plaintext);
-                session.seal(&text).into_bytes()
+                live.session.seal(&text).into_bytes()
             }
             None => plaintext,
         };
@@ -1092,7 +1212,7 @@ fn serve_ws(
     // read loop, so anything that can fail with `?` must happen before the
     // writer is spawned or the connection is registered — otherwise a
     // failure here would leak the registry entry and the writer thread.
-    // a dedicated handle for control frames (ping/pong/close)
+    // dedicated handle for control frames (ping/pong/close)
     let mut control = reader.try_clone()?;
     // Short read timeout so shutdown is noticed promptly (audit P6). It only
     // ever fires while idle between frames (`peek` consumes nothing) or is
@@ -1105,6 +1225,7 @@ fn serve_ws(
     writer.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
     let (outbound, rx) = Outbound::new(companion.shared.saturation.clone());
+    outbound.set_control(reader.try_clone()?);
     let conn_id = companion
         .shared
         .next_conn_id
@@ -1162,6 +1283,9 @@ fn serve_ws(
                 if misses > crate::protocol::HEARTBEAT_MISS_LIMIT {
                     break Err(io::Error::other("heartbeat miss limit"));
                 }
+                if outbound.is_revoked() {
+                    break Ok(());
+                }
                 if outbound.is_terminated() {
                     break Err(io::Error::other("outbound queue saturated (slow consumer)"));
                 }
@@ -1189,6 +1313,9 @@ fn serve_ws(
         // D8: a saturated queue means this peer is stalled — tear down even
         // if it keeps driving the heartbeat (checked before handling the
         // frame so no further reply is produced for a terminated peer)
+        if outbound.is_revoked() {
+            break Ok(());
+        }
         if outbound.is_terminated() {
             break Err(io::Error::other("outbound queue saturated (slow consumer)"));
         }
@@ -1208,10 +1335,10 @@ fn serve_ws(
                 // (send_malformed → enqueue_sealed).
                 let opened: Option<Result<String, String>> = {
                     let mut guard = outbound.session.lock().unwrap();
-                    guard.as_mut().map(|session| {
+                    guard.as_mut().map(|live| {
                         std::str::from_utf8(&payload)
                             .map_err(|_| "non-utf8 sealed frame".to_string())
-                            .and_then(|s| session.open(s))
+                            .and_then(|s| live.session.open(s))
                     })
                 };
                 let plaintext: String = match opened {
@@ -1275,7 +1402,7 @@ fn serve_ws(
                                     {
                                         break Err(io::Error::other("outbound queue saturated"));
                                     }
-                                    outbound.set_session(session);
+                                    outbound.set_session(pending.device_id, session);
                                 }
                                 Err(reason) => {
                                     if hs_err(&outbound, &reason).is_err() {
@@ -1330,7 +1457,7 @@ fn serve_ws(
                     let ack_payload = {
                         let mut guard = outbound.session.lock().unwrap();
                         match guard.as_mut() {
-                            Some(session) => session.seal(&ack),
+                            Some(live) => live.session.seal(&ack),
                             None => ack.clone(),
                         }
                     };
@@ -2310,6 +2437,221 @@ mod e2e_tests {
     }
 
     #[test]
+    fn revocation_route_terminates_live_session_leaves_others_intact_and_blocks_reconnect() {
+        // D4: revoking a device via the loopback diagnostics route terminates every live
+        // connection belonging to that device with WebSocket close code 4003 ("device revoked"),
+        // removes it from the registry, leaves other devices' live sessions untouched, and
+        // blocks future handshakes.
+        let dir = temp_dir("d4-live");
+        let mut cfg = default_config();
+        cfg.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(cfg).unwrap());
+        let psk1 = [42u8; 32];
+        let dev1 = "dev-revoked-1".to_string();
+        let psk2 = [43u8; 32];
+        let dev2 = "dev-untouched-2".to_string();
+        let prot1 = base64::encode(&crate::ffi::dpapi_protect(&psk1).unwrap());
+        let prot2 = base64::encode(&crate::ffi::dpapi_protect(&psk2).unwrap());
+        {
+            let mut store = companion.shared.storage.lock().unwrap();
+            store
+                .put_device(&DeviceRecord {
+                    device_id: dev1.clone(),
+                    name: "phone1".into(),
+                    psk_protected: prot1,
+                    paired_at: now_ms(),
+                    revoked: false,
+                })
+                .unwrap();
+            store
+                .put_device(&DeviceRecord {
+                    device_id: dev2.clone(),
+                    name: "phone2".into(),
+                    psk_protected: prot2,
+                    paired_at: now_ms(),
+                    revoked: false,
+                })
+                .unwrap();
+        }
+        let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        let f = Fixture {
+            companion,
+            handle,
+            psk: psk1,
+            device_id: dev1.clone(),
+            data_dir: dir,
+        };
+
+        // 1. Client 1 (dev1) handshakes into a live E2E session
+        let mut c1 = connect(&f);
+        let (r1, sess1) = attempt(&mut c1, &psk1, &dev1);
+        assert!(r1.contains("hs_ok"), "client 1 must connect: {r1}");
+        let mut sess1 = sess1.expect("client 1 session");
+        c1.send_text(&sess1.seal(r#"{"type":"ping","commandId":"p1"}"#))
+            .unwrap();
+        let pong1 = sess1.open(&c1.next_text().unwrap()).unwrap();
+        assert!(pong1.contains("pong"));
+
+        // 2. Client 2 (dev2) handshakes into a live E2E session
+        let mut c2 = connect(&f);
+        let (r2, sess2) = attempt(&mut c2, &psk2, &dev2);
+        assert!(r2.contains("hs_ok"), "client 2 must connect: {r2}");
+        let mut sess2 = sess2.expect("client 2 session");
+        c2.send_text(&sess2.seal(r#"{"type":"ping","commandId":"p2"}"#))
+            .unwrap();
+        let pong2 = sess2.open(&c2.next_text().unwrap()).unwrap();
+        assert!(pong2.contains("pong"));
+
+        // Both clients are in the registry
+        assert_eq!(f.companion.shared.clients.lock().unwrap().len(), 2);
+
+        // 3. Revoke dev1 via POST /devices/revoke on diagnostics listener
+        let diag_url = format!(
+            "http://127.0.0.1:{}/devices/revoke",
+            f.handle.diagnostics_port
+        );
+        let req_body = format!("{{\"deviceId\":\"{dev1}\"}}");
+        let resp = http_request("POST", &diag_url, None, Some(&req_body)).unwrap();
+        assert_eq!(resp.status, 200, "revoke response: {resp:?}");
+        assert!(
+            resp.body.contains("\"revoked\":true"),
+            "body: {}",
+            resp.body
+        );
+        assert!(
+            resp.body.contains("\"terminated\":1"),
+            "body: {}",
+            resp.body
+        );
+
+        // 4. Client 1 receives Close 4003 with reason "device revoked"
+        let frame = c1.read_frame().unwrap();
+        match frame {
+            Frame::Close(code, reason) => {
+                assert_eq!(code, Some(CLOSE_DEVICE_REVOKED));
+                assert_eq!(reason, "device revoked");
+            }
+            other => panic!("expected close 4003, got {other:?}"),
+        }
+
+        // 5. Client 1 is removed from registry; Client 2 is untouched
+        let clients = f.companion.shared.clients.lock().unwrap();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].1.device_id().as_deref(), Some(dev2.as_str()));
+        drop(clients);
+
+        // Client 2 session still works (ping/pong)
+        c2.send_text(&sess2.seal(r#"{"type":"ping","commandId":"p2-after"}"#))
+            .unwrap();
+        let pong2_after = sess2.open(&c2.next_text().unwrap()).unwrap();
+        assert!(pong2_after.contains("pong"));
+
+        // 6. Device 1 is marked revoked in store with audit record
+        {
+            let store = f.companion.shared.storage.lock().unwrap();
+            assert!(store.devices[&dev1].revoked);
+            let has_audit = store
+                .audit
+                .iter()
+                .any(|a| a.kind == "revoke" && a.text.contains(&dev1));
+            assert!(has_audit, "durable audit log must record revocation");
+        }
+
+        // 7. Client 1 reconnect attempt is refused (hs_err device revoked)
+        let mut c1_reconnect = connect(&f);
+        let (r1_rec, s1_rec) = attempt(&mut c1_reconnect, &psk1, &dev1);
+        assert!(
+            s1_rec.is_none(),
+            "revoked device must not establish session"
+        );
+        assert!(r1_rec.contains("device revoked"), "got: {r1_rec}");
+
+        shutdown(f);
+    }
+
+    #[test]
+    fn revocation_route_rejects_origin_header_with_403() {
+        use std::io::Read;
+        let f = fixture_paired("d4-origin", false);
+        let mut s =
+            std::net::TcpStream::connect(format!("127.0.0.1:{}", f.handle.diagnostics_port))
+                .unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body = format!("{{\"deviceId\":\"{}\"}}", f.device_id);
+        let req = format!(
+            "POST /devices/revoke HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+
+        let mut resp = String::new();
+        let mut buf = [0u8; 512];
+        while !resp.contains("\r\n") {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed before status line");
+            resp.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+
+        // Device in store was NOT revoked
+        let store = f.companion.shared.storage.lock().unwrap();
+        assert!(!store.devices[&f.device_id].revoked);
+        drop(store);
+
+        shutdown(f);
+    }
+
+    #[test]
+    fn revocation_route_is_absent_on_main_listener() {
+        let f = fixture_paired("d4-main-absent", false);
+        let main_url = format!("http://127.0.0.1:{}/devices/revoke", f.handle.port);
+        let body = format!("{{\"deviceId\":\"{}\"}}", f.device_id);
+        let resp = http_request("POST", &main_url, None, Some(&body)).unwrap();
+        assert_eq!(
+            resp.status, 404,
+            "main listener must not answer /devices/revoke"
+        );
+
+        // Device in store was NOT revoked
+        let store = f.companion.shared.storage.lock().unwrap();
+        assert!(!store.devices[&f.device_id].revoked);
+        drop(store);
+
+        shutdown(f);
+    }
+
+    #[test]
+    fn revocation_route_returns_404_for_unknown_device_and_400_for_malformed_body() {
+        let f = fixture_paired("d4-errs", false);
+        let diag_url = format!(
+            "http://127.0.0.1:{}/devices/revoke",
+            f.handle.diagnostics_port
+        );
+
+        // Unknown device -> 404
+        let unknown_body = r#"{"deviceId":"unknown-device-xyz"}"#;
+        let resp_404 = http_request("POST", &diag_url, None, Some(unknown_body)).unwrap();
+        assert_eq!(resp_404.status, 404, "got: {resp_404:?}");
+
+        // Missing deviceId -> 400
+        let bad_body = r#"{"wrongKey":"foo"}"#;
+        let resp_400a = http_request("POST", &diag_url, None, Some(bad_body)).unwrap();
+        assert_eq!(resp_400a.status, 400, "got: {resp_400a:?}");
+
+        // Empty deviceId -> 400
+        let empty_body = r#"{"deviceId":""}"#;
+        let resp_400b = http_request("POST", &diag_url, None, Some(empty_body)).unwrap();
+        assert_eq!(resp_400b.status, 400, "got: {resp_400b:?}");
+
+        // Malformed JSON -> 400
+        let invalid_json = "{not json";
+        let resp_400c = http_request("POST", &diag_url, None, Some(invalid_json)).unwrap();
+        assert_eq!(resp_400c.status, 400, "got: {resp_400c:?}");
+
+        shutdown(f);
+    }
+
+    #[test]
     fn malformed_message_is_acked_and_connection_survives() {
         // message-level garbage is an ack + continue (send_malformed); only
         // frame-level violations tear the connection down
@@ -2460,7 +2802,7 @@ mod e2e_tests {
         let (outbound, _rx) = test_outbound();
         let keys = e2e::derive_keys(&[7u8; 32], &[9u8; 16]);
         let peer_keys = e2e::derive_keys(&[7u8; 32], &[9u8; 16]);
-        *outbound.session.lock().unwrap() = Some(e2e::Session::host(keys));
+        outbound.set_session("test-device".into(), e2e::Session::host(keys));
         let mut peer = e2e::Session::client(peer_keys);
         // fill the bulk class to its cap (depth admission only, no sealing)
         for _ in 0..BULK_QUEUE_MAX_MESSAGES {
@@ -2478,6 +2820,7 @@ mod e2e_tests {
             .unwrap()
             .as_mut()
             .expect("session installed above")
+            .session
             .seal("post-shed frame");
         assert_eq!(
             peer.open(&payload)

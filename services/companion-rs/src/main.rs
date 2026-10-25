@@ -23,7 +23,7 @@
 //!                            sessions, approvals, pairing, keybinds) on loopback
 //!   --version                print version and exit
 
-use chernobyl_companion::client::{WsClient, http_get};
+use chernobyl_companion::client::{WsClient, http_get, http_request};
 use chernobyl_companion::companion::Companion;
 use chernobyl_companion::config;
 use chernobyl_companion::json;
@@ -457,9 +457,42 @@ fn devices_main(cfg: &config::CompanionConfig) -> i32 {
     0
 }
 
-/// `companion revoke <device-id>` — mark a paired device revoked. The E2E
-/// handshake refuses revoked devices, so this cuts a lost/stolen phone off.
+/// `companion revoke <device-id>` — mark a paired device revoked (D4).
+/// First tries the running companion via loopback diagnostics POST /devices/revoke;
+/// if unreachable, falls back to offline journal write (restart-scoped, unchanged).
 fn revoke_main(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
+    let url = format!("http://127.0.0.1:{}/devices/revoke", cfg.diagnostics_port);
+    let req_body = json::stringify(&json::obj(vec![("deviceId", json::s(device_id))]));
+    match http_request("POST", &url, None, Some(&req_body)) {
+        Ok(resp) => match resp.status {
+            200 => {
+                let terminated = json::parse(&resp.body)
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| json::get_i64(v, "terminated"))
+                    .unwrap_or(0);
+                println!(
+                    "revoked device {device_id} via running companion (terminated {terminated} live session(s))"
+                );
+                0
+            }
+            404 => {
+                eprintln!("[companion] revoke: unknown device {device_id}");
+                1
+            }
+            other => {
+                eprintln!(
+                    "[companion] revoke: server returned HTTP {other}: {}",
+                    resp.body
+                );
+                1
+            }
+        },
+        Err(_) => revoke_offline(cfg, device_id),
+    }
+}
+
+fn revoke_offline(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
     use chernobyl_companion::storage;
     let mut store = match storage::Storage::open(&cfg.data_dir, cfg.events_cap, cfg.commands_cap) {
         Ok(s) => s,
@@ -473,7 +506,7 @@ fn revoke_main(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
         return 1;
     };
     if d.revoked {
-        println!("device {device_id} already revoked");
+        println!("device {device_id} already revoked (offline journal)");
         return 0;
     }
     d.revoked = true;
@@ -481,7 +514,8 @@ fn revoke_main(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
         eprintln!("[companion] revoke: cannot persist: {e}");
         return 1;
     }
-    println!("revoked device {device_id}");
+    let _ = store.append_audit("revoke", &format!("device {device_id} revoked (offline)"));
+    println!("revoked device {device_id} (offline journal)");
     0
 }
 
@@ -952,5 +986,120 @@ mod tests {
             ),
             r#""C:\x.exe" --background --config "C:\cfg dir\companion.json""#
         );
+    }
+
+    #[test]
+    fn cli_revoke_offline_falls_back_and_online_routes_to_running_companion() {
+        use super::run;
+        use chernobyl_companion::config::default_config;
+        use chernobyl_companion::protocol::now_ms;
+        use chernobyl_companion::storage::{self, DeviceRecord};
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "chernobyl-cli-revoke-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut cfg = default_config();
+        cfg.data_dir = temp_dir.clone();
+        cfg.diagnostics_port = 0; // won't connect when offline
+        let cfg_path = temp_dir.join("companion.json");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cfg_json = chernobyl_companion::json::stringify(
+            &chernobyl_companion::config::config_to_json(&cfg),
+        );
+        std::fs::write(&cfg_path, cfg_json).unwrap();
+
+        // Seed devices in the storage
+        let psk = [7u8; 32];
+        let prot = chernobyl_companion::base64::encode(
+            &chernobyl_companion::ffi::dpapi_protect(&psk).unwrap(),
+        );
+        {
+            let mut store =
+                storage::Storage::open(&temp_dir, cfg.events_cap, cfg.commands_cap).unwrap();
+            store
+                .put_device(&DeviceRecord {
+                    device_id: "dev-offline".into(),
+                    name: "offline-phone".into(),
+                    psk_protected: prot.clone(),
+                    paired_at: now_ms(),
+                    revoked: false,
+                })
+                .unwrap();
+            store
+                .put_device(&DeviceRecord {
+                    device_id: "dev-online".into(),
+                    name: "online-phone".into(),
+                    psk_protected: prot,
+                    paired_at: now_ms(),
+                    revoked: false,
+                })
+                .unwrap();
+        }
+
+        let cfg_str = cfg_path.to_str().unwrap().to_string();
+
+        // 1. Offline path: unknown device -> exit 1
+        let exit_unknown = run(&[
+            "--config".into(),
+            cfg_str.clone(),
+            "--revoke".into(),
+            "unknown-offline".into(),
+        ]);
+        assert_eq!(exit_unknown, 1);
+
+        // 2. Offline path: known device -> exit 0 (written to offline journal)
+        let exit_offline = run(&[
+            "--config".into(),
+            cfg_str.clone(),
+            "--revoke".into(),
+            "dev-offline".into(),
+        ]);
+        assert_eq!(exit_offline, 0);
+        {
+            let store =
+                storage::Storage::open(&temp_dir, cfg.events_cap, cfg.commands_cap).unwrap();
+            assert!(store.devices["dev-offline"].revoked);
+        }
+
+        // 3. Online path: boot a companion + server on this data dir
+        let companion = std::sync::Arc::new(
+            chernobyl_companion::companion::Companion::boot(cfg.clone()).unwrap(),
+        );
+        let handle =
+            chernobyl_companion::server::start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        let diag_port_str = handle.diagnostics_port.to_string();
+
+        // Unknown device against running companion -> exit 1
+        let exit_online_unknown = run(&[
+            "--config".into(),
+            cfg_str.clone(),
+            "--diagnostics-port".into(),
+            diag_port_str.clone(),
+            "--revoke".into(),
+            "unknown-online".into(),
+        ]);
+        assert_eq!(exit_online_unknown, 1);
+
+        // Known device against running companion -> exit 0
+        let exit_online_known = run(&[
+            "--config".into(),
+            cfg_str,
+            "--diagnostics-port".into(),
+            diag_port_str,
+            "--revoke".into(),
+            "dev-online".into(),
+        ]);
+        assert_eq!(exit_online_known, 0);
+        {
+            let store = companion.shared.storage.lock().unwrap();
+            assert!(store.devices["dev-online"].revoked);
+        }
+
+        let clean = handle.stop();
+        companion.shutdown(clean);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

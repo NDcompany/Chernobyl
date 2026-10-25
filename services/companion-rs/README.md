@@ -44,8 +44,9 @@ a captured proof cannot be replayed and a MITM without the PSK is rejected. A pe
 redeemed on first connect (single-use consume + device registration); a paired device
 reconnects with its stored PSK. From `hs_ok` on, every frame is ChaCha20-Poly1305-sealed with
 HKDF-SHA-256 directional keys and a monotonic counter nonce, so replay, desync and tampering
-all tear the connection down. Revocation (`companion revoke <device-id>`) blocks a device at
-the next handshake. All crypto is std-only with official RFC/NIST known-answer tests; no
+all tear the connection down. Revocation (`companion revoke <device-id>`) terminates any
+live session with close code 4003 ("device revoked") via an in-process diagnostics route
+and blocks future handshakes (D4). All crypto is std-only with official RFC/NIST known-answer tests; no
 X25519 forward secrecy yet (PSK + fresh nonces — post-compromise secrecy is not claimed).
 
 The `?token=` loopback path is unchanged and stays for dev/differential parity. Beyond
@@ -170,7 +171,7 @@ matrix covers those).
 | `seed` / `engine` | deterministic seed state + the MockEngine port (plans, G1/G2, ack cache) |
 | `storage` | append-only JSONL journal: torn-tail recovery, atomic compaction, retention |
 | `config` / `adapters` / `companion` | Node-parity config, adapter discovery, boot/reconcile/idempotency |
-| `server` | accept loops, auth (4001/429), origin refusal (403), posture gates (D1/D2/D6), version gate (4002), heartbeat, diagnostics HTTP, E2E handshake + sealed-frame dispatch |
+| `server` | accept loops, auth (4001/429), origin refusal (403), posture gates (D1/D2/D6), version gate (4002), live session revocation (4003, D4), heartbeat, diagnostics HTTP, E2E handshake + sealed-frame dispatch |
 | `client` | test WS client + loopback `http_get` (used by `--self-test`) |
 | `crypto` | std-only SHA-256, HMAC, HKDF, ChaCha20, Poly1305, AEAD (official RFC/NIST KATs) |
 | `e2e` | PSK handshake proofs, HKDF directional keys, sealed frames with counter nonces |

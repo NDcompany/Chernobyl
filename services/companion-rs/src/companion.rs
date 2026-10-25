@@ -31,6 +31,12 @@ pub struct Saturation {
     pub teardowns: std::sync::atomic::AtomicU64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevokeResult {
+    NotFound,
+    Revoked { terminated: usize },
+}
+
 pub struct Shared {
     pub storage: Mutex<Storage>,
     /// Outbound payload queues, one per live WS connection, keyed by a
@@ -882,6 +888,38 @@ impl Companion {
         };
         let _ = store.append_audit("shutdown", message);
         let _ = store.compact();
+    }
+
+    /// Marks a device revoked in the durable store, appends an audit record,
+    /// and terminates any live connections whose E2E session belongs to that device.
+    pub fn revoke_device(&self, device_id: &str) -> Result<RevokeResult, String> {
+        let mut store = self.shared.storage.lock().unwrap();
+        let Some(mut d) = store.devices.get(device_id).cloned() else {
+            return Ok(RevokeResult::NotFound);
+        };
+        d.revoked = true;
+        store.put_device(&d)?;
+        let _ = store.append_audit("revoke", &format!("device {device_id} revoked"));
+        drop(store);
+
+        let to_close: Vec<Arc<Outbound>> = {
+            let mut clients = self.shared.clients.lock().unwrap();
+            let mut matching = Vec::new();
+            clients.retain(|(_, outbound)| {
+                if outbound.device_id().as_deref() == Some(device_id) {
+                    matching.push(outbound.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            matching
+        };
+        let terminated = to_close.len();
+        for outbound in to_close {
+            outbound.close(crate::server::CLOSE_DEVICE_REVOKED, "device revoked");
+        }
+        Ok(RevokeResult::Revoked { terminated })
     }
 }
 
