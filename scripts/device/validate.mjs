@@ -377,7 +377,8 @@ const ROWS = {
     shot('4.4', 'after-restart');
     record('4.4', after <= before + 1, `sessions ${before} -> ${after} (never +2; the demo engine keeps sessions in memory, so a restart returns to its seed); the phone kept the outcome honest`);
   },
-  // 2.2: the same pairing payload cannot pair a second time
+  // 2.2: a pairing QR stops being a credential once the first phone has paired
+  // (its device key is rotated at first use, hs_rekey)
   async '2.2'() {
     await start();
     await freshPair('2.2');
@@ -396,7 +397,7 @@ const ROWS = {
     const t = await waitText(/Access denied/, 45_000);
     shot('2.2', 'reused-offer');
     saveLog('2.2');
-    record('2.2', !!t, `second redemption of one offer -> ${t ? 'Access denied (pairing offer already used)' : 'not denied'}`);
+    record('2.2', !!t, `the same QR re-used after the first phone paired and acked its rotated key -> ${t ? 'Access denied (proof verification failed)' : 'not denied'}`);
     deviceId = null;
   },
   // 2.1: an expired offer is refused
