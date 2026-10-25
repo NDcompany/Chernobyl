@@ -22,8 +22,8 @@
     "verify": "npm run typecheck && npm run lint && npm run test && npm run build && npm run build:mobile",
     "verify:rust": "cargo test --manifest-path services/companion-rs/Cargo.toml && cargo clippy --manifest-path services/companion-rs/Cargo.toml --all-targets -- -D warnings && cargo fmt --manifest-path services/companion-rs/Cargo.toml --check && cargo run --quiet --manifest-path services/companion-rs/Cargo.toml -- --self-test",
     "verify:e2e": "npm run build:e2e && node services/companion-rs/tools/e2e-interop.mjs",
-    "soak:smoke": "node services/companion-rs/tools/soak.mjs --mode smoke",
-    "soak:long": "node services/companion-rs/tools/soak.mjs --mode long --duration 86400",
+    "soak:smoke": "cargo run --release --manifest-path services/companion-rs/Cargo.toml -- --soak smoke",
+    "soak:long": "cargo run --release --manifest-path services/companion-rs/Cargo.toml -- --soak 86400",
     "build:mobile": "npm run build -w @chernobyl/mobile"
   },
   "engines": {

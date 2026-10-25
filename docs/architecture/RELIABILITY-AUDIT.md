@@ -11,6 +11,11 @@ tool*. Nothing in this audit adds soak code, soak UI, or a production dependency
 run; passing a soak is never equated with being resilient. Every finding is about the
 shipped companion/protocol/client code.
 
+**Update 2026-10-26:** at the owner's request the soak moved into the companion binary as
+`--soak smoke|<seconds>` (`src/soak.rs`, same 10 criteria and thresholds; `tools/soak.mjs` is
+kept one release as superseded). It is reachable only through that flag; no runtime path
+depends on it.
+
 **Disposition convention:** each finding states the failure scenario and the required
 production behavior. Status is updated once the fix lands (§12 verification per commit).
 

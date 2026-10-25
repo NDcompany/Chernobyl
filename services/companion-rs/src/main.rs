@@ -22,7 +22,12 @@
 //!   --require-e2e            force remote E2E session posture on any bind (e.g. tunnels)
 //!   --tui                    boot the daemon and open the terminal UI (status,
 //!                            sessions, approvals, pairing, keybinds) on loopback
+//!   --soak smoke|<seconds>   soak harness (soak.rs): run this exe as the server under
+//!                            test and judge 10 PASS/FAIL criteria; smoke = one pass,
+//!                            <seconds> = long run; --out <dir>, --inject server-kill
 //!   --version                print version and exit
+
+mod soak;
 
 use chernobyl_companion::client::{WsClient, http_get};
 use chernobyl_companion::companion::Companion;
@@ -61,6 +66,9 @@ fn run(args: &[String]) -> i32 {
     let mut background = false;
     let mut tui = false;
     let mut require_e2e = false;
+    let mut soak_mode: Option<String> = None;
+    let mut soak_out: Option<String> = None;
+    let mut soak_inject: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -94,6 +102,10 @@ fn run(args: &[String]) -> i32 {
             "--background" => background = true,
             "--tui" => tui = true,
             "--require-e2e" => require_e2e = true,
+            // a bare --soak must not fall through to booting the daemon
+            "--soak" => soak_mode = Some(take(&mut i).unwrap_or_default()),
+            "--out" => soak_out = take(&mut i),
+            "--inject" => soak_inject = take(&mut i),
             "--config" => config_path = take(&mut i),
             "--port" => port_override = take(&mut i).and_then(|v| v.parse().ok()),
             "--bind" => bind_override = take(&mut i),
@@ -106,6 +118,17 @@ fn run(args: &[String]) -> i32 {
             }
         }
         i += 1;
+    }
+
+    // The soak harness drives child processes of this same exe. Dispatched
+    // before the shutdown handler, so Ctrl-C ends the harness at once (as it
+    // did the Node tool) while each child shuts itself down.
+    if let Some(mode) = soak_mode {
+        return soak::run(&mode, soak_out.as_deref(), soak_inject.as_deref());
+    }
+    if soak_out.is_some() || soak_inject.is_some() {
+        eprintln!("--out / --inject only apply to --soak");
+        return 2;
     }
 
     ffi::install_shutdown_handler();

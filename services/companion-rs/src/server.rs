@@ -29,7 +29,7 @@ pub const CLOSE_DEVICE_REVOKED: u16 = 4003;
 /// non-web origin (D1). Mirrored by `APP_ORIGIN` in packages/e2e.
 pub const APP_ORIGIN: &str = "chernobyl://app";
 
-const AUTH_FAILURE_LIMIT: u32 = 5;
+pub const AUTH_FAILURE_LIMIT: u32 = 5;
 
 // Per-message-class outbound bounds (D8 + mandate §4): ONE FIFO, TWO admission
 // policies, so a bulk event burst can never consume the room a control frame
@@ -43,8 +43,8 @@ const AUTH_FAILURE_LIMIT: u32 = 5;
 // the socket's options), so the writer thread and the teardown join() can
 // never block forever; 10 s is generous for loopback/LAN and far inside the
 // 3-beat (45 s) dead-peer window.
-const OUTBOUND_QUEUE_MAX_MESSAGES: usize = 256;
-const OUTBOUND_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const OUTBOUND_QUEUE_MAX_MESSAGES: usize = 256;
+pub const OUTBOUND_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Bulk (event fan-out) is admitted only while its own depth and a 3 MiB
 /// shared byte budget hold: the last 64 queue slots and the last 1 MiB stay
 /// reserved for control frames. Overflowing either bound refuses admission —

@@ -194,6 +194,8 @@ Updated: 2026-10-25 night (emulator validation of the release APK: 14 checklist 
 - [x] Soak test harness — **built 2026-10-23** (`services/companion-rs/tools/soak.mjs`,
       committed `032257d`). Two modes: `npm run soak:smoke` (~80 s, 10 predefined pass/fail
       criteria) and `npm run soak:long -- --duration <s>` (explicit long/24-hour mode).
+      2026-10-26: moved into the binary as `chernobyl-companion --soak smoke|<seconds>`
+      (`src/soak.rs`); the npm scripts now run it.
       Emits JSONL telemetry + a machine-readable `summary.json`; threshold provenance is
       labelled (server-derived limits vs newly proposed RSS/timeout bounds); a fault-injection
       mode (`--inject server-kill`) proves the harness detects an unexpected exit (exit 1)

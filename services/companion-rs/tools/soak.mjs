@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 // soak.mjs — CHERNOBYL companion soak-test harness (repeatability over time).
+// SUPERSEDED by `chernobyl-companion --soak smoke|<seconds>` (src/soak.rs, same
+// phases, criteria and thresholds; npm run soak:* now run it). Kept for one release.
 //
 // Spawns the REAL companion binary (loopback, token auth, isolated temp
 // home), drives it through lifecycle stress phases, samples resources, and
@@ -8,7 +10,6 @@
 //   node services/companion-rs/tools/soak.mjs                      # smoke (~2-3 min)
 //   node services/companion-rs/tools/soak.mjs --mode long --duration 86400
 //   node services/companion-rs/tools/soak.mjs --inject server-kill  # failure-detection demo
-//   npm run soak:smoke / npm run soak:long                          # from repo root
 //
 // Options (defaults in brackets):
 //   --mode smoke|long        [smoke]  smoke = one full pass; long = pass + load loop

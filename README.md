@@ -173,10 +173,13 @@ Two suites, both green on the current tree:
   and E2E adversarial matrix, live revocation (4003), ordered shutdown and adapter fault
   injection; `cargo clippy -D warnings`, `cargo fmt --check`, and the binary's
   `--self-test`. Release-gate status: `docs/validation/RELEASE-GATE.md`.
-- **Soak harness** (`services/companion-rs/tools/soak.mjs`): `npm run soak:smoke` (~80 s,
-  10 predefined pass/fail criteria) and `npm run soak:long` (explicit long/24-hour mode).
-  Emits JSONL telemetry + a machine-readable `summary.json`; a fault-injection mode proves
-  the harness detects an unexpected server exit (exit 1) rather than passing blindly.
+- **Soak harness**, built into the companion binary (`chernobyl-companion --soak`, which runs
+  the same exe as the server under test): `npm run soak:smoke` (~80 s, 10 predefined
+  pass/fail criteria) and `npm run soak:long` (explicit 24-hour mode, `--soak 86400`; any
+  duration via `--soak <seconds>`). No Node needed; the old `tools/soak.mjs` is superseded.
+  Emits JSONL telemetry + a machine-readable `summary.json`; a fault-injection mode
+  (`--inject server-kill`) proves the harness detects an unexpected server exit (exit 1)
+  rather than passing blindly.
   Thresholds are labelled by provenance — server-derived existing limits (queue bounds,
   heartbeat, auth-failure cap) vs newly proposed ones (RSS growth, release timeouts).
 

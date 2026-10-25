@@ -20,7 +20,8 @@ idempotent; carries `--config` when given, console window at login — packaging
 `TODO.md`) · `--pair` (create a pairing offer, print its terminal QR, exit) ·
 `--endpoint <ws-url>` (address embedded in the QR, default `ws://bind:port`) ·
 `--devices` (list the paired-device registry) · `--revoke <device-id>` (revoke a paired
-device) · `--require-e2e` (force remote E2E session posture on any bind, e.g. for tunnels). `CHERNOBYL_HOME` selects the data directory (config, journal).
+device) · `--require-e2e` (force remote E2E session posture on any bind, e.g. for tunnels) ·
+`--soak smoke|<seconds>` (built-in soak harness, see [Soak testing](#soak-testing-repeatability-over-time)). `CHERNOBYL_HOME` selects the data directory (config, journal).
 
 **Secure-by-default:** a non-loopback bind without `--token`/`HOST_TOKEN` is refused.
 Loopback with no token keeps Node-parity behavior (dev/demo). Three posture policies layer on
@@ -137,33 +138,44 @@ filter, e.g. `cargo test --release microbench_engine -- --ignored --nocapture`, 
 
 ## Soak testing (repeatability over time)
 
-`tools/soak.mjs` (Node, workspace `ws`, no new deps) spawns the **real** binary on loopback
-with an isolated temp home (`CHERNOBYL_HOME` under the run dir) and an `--exit-after`
-failsafe, drives it through lifecycle stress, samples `/health` resources every 30 s, and
-writes timestamped JSONL events plus a machine-readable `summary.json` (threshold provenance
-included: existing source limits vs newly proposed soak limits).
+The soak harness is built into the binary (`src/soak.rs`, std only, no Node needed):
+`--soak` spawns **this same executable** as the server under test, as child processes on
+loopback with a token, ephemeral ports, an isolated home (`CHERNOBYL_HOME` under the run dir)
+and an `--exit-after` failsafe, so crash, graceful shutdown and restart are judged across a
+real process boundary. It drives the server with the in-repo client through lifecycle
+stress, samples `/health` resources every 30 s, prints one PASS/FAIL line per criterion, and
+writes timestamped `events.jsonl` plus a machine-readable `summary.json` (criteria, threshold
+provenance: existing source limits vs newly proposed soak limits, failures, `pass`) to
+`target/soak/<timestamp>-<mode>` or `--out <dir>`.
 
 ```powershell
-npm run soak:smoke                                       # ~2-3 min, CI-suitable
-npm run soak:long -- --duration 86400                   # explicit 24 h run (default 86400)
-node services\companion-rs\tools\soak.mjs --inject server-kill   # failure-detection demo
+npm run soak:smoke                                         # one pass, ~80 s, CI-suitable
+npm run soak:long                                          # explicit 24 h run (--soak 86400)
+cargo run --release -- --soak 3600                         # any other duration, in seconds
+cargo run --release -- --soak smoke --inject server-kill   # failure-detection demo (exit 1)
 ```
+
+Long mode runs the same pass with a load loop (churn + FIFO every cycle, saturation every
+3rd, dead peer every 10th) until the duration has really elapsed, before the closing phases,
+so the quiesced RSS is measured after the load; a progress line every 30 s replaces
+per-phase output while the loop runs. `tools/soak.mjs` (the Node original, same phases and
+criteria) is superseded and kept for one release.
 
 Phases: token auth failure/429/recovery · pipelined-ping FIFO ordering · churn with
 registry-leak checks · reconnect recovery · stopped-consumer saturation (count- and
 byte-bound paths, chosen adaptively from measured reply size vs the 4 MiB/256 = 16 KiB
 threshold) · heartbeat dead-peer release · abrupt client death · graceful `--exit-after`
 shutdown with live clients + queued work · restart on the same data dir. Pass/fail criteria
-(10, listed in the tool header and evaluated from observations — never process-liveness
+(10, listed in the `src/soak.rs` header and evaluated from observations — never process-liveness
 alone): unexpected exits, ordering violations, unauthorized data, peer leaks, missing D8
 teardowns, dead-peer survival, graceful-shutdown exit code, restart recovery, RSS growth +
-absolute caps, connection failures. Any failure ⇒ exit 1.
+absolute caps, connection failures. Exit 0 only when all ten pass; any failure ⇒ exit 1.
 
 Gotchas: the machine must **stay awake** for a long run (a prior 24 h attempt died at ~4.7 h
 on PC sleep); a short long-mode run is labeled by its measured duration in `summary.json`
 and does **not** close soak gate S11 — only a genuine 24 h window does. S11 closed on
 2026-10-24 with `target/soak/2026-10-23T19-55Z-long-24h-restart/summary.json`
-(`pass: true`, all 10 criteria, 86 429 s window). The standard
+(`pass: true`, all 10 criteria, 86 429 s window, run by the Node harness). The standard
 `verify` scripts never depend on a soak run. The harness is loopback-only by design (no LAN
 exposure); it does not simulate a phone and does not exercise E2E-sealed sessions (the Rust
 matrix covers those).
@@ -185,3 +197,4 @@ matrix covers those).
 | `qr` / `pairing` | std-only QR Model-2 encoder + single-use, TTL/rate-limited pairing offers |
 | `ffi` | `SetConsoleCtrlHandler` (graceful shutdown), `GetProcessMemoryInfo` (rssBytes), `BCryptGenRandom`, DPAPI, large-backlog listener |
 | `main` | CLI/env wiring, scheduler pump (50 ms), `--self-test`, pairing/revoke, graceful shutdown |
+| `soak` | `--soak` harness: spawns this exe as the server under test, 10 PASS/FAIL criteria, summary.json |
