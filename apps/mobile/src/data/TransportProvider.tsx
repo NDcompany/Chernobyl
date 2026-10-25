@@ -10,10 +10,18 @@ import { getTransport, hostUrl, resetTransport, setTransport, type Transport } f
 import { createWsTransport } from './wsTransport';
 import { readHostToken, readPairing } from '@/platform/secure';
 import { applyMessage, queryClient, STATE_KEY } from './state';
-import { useAppStore } from '@/store/appStore';
+import { useAppStore, type Settings } from '@/store/appStore';
 import { initNotifications, notify } from '@/platform/notify';
+import * as connectionService from '@/platform/connectionService';
 import { recordAudit } from '@/platform/storage';
 import { agentById } from './selectors';
+
+/**
+ * Alerts are on: enabled in Settings, and signed in — sign-out promises the
+ * user must sign in again to see approvals, so none are posted after it.
+ */
+const alertsOn = ({ authed, settings: s }: { authed: boolean; settings: Settings }): boolean =>
+  authed && s.push && (s.approvalAlerts || s.sessionAlerts);
 
 function agentName(snapshot: Snapshot | undefined, id: string): string {
   if (!snapshot) return 'Agent';
@@ -21,9 +29,10 @@ function agentName(snapshot: Snapshot | undefined, id: string): string {
 }
 
 async function handleSideEffect(msg: ServerMessage): Promise<void> {
-  const settings = useAppStore.getState().settings;
+  const { authed, settings } = useAppStore.getState();
+  const push = authed && settings.push;
 
-  if (msg.type === 'permission_requested' && settings.push && settings.approvalAlerts) {
+  if (msg.type === 'permission_requested' && push && settings.approvalAlerts) {
     const snapshot = queryClient.getQueryData<Snapshot>(STATE_KEY);
     await notify(
       'Approval needed',
@@ -33,7 +42,7 @@ async function handleSideEffect(msg: ServerMessage): Promise<void> {
   }
 
   if (msg.type === 'session_updated' && msg.session.status === 'completed') {
-    if (settings.push && settings.sessionAlerts) {
+    if (push && settings.sessionAlerts) {
       await notify('Session finished', msg.session.title);
     }
     return;
@@ -62,13 +71,43 @@ export function TransportProvider({ children }: { children: ReactNode }) {
     let cleanupTransport: Transport | null = null;
     let unsubMessages: (() => void) | null = null;
     let unsubStatus: (() => void) | null = null;
-    // Back in the foreground: a reconnect sitting in backoff (the OS may have
-    // frozen timers or dropped the socket while backgrounded) dials now.
-    // Only from 'reconnecting' — never re-dial a denied credential (section 9).
+    // ADR-011 §4: the Android foreground service exists only to deliver alerts,
+    // so it runs only for a real paired transport, while alerts are on and the
+    // notification permission lets them post, and never for a credential the
+    // companion refused (section 9). Re-decided whenever any of that changes.
+    let e2e = false;
+    let canPost = false;
+    let serviceText = 'Connecting to your desktop companion…';
+    const syncService = () => {
+      if (disposed) return;
+      const want =
+        e2e && canPost && alertsOn(useAppStore.getState()) && cleanupTransport?.status() !== 'denied';
+      if (!want) {
+        connectionService.stop();
+      } else if (AppState.currentState === 'active') {
+        // Android 12+ refuses a background start: the next 'active' retries,
+        // which also covers a start the OS refused. A running service only
+        // re-posts its notification.
+        connectionService.start('Background connection', serviceText);
+      }
+    };
+    // sign-in / sign-out and the alert settings switch the service
+    const unsubStore = useAppStore.subscribe((s, prev) => {
+      if (alertsOn(s) !== alertsOn(prev)) syncService();
+    });
     const appState = AppState.addEventListener('change', (next) => {
-      if (next === 'active' && cleanupTransport?.status() === 'reconnecting') {
+      if (next !== 'active') return;
+      // Back in the foreground: a reconnect sitting in backoff (the OS may have
+      // frozen timers or dropped the socket while backgrounded) dials now.
+      // Only from 'reconnecting' — never re-dial a denied credential (section 9).
+      if (cleanupTransport?.status() === 'reconnecting') {
         cleanupTransport.connect();
       }
+      // asks nothing: picks up a permission granted in system settings meanwhile
+      void initNotifications(false).then((ok) => {
+        canPost = ok;
+        syncService();
+      });
     });
 
     void (async () => {
@@ -93,6 +132,7 @@ export function TransportProvider({ children }: { children: ReactNode }) {
             pairing: cred,
           });
           setTransport(active);
+          e2e = true;
         } catch (e) {
           // A corrupt stored pairing must not brick the app — surface it.
           useAppStore
@@ -125,20 +165,45 @@ export function TransportProvider({ children }: { children: ReactNode }) {
         useAppStore.getState().trackCommand(msg);
         void handleSideEffect(msg);
       });
-      unsubStatus = active.subscribeStatus((s) =>
-        useAppStore.getState().setConnection(s),
-      );
+      unsubStatus = active.subscribeStatus((s) => {
+        useAppStore.getState().setConnection(s);
+        if (!e2e) return;
+        if (s === 'denied') {
+          // the ongoing notification would just vanish: say that alerts stopped
+          if (alertsOn(useAppStore.getState()) && AppState.currentState !== 'active') {
+            void notify(
+              'Disconnected from your desktop companion',
+              'This phone can no longer connect (revoked, token changed or version mismatch). Approval alerts have stopped. Open CHERNOBYL to pair again.',
+            );
+          }
+          syncService(); // stops it
+        } else if (s === 'connected' || s === 'reconnecting') {
+          // 'handshaking' keeps the current text (Connecting… / Reconnecting…)
+          serviceText =
+            s === 'connected'
+              ? 'Connected to your desktop companion'
+              : 'Reconnecting to your desktop companion…';
+          connectionService.update(serviceText);
+        }
+      });
       active.connect();
-      void initNotifications();
+      // first run shows the permission dialog; the service waits for the answer
+      void initNotifications().then((ok) => {
+        canPost = ok;
+        syncService();
+      });
     })();
 
     return () => {
       disposed = true;
       appState.remove();
+      unsubStore();
       unsubMessages?.();
       unsubStatus?.();
       cleanupTransport?.close();
       resetTransport();
+      // unpair / re-pair rebuild the transport through this cleanup
+      connectionService.stop();
     };
   }, [epoch]);
 

@@ -15,7 +15,11 @@ import { Platform } from 'react-native';
 
 let initialized = false;
 
-export async function initNotifications(): Promise<boolean> {
+/**
+ * Resolves whether notify() can post. `ask: false` never shows the permission
+ * dialog: it re-reads a grant the user may have given in system settings.
+ */
+export async function initNotifications(ask = true): Promise<boolean> {
   if (Platform.OS === 'web' || initialized) return initialized;
   try {
     setNotificationHandler({
@@ -35,11 +39,11 @@ export async function initNotifications(): Promise<boolean> {
       });
     }
     const current = await getPermissionsAsync();
-    if (!current.granted) {
+    if (!current.granted && ask) {
       const asked = await requestPermissionsAsync();
       initialized = asked.granted;
     } else {
-      initialized = true;
+      initialized = current.granted;
     }
   } catch {
     initialized = false;

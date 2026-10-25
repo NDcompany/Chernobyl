@@ -9,6 +9,9 @@ web-build/
 
 # Native build artifacts
 android/
+# ...but local Expo modules keep hand-written native sources there
+!apps/mobile/modules/*/android/
+apps/mobile/modules/*/android/build/
 ios/
 *.apk
 *.aab

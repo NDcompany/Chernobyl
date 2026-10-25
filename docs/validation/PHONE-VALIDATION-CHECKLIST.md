@@ -95,6 +95,8 @@ test artifact path. Store under `docs/validation/evidence/<YYYY-MM-DD>-<item-id>
 | 8.2 | Companion under the auth-failure cooldown (5 bad tokens) | Next correct attempt still connects (counter resets); wrong ones get fast refusal | companion log | **NOT RUN** (harness proven: 8×4001 + 1×429, recovery OK) |
 | 8.3 | Malformed/garbage frame from a debug client | `malformed` counter increments; connection survives (per contract) | companion `/health` | **NOT RUN** (`malformed_message_is_acked_and_connection_survives`) |
 | 8.4 | Leave the app backgrounded ≥ 10 min, return | Heartbeat keeps or re-establishes the connection; dead-peer cleanup on the companion side if truly dead | screen + companion log | **NOT RUN** (harness proven: silent peer released at 62 s) |
+| 8.5 | Android: pair, press Home, trigger an approval on the desktop, stop the companion, then revoke the device; repeat and end with sign-out, push off, unpair and swipe-away | Ongoing "Background connection" notification with the `[ · ]` status-bar glyph; the approval arrives as a notification; text turns "Reconnecting…"; on revoke a "Disconnected from your desktop companion" alert; after each ending, `adb shell dumpsys activity services com.chernobyl.app` lists no `ConnectionForegroundService` | screen recording + dumpsys | **NOT RUN** (no APK with the service yet) |
+| 8.6 | Android: revoke the device, keep its pairing stored, cold-launch the app 10 times | No crash ("did not then call Service.startForeground()"); status Denied; no service left running | screen + `adb logcat` | **NOT RUN** |
 
 ## Known risks to watch during the first device run
 
@@ -129,7 +131,8 @@ unilaterally:
 2. **QR scanning.** Reading the pairing QR needs `expo-camera` (native, camera permission,
    device-only). A manual paste/type fallback for the QR JSON is testable without it.
 3. **Foreground service + persistent WS** for backgrounded notifications (Android native,
-   device-only) — ADR-011 §4.
+   device-only) — ADR-011 §4. Written 2026-10-25 (`apps/mobile/modules/connection-service`);
+   its Kotlin compiles but no APK with it has been built yet. Rows 8.5 and 8.6 check it.
 
 Once the stack is chosen, implement the client against the documented contract and validate
 it **in a Node harness against the real companion first** (the server's own crypto

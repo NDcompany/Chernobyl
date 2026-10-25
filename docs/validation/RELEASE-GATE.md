@@ -38,8 +38,10 @@ session-only).
 2. Build and install a signed or development APK (needs the Android SDK).
 3. An independent review of the E2E layer (`e2e.rs`, `crypto.rs`, `packages/e2e`). The package
    is kept audit-ready: threat model, ADRs 011–014, golden vectors.
-4. Optional: an Android foreground service so the WebSocket survives long backgrounding. Today
-   the app re-dials when it returns to the foreground and notifications are local only.
+4. Build the Android foreground service (`apps/mobile/modules/connection-service`, ADR-011 §4)
+   and run checklist rows 8.5 and 8.6. It keeps the WebSocket alive in the background; its Kotlin
+   compiles, but no APK with it has been built yet. Google Play also needs a declaration for its
+   `specialUse` type.
 
 ## Final verification run
 

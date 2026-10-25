@@ -146,10 +146,13 @@ production backend — use the companion for real connections.
   (Phase 6 code complete: pure-JS crypto per ADR-012, pairing scan, sealed frames,
   endpoint-list reconnect). Every row in `docs/validation/PHONE-VALIDATION-CHECKLIST.md`
   is NOT RUN/BLOCKED until someone scans a QR with a real Android phone.
-- **Notifications are local-only while the app is open.** Backgrounded delivery is
-  designed as a persistent WebSocket + Android foreground service posting local
-  notifications (ADR-011 — FCM/APNs deliberately dropped). No delivery while the socket
-  is down; iOS background push (APNs) is out of scope.
+- **Background notifications are written but not yet built or device-tested.** On Android
+  a foreground service (`apps/mobile/modules/connection-service`) keeps the paired
+  WebSocket alive while the app is in the background, but not after it is swiped away from
+  Recents, and the app posts local notifications (ADR-011 §4; FCM/APNs deliberately dropped).
+  Its Kotlin compiles, but no APK with it has been built yet. Nothing is delivered while the
+  socket is down. iOS shows
+  alerts only while the app is open; APNs is out of scope.
 - **Transport encryption is app-layer E2E**, not TLS — the std-only Rust companion has
   no TLS crate, so security lives in the per-device PSK session (ADR-011). The
   companion's own socket is plain `ws://`; a middleman sees ciphertext only.

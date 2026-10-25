@@ -1,0 +1,22 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+// expo-module-gradle-plugin's publishing setup requires a version
+group = 'expo.modules.connectionservice'
+version = '0.1.0'
+
+android {
+  namespace "expo.modules.connectionservice"
+  defaultConfig {
+    versionCode 1
+    versionName '0.1.0'
+  }
+}
+
+dependencies {
+  // expo-modules-core links react-android as `implementation`, not `api`
+  implementation 'com.facebook.react:react-android'
+  implementation 'androidx.core:core:1.17.0'
+}

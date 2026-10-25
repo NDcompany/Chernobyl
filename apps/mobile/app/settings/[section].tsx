@@ -291,8 +291,9 @@ export default function SettingsSectionScreen() {
           />
         </SectionCard>
         <Text variant="xs" color={colors.text3} center>
-          This build shows notifications while the app is open. Silent push while backgrounded
-          requires FCM/APNs configuration on the host.
+          {Platform.OS === 'android'
+            ? 'While a host is paired, a background connection (the ongoing "Background connection" notification) keeps these alerts coming with the app in the background. Nothing arrives while that connection is down, after you swipe the app away from Recents, or after a restart until you open the app.'
+            : 'Alerts appear only while the app is open.'}
         </Text>
       </>
     );

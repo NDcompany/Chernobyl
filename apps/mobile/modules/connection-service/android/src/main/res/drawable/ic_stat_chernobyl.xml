@@ -1,0 +1,12 @@
+<!-- Status-bar icon for every CHERNOBYL notification: the app mark "[ · ]", traced from
+     assets/android-icon-monochrome.png (its 1024 px canvas minus 242). Android draws only the
+     alpha channel of a small icon. 24dp with the mark in the central 20dp. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+  android:width="24dp"
+  android:height="24dp"
+  android:viewportWidth="540"
+  android:viewportHeight="540">
+  <path
+    android:fillColor="#FFFFFFFF"
+    android:pathData="M45,45H180V85H85V455H180V495H45Z M495,45H360V85H455V455H360V495H495Z M247,247H293V293H247Z" />
+</vector>

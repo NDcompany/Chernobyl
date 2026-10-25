@@ -1,0 +1,21 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+  <application>
+    <!-- expo-notifications posts the approval and session alerts with this glyph too; without it
+         they fall back to the full-colour launcher icon. If app.json ever sets the
+         expo-notifications plugin "icon", delete this: the manifest merger rejects both. -->
+    <meta-data
+      android:name="expo.modules.notifications.default_notification_icon"
+      android:resource="@drawable/ic_stat_chernobyl" />
+    <service
+      android:name="expo.modules.connectionservice.ConnectionForegroundService"
+      android:exported="false"
+      android:foregroundServiceType="specialUse">
+      <property
+        android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+        android:value="Keeps the end-to-end encrypted connection to the desktop companion that the user runs on their own computer open, so agent approval requests arrive while the app is in the background." />
+    </service>
+  </application>
+</manifest>

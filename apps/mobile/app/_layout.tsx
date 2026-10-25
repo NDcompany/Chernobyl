@@ -4,6 +4,8 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { queryClient } from '@/data/state';
 import { TransportProvider } from '@/data/TransportProvider';
+// registers the Android headless task before any service start (ADR-011 §4)
+import '@/platform/connectionService';
 import { ToastHost, SimulationBadge } from '@/ui/surface';
 import { colors } from '@/theme/tokens';
 

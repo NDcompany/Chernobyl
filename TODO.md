@@ -258,8 +258,9 @@ Updated: 2026-10-25 late (reliability mandate closed: audit P1–P10 + extra fin
       two devices, restart recovery, revocation-at-restart semantics). **2026-10-25:** camera QR scanning (`bdfe6e5`), paired-host record with endpoint list + honest
       uncertain-outcome states (`37f6056`), pair-or-demo entry replacing the fake sign-in (C14), unpair
       in Settings, foreground re-dial. Still owed: on-device rows (physical device —
-      `docs/validation/PHONE-VALIDATION-CHECKLIST.md`) and an Android foreground service for long
-      backgrounding (needs a native build).
+      `docs/validation/PHONE-VALIDATION-CHECKLIST.md`) and a native build of the Android foreground
+      service (`apps/mobile/modules/connection-service`, written 2026-10-25; Kotlin compiles, no
+      APK yet; checklist rows 8.5 and 8.6).
 - [x] Phase 7: adapters — **done 2026-10-23**. Ollama (`04117ee`) + Claude Code (`b0bf067`) as Rust
       modules; **Hermes deferred** per ADR-008 (not installed — no pretend capability claims; the
       adapter SDK keeps unsupported adapters invisible rather than broken). Ollama is a model-runtime

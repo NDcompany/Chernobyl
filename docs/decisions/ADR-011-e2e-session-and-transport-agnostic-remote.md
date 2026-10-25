@@ -69,10 +69,47 @@ revocation. Existing devices are unaffected by new pairings.
 
 ### 4. Push: persistent WebSocket, no FCM (as chosen)
 
-App-open approvals stream live over the existing fan-out. App-closed: Android foreground
-service keeps the WS alive and posts **local notifications** on approval events. Honest
-limitation: no delivery while the socket is down. iOS background push (APNs) is out of
-scope and would revisit this decision.
+App-open approvals stream live over the existing fan-out. App in the background (not swiped
+away from Recents): Android foreground service keeps the WS alive and posts **local
+notifications** on approval events. Honest limitation: no delivery while the socket is down.
+iOS background push (APNs) is out of scope and would revisit this decision.
+
+**Implementation (2026-10-25).** The local Expo module `apps/mobile/modules/connection-service`
+(Android only) runs `ConnectionForegroundService`, a `specialUse` foreground service with a
+low-importance ongoing notification on channel `chernobyl-connection`. The service exists only
+to deliver alerts, so `TransportProvider` runs it only for a stored pairing (the real E2E
+transport, never the mock or the plaintext dev transport), while the user is signed in, push and
+at least one alert type are on, and the notification permission is granted. It starts only while
+the app is in the foreground, because Android 12+ refuses background starts; each return to the
+foreground retries a start that was missed or refused. It updates the notification text from the
+transport status. It stops on `denied` (posting a "Disconnected" alert when the app is in the
+background), on sign-out or alerts off, on unpair or re-pair, and on unmount. A stop goes through
+the service's own start queue (`ACTION_STOP`, then `stopSelf(startId)`), never `stopService()`:
+a `stopService()` that lands before `startForeground()` crashes the app. The service starts the
+headless JS task `ChernobylConnection`, a promise that never settles, because React Native pauses JS timers
+when the activity pauses unless a headless task is active. It does not extend
+`HeadlessJsTaskService`, which holds a partial wake lock for its whole lifetime. Approval
+notifications are still posted from JS (`apps/mobile/src/platform/notify.ts`).
+
+Limits:
+
+- It keeps the process, the socket and JS timers alive while the app is in the background.
+  It does nothing else.
+- It holds no wake lock. The foreground service keeps network access in Doze, but JS runs only
+  while the CPU is awake. The companion's 15 s WebSocket ping wakes the device and is answered
+  natively (OkHttp), so the socket survives sleep, at the battery cost of a wake about every 15 s
+  (significant on cellular).
+- It is `START_NOT_STICKY`: after the process dies (force-stop, the OS reclaiming memory) nothing
+  restarts it until the app is opened again. Swiping the app away from Recents destroys the
+  activity; React Native's `ReactDelegate.onHostDestroy()` then stops the React surface, which
+  unmounts the provider and stops the service. Delivery after a swipe-away would need the
+  transport to live outside the React tree.
+- While the task runs, React Native's timer loop ticks on display frames, as in the foreground.
+- Notifications stay local: no FCM, and nothing is delivered while the socket is down.
+- Google Play requires a declaration for the `specialUse` type at release; the manifest property
+  `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` states the reason.
+- Its Kotlin compiles (checked 2026-10-25 with the Kotlin 2.2.10 compiler against android-36,
+  outside Gradle), but it has not been built into an APK or run on a device yet.
 
 ### 5. Companion UI = CLI + TUI only
 
