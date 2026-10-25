@@ -4,7 +4,7 @@
  */
 import { useEffect, type ReactNode } from 'react';
 import { AppState } from 'react-native';
-import type { ServerMessage, Snapshot } from '@chernobyl/protocol';
+import { createSeedSnapshot, type ServerMessage, type Snapshot } from '@chernobyl/protocol';
 import { createE2eTransport, parsePairingPayload } from '@chernobyl/e2e';
 import { getTransport, hostUrl, resetTransport, setTransport, type Transport } from './transport';
 import { createWsTransport } from './wsTransport';
@@ -62,6 +62,8 @@ async function handleSideEffect(msg: ServerMessage): Promise<void> {
   }
 }
 
+const EMPTY_SNAPSHOT: Snapshot = { hosts: [], agents: [], sessions: [], permissions: [], activity: [] };
+
 export function TransportProvider({ children }: { children: ReactNode }) {
   // Rebuilt whenever the credential changes (a new pairing was saved).
   const epoch = useAppStore((s) => s.transportEpoch);
@@ -76,6 +78,8 @@ export function TransportProvider({ children }: { children: ReactNode }) {
     // notification permission lets them post, and never for a credential the
     // companion refused (section 9). Re-decided whenever any of that changes.
     let e2e = false;
+    // any real host (E2E pairing or the dev plaintext URL), i.e. not the demo
+    let live = false;
     let canPost = false;
     let serviceText = 'Connecting to your desktop companion…';
     const syncService = () => {
@@ -133,6 +137,7 @@ export function TransportProvider({ children }: { children: ReactNode }) {
           });
           setTransport(active);
           e2e = true;
+          live = true;
         } catch (e) {
           // A corrupt stored pairing must not brick the app — surface it.
           useAppStore
@@ -142,6 +147,7 @@ export function TransportProvider({ children }: { children: ReactNode }) {
           if (url) {
             active = createWsTransport(withToken(url));
             setTransport(active);
+            live = true;
           } else {
             active = getTransport();
           }
@@ -151,6 +157,7 @@ export function TransportProvider({ children }: { children: ReactNode }) {
         if (url) {
           active = createWsTransport(withToken(url));
           setTransport(active);
+          live = true;
         } else {
           active = getTransport();
         }
@@ -160,6 +167,10 @@ export function TransportProvider({ children }: { children: ReactNode }) {
         return;
       }
       cleanupTransport = active;
+      // The cache follows the transport (ADR-009): a live host starts empty
+      // until its hello_ack snapshot arrives — never with the demo seed shown
+      // as live — and demo mode (e.g. after unpairing) gets the seed back.
+      queryClient.setQueryData<Snapshot>(STATE_KEY, live ? EMPTY_SNAPSHOT : createSeedSnapshot());
       unsubMessages = active.subscribe((msg) => {
         applyMessage(msg);
         useAppStore.getState().trackCommand(msg);
@@ -187,8 +198,9 @@ export function TransportProvider({ children }: { children: ReactNode }) {
         }
       });
       active.connect();
-      // first run shows the permission dialog; the service waits for the answer
-      void initNotifications().then((ok) => {
+      // the permission dialog is shown for a real host only (demo mode never
+      // asks); the service waits for the answer
+      void initNotifications(live).then((ok) => {
         canPost = ok;
         syncService();
       });

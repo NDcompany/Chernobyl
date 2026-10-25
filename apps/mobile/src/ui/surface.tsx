@@ -393,13 +393,15 @@ export function SimulationBadge() {
   // data itself is marked simulated (ADR-009).
   useAppStore((s) => s.connection);
   const simulatedData = hasSimulatedData(useSnapshot());
+  // below the status bar, not over the clock (seen on the emulator)
+  const insetTop = useSafeAreaInsets().top;
   const top = segments[segments.length - 1];
   if (typeof top === 'string' && SIMULATION_PATHS.has(top)) return null;
   if (transportKind() !== 'mock' && !simulatedData) return null;
   return (
     <View
       pointerEvents="none"
-      style={styles.simBadge}
+      style={[styles.simBadge, { top: insetTop + spacing.xs }]}
       accessibilityRole="text"
       accessibilityLabel="Simulation mode: showing demo data, not a real agent"
     >

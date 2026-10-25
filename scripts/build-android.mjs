@@ -35,6 +35,9 @@ const cmake = cmakeVersions
   .pop();
 if (!cmake) fail(`no CMake >= 3.31 under ${sdk}\\cmake — install it: sdkmanager "cmake;3.31.6"`);
 
+// the app bundles the workspace packages from their compiled dist: build
+// them first or the APK ships whatever stale dist is on disk
+run('npm', ['run', 'build:e2e'], root);
 if (!existsSync(android)) run('npx', ['expo', 'prebuild', '--platform', 'android', '--no-install'], mobile);
 
 const esc = (p) => p.replace(/\\/g, '\\\\').replace(/:/g, '\\:');
