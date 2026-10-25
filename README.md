@@ -32,7 +32,8 @@ npm run verify:rust  # Rust runtime: tests + clippy + fmt + self-test
 
 Building + verifying a release binary, install/autostart, backup/restore, and
 SmartScreen troubleshooting: see [`docs/INSTALL.md`](docs/INSTALL.md) (ADR-007 —
-unsigned binary + published SHA-256 checksums).
+unsigned binary + published SHA-256 checksums). Remote access setup (LAN,
+Tailscale, tunnels), failover, and hardening: see [`docs/REMOTE-ACCESS.md`](docs/REMOTE-ACCESS.md).
 
 Run the pieces:
 
@@ -163,12 +164,12 @@ Two suites, both green on the current tree:
   (0 errors; 2 known warnings from React Compiler skipping `react-hook-form.watch`),
   **44 tests** (13 domain + 22 host + 9 adapter-sdk via `node --test`), workspace builds,
   and `expo export --platform android` → `dist-android` (Hermes bundle).
-- `npm run verify:rust` (the real runtime): **186 passed / 0 failed / 4 ignored** Rust
-  tests (incl. the crypto known-answer tests, the D1/D2/D6 posture + E2E adversarial
-  matrix, and the two post-integration sealing tests — fanned-out events and the
-  protocol-mismatch ack are sealed for session clients), `cargo clippy -D warnings`,
-  `cargo fmt --check`, and the binary's `--self-test` end-to-end probe. (Was 160/0/3
-  before the Phase 6/7/8 integration hardening.)
+- `npm run verify:rust` (the real runtime): **219 unit + 4 CLI + 5 lifecycle
+  integration tests, 0 failed** (4 + 1 ignored microbench/live tests), incl. the crypto
+  known-answer tests, golden E2E frames shared with the TS client, the D1/D2/D6/D9 posture
+  and E2E adversarial matrix, live revocation (4003), ordered shutdown and adapter fault
+  injection; `cargo clippy -D warnings`, `cargo fmt --check`, and the binary's
+  `--self-test`. Release-gate status: `docs/validation/RELEASE-GATE.md`.
 - **Soak harness** (`services/companion-rs/tools/soak.mjs`): `npm run soak:smoke` (~80 s,
   10 predefined pass/fail criteria) and `npm run soak:long` (explicit long/24-hour mode).
   Emits JSONL telemetry + a machine-readable `summary.json`; a fault-injection mode proves

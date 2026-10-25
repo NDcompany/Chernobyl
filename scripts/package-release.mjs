@@ -18,6 +18,7 @@
 // format (verifiable with `sha256sum -c` on Linux/macOS or this script's
 // --verify on any platform).
 
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -54,6 +55,13 @@ function sha256File(path) {
 }
 
 async function build() {
+  // always hash a fresh build: stale checksums once shipped for an old exe
+  const cargo = spawnSync(
+    'cargo',
+    ['build', '--release', '--manifest-path', join(root, 'services', 'companion-rs', 'Cargo.toml')],
+    { stdio: 'inherit' },
+  );
+  if (cargo.status !== 0) process.exit(cargo.status ?? 1);
   const files = candidates();
   if (files.length === 0) {
     console.error('no artifacts found — run `cargo build --release` first');

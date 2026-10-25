@@ -91,6 +91,8 @@ from a terminal. This warning is a disclosed release limitation, not a bug.
   (repeat `--endpoint` for LAN + tailnet + tunnel in one QR).
 - A non-loopback bind **requires** `--token`; the companion refuses to start
   otherwise.
+- For complete transport setup guides (LAN, Tailscale, tunnels), failover, and
+  hardening, see [`REMOTE-ACCESS.md`](REMOTE-ACCESS.md).
 
 ### The phone connects but commands are refused
 
