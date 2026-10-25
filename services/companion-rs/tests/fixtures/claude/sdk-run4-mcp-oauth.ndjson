@@ -1,0 +1,48 @@
+{"t":67,"dir":"in","msg":{"type":"control_request","request_id":"req_1","request":{"subtype":"initialize","hooks":null}}}
+{"t":3187,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{"commands":"<trimmed>","agents":"<trimmed>","output_style":"default","available_output_styles":["default","Proactive","Concise","Explanatory","Learning"],"user_output_styles_dir":"<home>\\.claude\\output-styles","models":"<trimmed>","account":"<redacted>","pid":16140,"claude_code_version":"2.1.310","current_permission_mode":"default","feedback_mode":{"kind":"post"},"analytics_disabled":false,"remote_control_auto_enable":false,"remote_control_auto_connect_default":false,"remote_control_available":true,"remote_control_auto_on_by_default":false,"ide_rc_auto_enable_gate":true,"fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","session_state":"idle","capabilities":["ui_surface_v1","mcp_call_result_not_for_model_v1"]},"pending_permission_requests":[],"pending_user_dialog_requests":[]}}}
+{"t":3188,"dir":"in","msg":{"type":"control_request","request_id":"req_2","request":{"subtype":"mcp_status"}}}
+{"t":3281,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_2","response":{"mcpServers":[{"name":"chernobyl-mock-oauth","status":"needs-auth","config":{"type":"http","url":"http://127.0.0.1:63152/mcp"},"transport":"http","scope":"dynamic","source":"dynamic"}]}}}}
+{"t":3281,"dir":"in","msg":{"type":"control_request","request_id":"req_3","request":{"subtype":"mcp_authenticate","serverName":"chernobyl-mock-oauth"}}}
+{"t":3411,"dir":"mock","msg":{"method":"GET","path":"/.well-known/oauth-protected-resource/mcp","auth":null}}
+{"t":3628,"dir":"mock","msg":{"method":"GET","path":"/.well-known/oauth-authorization-server","auth":null}}
+{"t":3662,"dir":"mock","msg":{"method":"GET","path":"/.well-known/oauth-protected-resource/mcp","auth":null}}
+{"t":3666,"dir":"mock","msg":{"method":"GET","path":"/.well-known/oauth-authorization-server","auth":null}}
+{"t":3901,"dir":"mock","msg":{"method":"POST","path":"/register","auth":null}}
+{"t":4224,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_3","response":{"authUrl":"http://127.0.0.1:63152/authorize?response_type=code&client_id=mock-client&code_challenge=redacted-challenge&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A48807%2Fcallback&state=redacted-state&resource=http%3A%2F%2F127.0.0.1%3A63152%2Fmcp","requiresUserAction":true,"callbackExpected":true,"redirectScheme":"localhost","state":"redacted-state","callbackPort":48807}}}}
+{"t":4279,"dir":"mock","msg":{"method":"GET","path":"/authorize","auth":null}}
+{"t":4303,"dir":"phone","msg":{"authorize_status":302,"callbackUrl":"http://localhost:48807/callback?code=redacted-code&state=redacted-state"}}
+{"t":4303,"dir":"in","msg":{"type":"control_request","request_id":"req_4","request":{"subtype":"mcp_oauth_callback_url","serverName":"chernobyl-mock-oauth","callbackUrl":"http://localhost:48807/callback?code=redacted-code&state=redacted-state"}}}
+{"t":4351,"dir":"mock","msg":{"method":"POST","path":"/token","auth":null}}
+{"t":4613,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_4"}}}
+{"t":4613,"dir":"in","msg":{"type":"control_request","request_id":"req_5","request":{"subtype":"mcp_status"}}}
+{"t":4615,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_5","response":{"mcpServers":[{"name":"chernobyl-mock-oauth","status":"needs-auth","config":{"type":"http","url":"http://127.0.0.1:63152/mcp"},"transport":"http","scope":"dynamic","source":"dynamic"}]}}}}
+{"t":5119,"dir":"in","msg":{"type":"control_request","request_id":"req_6","request":{"subtype":"mcp_status"}}}
+{"t":5120,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_6","response":{"mcpServers":[{"name":"chernobyl-mock-oauth","status":"needs-auth","config":{"type":"http","url":"http://127.0.0.1:63152/mcp"},"transport":"http","scope":"dynamic","source":"dynamic"}]}}}}
+{"t":5630,"dir":"in","msg":{"type":"control_request","request_id":"req_7","request":{"subtype":"mcp_status"}}}
+{"t":5632,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_7","response":{"mcpServers":[{"name":"chernobyl-mock-oauth","status":"needs-auth","config":{"type":"http","url":"http://127.0.0.1:63152/mcp"},"transport":"http","scope":"dynamic","source":"dynamic"}]}}}}
+{"t":6144,"dir":"in","msg":{"type":"control_request","request_id":"req_8","request":{"subtype":"mcp_status"}}}
+{"t":6145,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_8","response":{"mcpServers":[{"name":"chernobyl-mock-oauth","status":"needs-auth","config":{"type":"http","url":"http://127.0.0.1:63152/mcp"},"transport":"http","scope":"dynamic","source":"dynamic"}]}}}}
+{"t":6658,"dir":"in","msg":{"type":"control_request","request_id":"req_9","request":{"subtype":"mcp_status"}}}
+{"t":6659,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_9","response":{"mcpServers":[{"name":"chernobyl-mock-oauth","status":"needs-auth","config":{"type":"http","url":"http://127.0.0.1:63152/mcp"},"transport":"http","scope":"dynamic","source":"dynamic"}]}}}}
+{"t":6660,"dir":"in","msg":{"type":"control_request","request_id":"req_10","request":{"subtype":"mcp_reconnect","serverName":"chernobyl-mock-oauth"}}}
+{"t":6700,"dir":"mock","msg":{"method":"POST","path":"/mcp","auth":"Bearer <present>"}}
+{"t":6741,"dir":"mock","msg":{"method":"POST","path":"/mcp","auth":"Bearer <present>"}}
+{"t":6750,"dir":"mock","msg":{"method":"POST","path":"/mcp","auth":"Bearer <present>"}}
+{"t":6764,"dir":"mock","msg":{"method":"GET","path":"/mcp","auth":"Bearer <present>"}}
+{"t":6768,"dir":"mock","msg":{"method":"POST","path":"/mcp","auth":"Bearer <present>"}}
+{"t":6794,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_10"}}}
+{"t":6794,"dir":"in","msg":{"type":"control_request","request_id":"req_11","request":{"subtype":"mcp_status"}}}
+{"t":6796,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_11","response":{"mcpServers":[{"name":"chernobyl-mock-oauth","status":"connected","serverInfo":{"name":"mock-oauth","version":"0.0.1"},"config":{"type":"http","url":"http://127.0.0.1:63152/mcp"},"transport":"http","scope":"dynamic","source":"dynamic","tools":[{"name":"ping","annotations":{}}]}]}}}}
+{"t":6797,"dir":"in","msg":{"type":"control_request","request_id":"req_12","request":{"subtype":"mcp_clear_auth","serverName":"chernobyl-mock-oauth"}}}
+{"t":6800,"dir":"mock","msg":{"method":"GET","path":"/.well-known/oauth-protected-resource","auth":null}}
+{"t":6802,"dir":"mock","msg":{"method":"GET","path":"/.well-known/oauth-authorization-server","auth":null}}
+{"t":6861,"dir":"mock","msg":{"method":"POST","path":"/mcp","auth":null}}
+{"t":6866,"dir":"mock","msg":{"method":"GET","path":"/.well-known/oauth-protected-resource","auth":null}}
+{"t":6870,"dir":"mock","msg":{"method":"GET","path":"/.well-known/oauth-authorization-server","auth":null}}
+{"t":6941,"dir":"mock","msg":{"method":"POST","path":"/mcp","auth":null}}
+{"t":6950,"dir":"mock","msg":{"method":"GET","path":"/.well-known/oauth-authorization-server","auth":null}}
+{"t":6955,"dir":"mock","msg":{"method":"GET","path":"/.well-known/oauth-protected-resource","auth":null}}
+{"t":7044,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_12","response":{}}}}
+{"t":7045,"dir":"in","msg":{"type":"control_request","request_id":"req_13","request":{"subtype":"mcp_status"}}}
+{"t":7048,"dir":"out","msg":{"type":"control_response","response":{"subtype":"success","request_id":"req_13","response":{"mcpServers":[{"name":"chernobyl-mock-oauth","status":"needs-auth","config":{"type":"http","url":"http://127.0.0.1:63152/mcp"},"transport":"http","scope":"dynamic","source":"dynamic"}]}}}}
+{"t":8322,"dir":"exit","msg":{"code":0}}

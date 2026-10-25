@@ -13,11 +13,14 @@
 //! (memory-only live transcripts, subscriptions, backpressure).
 //! codex: ADR-015 step 7 Codex app-server adapter core (JSON-RPC client,
 //! notification decoder, approvals).
+//! claude_live: ADR-015 Claude Code driver core (frame decoder, permission
+//! options, stdin encoders, launch and workspace policy).
 
 pub mod adapters;
 pub mod backup;
 pub mod base64;
 pub mod claude;
+pub mod claude_live;
 pub mod client;
 pub mod codex;
 pub mod companion;
