@@ -9,7 +9,8 @@
 //! (orchestration), server (WS/HTTP), client (test client), tui (Phase 8
 //! terminal UI), ffi (Windows console/memory).
 //! runtime_io: ADR-015 child process IO, env scrub, redaction, desktop
-//! opener and OAuth callback check.
+//! opener and OAuth callback check. transcript: ADR-015 transcript hub
+//! (memory-only live transcripts, subscriptions, backpressure).
 //! codex: ADR-015 step 7 Codex app-server adapter core (JSON-RPC client,
 //! notification decoder, approvals).
 
@@ -36,5 +37,6 @@ pub mod seed;
 pub mod server;
 pub mod sha1;
 pub mod storage;
+pub mod transcript;
 pub mod tui;
 pub mod ws;

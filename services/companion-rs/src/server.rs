@@ -50,8 +50,8 @@ pub const OUTBOUND_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// reserved for control frames. Overflowing either bound refuses admission —
 /// the connection tears down (never a silent drop; a shed event would be
 /// invisible loss because no client consumes `lastSeq` for gap detection).
-const BULK_QUEUE_MAX_MESSAGES: usize = 192;
-const BULK_QUEUE_MAX_BYTES: usize = 3 * 1024 * 1024;
+pub(crate) const BULK_QUEUE_MAX_MESSAGES: usize = 192;
+pub(crate) const BULK_QUEUE_MAX_BYTES: usize = 3 * 1024 * 1024;
 /// Channel capacity = both class caps summed: control stays admissible up to
 /// its own 256 even when bulk already holds its full 192 (reserved headroom).
 const CHANNEL_CAPACITY: usize = OUTBOUND_QUEUE_MAX_MESSAGES + BULK_QUEUE_MAX_MESSAGES;
@@ -1209,7 +1209,7 @@ pub enum EnqueueError {
 }
 
 impl Outbound {
-    fn new(
+    pub(crate) fn new(
         saturation: Arc<crate::companion::Saturation>,
         require_e2e: bool,
     ) -> (Arc<Outbound>, Receiver<(MsgClass, Vec<u8>)>) {
@@ -1396,6 +1396,32 @@ impl Outbound {
     pub(crate) fn is_terminated(&self) -> bool {
         self.terminated.load(Ordering::SeqCst)
     }
+
+    /// ADR-015 §3.5 backpressure: bulk-class frames queued now.
+    pub(crate) fn bulk_depth(&self) -> usize {
+        self.depth.get(MsgClass::Bulk)
+    }
+
+    /// Bytes the bulk budget is checked against: the whole queue's byte
+    /// count (see `MsgClass::max_bytes`).
+    pub(crate) fn bulk_bytes(&self) -> usize {
+        self.queued_bytes.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Outbound {
+    /// Takes one queued frame with the writer's accounting (byte and depth
+    /// release), for tests that drain a queue without a socket.
+    pub(crate) fn test_dequeue(
+        &self,
+        rx: &Receiver<(MsgClass, Vec<u8>)>,
+    ) -> Option<(MsgClass, Vec<u8>)> {
+        let (class, payload) = rx.try_recv().ok()?;
+        self.queued_bytes.fetch_sub(payload.len(), Ordering::SeqCst);
+        self.depth.release(class);
+        Some((class, payload))
+    }
 }
 
 /// Writer thread body: dequeue queued payloads and write them as text
@@ -1451,6 +1477,13 @@ impl ConnGuard {
         };
         list.retain(|(id, _)| *id != self.conn_id);
         drop(list);
+        // ADR-015: a gone connection keeps no transcript subscription
+        let mut hub = match self.shared.hub.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        hub.unsubscribe(self.conn_id, None);
+        drop(hub);
         self.writer_stop.store(true, Ordering::SeqCst);
         if let Some(w) = self.writer.take() {
             let _ = w.join();
@@ -1852,6 +1885,25 @@ fn serve_ws(
                         last_seq: companion.last_seq(),
                         features: crate::protocol::FEATURES,
                     }),
+                    // ADR-015: a subscription belongs to this connection (its
+                    // id and Outbound); the D2 gate above already demanded a
+                    // live E2E session beyond loopback. Never journaled.
+                    ClientMsg::SessionSubscribe {
+                        command_id,
+                        session_id,
+                        epoch,
+                        after_seq,
+                    } => Some(companion.subscribe(
+                        conn_id,
+                        &outbound,
+                        command_id,
+                        session_id,
+                        epoch.clone().zip(*after_seq),
+                    )),
+                    ClientMsg::SessionUnsubscribe {
+                        command_id,
+                        session_id,
+                    } => Some(companion.unsubscribe(conn_id, command_id, session_id)),
                     _ => companion.handle_client_msg(msg),
                 };
                 if let Some(reply) = reply {
@@ -4139,6 +4191,230 @@ mod e2e_tests {
 
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ---- ADR-015: transcript subscriptions (step 2) ----------------- */
+
+    /// No real runtime streams yet: tests push ops through the hub API.
+    fn push_text(f: &Fixture, session: &str, id: &str, text: &str) {
+        use crate::transcript::{Item, ItemKind, Op};
+        let item = Item {
+            id: id.into(),
+            kind: ItemKind::Text,
+            text: text.into(),
+            ..Default::default()
+        };
+        f.companion.hub().push(session, Op::Item(item));
+    }
+
+    fn subscribe_json(command_id: &str, session: &str) -> String {
+        format!(
+            r#"{{"type":"session_subscribe","commandId":"{command_id}","sessionId":"{session}"}}"#
+        )
+    }
+
+    fn transcript_subs(f: &Fixture) -> i64 {
+        json::get_i64(&f.companion.health(), "transcriptSubs").unwrap()
+    }
+
+    /// Reads sealed frames until `pred` matches one (opened), failing on any
+    /// frame that does not open with the session.
+    fn next_sealed(
+        c: &mut WsClient,
+        sess: &mut e2e::Session,
+        pred: impl Fn(&json::Json) -> bool,
+    ) -> json::Json {
+        for _ in 0..32 {
+            let frame = c.next_text().unwrap();
+            let inner = sess
+                .open(&frame)
+                .unwrap_or_else(|e| panic!("non-sealed frame: {e} ({frame})"));
+            let v = json::parse(&inner).unwrap();
+            if pred(&v) {
+                return v;
+            }
+        }
+        panic!("no matching sealed frame");
+    }
+
+    fn is_type(v: &json::Json, t: &str) -> bool {
+        json::get_str(v, "type") == Some(t)
+    }
+
+    #[test]
+    fn transcript_frames_are_sealed_for_session_clients() {
+        let f = fixture_paired("tx-sealed", false);
+        push_text(&f, "ses_tx", "i1", "hello from the runtime");
+        let mut c = connect(&f);
+        let (_r, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        let mut sess = sess.unwrap();
+        c.send_text(&sess.seal(&subscribe_json("sub-1", "ses_tx")))
+            .unwrap();
+        // the ack (read loop) and the snapshot (scheduler) may come either way
+        let (mut ack, mut snap) = (None, None);
+        while ack.is_none() || snap.is_none() {
+            let v = next_sealed(&mut c, &mut sess, |_| true);
+            if is_type(&v, "ack") {
+                ack = Some(v);
+            } else if is_type(&v, "transcript_snapshot") {
+                snap = Some(v);
+            }
+        }
+        let (ack, snap) = (ack.unwrap(), snap.unwrap());
+        assert_eq!(
+            json::get(&ack, "ok"),
+            Some(&json::Json::Bool(true)),
+            "{ack:?}"
+        );
+        assert_eq!(json::get_str(&snap, "sessionId"), Some("ses_tx"));
+        assert!(json::stringify(&snap).contains("hello from the runtime"));
+        // live ops follow sealed too, continuing the snapshot's seq
+        push_text(&f, "ses_tx", "i2", "and more");
+        let live = next_sealed(&mut c, &mut sess, |v| is_type(v, "transcript"));
+        let ops = json::as_arr(json::get(&live, "ops").unwrap()).unwrap();
+        assert_eq!(json::get_i64(&ops[0], "seq"), Some(2));
+        // the snapshot says which sessions stream: none of the demo ones here
+        assert!(
+            f.companion
+                .snapshot()
+                .sessions
+                .iter()
+                .all(|s| !s.transcript)
+        );
+        // an unknown session is refused
+        c.send_text(&sess.seal(&subscribe_json("sub-2", "nope")))
+            .unwrap();
+        let ack = next_sealed(&mut c, &mut sess, |v| is_type(v, "ack"));
+        assert_eq!(json::get_str(&ack, "error"), Some("unknown session"));
+        shutdown(f);
+    }
+
+    #[test]
+    fn sessionless_remote_connection_gets_no_transcript() {
+        let f = fixture_remote("tx-lurker");
+        push_text(&f, "ses_tx", "i1", "secret transcript text");
+        // the lurker holds only the token; the ping proves it is registered
+        let mut lurker = connect_remote(&f);
+        lurker
+            .send_text(r#"{"type":"ping","commandId":"lurk-1"}"#)
+            .unwrap();
+        assert!(lurker.next_text().unwrap().contains("pong"));
+        let (conn, out) = f.companion.shared.clients.lock().unwrap()[0].clone();
+        // what a D2 bypass would amount to: its Outbound subscribed directly
+        f.companion
+            .shared
+            .hub
+            .lock()
+            .unwrap()
+            .subscribe(conn, out, "ses_tx", None)
+            .unwrap();
+        // a sessioned phone subscribes and gets the snapshot, sealed: the
+        // pump served the lurker (subscribed first) in that pass or earlier
+        let mut phone = connect_remote(&f);
+        let (_r, sess) = attempt(&mut phone, &f.psk, &f.device_id);
+        let mut sess = sess.unwrap();
+        phone
+            .send_text(&sess.seal(&subscribe_json("sub-r", "ses_tx")))
+            .unwrap();
+        next_sealed(&mut phone, &mut sess, |v| is_type(v, "transcript_snapshot"));
+        // D9: nothing was queued for the sessionless connection
+        lurker
+            .send_text(r#"{"type":"ping","commandId":"lurk-2"}"#)
+            .unwrap();
+        let next = lurker.next_text().unwrap();
+        assert!(
+            next.contains("pong") && next.contains("lurk-2"),
+            "a sessionless remote peer got: {next}"
+        );
+        shutdown(f);
+    }
+
+    #[test]
+    fn subscribe_requires_session_at_remote_posture() {
+        let f = fixture_remote("tx-d2");
+        push_text(&f, "ses_tx", "i1", "text");
+        let mut c = connect_remote(&f);
+        c.send_text(&subscribe_json("sub-d2", "ses_tx")).unwrap();
+        let refusal = c.next_text().unwrap();
+        assert!(refusal.contains("e2e session required"), "got: {refusal}");
+        assert!(
+            refusal.contains("sub-d2"),
+            "commandId must survive: {refusal}"
+        );
+        assert_eq!(transcript_subs(&f), 0);
+        // after the handshake the same subscribe is accepted
+        let (_r, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        let mut sess = sess.unwrap();
+        c.send_text(&sess.seal(&subscribe_json("sub-d2b", "ses_tx")))
+            .unwrap();
+        let ack = next_sealed(&mut c, &mut sess, |v| is_type(v, "ack"));
+        assert_eq!(json::get(&ack, "ok"), Some(&json::Json::Bool(true)));
+        assert_eq!(transcript_subs(&f), 1);
+        shutdown(f);
+    }
+
+    #[test]
+    fn teardown_drops_subscriptions() {
+        let f = fixture("tx-teardown", now_ms() + 60_000, false);
+        push_text(&f, "ses_tx", "i1", "text");
+        let mut c = connect(&f);
+        c.send_text(&subscribe_json("sub-t", "ses_tx")).unwrap();
+        c.next_text_matching(|t| t.contains("\"ack\""), Duration::from_secs(5))
+            .unwrap();
+        // re-subscribing on the same connection only moves the cursor
+        c.send_text(&subscribe_json("sub-t2", "ses_tx")).unwrap();
+        c.next_text_matching(|t| t.contains("sub-t2"), Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(transcript_subs(&f), 1);
+        let _ = c.close(1000);
+        drop(c);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while transcript_subs(&f) != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            transcript_subs(&f),
+            0,
+            "ConnGuard teardown kept a subscription"
+        );
+        let health = f.companion.health();
+        assert_eq!(json::get_i64(&health, "transcriptSessions"), Some(1));
+        assert_eq!(json::get_i64(&health, "runtimeMalformed"), Some(0));
+        shutdown(f);
+    }
+
+    #[test]
+    fn revoked_device_loses_its_subscriptions() {
+        let f = fixture_paired("tx-revoke", false);
+        push_text(&f, "ses_tx", "i1", "text");
+        let mut c = connect(&f);
+        let (_r, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        let mut sess = sess.unwrap();
+        c.send_text(&sess.seal(&subscribe_json("sub-v", "ses_tx")))
+            .unwrap();
+        next_sealed(&mut c, &mut sess, |v| is_type(v, "ack"));
+        assert_eq!(transcript_subs(&f), 1);
+        let url = format!(
+            "http://127.0.0.1:{}/devices/revoke",
+            f.handle.diagnostics_port
+        );
+        let body = format!(r#"{{"deviceId":"{}"}}"#, f.device_id);
+        let resp = control_post(&url, f.companion.control_key(), &body).unwrap();
+        assert_eq!(resp.status, 200, "{resp:?}");
+        // gone before the route answered, not at the next teardown
+        assert_eq!(transcript_subs(&f), 0);
+        loop {
+            match c.read_frame().unwrap() {
+                Frame::Close(code, _) => {
+                    assert_eq!(code, Some(CLOSE_DEVICE_REVOKED));
+                    break;
+                }
+                // a snapshot queued before the revoke, or a heartbeat
+                Frame::Text(_) | Frame::Ping(_) | Frame::Pong(_) => continue,
+                other => panic!("expected close 4003, got {other:?}"),
+            }
+        }
+        shutdown(f);
     }
 
     /* ---- mandate §2: connection caps (audit P7) --------------------- */

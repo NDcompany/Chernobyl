@@ -14,8 +14,12 @@ use crate::opencode::OpenCodeAdapter;
 use crate::protocol::{Agent, ClientMsg, EventKind, PROTOCOL_VERSION, ServerMsg, Session, now_ms};
 use crate::server::Outbound;
 use crate::storage::{CommandRecord, Storage};
+use crate::transcript::{Hub, HubHandle};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+
+/// Refusal for an id two healthy runtimes claim (never guessed).
+const AMBIGUOUS: &str = "claimed by more than one runtime — refused";
 
 /// Process-wide outbound saturation counters (mandate §4): the production
 /// overload story must be readable from `/health` and `/metrics` instead of
@@ -94,6 +98,9 @@ pub struct Shared {
     /// Phase 7: the Claude Code hook ingress, when configured (PRD §7.5) —
     /// Claude Code pushes hook events to the companion's loopback route.
     pub claude: Mutex<Option<Arc<ClaudeAdapter>>>,
+    /// ADR-015: live transcripts and their subscriptions, memory only. A
+    /// leaf lock (see `transcript`); runtimes hold a `HubHandle` to it.
+    pub hub: Arc<Mutex<Hub>>,
     pub started_at: i64,
     pub config: CompanionConfig,
     /// Consecutive auth failures; trips a cooldown (brute-force resistance).
@@ -170,6 +177,7 @@ impl Companion {
             opencode: Mutex::new(None),
             ollama: Mutex::new(None),
             claude: Mutex::new(None),
+            hub: Arc::new(Mutex::new(Hub::default())),
             started_at: now_ms(),
             config,
             auth_failures: Mutex::new(0),
@@ -259,6 +267,10 @@ impl Companion {
                 ),
             );
         }
+
+        // Live runtimes are pushed to `companion.runtimes` here, each built
+        // with `companion.hub()` to stream its transcripts (ADR-015 §3.3);
+        // OpenCode streams once its rich parts land (step 5).
 
         // Phase 3: attach the OpenCode adapter (attach-only — G4.3 forbids
         // spawning a competing server on a possibly-shared data dir).
@@ -487,7 +499,7 @@ impl Companion {
             },
             Route::Ambiguous => Some(ServerMsg::ack_err(
                 msg_cmd_id.as_deref().unwrap_or(""),
-                "claimed by more than one runtime — refused",
+                AMBIGUOUS,
             )),
             Route::Engine => {
                 let mut engine = self.engine.lock().unwrap();
@@ -547,7 +559,71 @@ impl Companion {
             snap.sessions = sessions;
             snap.agents = agents;
         }
+        // ADR-015: a session with a transcript stream says so, which is how
+        // the phone picks its conversation view
+        let hub = self.shared.hub.lock().unwrap();
+        for s in &mut snap.sessions {
+            s.transcript |= hub.has(&s.id);
+        }
+        drop(hub);
         snap
+    }
+
+    /// The handle live runtimes get at construction to stream transcripts.
+    pub fn hub(&self) -> HubHandle {
+        HubHandle::new(self.shared.hub.clone())
+    }
+
+    /// ADR-015 `session_subscribe` for one connection (the server calls it:
+    /// it holds the connection id and `Outbound`). Non-mutating: no journal
+    /// row. Acked here; the hub's pump sends the snapshot or the replay. An
+    /// unknown session is refused; a session a runtime owns gets an empty
+    /// transcript if it has none, and its first subscriber wakes the runtime
+    /// (`on_subscribe`, outside the hub lock).
+    pub fn subscribe(
+        &self,
+        conn: u64,
+        out: &Arc<Outbound>,
+        command_id: &str,
+        session_id: &str,
+        resume: Option<(String, u64)>,
+    ) -> ServerMsg {
+        let owners = self.claimants(|r| r.owns_session(session_id));
+        if owners.len() > 1 {
+            return ServerMsg::ack_err(command_id, AMBIGUOUS);
+        }
+        let first = {
+            let mut hub = self.shared.hub.lock().unwrap();
+            if !owners.is_empty() {
+                hub.ensure(session_id, now_ms());
+            }
+            hub.subscribe(conn, out.clone(), session_id, resume)
+        };
+        match first {
+            Err(e) => ServerMsg::ack_err(command_id, e),
+            Ok(first) => {
+                if first && let Some(owner) = owners.first() {
+                    owner.on_subscribe(session_id);
+                }
+                ServerMsg::ack_ok(command_id, Some(session_id))
+            }
+        }
+    }
+
+    /// ADR-015 `session_unsubscribe`: idempotent, never journaled.
+    pub fn unsubscribe(&self, conn: u64, command_id: &str, session_id: &str) -> ServerMsg {
+        let mut hub = self.shared.hub.lock().unwrap();
+        hub.unsubscribe(conn, Some(session_id));
+        ServerMsg::ack_ok(command_id, Some(session_id))
+    }
+
+    /// Healthy runtimes for which `claimed` holds, in config order.
+    fn claimants(&self, claimed: impl Fn(&dyn LiveRuntime) -> bool) -> Vec<Arc<dyn LiveRuntime>> {
+        self.runtimes
+            .iter()
+            .filter(|r| r.is_healthy() && claimed(r.as_ref()))
+            .cloned()
+            .collect()
     }
 
     /// Agents and sessions of every healthy runtime, concatenated in config
@@ -575,19 +651,12 @@ impl Companion {
     /// ADR-015 §4.1 routing rule (one place so tests can pin it). Only
     /// healthy runtimes claim anything; two claimants are refused and logged.
     fn route(&self, msg: &ClientMsg) -> Route {
-        let claims = |claimed: &dyn Fn(&dyn LiveRuntime) -> bool| -> Vec<Arc<dyn LiveRuntime>> {
-            self.runtimes
-                .iter()
-                .filter(|r| r.is_healthy() && claimed(r.as_ref()))
-                .cloned()
-                .collect()
-        };
         let (what, id, claimants) = match msg {
             // by the agent's host: the runtime whose id is the agent's hostId
             ClientMsg::CreateSession { agent_id, .. } => (
                 "agent",
                 agent_id,
-                claims(&|r| {
+                self.claimants(|r| {
                     r.agents()
                         .iter()
                         .any(|a| a.id == *agent_id && a.host_id == r.id())
@@ -602,14 +671,14 @@ impl Companion {
             | ClientMsg::McpReconnect { session_id, .. } => (
                 "session",
                 session_id,
-                claims(&|r| r.owns_session(session_id)),
+                self.claimants(|r| r.owns_session(session_id)),
             ),
             // engine-authoritative unless a runtime surfaced the request
             // natively (revision/expiry checked by the engine either way)
             ClientMsg::PermissionDecision { permission_id, .. } => (
                 "permission",
                 permission_id,
-                claims(&|r| r.knows_permission(permission_id)),
+                self.claimants(|r| r.knows_permission(permission_id)),
             ),
             // session-neutral; subscriptions need the connection, so the
             // server answers those itself (never journaled, never routed)
@@ -665,6 +734,7 @@ impl Companion {
         let journal_corrupt = store.corrupt_events;
         drop(store);
         let clients = self.shared.clients.lock().unwrap().len();
+        let (t_sessions, t_subs, t_malformed) = self.shared.hub.lock().unwrap().stats();
         let sat = &self.shared.saturation;
         crate::json::obj(vec![
             ("ok", crate::json::Json::Bool(true)),
@@ -741,6 +811,17 @@ impl Companion {
                         .outcome_write_failures
                         .load(std::sync::atomic::Ordering::Relaxed) as i64,
                 ),
+            ),
+            // ADR-015: live transcripts held, their subscriptions, and
+            // runtime input that failed to parse (the runtimes count it)
+            (
+                "transcriptSessions",
+                crate::json::Json::Int(t_sessions as i64),
+            ),
+            ("transcriptSubs", crate::json::Json::Int(t_subs as i64)),
+            (
+                "runtimeMalformed",
+                crate::json::Json::Int(t_malformed as i64),
             ),
             (
                 "uptimeMs",
@@ -979,6 +1060,9 @@ impl Companion {
             let mut engine = self.engine.lock().unwrap();
             engine.pump(now);
         }
+        // ADR-015: flush coalesced deltas (every second tick = 100 ms), then
+        // send each subscriber what lies after its cursor
+        self.shared.hub.lock().unwrap().pump(now);
         let due = {
             let mut last = self.last_probe.lock().unwrap();
             if now - *last >= self.shared.config.probe_interval_ms as i64 {
@@ -1055,12 +1139,12 @@ impl Companion {
         let _ = store.append_audit("revoke", &format!("device {device_id} revoked"));
         drop(store);
 
-        let to_close: Vec<Arc<Outbound>> = {
+        let to_close: Vec<(u64, Arc<Outbound>)> = {
             let mut clients = self.shared.clients.lock().unwrap();
             let mut matching = Vec::new();
-            clients.retain(|(_, outbound)| {
+            clients.retain(|(id, outbound)| {
                 if outbound.device_id().as_deref() == Some(device_id) {
-                    matching.push(outbound.clone());
+                    matching.push((*id, outbound.clone()));
                     false
                 } else {
                     true
@@ -1069,7 +1153,14 @@ impl Companion {
             matching
         };
         let terminated = to_close.len();
-        for outbound in to_close {
+        {
+            // ADR-015: no transcript frame is queued for them after this
+            let mut hub = self.shared.hub.lock().unwrap();
+            for (id, _) in &to_close {
+                hub.unsubscribe(*id, None);
+            }
+        }
+        for (_, outbound) in to_close {
             outbound.close(crate::server::CLOSE_DEVICE_REVOKED, "device revoked");
         }
         Ok(RevokeResult::Revoked { terminated })
@@ -2271,6 +2362,27 @@ mod tests {
             session_id: "ses-a".into(),
         })));
         assert_eq!(a.got(), vec!["dup-2".to_string()]);
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    /// ADR-015: `Session.transcript` is set for sessions with a stream.
+    #[test]
+    fn snapshot_marks_sessions_with_a_transcript() {
+        use crate::transcript::Op;
+        let c = temp_config("transcript-flag");
+        let comp = Companion::boot(c.clone()).unwrap();
+        let flag = |id: &str| {
+            let snap = comp.snapshot();
+            snap.sessions
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .transcript
+        };
+        assert!(!flag("s1"));
+        comp.hub().push("s1", Op::State(Default::default()));
+        assert!(flag("s1") && !flag("s2"));
         comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }

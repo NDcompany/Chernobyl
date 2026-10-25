@@ -82,8 +82,13 @@ impl std::fmt::Display for AdapterError {
 /// - A live message the runtime does not support gets an error ack
 ///   (`Err(AdapterError::Unsupported)` or `Ok` with `ok: false`), never
 ///   silence.
-/// - Runtimes stream transcripts through the hub handle they are given at
-///   construction (the transcript hub, ADR-015 step 2).
+/// - Runtimes stream transcripts through the `transcript::HubHandle` they
+///   get at construction (`Companion::hub()`): `push` whole items, turns,
+///   state and the MCP list, `append` deltas, `update` one item,
+///   `end_session`. The hub is a leaf lock: never call the handle while
+///   holding the engine lock. Set `Session::transcript` on sessions that
+///   stream, so the phone picks its conversation view before the first
+///   subscribe (`on_subscribe` then hydrates).
 /// - Every method may be called from any thread, and must not block on the
 ///   network for long: routing calls `is_healthy`, `agents`, `owns_session`
 ///   and `knows_permission` on the WS read path.

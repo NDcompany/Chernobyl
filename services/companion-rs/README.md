@@ -112,6 +112,36 @@ under the pending key (the phone stored it but the ack was lost) promotes it the
 client that ignores `hs_rekey` keeps working on the QR's PSK and is offered the same key on
 each connection.
 
+### Live transcripts (ADR-015, feature `transcript.v1`)
+
+`hello_ack.features` carries `"transcript.v1"`. A phone that sees it may subscribe to a live
+session's transcript; older phones never receive transcript frames.
+
+- C→S `{"type":"session_subscribe","commandId":"…","sessionId":"…","epoch":"…","afterSeq":N}`
+  (`epoch`/`afterSeq` optional, both needed to resume) → `ack` with `ok:true` and `sessionId`,
+  or `ok:false` `"unknown session"`. Non-mutating: no journal row. Subscribing again on the
+  same connection only moves the cursor; a fifth subscription on one connection drops its oldest.
+- C→S `{"type":"session_unsubscribe","commandId":"…","sessionId":"…"}` → `ack` (idempotent).
+- S→C `{"type":"transcript_snapshot","sessionId","epoch","seq","items","truncatedBefore","turns","state","mcp"}`
+  when the phone's `epoch`/`afterSeq` cannot be replayed (another epoch, behind the replay
+  ring, or none sent); at most one per second per connection and session, at most 512 KiB,
+  newest items kept (`truncatedBefore` when older ones were left out).
+- S→C `{"type":"transcript","sessionId","epoch","ops":[…]}`: contiguous ops after the cursor
+  (`seq` +1 each), at most 256 ops and about 64 KiB per message (a larger single op travels
+  alone). Ops: `item` (insert or replace by id), `append` (`text`/`input`/`output` delta),
+  `turn` (upsert by id), `state`, `mcp` (full list). The phone re-subscribes with its
+  `epoch` and last `seq` on a gap, an epoch change, or a reconnect.
+
+Beyond loopback `session_subscribe` needs a live E2E session (the D2 gate) and a sessionless
+connection receives no transcript frame (D9). Transcript frames are sealed Bulk-class frames,
+sent only while the connection's bulk queue is at most half full, so they never cause a D8
+teardown; a lagging phone gets a snapshot once it drains. Subscriptions end with the
+connection (teardown, revocation 4003). Transcripts are memory only: 8 sessions (least
+recently active evicted), ended ones dropped after 1 h, replay ring 2,048 ops or 1 MiB, 400
+items or 2 MiB per session; text is redacted and capped as ADR-015 §3.5 lists (deltas every
+100 ms, at most 8 KiB per append). `/health` reports `transcriptSessions`, `transcriptSubs`
+and `runtimeMalformed`.
+
 ## Verify
 
 ```powershell
@@ -212,7 +242,9 @@ matrix covers those).
 | `seed` / `engine` | deterministic seed state + the MockEngine port (plans, G1/G2, ack cache) |
 | `storage` | append-only JSONL journal: torn-tail recovery, atomic compaction, retention |
 | `config` / `adapters` / `companion` | Node-parity config, adapter discovery, boot/reconcile/idempotency; the `LiveRuntime` trait and router (ADR-015 §4.1): `create_session` by the agent's `hostId`, session commands to the owning runtime, `permission_decision` to the runtime that surfaced it, the rest to the engine; demo data hidden while any runtime is healthy |
-| `server` | accept loops, auth (4001/429), origin refusal (403), posture gates (D1/D2/D6), version gate (4002), live session revocation (4003, D4), heartbeat, diagnostics HTTP, E2E handshake + sealed-frame dispatch |
+| `server` | accept loops, auth (4001/429), origin refusal (403), posture gates (D1/D2/D6), version gate (4002), live session revocation (4003, D4), heartbeat, diagnostics HTTP, E2E handshake + sealed-frame dispatch, `session_subscribe`/`session_unsubscribe` per connection |
+| `transcript` | ADR-015 transcript hub: per-session op ring + compacted items, coalesced deltas, subscriptions, half-bulk backpressure, snapshots, redaction and caps; `HubHandle` is what live runtimes push through |
+| `runtime_io` | ADR-015 child process IO, env scrub, secret redaction, desktop URL opener, OAuth callback check |
 | `client` | test WS client + loopback `http_get` (used by `--self-test`) |
 | `crypto` | std-only SHA-256, HMAC, HKDF, ChaCha20, Poly1305, AEAD (official RFC/NIST KATs) |
 | `e2e` | PSK handshake proofs, HKDF directional keys, sealed frames with counter nonces |
