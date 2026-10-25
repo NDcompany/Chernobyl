@@ -79,7 +79,7 @@ production behavior. Status is updated once the fix lands (§12 verification per
   after it → boot succeeds, counter set, health field present, tail preserved policy
   unchanged.
 
-### P4 — C15 durability claim does not match the code (§5 documentation) · Status: open — fix next
+### P4 — C15 durability claim does not match the code (§5 documentation) · Status: fixed (C15 wording corrected; fsync-per-append deliberately not adopted)
 
 - **Where:** `CONFLICT_REGISTER.md` C15 says "fsync-on-append"; `storage.rs:398-416` only
   does `write_all` + `flush`, and `File::flush` is a no-op — the bytes reach the OS page
