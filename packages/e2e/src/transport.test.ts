@@ -13,6 +13,7 @@ import {
   b64encode,
   createE2eTransport,
   deriveKeys,
+  retryDelayMs,
   handshakeProof,
   type PairingCredential,
   type SocketLike,
@@ -63,13 +64,20 @@ class FakeSocket implements SocketLike {
   }
 }
 
-function harness(opts?: { heartbeatMs?: number; pongTimeoutMs?: number }) {
+function harness(opts?: {
+  heartbeatMs?: number;
+  pongTimeoutMs?: number;
+  retryBaseMs?: number;
+  retryMaxMs?: number;
+  stableMs?: number;
+}) {
   const socks: FakeSocket[] = [];
   const t = createE2eTransport({
     url: 'ws://test:8787',
     pairing,
-    retryBaseMs: 5,
-    retryMaxMs: 20,
+    retryBaseMs: opts?.retryBaseMs ?? 5,
+    retryMaxMs: opts?.retryMaxMs ?? 20,
+    stableMs: opts?.stableMs,
     heartbeatMs: opts?.heartbeatMs ?? 0,
     pongTimeoutMs: opts?.pongTimeoutMs ?? 50,
     openSocket: () => {
@@ -377,3 +385,52 @@ test('ordered reconnect walks the QR endpoint list in order, restarting each cyc
   }
 });
 
+
+test('retryDelayMs: equal jitter inside [cap/2, cap], growing and bounded (audit P5)', () => {
+  for (let a = 0; a < 40; a++) {
+    for (const r of [0, 0.25, 0.999]) {
+      const d = retryDelayMs(a, 1000, 15_000, () => r);
+      const cap = Math.min(15_000, 1000 * 2 ** a);
+      assert.ok(d >= cap / 2 && d <= cap, `attempt ${a} rand ${r}: ${d}`);
+    }
+  }
+  assert.notEqual(retryDelayMs(3, 1000, 15_000, () => 0), retryDelayMs(3, 1000, 15_000, () => 0.9));
+  assert.ok(retryDelayMs(2, 1000, 15_000, () => 0.5) > retryDelayMs(1, 1000, 15_000, () => 0.5));
+  assert.equal(retryDelayMs(1e6, 1000, 15_000, () => 1), 15_000);
+});
+
+test('a session that drops right after hs_ok keeps its backoff penalty (audit P5)', async () => {
+  const { t, socks } = harness({ retryBaseMs: 100, retryMaxMs: 100_000, stableMs: 1e9 });
+  try {
+    t.connect();
+    for (let i = 0; i < 3; i++) {
+      const s = socks[i];
+      s.serverOpen();
+      assert.ok(await serverHandshake(s));
+      s.serverClose(1006); // flap: live session, then immediate drop
+      const deadline = Date.now() + 3000;
+      while (socks.length === i + 1 && i < 2 && Date.now() < deadline) await sleep(5);
+    }
+    // third retry is attempt 2 → at least 200 ms; a reset-per-handshake
+    // backoff would have redialled within 100 ms
+    await sleep(190);
+    assert.equal(socks.length, 3, 'flapping session must not reset the backoff');
+  } finally {
+    t.close();
+  }
+});
+
+test('connect() during a scheduled retry cancels it: no duplicate socket (section 2)', async () => {
+  const { t, socks } = harness({ retryBaseMs: 30, retryMaxMs: 30 });
+  try {
+    t.connect();
+    socks[0].serverClose(1006); // retry now scheduled (15-30 ms)
+    t.connect(); // e.g. app foregrounded: dial immediately
+    assert.equal(socks.length, 2);
+    await sleep(80); // well past the old timer
+    assert.equal(socks.length, 2, 'the superseded retry must not open a second socket');
+    assert.equal(socks[1].closedWith, null, 'the live dial is not orphaned');
+  } finally {
+    t.close();
+  }
+});

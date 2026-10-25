@@ -3,6 +3,7 @@
  * (local notifications, audit trail). Mounted once at the root layout.
  */
 import { useEffect, type ReactNode } from 'react';
+import { AppState } from 'react-native';
 import type { ServerMessage, Snapshot } from '@chernobyl/protocol';
 import { createE2eTransport, parsePairingPayload } from '@chernobyl/e2e';
 import { getTransport, hostUrl, resetTransport, setTransport, type Transport } from './transport';
@@ -61,6 +62,14 @@ export function TransportProvider({ children }: { children: ReactNode }) {
     let cleanupTransport: Transport | null = null;
     let unsubMessages: (() => void) | null = null;
     let unsubStatus: (() => void) | null = null;
+    // Back in the foreground: a reconnect sitting in backoff (the OS may have
+    // frozen timers or dropped the socket while backgrounded) dials now.
+    // Only from 'reconnecting' — never re-dial a denied credential (section 9).
+    const appState = AppState.addEventListener('change', (next) => {
+      if (next === 'active' && cleanupTransport?.status() === 'reconnecting') {
+        cleanupTransport.connect();
+      }
+    });
 
     void (async () => {
       // Build the transport here (awaiting keystore reads) and install it
@@ -125,6 +134,7 @@ export function TransportProvider({ children }: { children: ReactNode }) {
 
     return () => {
       disposed = true;
+      appState.remove();
       unsubMessages?.();
       unsubStatus?.();
       cleanupTransport?.close();

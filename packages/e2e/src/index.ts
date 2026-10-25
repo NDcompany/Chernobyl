@@ -10,6 +10,7 @@ export { PairingError, parsePairingPayload, type PairingCredential } from './pai
 export { SealedSession, deriveKeys, type SessionKeys } from './session.js';
 export {
   createE2eTransport,
+  retryDelayMs,
   type Ack,
   type E2eTransport,
   type E2eTransportOptions,

@@ -60,6 +60,12 @@ export interface E2eTransportOptions {
   handshakeTimeoutMs?: number;
   retryBaseMs?: number;
   retryMaxMs?: number;
+  /**
+   * A live session must stay up this long before the backoff resets; a
+   * connection that handshakes then drops at once keeps its penalty, so a
+   * flapping server is not hammered at the base delay (audit P5).
+   */
+  stableMs?: number;
   /** App-level ping interval; 0 disables the heartbeat. */
   heartbeatMs?: number;
   pongTimeoutMs?: number;
@@ -87,9 +93,26 @@ const DEFAULTS = {
   handshakeTimeoutMs: 10_000,
   retryBaseMs: 1_000,
   retryMaxMs: 15_000,
+  stableMs: 30_000,
   heartbeatMs: 15_000,
   pongTimeoutMs: 10_000,
 };
+
+/**
+ * Bounded exponential backoff with equal jitter (audit P5): half the capped
+ * step is fixed, half is random, so clients that lost the same server at the
+ * same instant spread their retries instead of reconnecting in lockstep.
+ * Always within [min(base, max) / 2, max].
+ */
+export function retryDelayMs(
+  attempt: number,
+  baseMs: number,
+  maxMs: number,
+  rand: () => number = Math.random,
+): number {
+  const cap = Math.min(maxMs, baseMs * 2 ** Math.min(attempt, 30));
+  return cap / 2 + rand() * (cap / 2);
+}
 
 function defaultOpenSocket(url: string): SocketLike {
   const ctor = (globalThis as { WebSocket?: new (url: string) => SocketLike }).WebSocket;
@@ -102,6 +125,7 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
   const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? DEFAULTS.handshakeTimeoutMs;
   const retryBaseMs = opts.retryBaseMs ?? DEFAULTS.retryBaseMs;
   const retryMaxMs = opts.retryMaxMs ?? DEFAULTS.retryMaxMs;
+  const stableMs = opts.stableMs ?? DEFAULTS.stableMs;
   const heartbeatMs = opts.heartbeatMs ?? DEFAULTS.heartbeatMs;
   const pongTimeoutMs = opts.pongTimeoutMs ?? DEFAULTS.pongTimeoutMs;
   const openSocket = opts.openSocket ?? defaultOpenSocket;
@@ -119,6 +143,8 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
   let session: SealedSession | null = null;
   let status: TransportStatus = 'offline';
   let attempts = 0;
+  // when the current session reached hs_ok; decides the backoff reset on close
+  let liveSince = 0;
   // position in the QR endpoint list; advanced per failed attempt, reset to
   // the primary endpoint on a successful handshake (ordered reconnect)
   let endpointIdx = 0;
@@ -172,7 +198,7 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
 
   function scheduleRetry(): void {
     if (stopped || retryTimer || status === 'denied') return;
-    const delay = Math.min(retryMaxMs, retryBaseMs * 2 ** attempts);
+    const delay = retryDelayMs(attempts, retryBaseMs, retryMaxMs);
     attempts += 1;
     retryTimer = setTimeout(() => {
       retryTimer = null;
@@ -257,7 +283,7 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
           if (stopped || ws !== socket) return; // superseded while handshaking
           session = s;
           handshakeDone = true;
-          attempts = 0;
+          liveSince = Date.now();
           endpointIdx = 0; // live session → future reconnects start from the primary
           setStatus('connected');
           try {
@@ -319,6 +345,8 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
       endpointIdx = handshakeDone
         ? 0
         : (endpointIdx + 1) % endpoints.length;
+      // only a session that stayed up earns a fresh backoff (audit P5)
+      if (handshakeDone && Date.now() - liveSince >= stableMs) attempts = 0;
       setStatus('reconnecting');
       scheduleRetry();
     };
@@ -346,6 +374,13 @@ export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
       stopped = false;
       if (status === 'denied') setStatus('offline'); // explicit retry clears the terminal state
       endpointIdx = 0; // an explicit connect starts at the primary endpoint
+      // an explicit connect supersedes any scheduled retry: without this the
+      // old timer would later open a second socket and orphan this one
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      attempts = 0;
       if (!ws) open();
     },
 

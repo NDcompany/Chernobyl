@@ -1,5 +1,5 @@
 /**
- * WebSocket transport with exponential-backoff reconnection.
+ * WebSocket transport with jittered exponential-backoff reconnection.
  *
  * On reconnect it re-sends `hello` (full snapshot resume) and replays every
  * unresolved command with its ORIGINAL commandId — the host suppresses
@@ -12,10 +12,13 @@ import {
   type ClientMessage,
   type ServerMessage,
 } from '@chernobyl/protocol';
+import { retryDelayMs } from '@chernobyl/e2e';
 import type { Ack, Transport, TransportStatus } from './transport';
 
 const MAX_BACKOFF_MS = 15_000;
 const ACK_TIMEOUT_MS = 10_000;
+// a connection must stay up this long to reset the backoff (audit P5)
+const STABLE_MS = 30_000;
 const clientId = nextId('app');
 
 interface Pending {
@@ -32,6 +35,7 @@ export function createWsTransport(url: string): Transport {
   let ws: WebSocket | null = null;
   let status: TransportStatus = 'offline';
   let attempts = 0;
+  let liveSince = 0;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let stopped = true;
 
@@ -64,7 +68,7 @@ export function createWsTransport(url: string): Transport {
 
     socket.onopen = () => {
       if (stopped) return;
-      attempts = 0;
+      liveSince = Date.now();
       setStatus('connected');
       socket.send(JSON.stringify({ type: 'hello', clientId, protocol: PROTOCOL_VERSION }));
       for (const [, p] of pending) socket.send(JSON.stringify(p.msg));
@@ -96,6 +100,8 @@ export function createWsTransport(url: string): Transport {
         return;
       }
       // pending commands stay queued for replay on the next open
+      if (liveSince && Date.now() - liveSince >= STABLE_MS) attempts = 0;
+      liveSince = 0;
       setStatus('reconnecting');
       scheduleRetry();
     };
@@ -103,7 +109,7 @@ export function createWsTransport(url: string): Transport {
 
   function scheduleRetry(): void {
     if (stopped || retryTimer) return;
-    const delay = Math.min(MAX_BACKOFF_MS, 1000 * 2 ** attempts);
+    const delay = retryDelayMs(attempts, 1000, MAX_BACKOFF_MS);
     attempts += 1;
     retryTimer = setTimeout(() => {
       retryTimer = null;
@@ -127,6 +133,12 @@ export function createWsTransport(url: string): Transport {
 
     connect() {
       stopped = false;
+      // supersede a scheduled retry, or its timer would open a second socket
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      attempts = 0;
       if (!ws) open();
     },
 
