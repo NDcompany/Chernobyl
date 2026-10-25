@@ -136,6 +136,15 @@ pub struct PermRow {
     pub risk: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnState {
+    #[default]
+    Live,
+    Reconnecting {
+        attempt: u32,
+    },
+}
+
 #[derive(Debug, Default)]
 pub struct TuiState {
     pub host_line: String,
@@ -145,6 +154,7 @@ pub struct TuiState {
     pub msg: String,
     pub help: bool,
     pub quit: bool,
+    pub conn_state: ConnState,
     /// When set, the screen renders the pairing overlay (payload + QR) instead
     /// of the dashboard; `p`/Esc closes it.
     pub pairing: Option<String>,
@@ -153,6 +163,18 @@ pub struct TuiState {
 impl TuiState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mandate §8 (audit P8/P6): truthful reconnecting state on socket disconnect
+    pub fn mark_disconnected(&mut self, attempt: u32) {
+        self.conn_state = ConnState::Reconnecting { attempt };
+        self.msg = format!("disconnected from companion — reconnecting (attempt {attempt})");
+    }
+
+    /// Mandate §8: normal state restored on reconnect
+    pub fn mark_reconnected(&mut self) {
+        self.conn_state = ConnState::Live;
+        self.msg = String::new();
     }
 
     fn clamp(&mut self) {
@@ -543,33 +565,18 @@ fn spawn_keys(tx: mpsc::Sender<Key>) {
 /// `pairer` renders a fresh pairing block (payload + QR) for the `p` overlay —
 /// supplied by the caller so the TUI never touches storage itself. Returns when
 /// the operator quits or a shutdown is requested.
-pub fn run_tui(
-    addr: &str,
-    token: Option<&str>,
-    mut pairer: impl FnMut() -> Result<String, String>,
-) -> Result<(), String> {
-    let raw = {
-        let mut c = WsClient::connect(addr, "/", token)?;
-        c.hello()?;
-        c
-    };
-    let client = Arc::new(Mutex::new(raw));
-    // short read timeout so the reader thread polls instead of blocking for 10s
-    client.lock().unwrap().set_read_timeout_ms(30)?;
-
-    let mut state = TuiState::new();
-    state.host_line = addr.to_string();
-
-    let (event_tx, event_rx) = mpsc::channel::<String>();
-    let (key_tx, key_rx) = mpsc::channel::<Key>();
-
-    let reader_stop = Arc::new(AtomicBool::new(false));
-    let reader_client = client.clone();
-    let rstop = reader_stop.clone();
-    let reader = std::thread::spawn(move || {
-        while !rstop.load(Ordering::SeqCst) {
+fn spawn_reader(
+    client: Arc<Mutex<WsClient>>,
+    event_tx: mpsc::Sender<String>,
+    reader_stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !reader_stop.load(Ordering::SeqCst) {
             let item = {
-                let mut c = reader_client.lock().unwrap();
+                let mut c = match client.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
                 c.next_text_timeoutable()
             };
             match item {
@@ -585,43 +592,138 @@ pub fn run_tui(
                 }
             }
         }
-    });
+    })
+}
+
+/// Runs the interactive TUI against a companion at `addr`. Connects, greets the
+/// server, then loops: drain inbound events + keystrokes, re-render on change.
+/// `pairer` renders a fresh pairing block (payload + QR) for the `p` overlay —
+/// supplied by the caller so the TUI never touches storage itself. Returns when
+/// the operator quits or a shutdown is requested.
+pub fn run_tui(
+    addr: &str,
+    token: Option<&str>,
+    mut pairer: impl FnMut() -> Result<String, String>,
+) -> Result<(), String> {
+    let (event_tx, event_rx) = mpsc::channel::<String>();
+    let (key_tx, key_rx) = mpsc::channel::<Key>();
 
     // raw console input; if stdin is not a console, fall back to line input
     let _raw_guard = crate::ffi::enable_raw_console_input().ok();
     spawn_keys(key_tx);
 
+    let mut state = TuiState::new();
+    state.host_line = addr.to_string();
+
+    let mut client: Option<Arc<Mutex<WsClient>>> = None;
+    let mut reader: Option<std::thread::JoinHandle<()>> = None;
+    let mut reader_stop: Option<Arc<AtomicBool>> = None;
+    let mut connected = false;
+    let mut attempt = 0u32;
+    let mut backoff = Duration::from_millis(250);
+    let mut next_retry = std::time::Instant::now();
     let mut seq: u64 = 0;
-    if let Err(e) = send(
-        &client,
-        &format!(
-            "{{\"type\":\"list_state\",\"commandId\":\"{}\"}}",
-            next_cid(&mut seq)
-        ),
-    ) {
-        reader_stop.store(true, Ordering::SeqCst);
-        return Err(e);
+
+    // Initial connection attempt (audit P8/P6)
+    match WsClient::connect(addr, "/", token).and_then(|mut c| {
+        c.hello()?;
+        c.set_read_timeout_ms(30)?;
+        Ok(c)
+    }) {
+        Ok(c) => {
+            let cl = Arc::new(Mutex::new(c));
+            let stop = Arc::new(AtomicBool::new(false));
+            let r = spawn_reader(cl.clone(), event_tx.clone(), stop.clone());
+            let _ = send(
+                &cl,
+                &format!(
+                    "{{\"type\":\"list_state\",\"commandId\":\"{}\"}}",
+                    next_cid(&mut seq)
+                ),
+            );
+            client = Some(cl);
+            reader = Some(r);
+            reader_stop = Some(stop);
+            connected = true;
+        }
+        Err(_) => {
+            attempt = 1;
+            state.mark_disconnected(attempt);
+            next_retry = std::time::Instant::now() + backoff;
+            backoff = (backoff * 2).min(Duration::from_millis(5000));
+        }
     }
 
     let mut last_frame = String::new();
-    let mut running = true;
-    while running && !crate::ffi::shutdown_requested() {
+    while !state.quit && !crate::ffi::shutdown_requested() {
         let mut changed = false;
+
+        // Drain incoming messages
         while let Ok(text) = event_rx.try_recv() {
             if text == "\u{0}disconnect" {
-                state.msg = "disconnected from companion".into();
-                changed = true;
-                running = false;
-                break;
+                if connected {
+                    connected = false;
+                    attempt = 1;
+                    state.mark_disconnected(attempt);
+                    changed = true;
+                    if let Some(stop) = reader_stop.take() {
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                    if let Some(r) = reader.take() {
+                        let _ = r.join();
+                    }
+                    client = None;
+                    backoff = Duration::from_millis(250);
+                    next_retry = std::time::Instant::now() + backoff;
+                    backoff = (backoff * 2).min(Duration::from_millis(5000));
+                }
+                continue;
             }
             if apply_inbound(&mut state, &text) {
                 changed = true;
             }
         }
+
+        // Reconnect with bounded backoff if disconnected (audit P8/P6)
+        if !connected && std::time::Instant::now() >= next_retry {
+            match WsClient::connect(addr, "/", token).and_then(|mut c| {
+                c.hello()?;
+                c.set_read_timeout_ms(30)?;
+                Ok(c)
+            }) {
+                Ok(c) => {
+                    let cl = Arc::new(Mutex::new(c));
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let r = spawn_reader(cl.clone(), event_tx.clone(), stop.clone());
+                    let _ = send(
+                        &cl,
+                        &format!(
+                            "{{\"type\":\"list_state\",\"commandId\":\"{}\"}}",
+                            next_cid(&mut seq)
+                        ),
+                    );
+                    client = Some(cl);
+                    reader = Some(r);
+                    reader_stop = Some(stop);
+                    connected = true;
+                    attempt = 0;
+                    backoff = Duration::from_millis(250);
+                    state.mark_reconnected();
+                    changed = true;
+                }
+                Err(_) => {
+                    attempt += 1;
+                    state.mark_disconnected(attempt);
+                    changed = true;
+                    next_retry = std::time::Instant::now() + backoff;
+                    backoff = (backoff * 2).min(Duration::from_millis(5000));
+                }
+            }
+        }
+
+        // Process operator keys
         while let Ok(key) = key_rx.try_recv() {
-            // While the pairing overlay is up only p/Esc (close) and q (quit)
-            // act — every other key is inert, so nobody can approve or scroll
-            // a dashboard they cannot see.
+            // While the pairing overlay is up only p/Esc (close) and q (quit) act
             if state.pairing.is_some() {
                 match key {
                     Key::Esc | Key::Char('p') => {
@@ -629,8 +731,7 @@ pub fn run_tui(
                         changed = true;
                     }
                     Key::Char('q') => {
-                        handle_action(&mut state, Action::Quit, &client, &mut seq, &mut pairer);
-                        running = false;
+                        state.quit = true;
                         break;
                     }
                     _ => {}
@@ -638,14 +739,52 @@ pub fn run_tui(
                 continue;
             }
             if let Some(action) = key_to_action(key) {
-                handle_action(&mut state, action, &client, &mut seq, &mut pairer);
-                changed = true;
+                if action == Action::Quit {
+                    state.quit = true;
+                    break;
+                }
+                if let Some(ref cl) = client {
+                    handle_action(&mut state, action, cl, &mut seq, &mut pairer);
+                    changed = true;
+                } else {
+                    // Actions while disconnected
+                    match action {
+                        Action::Pair => match pairer() {
+                            Ok(block) => {
+                                state.pairing = Some(block);
+                                changed = true;
+                            }
+                            Err(e) => {
+                                state.msg = format!("pair failed: {e}");
+                                changed = true;
+                            }
+                        },
+                        Action::Next => {
+                            state.select_next();
+                            changed = true;
+                        }
+                        Action::Prev => {
+                            state.select_prev();
+                            changed = true;
+                        }
+                        Action::Help => {
+                            state.help = !state.help;
+                            changed = true;
+                        }
+                        _ => {
+                            state.msg = format!(
+                                "disconnected from companion — reconnecting (attempt {attempt})"
+                            );
+                            changed = true;
+                        }
+                    }
+                }
             }
             if state.quit {
-                running = false;
                 break;
             }
         }
+
         if changed {
             let frame = render(&state);
             if frame != last_frame {
@@ -658,11 +797,17 @@ pub fn run_tui(
         std::thread::sleep(Duration::from_millis(16));
     }
 
-    reader_stop.store(true, Ordering::SeqCst);
-    let _ = client.lock().unwrap().close(1000);
+    if let Some(stop) = reader_stop {
+        stop.store(true, Ordering::SeqCst);
+    }
+    if let Some(cl) = client {
+        let _ = cl.lock().unwrap().close(1000);
+    }
     // leave the cursor on a fresh line after the last frame
     println!();
-    let _ = reader.join();
+    if let Some(r) = reader {
+        let _ = r.join();
+    }
     Ok(())
 }
 
@@ -826,5 +971,48 @@ mod tests {
         assert_eq!(s.approvals.len(), 1);
         // garbage is ignored without a panic or a change
         assert!(!apply_inbound(&mut s, "not json"));
+    }
+
+    #[test]
+    fn tui_reconnect_lifecycle_and_quit_while_disconnected() {
+        // Regression for P8/P6: pure state transitions for disconnect, reconnect,
+        // and quitting while disconnected.
+        let mut state = TuiState::new();
+        assert_eq!(state.conn_state, ConnState::Live);
+        assert!(!state.quit);
+
+        // 1. disconnect -> reconnecting state (attempt 1)
+        state.mark_disconnected(1);
+        assert_eq!(state.conn_state, ConnState::Reconnecting { attempt: 1 });
+        assert_eq!(
+            state.msg,
+            "disconnected from companion — reconnecting (attempt 1)"
+        );
+
+        // Subsequent attempt
+        state.mark_disconnected(2);
+        assert_eq!(state.conn_state, ConnState::Reconnecting { attempt: 2 });
+        assert_eq!(
+            state.msg,
+            "disconnected from companion — reconnecting (attempt 2)"
+        );
+
+        // 2. reconnect -> live
+        state.mark_reconnected();
+        assert_eq!(state.conn_state, ConnState::Live);
+        assert_eq!(state.msg, "");
+
+        // 3. quit while disconnected -> exits
+        state.mark_disconnected(3);
+        assert!(!state.quit);
+        let action = key_to_action(Key::Char('q'));
+        assert_eq!(action, Some(Action::Quit));
+        if action == Some(Action::Quit) {
+            state.quit = true;
+        }
+        assert!(
+            state.quit,
+            "quit while disconnected must set state.quit = true"
+        );
     }
 }

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const CLOSE_UNAUTHORIZED: u16 = 4001;
 pub const CLOSE_PROTOCOL_MISMATCH: u16 = 4002;
@@ -140,19 +140,62 @@ fn authorized(h: &Handshake, token: &str) -> bool {
     false
 }
 
+/// Maximum concurrent connections on the main listener (mandate §2, audit P7).
+pub const MAIN_CONNECTION_CAP: usize = 1024;
+/// Maximum concurrent connections on the loopback diagnostics listener (mandate §2, audit P7).
+pub const DIAG_CONNECTION_CAP: usize = 64;
+
+type ConnRegistry = Arc<Mutex<Vec<(TcpStream, thread::JoinHandle<()>)>>>;
+
 pub struct ServerHandle {
     pub port: u16,
     pub diagnostics_port: u16,
     stop: Arc<AtomicBool>,
     threads: Vec<thread::JoinHandle<()>>,
+    conn_threads: ConnRegistry,
 }
 
 impl ServerHandle {
-    pub fn stop(mut self) {
+    /// Ordered shutdown (mandate §2, audit P6): stop listeners and scheduler,
+    /// shutdown all live connection sockets, then join connection threads with
+    /// an overall 5 s deadline. Returns true only if every connection thread
+    /// joined within the deadline.
+    pub fn stop(mut self) -> bool {
         self.stop.store(true, Ordering::SeqCst);
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
+        let mut conns = match self.conn_threads.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        for (stream, _) in &conns {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !conns.is_empty() {
+            let mut i = 0;
+            while i < conns.len() {
+                if conns[i].1.is_finished() {
+                    let (_, handle) = conns.swap_remove(i);
+                    let _ = handle.join();
+                } else {
+                    i += 1;
+                }
+            }
+            if conns.is_empty() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let all_joined = conns.is_empty();
+        if !all_joined {
+            eprintln!(
+                "[companion] stop: {} connection thread(s) still active after 5 s deadline",
+                conns.len()
+            );
+        }
+        all_joined
     }
 }
 
@@ -188,6 +231,31 @@ pub fn start_with_posture(
     companion: Arc<Companion>,
     remote_posture: bool,
 ) -> Result<ServerHandle, String> {
+    start_with_caps(
+        bind,
+        port,
+        diagnostics_port,
+        token,
+        companion,
+        remote_posture,
+        MAIN_CONNECTION_CAP,
+        DIAG_CONNECTION_CAP,
+    )
+}
+
+/// Same as [`start_with_posture`] with explicit per-listener connection caps
+/// (audit P7), so tests can exercise connection limits with small caps.
+#[allow(clippy::too_many_arguments)]
+pub fn start_with_caps(
+    bind: &str,
+    port: u16,
+    diagnostics_port: u16,
+    token: Option<String>,
+    companion: Arc<Companion>,
+    remote_posture: bool,
+    main_cap: usize,
+    diag_cap: usize,
+) -> Result<ServerHandle, String> {
     let listener = match crate::ffi::bind_listener_backlog(bind, port) {
         Ok(l) => l,
         Err(e) => {
@@ -207,21 +275,25 @@ pub fn start_with_posture(
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
+    let conn_threads: ConnRegistry = Arc::new(Mutex::new(Vec::new()));
 
-    for (listener, token, diagnostics_only) in [
+    for (listener, token, diagnostics_only, cap) in [
         (
             listener.try_clone().map_err(|e| e.to_string())?,
             token.clone(),
             false,
+            main_cap,
         ),
         (
             diag_listener.try_clone().map_err(|e| e.to_string())?,
             None,
             true,
+            diag_cap,
         ),
     ] {
         let stop = stop.clone();
         let companion = companion.clone();
+        let conns = conn_threads.clone();
         let name = if diagnostics_only {
             "accept-diag"
         } else {
@@ -238,6 +310,8 @@ pub fn start_with_posture(
                         companion,
                         diagnostics_only,
                         remote_posture,
+                        cap,
+                        conns,
                     )
                 })
                 .map_err(|e| e.to_string())?,
@@ -265,9 +339,11 @@ pub fn start_with_posture(
         diagnostics_port: actual_diag_port,
         stop,
         threads,
+        conn_threads,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept_loop(
     listener: TcpListener,
     stop: Arc<AtomicBool>,
@@ -275,18 +351,120 @@ fn accept_loop(
     companion: Arc<Companion>,
     diagnostics_only: bool,
     remote_posture: bool,
+    cap: usize,
+    conn_threads: ConnRegistry,
 ) {
     if listener.set_nonblocking(true).is_err() {
         return;
     }
+    let listener_active = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::SeqCst) {
+        // Opportunistic reaping of finished connection handles (mandate §2, audit P6)
+        if let Ok(mut conns) = conn_threads.lock() {
+            let mut i = 0;
+            while i < conns.len() {
+                if conns[i].1.is_finished() {
+                    let (_, handle) = conns.swap_remove(i);
+                    let _ = handle.join();
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
         match listener.accept() {
             Ok((stream, _)) => {
+                // Connection cap check (audit P7)
+                let admitted = listener_active
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |curr| {
+                        if curr < cap { Some(curr + 1) } else { None }
+                    })
+                    .is_ok();
+                if !admitted {
+                    companion
+                        .shared
+                        .connections_rejected
+                        .fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                    continue;
+                }
+                companion
+                    .shared
+                    .connections_active
+                    .fetch_add(1, Ordering::SeqCst);
+
+                // Windows quirk: sockets returned by accept() on a NONBLOCKING
+                // listener inherit nonblocking mode — force blocking immediately
+                stream.set_nonblocking(false).ok();
+
+                let stream_clone = match stream.try_clone() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        listener_active.fetch_sub(1, Ordering::SeqCst);
+                        companion
+                            .shared
+                            .connections_active
+                            .fetch_sub(1, Ordering::SeqCst);
+                        companion
+                            .shared
+                            .connections_rejected
+                            .fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+                };
+
                 let token = token.clone();
-                let companion = companion.clone();
-                let _ = thread::Builder::new().name("conn".into()).spawn(move || {
-                    let _ = handle_conn(stream, token, companion, diagnostics_only, remote_posture);
+                let companion_clone = companion.clone();
+                let active_guard_count = listener_active.clone();
+                let shared_guard_count = companion.shared.clone();
+
+                struct ActiveGuard {
+                    listener_active: Arc<AtomicUsize>,
+                    shared: Arc<crate::companion::Shared>,
+                }
+                impl Drop for ActiveGuard {
+                    fn drop(&mut self) {
+                        self.listener_active.fetch_sub(1, Ordering::SeqCst);
+                        self.shared
+                            .connections_active
+                            .fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+
+                let stop_conn = stop.clone();
+                let spawn_res = thread::Builder::new().name("conn".into()).spawn(move || {
+                    let _guard = ActiveGuard {
+                        listener_active: active_guard_count,
+                        shared: shared_guard_count,
+                    };
+                    let _ = handle_conn(
+                        stream,
+                        token,
+                        companion_clone,
+                        diagnostics_only,
+                        remote_posture,
+                        stop_conn,
+                    );
                 });
+
+                match spawn_res {
+                    Ok(handle) => {
+                        if let Ok(mut conns) = conn_threads.lock() {
+                            conns.push((stream_clone, handle));
+                        }
+                    }
+                    Err(_) => {
+                        listener_active.fetch_sub(1, Ordering::SeqCst);
+                        companion
+                            .shared
+                            .connections_active
+                            .fetch_sub(1, Ordering::SeqCst);
+                        companion
+                            .shared
+                            .connections_rejected
+                            .fetch_add(1, Ordering::SeqCst);
+                    }
+                }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -302,6 +480,7 @@ fn handle_conn(
     companion: Arc<Companion>,
     diagnostics_only: bool,
     remote_posture: bool,
+    stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
     // Windows quirk: sockets returned by accept() on a NONBLOCKING listener
     // inherit nonblocking mode — force blocking or every idle read "fails".
@@ -390,7 +569,7 @@ fn handle_conn(
         *companion.shared.auth_failures.lock().unwrap() = 0;
     }
     ws::write_handshake_response(&mut writer, &accept)?;
-    serve_ws(reader, writer, companion, remote_posture)
+    serve_ws(reader, writer, companion, remote_posture, &stop)
 }
 
 fn close_payload(code: u16, reason: &str) -> Vec<u8> {
@@ -867,11 +1046,47 @@ impl Drop for ConnGuard {
     }
 }
 
+/// Read-timeout poll interval while a connection is idle (audit P6).
+const IDLE_POLL: Duration = Duration::from_millis(250);
+
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
+}
+
+/// Reads the rest of a frame once its first byte arrived. A timeout here is
+/// retried — the bytes `read_exact` already consumed must not be lost —
+/// until shutdown or one heartbeat window: a peer stalled mid-frame that
+/// long is treated as dead.
+struct FrameReader<'a> {
+    inner: &'a mut TcpStream,
+    stop: &'a AtomicBool,
+    started: Instant,
+}
+
+impl Read for FrameReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.inner.read(buf) {
+                Err(e)
+                    if is_timeout(&e)
+                        && !self.stop.load(Ordering::SeqCst)
+                        && self.started.elapsed()
+                            < Duration::from_millis(crate::protocol::HEARTBEAT_MS) => {}
+                r => return r,
+            }
+        }
+    }
+}
+
 fn serve_ws(
     mut reader: TcpStream,
     writer: TcpStream,
     companion: Arc<Companion>,
     require_e2e: bool,
+    stop: &AtomicBool,
 ) -> io::Result<()> {
     // Fallible socket setup first: the cleanup below runs only after the
     // read loop, so anything that can fail with `?` must happen before the
@@ -879,9 +1094,12 @@ fn serve_ws(
     // failure here would leak the registry entry and the writer thread.
     // a dedicated handle for control frames (ping/pong/close)
     let mut control = reader.try_clone()?;
-    // heartbeat: read timeout = one beat; N misses → dead peer (parity with
-    // the Node host's HEARTBEAT_MS cadence and miss limit)
-    reader.set_read_timeout(Some(Duration::from_millis(crate::protocol::HEARTBEAT_MS)))?;
+    // Short read timeout so shutdown is noticed promptly (audit P6). It only
+    // ever fires while idle between frames (`peek` consumes nothing) or is
+    // retried by `FrameReader` mid-frame, so a frame is never split. (On
+    // Windows, ServerHandle::stop()'s shutdown of a cloned handle does not
+    // wake a blocked recv, hence the poll.)
+    reader.set_read_timeout(Some(IDLE_POLL))?;
     // the write timeout (D8) bounds every write, so a stalled peer can no
     // longer park the writer forever and teardown's join() is always bounded
     writer.set_write_timeout(Some(WRITE_TIMEOUT))?;
@@ -926,12 +1144,20 @@ fn serve_ws(
     // handshake between hs_hello and hs_proof.
     let mut hs: Option<HsPending> = None;
 
+    // heartbeat: every HEARTBEAT_MS of silence is a miss (ping sent); N
+    // misses → dead peer (parity with the Node host's cadence and limit)
+    let beat = Duration::from_millis(crate::protocol::HEARTBEAT_MS);
+    let mut idle_since = Instant::now();
     let result: io::Result<()> = loop {
-        let frame = match ws::read_frame(&mut reader, true) {
-            Ok(f) => f,
-            Err(ws::WsError::Io(e))
-                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock =>
-            {
+        match reader.peek(&mut [0u8; 1]) {
+            Ok(_) => {} // data or EOF: read_frame reports either
+            Err(e) if is_timeout(&e) => {
+                if stop.load(Ordering::SeqCst) {
+                    break Ok(());
+                }
+                if idle_since.elapsed() < beat * (misses + 1) {
+                    continue;
+                }
                 misses += 1;
                 if misses > crate::protocol::HEARTBEAT_MISS_LIMIT {
                     break Err(io::Error::other("heartbeat miss limit"));
@@ -945,11 +1171,21 @@ fn serve_ws(
                 }
                 continue;
             }
+            Err(e) => break Err(e),
+        }
+        let mut frame_reader = FrameReader {
+            inner: &mut reader,
+            stop,
+            started: Instant::now(),
+        };
+        let frame = match ws::read_frame(&mut frame_reader, true) {
+            Ok(f) => f,
             Err(ws::WsError::Io(e)) => break Err(e),
             // protocol violation from this peer: close the connection only
             Err(_) => break Err(io::Error::other("protocol violation")),
         };
         misses = 0;
+        idle_since = Instant::now();
         // D8: a saturated queue means this peer is stalled — tear down even
         // if it keeps driving the heartbeat (checked before handling the
         // frame so no further reply is produced for a terminated peer)
@@ -1197,8 +1433,8 @@ mod e2e_tests {
             data_dir,
             ..
         } = f;
-        handle.stop();
-        companion.shutdown();
+        let clean = handle.stop();
+        companion.shutdown(clean);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -2150,7 +2386,7 @@ mod e2e_tests {
         drop(again);
         assert_eq!(companion.shared.clients.lock().unwrap().len(), 0);
 
-        companion.shutdown();
+        companion.shutdown(true);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2254,7 +2490,170 @@ mod e2e_tests {
         assert!(metrics.contains("chernobyl_outbound_shed_ctrl_total"));
         assert!(metrics.contains("chernobyl_outbound_saturation_teardowns_total"));
 
-        companion.shutdown();
+        companion.shutdown(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 250 ms idle poll must never split a frame: a frame that trickles
+    /// in slower than the poll (here 700 ms between halves) is reassembled,
+    /// not desynced into a protocol violation.
+    #[test]
+    fn a_frame_slower_than_the_idle_poll_is_not_split() {
+        let dir = temp_dir("p6-slow-frame");
+        let mut cfg = default_config();
+        cfg.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(cfg).unwrap());
+        let srv = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        let mut c = WsClient::connect(&format!("127.0.0.1:{}", srv.port), "/", None).unwrap();
+        c.hello().unwrap();
+        let frame = ws::encode_frame(
+            ws::OP_TEXT,
+            br#"{"type":"ping","commandId":"slow-1"}"#,
+            true,
+        );
+        c.send_raw(&frame[..5]).unwrap();
+        thread::sleep(Duration::from_millis(700));
+        c.send_raw(&frame[5..]).unwrap();
+        let pong = c
+            .next_text_matching(|t| t.contains("\"pong\""), Duration::from_secs(5))
+            .expect("pong after a slow frame");
+        assert!(pong.contains("slow-1"), "{pong}");
+        drop(c);
+        assert!(srv.stop());
+        companion.shutdown(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ---- mandate §2: ordered shutdown (audit P6) -------------------- */
+
+    #[test]
+    fn ordered_shutdown_joins_live_ws_and_graceful_line_is_last() {
+        // Regression for P6: ServerHandle::stop() must join connection threads
+        // and companion.shutdown() must write the graceful line ONLY when all
+        // threads joined cleanly; no further appends may occur after it.
+        let dir = temp_dir("p6-ordered-shutdown");
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let srv = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();
+        let addr = format!("127.0.0.1:{}", srv.port);
+
+        // Open a live WS connection
+        let mut client = WsClient::connect(&addr, "/", None).unwrap();
+        client.hello().unwrap();
+
+        // Ensure the connection is established and tracked
+        assert!(companion.shared.connections_active.load(Ordering::SeqCst) >= 1);
+
+        // Stop the server: must return true (all threads joined within 5 s)
+        let clean = srv.stop();
+        assert!(
+            clean,
+            "ServerHandle::stop() must return true when threads join cleanly"
+        );
+
+        // Connection thread is gone
+        assert_eq!(
+            companion.shared.connections_active.load(Ordering::SeqCst),
+            0,
+            "connection thread must be gone after stop()"
+        );
+
+        // Shut down the companion
+        companion.shutdown(clean);
+
+        // Verify the audit log: graceful line must be the LAST record written
+        let store = companion.shared.storage.lock().unwrap();
+        let last_audit = store.audit.last().expect("must have audit records");
+        assert_eq!(last_audit.kind, "shutdown");
+        assert_eq!(last_audit.text, "companion shut down gracefully");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ---- mandate §2: connection caps (audit P7) --------------------- */
+
+    #[test]
+    fn connection_cap_rejects_excess_and_accepts_after_disconnect() {
+        // Regression for P7: bound on concurrent connections per listener.
+        // Cap=2, third concurrent connection is closed immediately and
+        // connectionsRejected is 1; after closing one, a new one is accepted.
+        let dir = temp_dir("p7-conn-cap");
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let srv =
+            start_with_caps("127.0.0.1", 0, 0, None, companion.clone(), false, 2, 64).unwrap();
+        let addr = format!("127.0.0.1:{}", srv.port);
+
+        // Connect 1
+        let mut c1 = WsClient::connect(&addr, "/", None).unwrap();
+        c1.hello().unwrap();
+
+        // Connect 2
+        let mut c2 = WsClient::connect(&addr, "/", None).unwrap();
+        c2.hello().unwrap();
+
+        // Both active
+        assert_eq!(
+            companion.shared.connections_active.load(Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            companion.shared.connections_rejected.load(Ordering::SeqCst),
+            0
+        );
+
+        // Third connection exceeds cap=2
+        let rejected = match WsClient::connect(&addr, "/", None) {
+            Ok(mut c3) => c3.hello().is_err(),
+            Err(_) => true,
+        };
+        assert!(
+            rejected,
+            "third connection must be closed/rejected due to cap"
+        );
+
+        assert_eq!(
+            companion.shared.connections_rejected.load(Ordering::SeqCst),
+            1
+        );
+
+        // Verify /health and /metrics report the counters
+        let health = companion.health();
+        let get = |k: &str| json::as_i64(json::get(&health, k).expect(k)).expect(k);
+        assert_eq!(get("connectionsActive"), 2);
+        assert_eq!(get("connectionsRejected"), 1);
+
+        let metrics = companion.metrics_text();
+        assert!(metrics.contains("chernobyl_connections_active 2"));
+        assert!(metrics.contains("chernobyl_connections_rejected_total 1"));
+
+        // Close connection 1
+        let _ = c1.close(1000);
+        drop(c1);
+
+        // Wait for connection 1 to finish and active count to decrement
+        let start = std::time::Instant::now();
+        while companion.shared.connections_active.load(Ordering::SeqCst) > 1 {
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("timed out waiting for active connections to drop to 1");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Now connection 4 can be accepted
+        let mut c4 = WsClient::connect(&addr, "/", None).unwrap();
+        c4.hello().unwrap();
+        assert_eq!(
+            companion.shared.connections_active.load(Ordering::SeqCst),
+            2
+        );
+
+        let clean = srv.stop();
+        assert!(clean);
+        companion.shutdown(clean);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -119,6 +119,10 @@ pub struct Storage {
     /// Details of the corruption event(s) for `/health` consumers and the
     /// audit record `open` writes after truncation.
     pub corrupt: Option<CorruptLoss>,
+    #[cfg(test)]
+    pub fail_after_appends: Option<usize>,
+    #[cfg(test)]
+    pub appends_count: usize,
 }
 
 /// Where the journal was corrupt and what the truncation discarded
@@ -182,6 +186,10 @@ impl Storage {
             failed: false,
             corrupt_events: 0,
             corrupt: None,
+            #[cfg(test)]
+            fail_after_appends: None,
+            #[cfg(test)]
+            appends_count: 0,
         };
 
         // Load, then truncate any torn tail so future appends stay aligned.
@@ -455,6 +463,14 @@ impl Storage {
         if self.failed {
             return Err("storage latched failed — refusing writes (fail-closed)".into());
         }
+        #[cfg(test)]
+        if let Some(limit) = self.fail_after_appends {
+            if self.appends_count >= limit {
+                self.failed = true;
+                return Err("simulated journal write failure".into());
+            }
+            self.appends_count += 1;
+        }
         match self
             .journal
             .write_all(line.as_bytes())
@@ -473,6 +489,11 @@ impl Storage {
 
     pub fn is_failed(&self) -> bool {
         self.failed
+    }
+
+    #[cfg(test)]
+    pub fn latch_failed_for_test(&mut self) {
+        self.failed = true;
     }
 
     /* ---- writes ------------------------------------------------- */

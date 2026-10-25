@@ -54,6 +54,12 @@ pub struct Shared {
     pub config: CompanionConfig,
     /// Consecutive auth failures; trips a cooldown (brute-force resistance).
     pub auth_failures: Mutex<u32>,
+    /// Active connection count across all listeners (mandate §2, audit P7).
+    pub connections_active: std::sync::atomic::AtomicU64,
+    /// Connections rejected due to listener cap or spawn failure (audit P7).
+    pub connections_rejected: std::sync::atomic::AtomicU64,
+    /// Command outcome persistence failures (mandate §5, audit P9).
+    pub outcome_write_failures: std::sync::atomic::AtomicU64,
 }
 
 pub struct Companion {
@@ -110,6 +116,9 @@ impl Companion {
             started_at: now_ms(),
             config,
             auth_failures: Mutex::new(0),
+            connections_active: std::sync::atomic::AtomicU64::new(0),
+            connections_rejected: std::sync::atomic::AtomicU64::new(0),
+            outcome_write_failures: std::sync::atomic::AtomicU64::new(0),
         });
 
         // Engine emit: PERSIST FIRST, then broadcast. A write failure latches
@@ -414,14 +423,20 @@ impl Companion {
         ) = (&reply, msg_cmd_id)
         {
             let mut store = self.shared.storage.lock().unwrap();
-            let _ = store.update_command_outcome(
+            if let Err(e) = store.update_command_outcome(
                 &cmd_id,
                 if *ok { "executed" } else { "refused" },
                 Some(*ok),
                 session_id.as_deref(),
                 permission_id.as_deref(),
                 error.as_deref(),
-            );
+            ) {
+                // audit P9: log failure and never pretend outcome was recorded
+                eprintln!("[companion] outcome write failed for {cmd_id}: {e}");
+                self.shared
+                    .outcome_write_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
         }
         reply
     }
@@ -544,6 +559,32 @@ impl Companion {
                 "outboundSatTeardowns",
                 crate::json::Json::Int(
                     sat.teardowns.load(std::sync::atomic::Ordering::Relaxed) as i64
+                ),
+            ),
+            // connection bounds (mandate §2, audit P7)
+            (
+                "connectionsActive",
+                crate::json::Json::Int(
+                    self.shared
+                        .connections_active
+                        .load(std::sync::atomic::Ordering::Relaxed) as i64,
+                ),
+            ),
+            (
+                "connectionsRejected",
+                crate::json::Json::Int(
+                    self.shared
+                        .connections_rejected
+                        .load(std::sync::atomic::Ordering::Relaxed) as i64,
+                ),
+            ),
+            // command outcome write failures (mandate §5, audit P9)
+            (
+                "outcomeWriteFailures",
+                crate::json::Json::Int(
+                    self.shared
+                        .outcome_write_failures
+                        .load(std::sync::atomic::Ordering::Relaxed) as i64,
                 ),
             ),
             (
@@ -682,6 +723,30 @@ impl Companion {
             i64::from(storage_failed),
         );
         out += &g(
+            "chernobyl_connections_active",
+            "concurrent active connections across listeners",
+            "gauge",
+            self.shared
+                .connections_active
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        out += &g(
+            "chernobyl_connections_rejected_total",
+            "connections rejected due to listener cap or spawn failure",
+            "counter",
+            self.shared
+                .connections_rejected
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        out += &g(
+            "chernobyl_outcome_write_failures_total",
+            "command outcome persistence failures",
+            "counter",
+            self.shared
+                .outcome_write_failures
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        out += &g(
             "chernobyl_rss_bytes",
             "resident set size",
             "gauge",
@@ -793,13 +858,29 @@ impl Companion {
         }
     }
 
-    pub fn shutdown(&self) {
+    pub fn shutdown(&self, graceful: bool) {
         // stop the adapter's event thread before the audit line
         if let Some(oc) = self.shared.opencode.lock().unwrap().take() {
             oc.dispose();
         }
         let mut store = self.shared.storage.lock().unwrap();
-        let _ = store.append_audit("shutdown", "companion shut down gracefully");
+        let fallback;
+        let message = if graceful {
+            "companion shut down gracefully"
+        } else {
+            let active = self
+                .shared
+                .connections_active
+                .load(std::sync::atomic::Ordering::SeqCst);
+            fallback = if active > 0 {
+                format!("companion shut down with {active} connection(s) still active")
+            } else {
+                "companion shut down with connection(s) still active".to_string()
+            };
+            eprintln!("[companion] {fallback}");
+            fallback.as_str()
+        };
+        let _ = store.append_audit("shutdown", message);
         let _ = store.compact();
     }
 }
@@ -909,7 +990,7 @@ mod tests {
         let comp = Companion::boot(c.clone()).unwrap();
         assert!(comp.last_seq() >= 0);
         assert!(crate::json::stringify(&comp.health()).contains("storageFailed"));
-        comp.shutdown();
+        comp.shutdown(true);
         // second boot reconciles nothing new
         let comp2 = Companion::boot(c.clone()).unwrap();
         let store = comp2.shared.storage.lock().unwrap();
@@ -922,7 +1003,7 @@ mod tests {
             0
         );
         drop(store);
-        comp2.shutdown();
+        comp2.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 
@@ -946,7 +1027,7 @@ mod tests {
                 ..
             })
         ));
-        comp.shutdown();
+        comp.shutdown(true);
         drop(comp);
 
         let comp2 = Companion::boot(c.clone()).unwrap();
@@ -971,7 +1052,7 @@ mod tests {
             sessions_before, sessions_after,
             "replay must not create a session"
         );
-        comp2.shutdown();
+        comp2.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 
@@ -1030,7 +1111,7 @@ mod tests {
             }) if p == "p1"
         ));
 
-        comp.shutdown();
+        comp.shutdown(true);
         drop(comp);
 
         let comp2 = Companion::boot(c.clone()).unwrap();
@@ -1069,7 +1150,7 @@ mod tests {
             }
             other => panic!("expected stored permission ack, got {other:?}"),
         }
-        comp2.shutdown();
+        comp2.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 
@@ -1086,11 +1167,11 @@ mod tests {
         });
         let seq1 = comp.last_seq();
         assert!(seq1 > 0);
-        comp.shutdown();
+        comp.shutdown(true);
         let comp2 = Companion::boot(c.clone()).unwrap();
         // restart must NOT reset the sequence (C2)
         assert!(comp2.last_seq() >= seq1);
-        comp2.shutdown();
+        comp2.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 
@@ -1199,7 +1280,7 @@ mod tests {
                 .all(|r| !r.contains("/permission/"))
         );
 
-        comp.shutdown();
+        comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 
@@ -1296,8 +1377,54 @@ mod tests {
         assert_eq!(p.decision.as_deref(), Some("approve-once"));
         assert_eq!(p.revision, 2); // resolution invalidates the old revision
 
-        comp.shutdown();
+        comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    #[test]
+    fn outcome_write_failure_increments_counter_and_surfaces_in_health_and_metrics() {
+        // Regression for P9: when journal writes fail, the failed outcome
+        // write must be logged, increment outcomeWriteFailures, and surface
+        // in /health and /metrics (never silently dropped with let _ =).
+        let c = temp_config("p9-outcome-fail");
+        let data_dir = c.data_dir.clone();
+        let comp = Companion::boot(c).unwrap();
+
+        let health0 = comp.health();
+        let get = |h: &crate::json::Json, key: &str| {
+            crate::json::as_i64(crate::json::get(h, key).expect(key)).expect(key)
+        };
+        assert_eq!(get(&health0, "outcomeWriteFailures"), 0);
+
+        // Fail after 1 append: put_command succeeds (first append), but the
+        // subsequent update_command_outcome fails on its append.
+        comp.shared.storage.lock().unwrap().fail_after_appends = Some(1);
+
+        let msg = ClientMsg::CreateSession {
+            command_id: "cmd-p9".into(),
+            agent_id: "a1".into(),
+            title: "T".into(),
+            prompt: "P".into(),
+            project: None,
+        };
+        let reply = comp.handle_client_msg(msg);
+        assert!(matches!(reply, Some(ServerMsg::Ack { ok: true, .. })));
+
+        assert_eq!(
+            comp.shared
+                .outcome_write_failures
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let health1 = comp.health();
+        assert_eq!(get(&health1, "outcomeWriteFailures"), 1);
+
+        let metrics = comp.metrics_text();
+        assert!(metrics.contains("chernobyl_outcome_write_failures_total 1"));
+
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     fn json_len(v: &crate::json::Json, key: &str) -> usize {

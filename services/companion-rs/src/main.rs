@@ -246,8 +246,8 @@ fn run(args: &[String]) -> i32 {
             eprintln!("[companion] tui error: {e}");
         }
         eprintln!("[companion] shutting down");
-        srv.stop();
-        companion.shutdown();
+        let clean = srv.stop();
+        companion.shutdown(clean);
         eprintln!("[companion] bye");
         return 0;
     }
@@ -266,8 +266,8 @@ fn run(args: &[String]) -> i32 {
         std::thread::sleep(Duration::from_millis(100));
     }
     eprintln!("[companion] shutting down");
-    srv.stop();
-    companion.shutdown();
+    let clean = srv.stop();
+    companion.shutdown(clean);
     eprintln!("[companion] bye");
     0
 }
@@ -886,8 +886,8 @@ fn self_test_main() -> i32 {
     // 9. durable seq across restart
     {
         let seq_before = companion.last_seq();
-        srv.stop();
-        companion.shutdown();
+        let clean = srv.stop();
+        companion.shutdown(clean);
         let companion2 = match Companion::boot(cfg.clone()) {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -905,13 +905,14 @@ fn self_test_main() -> i32 {
             &mut failures,
         );
         let srv2 = server::start("127.0.0.1", 0, 0, None, companion2.clone());
-        match srv2 {
+        let clean2 = match srv2 {
             Ok(s) => s.stop(),
             Err(e) => {
                 check("second boot serves", false, e, &mut failures);
+                false
             }
-        }
-        companion2.shutdown();
+        };
+        companion2.shutdown(clean2);
     }
 
     let _ = std::fs::remove_dir_all(&dir);

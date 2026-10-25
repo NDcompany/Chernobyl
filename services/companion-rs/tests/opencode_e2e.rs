@@ -393,7 +393,7 @@ fn live_opencode_end_to_end() {
     );
 
     // teardown: adapter first (stops the SSE thread), then the server
-    comp.shutdown();
+    comp.shutdown(true);
     kill_server(server);
     let _ = std::fs::remove_dir_all(&base);
 }
