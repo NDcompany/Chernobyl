@@ -233,3 +233,8 @@ production behavior. Status is updated once the fix lands (§12 verification per
 - **Duplicate socket on `connect()` during backoff (fixed `46bfa9f`).** The superseded retry timer opened a second socket and orphaned the first.
 - **Close 4001/4002 not terminal (fixed `3f0968d`).** The transport retried a bad token or protocol mismatch forever.
 - **Unbounded audit trails (fixed).** Desktop journal audit records and the phone's decision table now keep the newest 1000.
+- **Shutdown blocked by a half-sent HTTP upgrade (fixed).** The upgrade read had a plain 30 s timeout, so a client that stopped mid-request held `stop()` past its deadline (and Windows does not wake a blocked `recv` on shutdown). The request head is now read through `StopAwareReader` on the 250 ms poll with the same 30 s total deadline.
+
+### Section 8/10 integration coverage (`tests/lifecycle.rs`)
+
+`shutdown_while_client_mid_http_upgrade`, `shutdown_while_client_mid_e2e_handshake`, `shutdown_during_active_command_and_fanout_reconciles_at_reboot` (graceful line last; after reboot every command keeps its outcome or is reconciled `unknown`, never success), `resource_cleanup_after_repeated_failure_cycles` (200 garbage cycles, `connectionsActive` back to 0), `multi_client_isolation_malformed_flood_does_not_break_ping_pong`.

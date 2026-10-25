@@ -487,14 +487,22 @@ fn handle_conn(
     // inherit nonblocking mode — force blocking or every idle read "fails".
     stream.set_nonblocking(false).ok();
     stream.set_nodelay(true).ok();
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    // the upgrade request gets 30 s in total (slowloris bound), read through
+    // the short poll so a shutdown is not stuck behind a half-sent request
+    stream.set_read_timeout(Some(IDLE_POLL))?;
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
 
-    let handshake = match ws::read_handshake(&mut reader) {
+    let handshake = match ws::read_handshake(&mut StopAwareReader {
+        inner: &mut reader,
+        stop: &stop,
+        deadline: Instant::now() + HTTP_REQUEST_DEADLINE,
+    }) {
         Ok(h) => h,
-        Err(_) => return Ok(()), // hostile/garbage: drop the connection
+        Err(_) => return Ok(()), // hostile/garbage/shutdown: drop the connection
     };
+    // HTTP routes read their (capped) bodies with plain blocking reads
+    reader.set_read_timeout(Some(HTTP_REQUEST_DEADLINE))?;
 
     // HTTP routes (non-upgrade) -------------------------------------------
     if !handshake.is_websocket_upgrade() {
@@ -1168,6 +1176,8 @@ impl Drop for ConnGuard {
 
 /// Read-timeout poll interval while a connection is idle (audit P6).
 const IDLE_POLL: Duration = Duration::from_millis(250);
+/// Total time a peer gets to send its HTTP request head (and a POST body).
+const HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
 fn is_timeout(e: &io::Error) -> bool {
     matches!(
@@ -1176,25 +1186,24 @@ fn is_timeout(e: &io::Error) -> bool {
     )
 }
 
-/// Reads the rest of a frame once its first byte arrived. A timeout here is
-/// retried — the bytes `read_exact` already consumed must not be lost —
-/// until shutdown or one heartbeat window: a peer stalled mid-frame that
-/// long is treated as dead.
-struct FrameReader<'a> {
+/// A read that must not be split (an HTTP upgrade request, the rest of a WS
+/// frame) over a socket with the short IDLE_POLL timeout: timeouts are
+/// retried — bytes `read_exact` already consumed must not be lost — until
+/// shutdown (audit P6) or `deadline`, after which the peer counts as dead.
+struct StopAwareReader<'a> {
     inner: &'a mut TcpStream,
     stop: &'a AtomicBool,
-    started: Instant,
+    deadline: Instant,
 }
 
-impl Read for FrameReader<'_> {
+impl Read for StopAwareReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             match self.inner.read(buf) {
                 Err(e)
                     if is_timeout(&e)
                         && !self.stop.load(Ordering::SeqCst)
-                        && self.started.elapsed()
-                            < Duration::from_millis(crate::protocol::HEARTBEAT_MS) => {}
+                        && Instant::now() < self.deadline => {}
                 r => return r,
             }
         }
@@ -1216,7 +1225,7 @@ fn serve_ws(
     let mut control = reader.try_clone()?;
     // Short read timeout so shutdown is noticed promptly (audit P6). It only
     // ever fires while idle between frames (`peek` consumes nothing) or is
-    // retried by `FrameReader` mid-frame, so a frame is never split. (On
+    // retried by `StopAwareReader` mid-frame, so a frame is never split. (On
     // Windows, ServerHandle::stop()'s shutdown of a cloned handle does not
     // wake a blocked recv, hence the poll.)
     reader.set_read_timeout(Some(IDLE_POLL))?;
@@ -1297,10 +1306,10 @@ fn serve_ws(
             }
             Err(e) => break Err(e),
         }
-        let mut frame_reader = FrameReader {
+        let mut frame_reader = StopAwareReader {
             inner: &mut reader,
             stop,
-            started: Instant::now(),
+            deadline: Instant::now() + beat,
         };
         let frame = match ws::read_frame(&mut frame_reader, true) {
             Ok(f) => f,
