@@ -98,7 +98,11 @@ export default function ConnectHostScreen() {
   // lists every endpoint, exactly as for a scanned QR. Arriving through it
   // counts as choosing "Pair with a host" on the entry screen.
   const params = useLocalSearchParams<{ payload?: string }>();
-  const linkPayload = typeof params.payload === 'string' ? params.payload : undefined;
+  // query parsing turns '+' into a space (form encoding) even when sent as
+  // %2B; a payload is compact JSON + base64 and never holds a space, so the
+  // mapping back is lossless (found on the emulator: a base64 '+' went missing)
+  const linkPayload =
+    typeof params.payload === 'string' ? params.payload.replace(/ /g, '+') : undefined;
   useEffect(() => {
     if (!linkPayload) return;
     if (!useAppStore.getState().authed) useAppStore.getState().signIn();
