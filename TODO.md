@@ -1,6 +1,6 @@
 # CHERNOBYL — TODO
 
-Updated: 2026-10-25 (24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria, `pass: true`; Phase 8 complete: TUI + pairing overlay + windowless autostart + packaging ADR-007; client read-timeout cross-handle fix). Status of the Rust companion rewrite + everything left.
+Updated: 2026-10-25 late (reliability mandate closed: audit P1–P10 + extra findings, D4 live revoke, D9 option B, pairing-while-running fix, Phase 6 camera QR / host records / outcome honesty, Phase 9 gate assessed in `docs/validation/RELEASE-GATE.md`). Earlier: 24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria, `pass: true`; Phase 8 complete: TUI + pairing overlay + windowless autostart + packaging ADR-007; client read-timeout cross-handle fix). Status of the Rust companion rewrite + everything left.
 
 ## Done
 
@@ -245,7 +245,7 @@ Updated: 2026-10-25 (24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria
       only post-ADR-011; ticket flow deferred to the web-app milestone); **D4
       recommendation only** (ADR-014, S8 ⛔ — terminate-on-revoke via in-process revoke, needs
       product-owner ratification; not implemented, current restart-scoped semantics + exposure
-      documented). Optional-transport how-to docs still owed.
+      documented). Optional-transport how-to: `docs/REMOTE-ACCESS.md` (2026-10-25); D4 implemented (`c1c98c7`).
 - [~] Phase 6: mobile integration — **client + wiring done 2026-10-23** (ADR-012 `e7eec9d`,
       QR `dev` contract fix `4e9ff07`, `@chernobyl/e2e` + interop `e6f68b4`, app wiring
       `d5f828e`): crypto decision (pure-JS `@noble/*`, no build-model change), the real
@@ -255,10 +255,11 @@ Updated: 2026-10-25 (24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria
       states, badge/caption reactivity. Verified in layers: 27 unit tests (RFC KATs exact vs
       the Rust suite) + **13/13 interop vs the real Rust binary** (`npm run verify:e2e`:
       dev redemption, wrong-PSK denial, sealed hello_ack, heartbeat, replay/tamper teardown,
-      two devices, restart recovery, revocation-at-restart semantics). Still owed: QR
-      scanner camera path + on-device rows (physical device —
-      `docs/validation/PHONE-VALIDATION-CHECKLIST.md`), endpoint-list host records, and
-      **persistent WS + Android foreground-service local notifications (no FCM)**.
+      two devices, restart recovery, revocation-at-restart semantics). **2026-10-25:** camera QR scanning (`bdfe6e5`), paired-host record with endpoint list + honest
+      uncertain-outcome states (`37f6056`), pair-or-demo entry replacing the fake sign-in (C14), unpair
+      in Settings, foreground re-dial. Still owed: on-device rows (physical device —
+      `docs/validation/PHONE-VALIDATION-CHECKLIST.md`) and an Android foreground service for long
+      backgrounding (needs a native build).
 - [x] Phase 7: adapters — **done 2026-10-23**. Ollama (`04117ee`) + Claude Code (`b0bf067`) as Rust
       modules; **Hermes deferred** per ADR-008 (not installed — no pretend capability claims; the
       adapter SDK keeps unsupported adapters invisible rather than broken). Ollama is a model-runtime
@@ -291,8 +292,10 @@ Updated: 2026-10-25 (24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria
       options, so the read timeout set on the writer never bounded reads through the
       `BufReader` handle (dead 10 s bound in `connect`; `next_text_matching` could hang
       forever mid-match) — timeouts now set on the reading handle at all three sites.
-- [ ] Phase 9: release gate — no mock advertised as real (PRD §13.1); E2E crypto known-answer
-      tests + adversarial matrix green.
+- [~] Phase 9: release gate — **assessed 2026-10-25** (`docs/validation/RELEASE-GATE.md`): code-side
+      items ✅ (security suites, revocation incl. live 4003, privacy/retention doc, backup/restore,
+      credential scan, integrations doc, no mock advertised as real). Blocked on external
+      conditions only: physical-device rows (S4), Android APK build (no SDK), independent audit (S9).
 
 ## Explicitly not done (honesty)
 
