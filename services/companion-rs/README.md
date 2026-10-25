@@ -153,7 +153,9 @@ absolute caps, connection failures. Any failure ⇒ exit 1.
 
 Gotchas: the machine must **stay awake** for a long run (a prior 24 h attempt died at ~4.7 h
 on PC sleep); a short long-mode run is labeled by its measured duration in `summary.json`
-and does **not** close soak gate S11 — only a genuine 24 h window does. The standard
+and does **not** close soak gate S11 — only a genuine 24 h window does. S11 closed on
+2026-10-24 with `target/soak/2026-10-23T19-55Z-long-24h-restart/summary.json`
+(`pass: true`, all 10 criteria, 86 429 s window). The standard
 `verify` scripts never depend on a soak run. The harness is loopback-only by design (no LAN
 exposure); it does not simulate a phone and does not exercise E2E-sealed sessions (the Rust
 matrix covers those).

@@ -60,8 +60,10 @@ naive alternative):
 2. It changes a frozen-contract wire semantic (adds a close code + flips an
    interop-asserted behavior) and touches the revoke CLI's process model — a
    coordinated change needing owner sign-off, not an autonomous edit.
-3. The 24 h soak is currently running on a frozen binary; landing a transport
-   semantic change mid-soak would invalidate the tested-revision claim.
+3. The 24 h soak completed **2026-10-24** on the frozen revision `f47c4f6`
+   (S11 ✅); landing a transport semantic change afterwards puts the new tree on
+   an un-soaked revision, so S11's evidence would have to be re-established for
+   any transport-changing build.
 
 ## If the owner instead prefers "keep next-handshake"
 

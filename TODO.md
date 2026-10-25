@@ -1,6 +1,6 @@
 # CHERNOBYL — TODO
 
-Updated: 2026-10-24 (Phase 8 complete: TUI + pairing overlay + windowless autostart + packaging ADR-007; client read-timeout cross-handle fix; 24 h soak for S11 running in the frozen `G:\Chernobyl-soak` worktree). Status of the Rust companion rewrite + everything left.
+Updated: 2026-10-25 (24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria, `pass: true`; Phase 8 complete: TUI + pairing overlay + windowless autostart + packaging ADR-007; client read-timeout cross-handle fix). Status of the Rust companion rewrite + everything left.
 
 ## Done
 
@@ -201,9 +201,14 @@ Updated: 2026-10-24 (Phase 8 complete: TUI + pairing overlay + windowless autost
       binary passed all 10 criteria (exit 0): 13 936 connects / 0 failures, 233 000 pongs in
       order (0 violations), D8 saturation teardowns ~517–559 ms across 130 cycles, dead-peer
       released at 60 s, RSS growth 5.1→9.9 MB (peak 10.5 MB) over the hour, graceful exit 0,
-      restart 2/2, peers released to 0. The **24 h run for gate S11** is the same command with
-      `--duration 86400` and needs one uninterrupted awake window (an earlier pre-harness
-      attempt died ~4.7 h on PC sleep — keep the machine awake).
+      restart 2/2, peers released to 0. The **genuine 24 h run for gate S11 PASSED
+      2026-10-24** (`--duration 86400`, window 2026-10-23T15:06Z → 2026-10-24T15:07Z,
+      `summary.json` `pass: true`, `failures: []`): 5 448 800/5 448 800 pongs in order
+      (0 violations), 0 unexpected exits, 0 connection failures, 9 unauthorized attempts
+      refused (8× 4001, 1× 429), D8 3 027 teardowns (min 513 / p50 533 / p95 1 073 /
+      max 4 336 ms, all within bound), graceful exit 0, restart 2/2, RSS 5.14 → 8.12 MB
+      (peak 11.18 MB). Artifacts `target/soak/2026-10-23T19-55Z-long-24h-restart/`.
+      The soak is gate **evidence** only — resilience lives in the production code.
 
 ### Phase map (PRD §25; Phase 3 was in memory's gate list, approved this round)
 
@@ -296,8 +301,8 @@ Updated: 2026-10-24 (Phase 8 complete: TUI + pairing overlay + windowless autost
 - No measured numbers for loaded/burst memory — **now measured** for all three shapes: RSS
   under sustained load (10.99 MB after 517 k persisted commands in 30 s, post-cap), a
   multi-connection burst (3.8 → 10.4 MB across 400 simultaneous connections), and the soak
-  trend (**1-hour run: 5.1 → 9.9 MB, peak 10.5 MB**, 13 936 connects — the full **24 h**
-  window for gate S11 is still pending one uninterrupted awake run).
+  trend (**1-hour run: 5.1 → 9.9 MB, peak 10.5 MB**, 13 936 connects — and the full
+  **24 h window PASSED 2026-10-24**: 5.14 → 8.12 MB, peak 11.18 MB over 24 h).
 - ~~Command records have no retention cap~~ — **fixed 2026-10-21** (runtime caps + batched
   eviction + in-process compaction trigger; re-measured footprint above). Residual honest
   costs: stress throughput 17.2k/s vs 19.2k uncapped (retention selection + compaction

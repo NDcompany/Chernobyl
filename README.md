@@ -190,12 +190,14 @@ packaging, windowless autostart, terminal TUI) are implemented and tested
 
 1. **Physical-device validation** — `docs/validation/PHONE-VALIDATION-CHECKLIST.md`,
    all rows NOT RUN/BLOCKED (needs a real Android phone).
-2. **24-hour soak** for the S11 release gate (`npm run soak:long -- --duration 86400`;
-   the machine must stay awake).
-3. **Independent security assessment** (S9) — automated tests + review are not a
+2. **Independent security assessment** (S9) — automated tests + review are not a
    substitute for it.
-4. **D4 / S8** — live-session revocation awaits product-owner ratification of the
+3. **D4 / S8** — live-session revocation awaits product-owner ratification of the
    ADR-014 recommendation (terminate-on-revoke via an in-process revoke path).
+
+The S11 24-hour soak **passed on 2026-10-24** (all 10 criteria, evidence in
+`docs/decisions/PHASE5-THREAT-MODEL.md` §6) — it is gate evidence, not a
+mechanism: resilience lives in the companion code, not in the harness.
 
 See `docs/decisions/PHASE5-THREAT-MODEL.md` §6 for the per-gate status and the exact
 evidence each gate is waiting on.
