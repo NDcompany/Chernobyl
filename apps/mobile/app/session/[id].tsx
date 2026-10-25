@@ -1,22 +1,35 @@
 /**
- * Session workspace — live output, file changes and activity, with the
- * prompt composer and interrupt control pinned to the bottom.
+ * Session workspace. A transcript session on a host that speaks ADR-015
+ * (`hello_ack.features` has transcript.v1) opens as the live conversation:
+ * streaming transcript, approvals inside the tool cards, follow-ups while the
+ * agent works, Stop, MCP and permission-mode chips. Every other session keeps
+ * the classic view: output, file changes and activity, with the prompt
+ * composer and interrupt control pinned to the bottom.
  */
-import { useEffect, useRef, useState } from 'react';
-import { StyleSheet, View } from 'react-native';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, Linking, Pressable, StyleSheet, Text as RNText, View } from 'react-native';
 import type { ScrollViewInstance } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Redirect, useLocalSearchParams, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { colors, spacing } from '@/theme/tokens';
+import type { Agent, Host, Session, TranscriptItem } from '@chernobyl/protocol';
+import { colors, radii, spacing, typography } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { useSnapshot } from '@/data/state';
 import { useCommands, commands } from '@/data/commands';
-import { activityFor, agentById, hostById, sessionById } from '@/data/selectors';
+import { useLiveEnabled, useLiveSession } from '@/data/live';
+import {
+  activityFor,
+  agentById,
+  hostById,
+  pendingPermissions,
+  permissionById,
+  sessionById,
+} from '@/data/selectors';
 import { relativeTime } from '@/utils/format';
 import { useReducedMotion, useNow } from '@/hooks/useReducedMotion';
 import { ProgressBar, SimulatedTag, StatusDot, StatusPill, Text } from '@/ui/primitives';
-import { Screen, PageHeader, Card, EmptyState } from '@/ui/surface';
+import { Screen, PageHeader, Card, ConfirmModal, EmptyState } from '@/ui/surface';
 import {
   ActivityRow,
   FileRow,
@@ -25,13 +38,16 @@ import {
   SegmentedTabs,
   Timeline,
 } from '@/ui/lists';
+import { McpChip, McpSheet, ModeChip, TranscriptList, type ApprovalDecision } from '@/ui/transcript';
 import { Icon } from '@/ui/icons';
 
 type TabKey = 'output' | 'files' | 'activity';
 
 export default function SessionScreen() {
   const authed = useAppStore((s) => s.authed);
-  const { id } = useLocalSearchParams<{ id: string }>();
+  // `focus`: a tool item to scroll to (Approvals tab and notification deep links)
+  const { id, focus } = useLocalSearchParams<{ id: string; focus?: string }>();
+  const liveOn = useLiveEnabled();
   const snapshot = useSnapshot();
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -82,6 +98,10 @@ export default function SessionScreen() {
         />
       </Screen>
     );
+  }
+
+  if (session.transcript && liveOn) {
+    return <ConversationScreen session={session} agent={agent} host={host} focusItemId={focus} />;
   }
 
   const busy = session.status === 'running' || session.status === 'waiting';
@@ -154,19 +174,7 @@ export default function SessionScreen() {
         </Card>
       ) : null}
 
-      {hasUnknown ? (
-        <Card style={{ borderColor: colors.warning, gap: spacing.xs }}>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
-            <StatusDot tone="warning" label="Outcome unknown" />
-            <Text variant="bodyStrong" color={colors.warning}>
-              Outcome unknown — the host may have run it
-            </Text>
-          </View>
-          <Text variant="xs" color={colors.text2}>
-            A command was sent to this session, but the acknowledgement timed out or the connection dropped.
-          </Text>
-        </Card>
-      ) : null}
+      {hasUnknown ? <UnknownOutcomeCard /> : null}
 
       <Card style={{ gap: spacing.sm }}>
         <ProgressBar value={session.progress} tone={session.status === 'completed' ? 'success' : 'dark'} />
@@ -237,9 +245,234 @@ export default function SessionScreen() {
   );
 }
 
+/** Mandate section 9: a command whose ack never came stays visibly unresolved. */
+function UnknownOutcomeCard() {
+  return (
+    <Card style={{ borderColor: colors.warning, gap: spacing.xs }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
+        <StatusDot tone="warning" label="Outcome unknown" />
+        <Text variant="bodyStrong" color={colors.warning}>
+          Outcome unknown — the host may have run it
+        </Text>
+      </View>
+      <Text variant="xs" color={colors.text2}>
+        A command was sent to this session, but the acknowledgement timed out or the connection dropped.
+      </Text>
+    </Card>
+  );
+}
+
+/** Agent links and sign-in pages open in the phone browser: http(s) only, after the UI's own confirm (T3). */
+function openExternal(url: string): void {
+  if (/^https?:\/\//i.test(url)) void Linking.openURL(url).catch(() => undefined);
+}
+
+interface ConversationProps {
+  session: Session;
+  agent?: Agent;
+  host?: Host;
+  /** deep link: the tool card to scroll to */
+  focusItemId?: string;
+}
+
+/** ADR-015 §5: the live conversation, fed by useLiveSession (same transport stream as the snapshot). */
+function ConversationScreen({ session, agent, host, focusItemId }: ConversationProps) {
+  const insets = useSafeAreaInsets();
+  const send = useCommands();
+  const snapshot = useSnapshot();
+  const now = useNow(30_000);
+  const connected = useAppStore((s) => s.connection === 'connected');
+  const commandStates = useAppStore((s) => s.commandStates);
+  const { view, error } = useLiveSession(session.id);
+  const [mcpOpen, setMcpOpen] = useState(false);
+  const [confirmEnd, setConfirmEnd] = useState(false);
+
+  const sessionId = session.id;
+  const live = agent?.live;
+  const agentName = agent?.name ?? 'Agent';
+  const items = useMemo(() => view.items.filter((i): i is TranscriptItem => i.kind !== 'unknown'), [view.items]);
+  const turns = useMemo(() => [...view.turns.values()], [view.turns]);
+  // approval buttons come only from these snapshot records, never from transcript text (T3)
+  const permissions = useMemo(
+    () => pendingPermissions(snapshot, now).filter((p) => p.sessionId === sessionId),
+    [snapshot, now, sessionId],
+  );
+  // the existing command path: ack errors toast, a lost ack becomes a visible unknown outcome
+  const onDecide = useCallback(
+    ({ permissionId, decision, revision, ...extra }: ApprovalDecision) =>
+      send(commands.approve(permissionId, decision, revision, extra)),
+    [send],
+  );
+
+  const hasUnknown = Object.values(commandStates).some(
+    (c) =>
+      c.state === 'unknown' &&
+      (c.sessionId === sessionId ||
+        (c.permissionId !== undefined && permissionById(snapshot, c.permissionId)?.sessionId === sessionId)),
+  );
+  const status = view.state.status;
+  const busy = turns.some((t) => t.status === 'running') || status === 'running' || status === 'waiting';
+  const ended = status === 'ended';
+  const canEnd = live?.end === true && !ended;
+
+  const header = (
+    <View style={styles.headerBlock}>
+      <View style={[styles.headerRow, { paddingTop: insets.top + spacing.sm }]}>
+        <PageHeader
+          dark
+          bordered={false}
+          title={session.title}
+          subtitle={`${agentName}${host ? ` · ${host.name}` : ''}`}
+          right={<StatusPill status={session.status} inverse />}
+        />
+      </View>
+      {view.mcp.length > 0 || live?.permissionModes || canEnd ? (
+        <View style={styles.chipRow}>
+          <McpChip dark servers={view.mcp} onPress={() => setMcpOpen(true)} />
+          {live?.permissionModes ? (
+            <ModeChip
+              dark
+              mode={view.state.permissionMode}
+              modes={live.permissionModes}
+              onChange={(mode) => void send(commands.setPermissionMode(sessionId, mode))}
+            />
+          ) : null}
+          <View style={styles.flex} />
+          {canEnd ? (
+            <Pressable
+              onPress={() => setConfirmEnd(true)}
+              accessibilityRole="button"
+              accessibilityLabel="End session"
+              style={({ pressed }) => [styles.endChip, pressed && styles.pressed]}
+            >
+              <Icon name="stop" size={12} color={colors.white} />
+              <RNText style={[typography.xs, styles.endText]}>End session</RNText>
+            </Pressable>
+          ) : null}
+        </View>
+      ) : null}
+    </View>
+  );
+
+  return (
+    <Screen
+      safeTop={false}
+      scroll={false}
+      header={header}
+      footer={
+        <PromptComposer
+          busy={busy}
+          promptWhileBusy={live?.promptWhileBusy}
+          disabled={hasUnknown || ended}
+          placeholder={`Message ${agentName}…`}
+          hint={
+            hasUnknown
+              ? 'Outcome unknown — the host may have run it'
+              : ended
+                ? 'This session has ended'
+                : status === 'starting'
+                  ? `Starting ${agentName}…`
+                  : undefined
+          }
+          onSubmit={(text) => void send(commands.submitPrompt(sessionId, text))}
+          onInterrupt={live?.interrupt ? () => void send(commands.interrupt(sessionId)) : undefined}
+        />
+      }
+    >
+      <StatusBar style="light" />
+
+      {/* ADR-009: a session on a demo agent/host never reads as live */}
+      {agent?.simulated || host?.simulated || hasUnknown || (!connected && view.epoch) ? (
+        <View style={styles.notes}>
+          {agent?.simulated || host?.simulated ? <SimulatedTag /> : null}
+          {!connected && view.epoch ? (
+            <Text variant="xs" color={colors.warning}>
+              Not connected: showing what arrived so far. The conversation catches up on reconnect.
+            </Text>
+          ) : null}
+          {hasUnknown ? <UnknownOutcomeCard /> : null}
+        </View>
+      ) : null}
+
+      {view.epoch ? (
+        <TranscriptList
+          items={items}
+          turns={turns}
+          permissions={permissions}
+          onDecide={onDecide}
+          onOpenLink={openExternal}
+          promptWhileBusy={live?.promptWhileBusy}
+          agentKind={agent?.kind}
+          truncatedBefore={view.truncatedBefore}
+          focusItemId={focusItemId}
+        />
+      ) : (
+        <View style={styles.loading}>
+          {error ? (
+            <Text variant="sm" color={colors.error} center accessibilityRole="alert">
+              The live conversation is unavailable: {error}
+            </Text>
+          ) : (
+            <>
+              <ActivityIndicator color={colors.black} />
+              <Text variant="sm" color={colors.text2} center>
+                {connected ? 'Loading the conversation…' : 'Waiting for the connection to your desktop…'}
+              </Text>
+            </>
+          )}
+        </View>
+      )}
+
+      <McpSheet
+        visible={mcpOpen}
+        servers={view.mcp}
+        onClose={() => setMcpOpen(false)}
+        onAuth={(server, flow) => void send(commands.mcpAuth(sessionId, server, flow))}
+        onAuthCallback={(server, url) => void send(commands.mcpAuthCallback(sessionId, server, url))}
+        onReconnect={(server) => void send(commands.mcpReconnect(sessionId, server))}
+        onOpenUrl={openExternal}
+      />
+      <ConfirmModal
+        visible={confirmEnd}
+        title="End this session?"
+        message={`${agentName} stops on your PC and this conversation takes no more prompts.`}
+        note="The conversation history stays on your PC."
+        confirmLabel="End session"
+        onConfirm={() => {
+          setConfirmEnd(false);
+          void send(commands.endSession(sessionId));
+        }}
+        onCancel={() => setConfirmEnd(false)}
+      />
+    </Screen>
+  );
+}
+
 const styles = StyleSheet.create({
+  flex: { flex: 1 },
+  pressed: { opacity: 0.7 },
   headerBlock: { backgroundColor: colors.black },
   headerRow: { paddingBottom: spacing.sm },
+  chipRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.xl,
+    paddingBottom: spacing.md,
+  },
+  endChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    minHeight: 32,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.text2,
+  },
+  endText: { color: colors.white, fontWeight: '700' },
+  notes: { gap: spacing.sm, paddingTop: spacing.md },
+  loading: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing.md },
   progressMeta: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
   permBanner: { borderColor: colors.black, gap: spacing.sm },
   permBannerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },

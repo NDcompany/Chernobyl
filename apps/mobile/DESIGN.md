@@ -49,7 +49,10 @@ system→italic), `FileRow` (+add/−del), `DetailRow`, `SegmentedTabs`.
 pure logic in `src/utils/transcript.ts`, unit-tested by `npm test -w @chernobyl/mobile`).
 `TranscriptList` (FlatList keyed by item id; footer after each ended turn; standalone approval
 cards at the end for pending requests whose tool item is not in view; sticks to the bottom while
-the user is there, else a "Jump to latest" pill; announces turn ends only, never deltas),
+the user is there, else a "Jump to latest" pill; announces turn ends only, never deltas;
+`focusItemId` = deep link: once that item is in view it scrolls its card (or the top-level card it
+is nested in, or its standalone approval) into the upper third and gives it a brief `surface2`
+halo),
 `MessageText` (markdown subset: paragraphs, headings, bold, italic, inline code, fenced code mono on
 black with sideways scroll, lists, rules; no HTML, images or remote loads; links show the full URL
 and open only after a `ConfirmModal`; streaming-safe: unclosed syntax renders as if closed and
@@ -99,10 +102,30 @@ permanently blocks the success callback.
 ## State & transport honesty
 
 Screens read state via `useSnapshot()` (`@/data/state`, TanStack Query single snapshot) and UI state
-via `useAppStore` (`@/store/appStore`). Never add a second data path. Commands go through the
-transport (commandId dedupe). **ADR-009: mock mode is permanent** — mock-host hints (e.g. the
-PromptComposer caption) and the simulation badge must stay honest; never render mock data as live,
-never remove an offline/stale state to make a screen look alive.
+via `useAppStore` (`@/store/appStore`, which also keeps `hello_ack.features`). Never add a second
+data path. The one second *reducer* is the ADR-015 live transcript store (`@/data/live`): it folds
+`transcript` / `transcript_snapshot` frames with `applyTranscript` from the **same** transport
+message stream, fed next to the snapshot reducer in `TransportProvider`; it is not a second
+connection or fetch path. Its views are memory-only (threat model T2): created when a conversation
+screen focuses, dropped when the last one blurs, never persisted. Commands go through the
+transport (commandId dedupe); `session_subscribe` / `session_unsubscribe` go straight to
+`getTransport().send()` because they must never toast. **ADR-009: mock mode is permanent** —
+mock-host hints (e.g. the PromptComposer caption, the new-task note) and the simulation badge must
+stay honest; never render mock data as live, never remove an offline/stale state to make a screen
+look alive.
+
+**Live sessions (ADR-015 §5):** the conversation view shows only for a session with
+`transcript: true` on a host that advertised `transcript.v1`; everything else keeps the classic
+screen. `useLiveSession(sessionId)` subscribes while the screen is focused and again whenever the
+transport returns to `connected` (sending the view's `epoch` and last `seq`, so the companion
+replays the gap or sends a snapshot), re-subscribes when the reducer says `resubscribe` (at most
+once a second), and unsubscribes on blur (ref-counted per session). Inline decisions, prompts, Stop,
+mode, MCP and End go through `useCommands`, so ack errors toast and a lost ack stays a visible
+unknown outcome; nothing in the conversation shows a success toast (the transcript is the outcome).
+Links and MCP sign-in pages open only http(s) URLs, through `Linking.openURL`, after the component's
+own confirm or full-URL display. The app's mock runs `MockEngine` in live mode: Claude Code's
+billing session plays one scripted transcript (thinking, plan, streamed text, an Edit diff, an
+inline `npm test` approval), badged Simulated because its agent and host are `simulated`.
 
 **Provenance travels with the data:** `Host`/`Agent` carry `simulated: true` when they come from a
 mock seed/engine (the app's offline mock or a companion's demo `mock` adapter); real adapters omit the
@@ -141,5 +164,13 @@ carry a `SimulatedTag`. Derived from the keystore pairing and store transport st
 ## Routes (`app/`)
 
 Tabs: `(tabs)/index` Home · `agents` → `agent/[id]` · `sessions` → `session/[id]` · `approvals` →
-`permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task`.
+`permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id).
 Full-screen (no gesture back): `onboarding`, `sign-in`.
+
+`session/[id]` is the live conversation (see Live sessions) or the classic workspace;
+`?focus=<toolItemId>` scrolls the conversation to that card. Requests open through
+`permissionHref` (`@/data/selectors`): the Approvals tab, Home's pending list and notification taps
+open a request from a live conversation at its card, any other request at `permission/[id]`. Local
+notifications carry that route in `data.url`; `onNotificationOpen` (`@/platform/notify`, wired in
+`TransportProvider`) opens it on tap, also when the tap launched the app, and accepts only
+`/session/…` and `/permission/…` routes.

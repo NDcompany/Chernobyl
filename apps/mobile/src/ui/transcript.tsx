@@ -62,6 +62,7 @@ import {
   modeLabel,
   parseDiff,
   parseMarkdown,
+  rowIndexFor,
   turnFooter,
   type ApprovalChoice,
   type ApprovalDecision,
@@ -958,8 +959,13 @@ export interface TranscriptListProps {
   agentKind?: AgentKind;
   /** snapshot `truncatedBefore`: older items exist only on the PC */
   truncatedBefore?: boolean;
+  /** deep link (Approvals tab, notification): scroll this item's card into view once it is there, and highlight it briefly */
+  focusItemId?: string;
   style?: StyleProp<ViewStyle>;
 }
+
+const FLASH_MS = 1600;
+const FOCUS_POSITION = 0.3; // the focused card sits in the upper third
 
 interface ItemViewProps {
   item: TranscriptItem;
@@ -1029,12 +1035,39 @@ export function TranscriptList({
   promptWhileBusy,
   agentKind,
   truncatedBefore,
+  focusItemId,
   style,
 }: TranscriptListProps) {
   const model = useMemo(() => buildTranscript(items, turns, permissions), [items, turns, permissions]);
   const listRef = useRef<FlatList<TranscriptRow>>(null);
   const atBottom = useRef(true);
   const [showJump, setShowJump] = useState(false);
+  const [flash, setFlash] = useState<string | null>(null);
+  const focused = useRef<string | undefined>(undefined);
+  const focusRetries = useRef(0);
+
+  const focusIndex = useMemo(() => (focusItemId ? rowIndexFor(model, focusItemId) : -1), [model, focusItemId]);
+  useEffect(() => {
+    if (focusIndex < 0 || focused.current === focusItemId) return;
+    focused.current = focusItemId;
+    focusRetries.current = 0;
+    atBottom.current = false; // the stick-to-bottom must not pull it away again
+    setShowJump(true);
+    setFlash(model.rows[focusIndex].key);
+    listRef.current?.scrollToIndex({ index: focusIndex, animated: true, viewPosition: FOCUS_POSITION });
+  }, [focusIndex, focusItemId, model.rows]);
+  useEffect(() => {
+    if (!flash) return;
+    const t = setTimeout(() => setFlash(null), FLASH_MS);
+    return () => clearTimeout(t);
+  }, [flash]);
+  const onScrollToIndexFailed = useCallback(({ index, averageItemLength }: { index: number; averageItemLength: number }) => {
+    // not laid out yet: jump near it, then try again (a few times at most)
+    listRef.current?.scrollToOffset({ offset: averageItemLength * index, animated: false });
+    if (focusRetries.current++ < 3) {
+      setTimeout(() => listRef.current?.scrollToIndex({ index, animated: true, viewPosition: FOCUS_POSITION }), 120);
+    }
+  }, []);
 
   const seen = useRef<Map<string, string> | null>(null);
   useEffect(() => {
@@ -1078,7 +1111,7 @@ export function TranscriptList({
     />
   );
   const renderRow = ({ item: row }: ListRenderItemInfo<TranscriptRow>) => (
-    <View style={styles.row}>
+    <View style={[styles.row, row.key === flash && styles.flash]}>
       {row.type === 'item' ? (
         renderItem(row.item)
       ) : row.type === 'footer' ? (
@@ -1094,8 +1127,10 @@ export function TranscriptList({
       <FlatList
         ref={listRef}
         data={model.rows}
+        extraData={flash}
         keyExtractor={rowKey}
         renderItem={renderRow}
+        onScrollToIndexFailed={onScrollToIndexFailed}
         onScroll={onScroll}
         scrollEventThrottle={32}
         onContentSizeChange={stick}
@@ -1207,7 +1242,7 @@ export interface McpSheetProps {
   onAuth: (server: string, flow: 'desktop' | 'phone-callback') => void;
   /** `mcp_auth_callback` with the pasted localhost URL */
   onAuthCallback: (server: string, callbackUrl: string) => void;
-  /** reconnect a failed server (no §3.2 message yet, see the report) */
+  /** `mcp_reconnect` for a failed server */
   onReconnect: (server: string) => void;
   /** opens a URL on the phone: `auth.url` of the phone flow, or the claude.ai connectors page */
   onOpenUrl: (url: string) => void;
@@ -1518,6 +1553,15 @@ const styles = StyleSheet.create({
   planBox: { borderWidth: StyleSheet.hairlineWidth, borderColor: colors.border, borderRadius: radii.sm, padding: spacing.md },
 
   row: { paddingBottom: spacing.md },
+  // a halo around the deep-linked card; the negative margins keep the layout still
+  flash: {
+    backgroundColor: colors.surface2,
+    borderRadius: radii.sm,
+    marginHorizontal: -spacing.sm,
+    paddingHorizontal: spacing.sm,
+    marginTop: -spacing.sm,
+    paddingTop: spacing.sm,
+  },
   listContent: { paddingTop: spacing.lg, paddingBottom: spacing.lg },
   jump: {
     position: 'absolute',

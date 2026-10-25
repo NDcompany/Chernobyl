@@ -712,3 +712,18 @@ export function buildTranscript(
   }
   return { rows, children, approvals, attention };
 }
+
+/**
+ * The row that shows an item (deep links): its own, its top-level card when
+ * it is nested under a Task tool, or the standalone approval of a request
+ * whose card is not in view; -1 when nothing shows it yet.
+ */
+export function rowIndexFor(model: TranscriptModel, itemId: string): number {
+  const parentOf = new Map<string, string>();
+  for (const [parent, kids] of model.children) for (const kid of kids) parentOf.set(kid.id, parent);
+  let top = itemId;
+  for (let hops = 0; parentOf.has(top) && hops < 64; hops++) top = parentOf.get(top)!;
+  return model.rows.findIndex(
+    (r) => (r.type === 'item' && r.item.id === top) || (r.type === 'approval' && r.permission.toolItemId === itemId),
+  );
+}

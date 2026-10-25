@@ -1,20 +1,28 @@
 /**
- * Connects the transport to the query cache and routes side effects
- * (local notifications, audit trail). Mounted once at the root layout.
+ * Connects the transport to the query cache and the live transcript store
+ * (one message stream, two reducers) and routes side effects (local
+ * notifications and their taps, audit trail). Mounted once at the root layout.
  */
 import { useEffect, type ReactNode } from 'react';
 import { AppState } from 'react-native';
-import { createSeedSnapshot, type ServerMessage, type Snapshot } from '@chernobyl/protocol';
+import { router } from 'expo-router';
+import {
+  FEATURE_TRANSCRIPT,
+  createSeedSnapshot,
+  type ServerMessage,
+  type Snapshot,
+} from '@chernobyl/protocol';
 import { createE2eTransport, parsePairingPayload } from '@chernobyl/e2e';
 import { getTransport, hostUrl, resetTransport, setTransport, type Transport } from './transport';
 import { createWsTransport } from './wsTransport';
 import { readHostToken, readPairing, rotatePairingPsk } from '@/platform/secure';
 import { applyMessage, queryClient, STATE_KEY } from './state';
+import { applyLiveMessage } from './live';
 import { useAppStore, type Settings } from '@/store/appStore';
-import { initNotifications, notify } from '@/platform/notify';
+import { initNotifications, notify, onNotificationOpen } from '@/platform/notify';
 import * as connectionService from '@/platform/connectionService';
 import { recordAudit } from '@/platform/storage';
-import { agentById } from './selectors';
+import { agentById, permissionHref } from './selectors';
 
 /**
  * Alerts are on: enabled in Settings, and signed in — sign-out promises the
@@ -34,16 +42,19 @@ async function handleSideEffect(msg: ServerMessage): Promise<void> {
 
   if (msg.type === 'permission_requested' && push && settings.approvalAlerts) {
     const snapshot = queryClient.getQueryData<Snapshot>(STATE_KEY);
+    const live = useAppStore.getState().features.includes(FEATURE_TRANSCRIPT);
     await notify(
       'Approval needed',
       `${agentName(snapshot, msg.permission.agentId)} wants to ${msg.permission.title.toLowerCase()}: ${msg.permission.command}`,
+      // the tap opens the conversation at its card (ADR-015 §5), else the request
+      snapshot ? permissionHref(snapshot, msg.permission, live) : `/permission/${msg.permission.id}`,
     );
     return;
   }
 
   if (msg.type === 'session_updated' && msg.session.status === 'completed') {
     if (push && settings.sessionAlerts) {
-      await notify('Session finished', msg.session.title);
+      await notify('Session finished', msg.session.title, `/session/${msg.session.id}`);
     }
     return;
   }
@@ -67,6 +78,9 @@ const EMPTY_SNAPSHOT: Snapshot = { hosts: [], agents: [], sessions: [], permissi
 export function TransportProvider({ children }: { children: ReactNode }) {
   // Rebuilt whenever the credential changes (a new pairing was saved).
   const epoch = useAppStore((s) => s.transportEpoch);
+
+  // a tapped alert opens what it is about, also when it launched the app
+  useEffect(() => onNotificationOpen((url) => router.push(url)), []);
 
   useEffect(() => {
     let disposed = false;
@@ -176,6 +190,8 @@ export function TransportProvider({ children }: { children: ReactNode }) {
       queryClient.setQueryData<Snapshot>(STATE_KEY, live ? EMPTY_SNAPSHOT : createSeedSnapshot());
       unsubMessages = active.subscribe((msg) => {
         applyMessage(msg);
+        applyLiveMessage(msg);
+        if (msg.type === 'hello_ack') useAppStore.getState().setFeatures(msg.features ?? []);
         useAppStore.getState().trackCommand(msg);
         void handleSideEffect(msg);
       });

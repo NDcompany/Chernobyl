@@ -2,6 +2,7 @@
  * ADR-015 step 1: live-session validators, golden fixtures and the transcript
  * reducer. The fixtures are the same files services/companion-rs reads with
  * include_str!, so the TS and Rust stacks agree on every shape tested here.
+ * Step 9 adds the app demo's scripted transcript (MockEngine live mode).
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -9,11 +10,14 @@ import { join } from 'node:path';
 import test from 'node:test';
 import {
   FEATURE_TRANSCRIPT,
+  MockEngine,
   applyTranscript,
   emptyTranscriptView,
   isClientMessage,
   isServerMessage,
   type LiveServerMessage,
+  type PermissionDecision,
+  type ServerMessage,
   type TranscriptOp,
   type TranscriptView,
 } from './index';
@@ -261,4 +265,77 @@ test('applyTranscript: unknown item kinds are kept but flagged', () => {
   assert.equal(unknown.kind, 'unknown');
   assert.ok(unknown.kind === 'unknown' && unknown.originalKind === 'hologram');
   assert.equal(view.items[view.index.get('x_1')!].kind, 'unknown');
+});
+
+/* ------------------------------------------------------------------ */
+/* The app's demo transcript (MockEngine live mode, ADR-009)           */
+/* ------------------------------------------------------------------ */
+
+test('mock transcript ops are valid and contiguous', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  // one tick only runs timers already due, so chained timeouts need small steps
+  const run = (ms: number) => {
+    for (let left = ms; left > 0; left -= 50) t.mock.timers.tick(50);
+  };
+  const ack = (m: ServerMessage | undefined) => (m?.type === 'ack' ? m : assert.fail(`expected an ack, got ${m?.type}`));
+  const frames: ServerMessage[] = [];
+  const engine = new MockEngine((m) => frames.push(m), { live: true });
+  t.after(() => engine.dispose());
+
+  const demo = engine.snapshot().sessions.find((s) => s.transcript);
+  assert.ok(demo, 'the demo session advertises its transcript');
+  assert.ok(engine.snapshot().agents.find((a) => a.id === demo.agentId)?.simulated, 'badged Simulated');
+  assert.equal(ack(engine.handle({ type: 'session_subscribe', commandId: 'sub-1', sessionId: demo.id })).ok, true);
+  run(30_000); // up to the inline approval
+
+  const p = engine.snapshot().permissions.find((x) => x.sessionId === demo.id && x.status === 'pending');
+  assert.ok(p?.toolItemId, 'the request names its tool card');
+  assert.deepEqual(p.options?.map((o) => o.scope), ['once', 'persistent', 'once']);
+  const decide = (commandId: string, decision: PermissionDecision, optionId?: string) =>
+    ack(engine.handle({ type: 'permission_decision', commandId, permissionId: p.id, decision, optionId, revision: p.revision }));
+  // G2: an option outside its bucket fails closed; a legacy decision never reaches the persistent grant
+  assert.equal(decide('d-0', 'approve-once', 'deny').ok, false);
+  assert.equal(decide('d-1', 'approve-session').ok, false);
+  assert.equal(decide('d-2', 'approve-once', 'allow').ok, true);
+  run(30_000); // to the end of the turn
+
+  let view = emptyTranscriptView();
+  let seq = -1;
+  const opKinds = new Set<string>();
+  for (const frame of frames) {
+    if (frame.type !== 'transcript' && frame.type !== 'transcript_snapshot') continue;
+    assert.ok(isServerMessage(JSON.parse(JSON.stringify(frame))), `${frame.type} passes the boundary validator`);
+    if (frame.type === 'transcript_snapshot') {
+      seq = frame.seq;
+    } else {
+      for (const op of frame.ops) {
+        assert.equal(op.seq, ++seq, 'contiguous seq');
+        opKinds.add(op.op === 'append' ? `append:${op.field}` : op.op);
+      }
+    }
+    const next = applyTranscript(view, frame);
+    assert.equal(next.resubscribe, false);
+    view = next.view;
+  }
+  for (const kind of ['item', 'append:text', 'append:output', 'turn', 'state']) assert.ok(opKinds.has(kind), kind);
+  for (const kind of ['user', 'thinking', 'text', 'tool', 'plan']) {
+    assert.ok(view.items.some((i) => i.kind === kind), kind);
+  }
+  assert.ok(view.items.some((i) => i.kind === 'tool' && i.tool.diffs?.length), 'a tool card carries a diff');
+  const bash = view.items[view.index.get(p.toolItemId)!];
+  assert.ok(bash.kind === 'tool' && bash.tool.status === 'completed' && bash.tool.permissionId === p.id);
+  assert.deepEqual([...view.turns.values()].map((turn) => turn.status), ['completed'], 'the turn footer');
+  assert.equal(view.state.status, 'idle');
+
+  // a reconnect with its cursor gets exactly the ops after it; a stale epoch gets a snapshot
+  frames.length = 0;
+  engine.handle({ type: 'session_subscribe', commandId: 'sub-2', sessionId: demo.id, epoch: view.epoch, afterSeq: view.seq - 3 });
+  assert.deepEqual(frames.flatMap((f): Array<number | string> => (f.type === 'transcript' ? f.ops.map((o) => o.seq) : [f.type])), [
+    view.seq - 2,
+    view.seq - 1,
+    view.seq,
+  ]);
+  frames.length = 0;
+  engine.handle({ type: 'session_subscribe', commandId: 'sub-3', sessionId: demo.id, epoch: 'stale', afterSeq: 1 });
+  assert.deepEqual(frames.map((f) => f.type), ['transcript_snapshot']);
 });

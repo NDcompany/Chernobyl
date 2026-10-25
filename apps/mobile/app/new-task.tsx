@@ -11,6 +11,7 @@ import { colors, spacing, radii } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { useSnapshot } from '@/data/state';
 import { useCommands, commands } from '@/data/commands';
+import { transportKind } from '@/data/transport';
 import { agentKindLabel } from '@/utils/format';
 import { zodHandler } from '@/forms/zodBridge';
 import { Button, Chip, SimulatedTag, StatusDot, Text, TextField } from '@/ui/primitives';
@@ -51,13 +52,22 @@ export default function NewTaskScreen() {
   const available = snapshot.agents.filter(
     (a) => a.acceptsNewSession && integrations[a.kind],
   );
-  const preselect =
-    available.find((a) => a.id === params.agent)?.id ?? available[0]?.id ?? '';
+  const preselect = available.find((a) => a.id === params.agent) ?? available[0];
 
   const form = useForm<TaskForm>({
-    defaultValues: { agentId: preselect, title: '', prompt: '', project: '' },
+    defaultValues: {
+      agentId: preselect?.id ?? '',
+      title: '',
+      prompt: '',
+      project: preselect?.live?.workspaces?.[0]?.id ?? '',
+    },
   });
   const selectedAgentId = form.watch('agentId');
+  const project = form.watch('project');
+  const selectedAgent = available.find((a) => a.id === selectedAgentId);
+  // ADR-015: a spawning runtime starts only in a workspace allow-listed on the PC;
+  // create_session.project then carries the workspace id
+  const workspaces = selectedAgent?.live?.workspaces ?? [];
 
   // Auto-navigate when reconciled on reconnect
   useEffect(() => {
@@ -108,7 +118,11 @@ export default function NewTaskScreen() {
                   key={a.id}
                   label={`${a.name} · ${agentKindLabel(a.kind)}`}
                   active={selectedAgentId === a.id}
-                  onPress={() => form.setValue('agentId', a.id, { shouldDirty: true })}
+                  onPress={() => {
+                    form.setValue('agentId', a.id, { shouldDirty: true });
+                    // a workspace id means nothing to another agent, and vice versa
+                    form.setValue('project', a.live?.workspaces?.[0]?.id ?? '');
+                  }}
                 />
               ))}
             </ScrollView>
@@ -120,22 +134,18 @@ export default function NewTaskScreen() {
           </View>
 
           <View style={styles.agentPreview}>
-            {(() => {
-              const agent = available.find((a) => a.id === selectedAgentId);
-              if (!agent) return null;
-              return (
-                <>
-                  <AgentIcon kind={agent.kind} size={36} />
-                  <View style={{ flex: 1, gap: 2 }}>
-                    <Text variant="smStrong">{agent.name}</Text>
-                    <Text variant="xs" color={colors.text2} numberOfLines={1}>
-                      {agent.capabilities.slice(0, 3).join(' · ') || agentKindLabel(agent.kind)}
-                    </Text>
-                    {agent.simulated ? <SimulatedTag /> : null}
-                  </View>
-                </>
-              );
-            })()}
+            {selectedAgent ? (
+              <>
+                <AgentIcon kind={selectedAgent.kind} size={36} />
+                <View style={{ flex: 1, gap: 2 }}>
+                  <Text variant="smStrong">{selectedAgent.name}</Text>
+                  <Text variant="xs" color={colors.text2} numberOfLines={1}>
+                    {selectedAgent.capabilities.slice(0, 3).join(' · ') || agentKindLabel(selectedAgent.kind)}
+                  </Text>
+                  {selectedAgent.simulated ? <SimulatedTag /> : null}
+                </View>
+              </>
+            ) : null}
           </View>
 
           <TextField form={form} name="title" label="Task title" placeholder="Fix flaky API tests" />
@@ -147,14 +157,40 @@ export default function NewTaskScreen() {
             multiline
             hint="This is sent to the agent immediately when the session starts"
           />
-          <TextField
-            form={form}
-            name="project"
-            label="Project (optional)"
-            placeholder="workspace/atlas"
-            hint="Working directory label for the session"
-            autoCapitalize="none"
-          />
+          {workspaces.length > 0 ? (
+            <View style={{ gap: 6 }}>
+              <Text variant="smStrong">Workspace</Text>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={{ gap: spacing.sm, paddingRight: spacing.xl }}
+              >
+                {workspaces.map((w) => (
+                  <Chip
+                    key={w.id}
+                    label={w.label}
+                    active={project === w.id}
+                    onPress={() => form.setValue('project', w.id, { shouldDirty: true })}
+                  />
+                ))}
+              </ScrollView>
+              <Text variant="mono" color={colors.text3} numberOfLines={1}>
+                {workspaces.find((w) => w.id === project)?.path ?? 'Choose a workspace'}
+              </Text>
+              <Text variant="xs" color={colors.text3}>
+                {selectedAgent?.name ?? 'The agent'} starts only in folders allow-listed on your PC.
+              </Text>
+            </View>
+          ) : (
+            <TextField
+              form={form}
+              name="project"
+              label="Project (optional)"
+              placeholder="workspace/atlas"
+              hint="Working directory label for the session"
+              autoCapitalize="none"
+            />
+          )}
 
           {isUnknown ? (
             <Card style={{ borderColor: colors.warning, gap: spacing.xs }}>
@@ -179,11 +215,14 @@ export default function NewTaskScreen() {
             accessibilityLabel="Start a new agent session"
           />
 
-          <View style={styles.note}>
-            <Text variant="xs" color={colors.text3} center>
-              Mock host — sessions are simulated. Nothing is executed on any machine.
-            </Text>
-          </View>
+          {/* ADR-009: only demo data says nothing runs; a real companion may spawn the agent */}
+          {transportKind() === 'mock' || selectedAgent?.simulated ? (
+            <View style={styles.note}>
+              <Text variant="xs" color={colors.text3} center>
+                Mock host — sessions are simulated. Nothing is executed on any machine.
+              </Text>
+            </View>
+          ) : null}
         </>
       )}
     </Screen>

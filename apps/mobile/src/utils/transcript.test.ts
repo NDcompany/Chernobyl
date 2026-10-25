@@ -19,6 +19,7 @@ import {
   parseDiff,
   parseInline,
   parseMarkdown,
+  rowIndexFor,
   turnFooter,
   type MdBlock,
 } from './transcript.ts';
@@ -349,6 +350,24 @@ test('rows: item order, turn footers, nesting, inline vs standalone approvals', 
   assert.deepEqual(m.children.get('T')?.map((c) => c.id), ['c1']);
   assert.equal(m.approvals.get('c1')?.id, 'p1');
   assert.deepEqual([...m.attention].sort(), ['T', 'c1']);
+});
+
+test('rows: the row that shows an item (Approvals and notification deep links)', () => {
+  const tool = (id: string, parentId?: string): TranscriptItem => ({
+    id,
+    ts: 0,
+    turnId: 't1',
+    parentId,
+    kind: 'tool',
+    tool: { name: 'Bash', status: 'running' },
+  });
+  const items: TranscriptItem[] = [{ id: 'u1', ts: 0, turnId: 't1', kind: 'user', text: 'go' }, tool('T'), tool('c1', 'T'), tool('g1', 'c1')];
+  const m = buildTranscript(items, [], [perm('p1', 'gone')]);
+  assert.deepEqual(m.rows.map((r) => r.key), ['u1', 'T', 'perm:p1']);
+  assert.equal(rowIndexFor(m, 'u1'), 0);
+  assert.equal(rowIndexFor(m, 'g1'), 1, 'nested work scrolls to its top-level card');
+  assert.equal(rowIndexFor(m, 'gone'), 2, 'a request whose card is not in view: its standalone card');
+  assert.equal(rowIndexFor(m, 'missing'), -1);
 });
 
 test('mode labels, MCP summary and callback precheck', () => {

@@ -1,6 +1,8 @@
 /**
  * Offline transport: runs the exact same MockEngine the host service uses,
- * in-process. The app is fully interactive with no host at all.
+ * in-process. The app is fully interactive with no host at all. Live mode
+ * adds the ADR-015 demo: Claude Code's billing session answers
+ * session_subscribe with a snapshot, then streams its scripted transcript.
  */
 import {
   MockEngine,
@@ -28,7 +30,7 @@ export function createMockTransport(): Transport {
     statusSubs.forEach((fn) => fn(s));
   };
   const emit = (m: ServerMessage) => msgSubs.forEach((fn) => fn(m));
-  const engine = new MockEngine(emit);
+  const engine = new MockEngine(emit, { live: true });
 
   const schedule = (fn: () => void) => {
     const delay = MIN_LATENCY + Math.random() * (MAX_LATENCY - MIN_LATENCY);

@@ -55,6 +55,18 @@ export function permissionById(s: Snapshot, id: string): PermissionRequest | und
   return s.permissions.find((p) => p.id === id);
 }
 
+/**
+ * Where a request opens (inbox rows, notification taps): the conversation
+ * scrolled to its tool card when it belongs to a transcript session and the
+ * host speaks FEATURE_TRANSCRIPT (`live`), else the request screen (ADR-015 §5).
+ */
+export function permissionHref(s: Snapshot, p: PermissionRequest, live: boolean): string {
+  if (live && p.toolItemId && sessionById(s, p.sessionId)?.transcript) {
+    return `/session/${p.sessionId}?focus=${encodeURIComponent(p.toolItemId)}`;
+  }
+  return `/permission/${p.id}`;
+}
+
 export function sessionsForAgent(s: Snapshot, agentId: string): Session[] {
   return s.sessions
     .filter((x) => x.agentId === agentId)

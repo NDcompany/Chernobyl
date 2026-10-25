@@ -68,6 +68,8 @@ export interface AppState {
   user: AppUser;
   settings: Settings;
   connection: ConnectionStatus;
+  /** `hello_ack.features` of the current host (e.g. FEATURE_TRANSCRIPT); not persisted. */
+  features: string[];
   /**
    * Bumped when the active transport must be rebuilt (a new pairing was
    * saved). The provider re-runs its boot effect on change; not persisted.
@@ -93,6 +95,7 @@ export interface AppState {
   addToast: (message: string, tone?: ToastTone) => void;
   dismissToast: (id: string) => void;
   setConnection: (c: ConnectionStatus) => void;
+  setFeatures: (features: string[]) => void;
   bumpTransport: () => void;
   setQuery: (key: 'homeQuery' | 'agentsQuery' | 'sessionsQuery', value: string) => void;
   setSessionFilter: (f: SessionFilter) => void;
@@ -120,6 +123,7 @@ export const useAppStore = create<AppState>()(
       user: DEFAULT_USER,
       settings: DEFAULT_SETTINGS,
       connection: 'connecting',
+      features: [],
       transportEpoch: 0,
       toasts: [],
       homeQuery: '',
@@ -141,6 +145,7 @@ export const useAppStore = create<AppState>()(
       dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 
       setConnection: (connection) => set({ connection }),
+      setFeatures: (features) => set({ features }),
 
       bumpTransport: () => set((s) => ({ transportEpoch: s.transportEpoch + 1 })),
 

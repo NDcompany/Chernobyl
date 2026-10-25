@@ -1,17 +1,21 @@
 /**
  * Approvals tab — pending requests (live expiry countdowns) on top,
- * decided ones below, dimmed, with an audit-style history feel.
+ * decided ones below, dimmed, with an audit-style history feel. An inbox:
+ * a request from a live conversation opens that conversation at its card
+ * (ADR-015 §5); any other request opens its own screen.
  */
 import { Redirect, useRouter } from 'expo-router';
 import { View } from 'react-native';
 import { colors, spacing, TAB_BAR_HEIGHT } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { useSnapshot } from '@/data/state';
+import { useLiveEnabled } from '@/data/live';
 import {
   agentById,
   decidedPermissions,
   hostById,
   pendingPermissions,
+  permissionHref,
   sessionById,
 } from '@/data/selectors';
 import { useNow } from '@/hooks/useReducedMotion';
@@ -24,6 +28,7 @@ export default function ApprovalsScreen() {
   const snapshot = useSnapshot();
   const router = useRouter();
   const now = useNow(1000);
+  const live = useLiveEnabled();
 
   if (!authed) return <Redirect href="/sign-in" />;
 
@@ -57,7 +62,7 @@ export default function ApprovalsScreen() {
               agent={agentById(snapshot, p.agentId)}
               host={hostById(snapshot, p.hostId)}
               session={sessionById(snapshot, p.sessionId)}
-              onPress={() => router.push(`/permission/${p.id}`)}
+              onPress={() => router.push(permissionHref(snapshot, p, live))}
             />
           ))}
         </View>
@@ -77,7 +82,7 @@ export default function ApprovalsScreen() {
               agent={agentById(snapshot, p.agentId)}
               host={hostById(snapshot, p.hostId)}
               session={sessionById(snapshot, p.sessionId)}
-              onPress={() => router.push(`/permission/${p.id}`)}
+              onPress={() => router.push(permissionHref(snapshot, p, live))}
             />
           ))}
           {staleCount > 0 ? (

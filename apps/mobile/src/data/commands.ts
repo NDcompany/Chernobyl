@@ -25,12 +25,15 @@ export const commands = {
     permissionId: string,
     decision: PermissionDecision,
     revision: number,
+    /** ADR-015: the chosen option, a reason the model sees, question answers */
+    extra?: { optionId?: string; message?: string; answers?: Record<string, string[]> },
   ): ClientMessage => ({
     type: 'permission_decision',
     commandId: nextId('cmd'),
     permissionId,
     decision,
     revision,
+    ...extra,
   }),
   submitPrompt: (sessionId: string, text: string): ClientMessage => ({
     type: 'submit_prompt',
@@ -50,6 +53,38 @@ export const commands = {
     title,
     prompt,
     project,
+  }),
+  /* ADR-015 live-session commands (session_subscribe/unsubscribe live in data/live.ts: they never toast) */
+  setPermissionMode: (sessionId: string, mode: 'default' | 'acceptEdits' | 'plan'): ClientMessage => ({
+    type: 'set_permission_mode',
+    commandId: nextId('cmd'),
+    sessionId,
+    mode,
+  }),
+  endSession: (sessionId: string): ClientMessage => ({
+    type: 'session_end',
+    commandId: nextId('cmd'),
+    sessionId,
+  }),
+  mcpAuth: (sessionId: string, server: string, flow: 'desktop' | 'phone-callback'): ClientMessage => ({
+    type: 'mcp_auth',
+    commandId: nextId('cmd'),
+    sessionId,
+    server,
+    flow,
+  }),
+  mcpAuthCallback: (sessionId: string, server: string, callbackUrl: string): ClientMessage => ({
+    type: 'mcp_auth_callback',
+    commandId: nextId('cmd'),
+    sessionId,
+    server,
+    callbackUrl,
+  }),
+  mcpReconnect: (sessionId: string, server: string): ClientMessage => ({
+    type: 'mcp_reconnect',
+    commandId: nextId('cmd'),
+    sessionId,
+    server,
   }),
 } as const;
 

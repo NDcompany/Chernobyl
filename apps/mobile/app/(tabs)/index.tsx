@@ -10,12 +10,14 @@ import type { Snapshot } from '@chernobyl/protocol';
 import { colors, spacing, radii, TAB_BAR_HEIGHT } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { useSnapshot } from '@/data/state';
+import { useLiveEnabled } from '@/data/live';
 import {
   activeSessions,
   agentById,
   counts,
   hostById,
   pendingPermissions,
+  permissionHref,
   recentActivity,
   searchAgents,
   searchSessions,
@@ -47,6 +49,7 @@ export default function DashboardScreen() {
   const setQuery = useAppStore((s) => s.setQuery);
   const connection = useAppStore((s) => s.connection);
   const user = useAppStore((s) => s.user);
+  const live = useLiveEnabled();
 
   const c = counts(snapshot, now);
   const pending = pendingPermissions(snapshot, now);
@@ -243,7 +246,7 @@ export default function DashboardScreen() {
                   permission={p}
                   agent={agentById(snapshot, p.agentId)}
                   host={hostById(snapshot, p.hostId)}
-                  onPress={() => router.push(`/permission/${p.id}`)}
+                  onPress={() => router.push(permissionHref(snapshot, p, live))}
                 />
               ))
             )}
