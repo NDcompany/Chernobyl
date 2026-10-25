@@ -1,18 +1,24 @@
 /**
  * Connect a host (modal) — TWO paths, honestly labeled (ADR-009):
- *  - Pair with QR: parses the host's pairing payload, stores it in the
+ *  - Pair with QR: scans or parses the host's pairing payload, stores it in the
  *    keystore and rebuilds the transport — a REAL E2E connection.
  *  - Manual form: adds a dashboard host record (prototype simulation);
  *    the token still goes to the keystore only.
  */
-import { useState } from 'react';
-import { StyleSheet, TextInput, View } from 'react-native';
+import { useRef, useState } from 'react';
+import { Platform, StyleSheet, TextInput, View } from 'react-native';
 import { Redirect, useRouter } from 'expo-router';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
+import {
+  CameraView,
+  PermissionStatus,
+  useCameraPermissions,
+  type BarcodeScanningResult,
+} from 'expo-camera';
 import { nextId, type EventEnvelope, type Host } from '@chernobyl/protocol';
 import { PairingError, parsePairingPayload, type PairingCredential } from '@chernobyl/e2e';
-import { colors, spacing } from '@/theme/tokens';
+import { colors, radii, spacing, typography } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { applyMessage } from '@/data/state';
 import { zodHandler } from '@/forms/zodBridge';
@@ -52,24 +58,67 @@ export default function ConnectHostScreen() {
     defaultValues: { name: '', address: '', token: '', kind: 'local' },
   });
   const kind = form.watch('kind');
+
   // QR pairing path (real connection): raw payload text → validated credential.
   const [qrText, setQrText] = useState('');
   const [pairing, setPairing] = useState<PairingCredential | null>(null);
   const [pairErr, setPairErr] = useState<string | null>(null);
   const [pairBusy, setPairBusy] = useState(false);
 
+  // Camera QR scanning state
+  const [scanning, setScanning] = useState(false);
+  const isScanningRef = useRef(false);
+  const [permission, requestPermission] = useCameraPermissions();
+
+  const isPermissionGranted = permission?.granted === true;
+  const isPermissionDenied = Boolean(
+    permission &&
+      !permission.granted &&
+      (permission.status === PermissionStatus.DENIED || !permission.canAskAgain),
+  );
+
   if (!authed) return <Redirect href="/sign-in" />;
 
-  const onQrChange = (text: string) => {
+  const handlePayload = (text: string): boolean => {
     setQrText(text);
     setPairing(null);
     setPairErr(null);
     const trimmed = text.trim();
-    if (!trimmed) return;
+    if (!trimmed) return false;
     try {
       setPairing(parsePairingPayload(trimmed));
+      return true;
     } catch (e) {
       setPairErr(e instanceof PairingError ? e.message : 'Not a CHERNOBYL pairing payload');
+      return false;
+    }
+  };
+
+  const openScanner = async () => {
+    setPairErr(null);
+    isScanningRef.current = false;
+    setScanning(true);
+    if (!permission?.granted && permission?.canAskAgain) {
+      await requestPermission();
+    }
+  };
+
+  const closeScanner = () => {
+    setScanning(false);
+    isScanningRef.current = false;
+  };
+
+  const onBarcodeScanned = (result: BarcodeScanningResult) => {
+    if (isScanningRef.current) return;
+    isScanningRef.current = true;
+    const ok = handlePayload(result.data);
+    if (ok) {
+      setScanning(false);
+      isScanningRef.current = false;
+    } else {
+      setTimeout(() => {
+        isScanningRef.current = false;
+      }, 1200);
     }
   };
 
@@ -143,27 +192,126 @@ export default function ConnectHostScreen() {
           <Text variant="smStrong">Pair with QR — real connection</Text>
         </View>
         <Text variant="sm" color={colors.text2}>
-          Run companion pair on the host and paste the payload it prints (a scanner lands in
-          this field too). The credential stays in the device keystore and every frame is
-          end-to-end encrypted.
+          Run companion pair on the host and scan the QR code or paste the payload it prints.
+          The credential stays in the device keystore and every frame is end-to-end encrypted.
         </Text>
-        <TextInput
-          value={qrText}
-          onChangeText={onQrChange}
-          multiline
-          autoCapitalize="none"
-          autoCorrect={false}
-          autoComplete="off"
-          placeholder={'{"v":1,"host":"…","dev":"…"}'}
-          placeholderTextColor={colors.text3}
-          style={styles.qrInput}
-          accessibilityLabel="Pairing payload from the host"
-        />
-        {pairErr ? (
-          <Text variant="xs" color={colors.error}>
-            {pairErr}
-          </Text>
+
+        {Platform.OS !== 'web' && !scanning ? (
+          <Button
+            label="Scan QR code"
+            icon="grid"
+            variant="secondary"
+            onPress={() => {
+              void openScanner();
+            }}
+            accessibilityLabel="Scan pairing QR code with camera"
+          />
         ) : null}
+
+        {scanning ? (
+          <View style={{ gap: spacing.sm }}>
+            {isPermissionGranted ? (
+              <>
+                <View
+                  style={styles.cameraContainer}
+                  accessible
+                  accessibilityLabel="Camera viewfinder. Point camera at the pairing QR code displayed by companion pair on the host"
+                >
+                  <CameraView
+                    style={StyleSheet.absoluteFill}
+                    facing="back"
+                    barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+                    onBarcodeScanned={onBarcodeScanned}
+                    onMountError={(e) => setPairErr(e.message || 'Camera failed to start')}
+                  />
+                  <View style={styles.viewfinderFrame} pointerEvents="none" />
+                </View>
+                <Text
+                  variant="xs"
+                  color={colors.text2}
+                  center
+                >
+                  Point camera at the QR code displayed by companion pair on the host
+                </Text>
+                {pairErr ? (
+                  <Text variant="xs" color={colors.error} center accessibilityRole="alert">
+                    {pairErr} — point at code again to retry
+                  </Text>
+                ) : null}
+                <Button
+                  label="Close scanner"
+                  icon="x"
+                  variant="secondary"
+                  onPress={closeScanner}
+                  accessibilityLabel="Close QR camera scanner"
+                />
+              </>
+            ) : isPermissionDenied ? (
+              <View style={styles.permissionBox}>
+                <Icon name="lock" size={24} color={colors.error} />
+                <Text variant="smStrong" color={colors.error} center>
+                  Camera access denied
+                </Text>
+                <Text variant="sm" color={colors.text2} center>
+                  Camera permission was denied. You can enable it in device settings, or paste the pairing payload below instead.
+                </Text>
+                <Button
+                  label="Use paste instead"
+                  variant="secondary"
+                  onPress={closeScanner}
+                  accessibilityLabel="Close camera scanner and return to paste field"
+                />
+              </View>
+            ) : (
+              <View style={styles.permissionBox}>
+                <Icon name="eye" size={24} color={colors.text2} />
+                <Text variant="smStrong" center>
+                  Camera permission required
+                </Text>
+                <Text variant="sm" color={colors.text2} center>
+                  Camera permission has not been granted yet. Allow camera access to scan the host pairing QR code.
+                </Text>
+                <Button
+                  label="Grant camera permission"
+                  variant="primary"
+                  onPress={() => {
+                    void requestPermission();
+                  }}
+                  accessibilityLabel="Grant camera permission"
+                />
+                <Button
+                  label="Cancel"
+                  variant="ghost"
+                  onPress={closeScanner}
+                  accessibilityLabel="Cancel camera scan and return to paste field"
+                />
+              </View>
+            )}
+          </View>
+        ) : (
+          <>
+            <TextInput
+              value={qrText}
+              onChangeText={(text) => {
+                handlePayload(text);
+              }}
+              multiline
+              autoCapitalize="none"
+              autoCorrect={false}
+              autoComplete="off"
+              placeholder={'{"v":1,"host":"…","dev":"…"}'}
+              placeholderTextColor={colors.text3}
+              style={styles.qrInput}
+              accessibilityLabel="Pairing payload from the host"
+            />
+            {pairErr ? (
+              <Text variant="xs" color={colors.error} accessibilityRole="alert">
+                {pairErr}
+              </Text>
+            ) : null}
+          </>
+        )}
+
         {pairing ? (
           <View style={{ gap: 2 }}>
             <Text variant="xs" color={colors.text2}>
@@ -235,12 +383,37 @@ const styles = StyleSheet.create({
   qrInput: {
     borderWidth: 1,
     borderColor: colors.border,
-    borderRadius: 8,
+    borderRadius: radii.sm,
     padding: spacing.sm,
     minHeight: 88,
     textAlignVertical: 'top',
-    fontFamily: 'monospace',
-    fontSize: 12,
+    fontFamily: typography.mono.fontFamily,
+    fontSize: typography.xs.fontSize,
     color: colors.text,
+  },
+  cameraContainer: {
+    height: 260,
+    width: '100%',
+    borderRadius: radii.md,
+    overflow: 'hidden',
+    backgroundColor: colors.black,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  viewfinderFrame: {
+    width: 180,
+    height: 180,
+    borderWidth: 1,
+    borderColor: colors.white,
+    borderRadius: radii.sm,
+  },
+  permissionBox: {
+    padding: spacing.lg,
+    borderRadius: radii.md,
+    backgroundColor: colors.surface2,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: 'center',
+    gap: spacing.sm,
   },
 });

@@ -88,5 +88,5 @@ never remove an offline/stale state to make a screen look alive.
 ## Routes (`app/`)
 
 Tabs: `(tabs)/index` Home · `agents` → `agent/[id]` · `sessions` → `session/[id]` · `approvals` →
-`permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host`, `new-task`.
+`permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task`.
 Full-screen (no gesture back): `onboarding`, `sign-in`.
