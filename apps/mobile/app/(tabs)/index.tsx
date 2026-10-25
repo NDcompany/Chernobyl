@@ -22,7 +22,7 @@ import {
   sessionById,
 } from '@/data/selectors';
 import { useNow } from '@/hooks/useReducedMotion';
-import { relativeTime } from '@/utils/format';
+import { relativeTime, transportStatusLabel, transportTone } from '@/utils/format';
 import { Button, SearchField, SectionTitle, StatCard, StatusDot, Text } from '@/ui/primitives';
 import { Screen } from '@/ui/surface';
 import { AgentCard, ActivityRow, PermissionCard, SessionRow } from '@/ui/lists';
@@ -58,16 +58,15 @@ export default function DashboardScreen() {
   const foundAgents = searching ? searchAgents(snapshot, query) : [];
   const foundSessions = searching ? searchSessions(snapshot, query, 'all') : [];
 
+  // every transport state gets its own truthful label: a denied credential
+  // must never read as "Connecting…" (section 9)
   const connectionLabel =
     connection === 'connected'
       ? `${c.hosts} host${c.hosts === 1 ? '' : 's'} online`
-      : connection === 'reconnecting'
-        ? 'Reconnecting…'
-        : connection === 'offline'
-          ? 'Offline'
-          : 'Connecting…';
-  const connectionTone =
-    connection === 'connected' ? 'success' : connection === 'reconnecting' ? 'warning' : 'neutral';
+      : connection === 'denied'
+        ? 'Access denied — re-pair this phone'
+        : transportStatusLabel(connection);
+  const connectionTone = transportTone(connection);
 
   const header = (
     <View style={styles.headerBlock}>
