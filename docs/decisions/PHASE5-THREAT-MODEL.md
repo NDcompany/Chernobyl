@@ -142,3 +142,26 @@ Status: ✅ passed **with cited evidence** · ⛔ not passed · ⏳ deferred to 
 ## 7. Explicitly not done by this document
 
 No code changed by this file (documentation only): TLS not implemented, E2E handshake wire format untouched, no endpoint advertised, no remote access added, no non-loopback listener exposed, no gate flipped without evidence, phase map and TODO phase list untouched. (The phase did change code — D1/D2/D6 policies in `d12bf9e`, soak harness in `032257d` — with both suites green at each commit per S12.)
+
+## 7. Reassessment 2026-10-25 (late): independent review + first device run
+
+- **Independent adversarial review** (`docs/security/INDEPENDENT-REVIEW-2026-10-25.md`):
+  95 agents and 22 upheld findings, all fixed. Material changes to this model:
+  - The handshake now binds a client nonce into both proofs and the session keys, so a
+    replayed server transcript neither authenticates an impostor nor repeats AEAD
+    key+nonce pairs (§3.2's replay claim now holds in both directions).
+  - Engine events never reach a sessionless connection at remote posture or during a
+    handshake.
+  - The loopback control routes (`/pairing/offer`, `/devices/revoke`) need the per-install
+    control key, so other local accounts and processes cannot mint a PSK.
+  - The daemon is the journal's single writer.
+- **D1 allow-list** (first emulator run): React Native's Android WebSocket adds a default
+  `Origin`, so the phone was refused like a browser. The companion now accepts exactly one
+  Origin, `chernobyl://app` (`APP_ORIGIN`), which the app sends explicitly. Browsers cannot
+  forge Origin and always send their real `http(s)` origin or `null`, all still refused, so
+  CSWSH and DNS rebinding stay closed. Test: `ws_upgrade_with_origin_header_is_refused_403`.
+- **Release builds allow cleartext `ws://`** (`expo-build-properties`). This is consistent
+  with ADR-011: the transport is untrusted and every frame after `hs_ok` is AEAD-sealed at the
+  app layer.
+- **S4:** emulator rows RUN (see the checklist); a physical phone is still owed. **S9:** agent
+  review done; a human audit is still owed before a public release.

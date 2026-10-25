@@ -17,6 +17,28 @@ server + pairing/E2E layer + adapters + loopback diagnostics.
 cargo build --release --manifest-path services/companion-rs/Cargo.toml
 ```
 
+### The Android app (APK)
+
+You need JDK 17 (`JAVA_HOME`) and the Android SDK (`ANDROID_HOME`) with platform 36,
+build-tools 36.0.0, NDK 27.1.12297006 and CMake 3.31.6 (`sdkmanager "cmake;3.31.6"`).
+On Windows, React Native's native build has object paths longer than 260 characters.
+Long paths must be enabled (`LongPathsEnabled=1`), and only the ninja that ships with
+CMake 3.31 or later handles them. The script selects that CMake for you.
+
+```powershell
+node scripts/build-android.mjs                 # arm64-v8a + x86_64
+node scripts/build-android.mjs --abi x86_64    # emulator only
+```
+
+It compiles the shared packages, runs `expo prebuild` if `apps/mobile/android` is missing,
+then builds the release APK into `apps/mobile/dist-android/`, where `package-release` hashes
+it. The APK is signed with the debug keystore from Expo's template. It installs on any
+device (`adb install -r …`), but it is not a Play Store identity.
+
+To test on an emulator, `scripts/device/validate.mjs` runs the phone checklist against the
+APK and a real companion. It pairs, connects, restarts things, revokes the device and saves
+evidence. The emulator reaches the PC's loopback as `10.0.2.2`.
+
 ## Publish checksums (maintainer)
 
 ```powershell

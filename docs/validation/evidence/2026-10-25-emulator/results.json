@@ -1,0 +1,53 @@
+{
+  "1.1": {
+    "pass": true,
+    "observed": "home: 2 hosts online; companion clients=1; device 3e77d39e500be2b9 registered=true",
+    "at": "2026-10-25T17:27:56.362Z"
+  },
+  "6.2": {
+    "pass": true,
+    "observed": "reconnected without re-pairing in 5 s",
+    "at": "2026-10-25T17:28:03.096Z"
+  },
+  "6.1": {
+    "pass": true,
+    "observed": "showed Reconnecting=true; back online in 3 s=true",
+    "at": "2026-10-25T17:28:10.372Z"
+  },
+  "5.1": {
+    "pass": true,
+    "observed": "Reconnecting while offline=true; reconnected 14 s after network returned=true",
+    "at": "2026-10-25T17:28:59.286Z"
+  },
+  "8.5": {
+    "pass": true,
+    "observed": "foreground service running=true; notification=\"Background connection | • \"; companion clients before/after 2 min in background = 1/1",
+    "at": "2026-10-25T17:31:09.223Z"
+  },
+  "7.1": {
+    "pass": true,
+    "observed": "revoke: revoked device 3e77d39e500be2b9 via running companion (terminated 1 live session(s)); app: Access denied — re-pair this phone; service still running=false",
+    "at": "2026-10-25T17:31:17.269Z"
+  },
+  "7.2": {
+    "pass": true,
+    "observed": "5 cold launches all show Access denied=true; crash buffer has a fatal/startForeground crash=false",
+    "at": "2026-10-25T17:31:41.711Z"
+  },
+  "8.1": {
+    "pass": true,
+    "observed": "status with no companion: Connecting…; UI navigable=true",
+    "at": "2026-10-25T17:32:33.825Z"
+  },
+  "1.3": {
+    "pass": true,
+    "observed": "wrong/missing token -> app: Access denied; companion log 4001 mentions over 10 s: 0",
+    "at": "2026-10-25T17:32:54.657Z"
+  },
+  "1.1-camera": {
+    "pass": false,
+    "partial": true,
+    "observed": "Scan QR opens the camera after the runtime permission grant and renders a live preview (1.1cam-scanned.png). Decoding was NOT verified: the emulator virtual-scene poster carrying a fresh pairing QR could not be brought into the camera view (two 360-degree sweeps, eye level and looking down). The scan feeds the same parse/confirm path the paste rows passed; QR decoding itself is ML Kit. Needs a physical phone.",
+    "at": "2026-10-25T17:44:28.691Z"
+  }
+}

@@ -1,58 +1,50 @@
 # Phase 9 — production release gate
 
-**PRD:** §25 Phase 9, §26 Definition of Done. **Assessed:** 2026-10-25 at the commit that adds or
-last updates this file. Every row says what was run and what it showed. A row is ✅ only with
-evidence, ⛔ when an external condition blocks it, and ⚠️ when it is partly met.
+**PRD:** §25 Phase 9, §26 Definition of Done. **Assessed:** 2026-10-25 (late) at the commit
+that last updates this file. Every row says what was run and what it showed. A row is ✅ only
+with evidence, ⛔ when an external condition blocks it, and ⚠️ when it is partly met.
 
 ## Verdict
 
-**Not releasable to the public yet.** The code-side gates pass. Three items need conditions
-this machine does not have: an Android device or SDK, an independent security reviewer, and
-a code-signing certificate (decided as "unsigned + checksums", ADR-007). Private use on your
-own desktop and phone is supported once the device rows below have been run.
+**Ready for private use; a public release still needs three external things:** one run of
+the checklist on a physical Android phone (real camera, radio and OEM battery policy), a human
+third-party security audit, and the signing decisions (debug-signed APK, unsigned Windows exe
+with published checksums, ADR-007).
+
+Everything a machine without a phone can prove has been proven. The release APK runs on an
+Android 15 emulator against the real companion and passes 14 checklist rows. An independent
+adversarial review by 95 agents found 22 issues; all are fixed.
 
 | # | PRD Phase 9 requirement | Status | Evidence |
 |---|---|---|---|
-| 1 | Security tests pass | ✅ | `npm run verify:rust`: the Rust suite covers the crypto known-answer tests (RFC 4231/5869/8439), the E2E adversarial matrix (replay, tamper, desync, bad proof, expired/spent QR, revoked device, live revocation 4003) and golden sealed frames at n=0/1 pinned in both languages. `@chernobyl/e2e`: 35/35. Interop against the real binary (`npm run verify:e2e`): 19/19. See "Final verification run" below for the counts. |
-| 2 | Real end-to-end test passes | ⚠️ | Companion ↔ real OpenCode 1.19.4: PASS (`docs/validation/PHASE3-LIVE-OPENCODE-E2E.md`). Phone client ↔ real companion over real sockets: PASS (interop, Node runtime of the same `@chernobyl/e2e` package the app ships). **Not run:** the app on a physical phone (`PHONE-VALIDATION-CHECKLIST.md`, gate S4, no Android device or SDK). |
-| 3 | Installers work on the supported platforms | ⚠️ | Windows: `node scripts/package-release.mjs` builds the release exe and `release/SHA256SUMS.txt`, and `--verify` re-hashes it (ADR-007, unsigned by decision, SmartScreen guidance in `docs/INSTALL.md`). Autostart install/uninstall verified live. **Android APK:** not buildable here (no Android SDK); `expo export --platform android` passes as the bundle check. |
-| 4 | Account deletion and revocation work | ✅ | There are no accounts (ADR-002). Revocation: `--revoke` reaches the running companion and closes the device's live session with 4003; after a restart it is still refused (interop scenario 7, `revocation_route_terminates_live_session_…`). Phone side: Settings → Security → *Unpair this host* deletes the pairing key and token from the keystore. |
-| 5 | Privacy and retention policies are published | ✅ | `docs/PRIVACY.md`. Every store has a bound: commands 5 000, events 5 000 / 7 days, audit 1 000 (desktop and phone), journal compaction at 64 MB, HTTP bodies 16 MiB, SSE lines 1 MiB. |
-| 6 | Backup restore is tested | ✅ | `backup::round_trip_restores_original_bytes`, `backup::tampered_backup_is_refused` (SHA-256 sidecar). Live CLI round trip in the final run below. |
-| 7 | No production credentials are committed | ✅ | Full `git log --all -p` scan for API keys, tokens, private keys and `HOST_TOKEN=` values: no hits (2026-10-25). The token is env-only; PSKs are DPAPI-protected at rest. |
-| 8 | Supported integrations have documented versions and capabilities | ✅ | `docs/INTEGRATIONS.md` plus the live `GET /adapters` route. |
-| 9 | No unimplemented mock feature is advertised as real | ✅ | ADR-009 Simulation badge on every data screen in mock mode; the fake "Sign In" was replaced by *Pair with a host* / *Explore the demo (Simulation)* (C14); "Sign out on all devices", which did nothing remote, was removed; uncertain command outcomes show as unknown, never as done. |
+| 1 | Security tests pass | ✅ | `npm run verify:rust`: crypto known-answer tests (RFC 4231/5869/8439), the E2E adversarial matrix (replay, tamper, desync, bad proof, expired/spent QR, revoked device, live revocation 4003, replayed server transcript with a fresh client nonce) and golden sealed frames at n=0/1 pinned in both languages. `@chernobyl/e2e` 37/37; interop with the real binary 19/19. Independent review: `docs/security/INDEPENDENT-REVIEW-2026-10-25.md` |
+| 2 | Real end-to-end test passes | ✅ (emulator) / ⚠️ (phone) | Release APK on an Android 15 emulator against the real companion: pairing, E2E handshake, live snapshot, restart recovery, network loss, background service, live revoke and token refusal all pass (`PHONE-VALIDATION-CHECKLIST.md`, `evidence/2026-10-25-emulator/`). Companion with real OpenCode 1.19.4: PASS. **Not yet on a physical phone;** camera QR decoding is unverified |
+| 3 | Installers work on the supported platforms | ✅ / ⚠️ | Windows: release exe plus `release/SHA256SUMS.txt`, `--verify` (ADR-007). Android: `node scripts/build-android.mjs` builds the release APK (arm64-v8a + x86_64), which installs and runs on the emulator. It is debug-signed (installable, not a Play identity) |
+| 4 | Account deletion and revocation work | ✅ | No accounts (ADR-002). `--revoke` closes the live session (4003); on the emulator the app went to "Access denied" and its background service stopped (row 7.1); 5 relaunches with the revoked pairing stayed denied without a crash (row 7.2). Phone: Settings → Security → *Unpair this host* |
+| 5 | Privacy and retention policies are published | ✅ | `docs/PRIVACY.md`; every store is bounded |
+| 6 | Backup restore is tested | ✅ | backup tests; live CLI round trip with an identical SHA-256; `--restore` keeps revocations and refuses while a companion runs |
+| 7 | No production credentials are committed | ✅ | Full `git log --all -p` scan, no hits |
+| 8 | Supported integrations have documented versions and capabilities | ✅ | `docs/INTEGRATIONS.md` and `GET /adapters` |
+| 9 | No unimplemented mock feature is advertised as real | ✅ | Demo data carries `simulated` end to end: on a real paired phone the companion's demo adapter shows the Simulation badge and "Simulated" tags (`evidence/2026-10-25-emulator/1.1-home.png`). The fake sign-in is gone; a live host never starts with demo data; uncertain outcomes show as unknown |
 
 ## Security gates carried from the threat model
 
-S1–S3, S5–S7, S10–S12 passed with cited evidence (`docs/decisions/PHASE5-THREAT-MODEL.md` §6).
-**S8 (live revocation)** is now implemented and tested (D4, ADR-014 accepted 2026-10-25).
-**S4** (physical device) and **S9** (independent security audit) remain ⛔ on external
-conditions. D9 was decided 2026-10-25 (option B: beyond loopback the state snapshot is
-session-only).
+S1–S3, S5–S8, S10–S12 passed with cited evidence (`docs/decisions/PHASE5-THREAT-MODEL.md` §6;
+S8 = live revocation, D4). **S4** (device validation): the emulator run is complete; one
+physical phone is still owed. **S9** (independent audit): the adversarial agent review is done
+and all its findings are fixed; a human third-party audit is still owed before a public release.
 
 ## What a release still needs
 
-1. Run `PHONE-VALIDATION-CHECKLIST.md` rows 1.2, 1.3, 4.1, 5.1, 6.1, 6.2 and 8.1 on a real
-   Android phone, including a camera QR scan.
-2. Build and install a signed or development APK (needs the Android SDK).
-3. An independent review of the E2E layer (`e2e.rs`, `crypto.rs`, `packages/e2e`). The package
-   is kept audit-ready: threat model, ADRs 011–014, golden vectors.
-4. Build the Android foreground service (`apps/mobile/modules/connection-service`, ADR-011 §4)
-   and run checklist rows 8.5 and 8.6. It keeps the WebSocket alive in the background; its Kotlin
-   compiles, but no APK with it has been built yet. Google Play also needs a declaration for its
-   `specialUse` type.
+1. Run `node scripts/device/validate.mjs` (or the checklist by hand) on one physical Android
+   phone, including a real camera scan of a pairing QR and an approval arriving as a
+   notification while backgrounded.
+2. A human third-party review of the E2E layer (`e2e.rs`, `crypto.rs`, `server.rs` handshake,
+   `packages/e2e`). Hand over `docs/security/INDEPENDENT-REVIEW-2026-10-25.md`, the threat
+   model, ADR-011 to ADR-014 and the golden vectors.
+3. Signing: a release keystore for the APK (and a Play `specialUse` foreground-service
+   declaration if it ever ships on Play); Windows code signing stays an ADR-007 decision.
 
 ## Final verification run
 
-Run on 2026-10-25 against the tree that adds this file:
-
-| Suite | Result |
-|---|---|
-| `npm run verify` (typecheck, lint, TS tests, builds incl. Android export) | exit 0. Tests: domain 13/13, host 22/22, adapter-sdk 9/9, e2e 35/35. Lint: 0 errors, 2 pre-existing warnings (RHF `watch`) |
-| `npm run verify:rust` | Rust 219 unit + 4 CLI + 5 lifecycle integration, 0 failed (4 + 1 ignored microbench/live tests); clippy `-D warnings` clean; fmt clean; `--self-test` ALL CHECKS PASSED |
-| `npm run verify:e2e` (Node client vs real binary) | 19/19 PASS, including live revoke → 4003 |
-| `npm run soak:smoke` | 10/10 criteria, `pass: true` (the 24 h S11 run passed 2026-10-24 on `f47c4f6`; later transport changes have smoke evidence, not a new 24 h run) |
-| `node scripts/package-release.mjs` + `--verify` | fresh release build (687 KB), `SHA256SUMS.txt` written and verified |
-| Live CLI on the release exe | `--pair` against the running companion: "pairing offer created via running companion"; `/health` shows `connectionsActive` / `connectionsRejected`; `--backup` → `--restore` round trip with an identical SHA-256 |
-| `git diff --check` | clean |
+Filled in by the final pass.

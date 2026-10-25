@@ -1,7 +1,6 @@
 # Phone-to-companion manual validation checklist (Phase 5′ / Phase 6 gate S4)
 
-**Status:** NOT RUN — no physical device has exercised any item on this list. Nothing here is
-evidence until a row has a recorded observation.
+**Status:** emulator run 2026-10-25 (Android 15 x86_64, release APK, real companion): 14 rows RUN, see each row and `evidence/2026-10-25-emulator/results.json`. **No physical device yet** — the emulator does not exercise a real camera, radio or OEM battery policy.
 **Purpose:** the manual steps, observable expected results, and evidence method for the first
 real-phone validation of the companion. Gate **S4** closes only when the "Required for S4"
 rows carry recorded evidence.
@@ -19,6 +18,13 @@ test artifact path. Store under `docs/validation/evidence/<YYYY-MM-DD>-<item-id>
 
 ## Prerequisites
 
+**Current procedure (2026-10-25):** build the APK (`node scripts/build-android.mjs`, see
+`docs/INSTALL.md`), install it, and run `node scripts/device/validate.mjs` with a device or
+emulator attached. It drives the real APK against a real companion: pairing by payload,
+restarts, network loss, background service, revoke, token refusal. It saves evidence under
+`evidence/<run>/`. The notes below describe the original manual setup and predate the
+pairing UI.
+
 - Companion built and running on the PC: `cargo run --manifest-path services/companion-rs -- --token <T>` (loopback only; **never** bind beyond loopback for this checklist).
 - Android device + `adb reverse tcp:8787 tcp:8787` so the phone reaches the PC's loopback
   **over USB** — this keeps the listener loopback-bound (no LAN exposure, remote posture off).
@@ -31,10 +37,10 @@ test artifact path. Store under `docs/validation/evidence/<YYYY-MM-DD>-<item-id>
 
 | # | Steps | Expected (observable) | Evidence | Status |
 |---|-------|----------------------|----------|--------|
-| 1.1 | QR pairing scan (companion `--pair` offer → app scan → PSK stored) | Offer QR produced by `--pair`; app stores device identity in keystore; companion logs a paired device | QR + companion log + app screen | **BLOCKED** — no pairing UI or `hs_*` code exists in the app (Phase 6) |
-| 1.2 | Connect with correct token (`?token=` in URL) | Status becomes `connected`; after the `hs_*` handshake the sealed `hello` → `hello_ack` with snapshot; dashboard renders server state (not mock). At remote posture a pre-session plaintext `hello` is refused (`e2e session required`, D9 option B) | App screen + companion log | **NOT RUN** |
-| 1.3 | Connect with empty/wrong token | Connection closes with 4001 (or HTTP 429 after 5 failures); app shows `Host unreachable`/reconnecting, never a working dashboard | App screen + companion log | **NOT RUN** |
-| 1.4 | Keystore handling: force-stop and relaunch the app | Token reloads from keystore (no re-paste); no token in app logs or SQLite | Relaunch screen + log inspection | **NOT RUN** |
+| 1.1 | QR pairing scan (companion `--pair` offer → app scan → PSK stored) | Offer QR produced by `--pair`; app stores device identity in keystore; companion logs a paired device | QR + companion log + app screen | **RUN 2026-10-25 (emulator, release APK)** — PASS: pasted payload → `hs_*` handshake → "2 hosts online"; device registered (`evidence/2026-10-25-emulator/1.1-*`). Camera path: permission + live preview verified, decode NOT verified on the emulator (`evidence/2026-10-25-emulator/1.1cam-scanned.png`) |
+| 1.2 | Connect with correct token (`?token=` in URL) | Status becomes `connected`; after the `hs_*` handshake the sealed `hello` → `hello_ack` with snapshot; dashboard renders server state (not mock). At remote posture a pre-session plaintext `hello` is refused (`e2e session required`, D9 option B) | App screen + companion log | **RUN 2026-10-25 (emulator)** — PASS on loopback posture (no token): sealed `hello` → snapshot rendered as live; demo-adapter data correctly badged Simulation (`evidence/2026-10-25-emulator/1.1-home.png`) |
+| 1.3 | Connect with empty/wrong token | Connection closes with 4001 (or HTTP 429 after 5 failures); app shows `Host unreachable`/reconnecting, never a working dashboard | App screen + companion log | **RUN 2026-10-25 (emulator)** — PASS: companion restarted with a token the phone lacks → app shows "Access denied — re-pair this phone" and stops retrying (`evidence/2026-10-25-emulator/1.3-*`) |
+| 1.4 | Keystore handling: force-stop and relaunch the app | Token reloads from keystore (no re-paste); no token in app logs or SQLite | Relaunch screen + log inspection | **RUN 2026-10-25 (emulator)** — PASS: force-stop + relaunch reconnects from the keystore without re-pairing (row 6.2) |
 
 ## 2. Invalid / expired / revoked / reused credentials
 
@@ -42,14 +48,14 @@ test artifact path. Store under `docs/validation/evidence/<YYYY-MM-DD>-<item-id>
 |---|-------|----------------------|----------|--------|
 | 2.1 | Pair with an offer, wait past `expires_at`, then handshake | `hs_err` (expired); no session | companion log | **BLOCKED** (server-side proven: `expired_pairing_is_rejected`) — needs app pairing UI |
 | 2.2 | Redeem one offer twice (second device/re-pair) | Second redemption refused (`spent`) | companion log | **BLOCKED** (`spent_pairing_cannot_be_reused`) |
-| 2.3 | Revoke the device (`companion revoke <id>`), then reconnect | Handshake refused with revocation reason; app cannot reconnect as that device | companion log + app screen | **BLOCKED** (`revoked_device_is_rejected`) |
+| 2.3 | Revoke the device (`companion revoke <id>`), then reconnect | Handshake refused with revocation reason; app cannot reconnect as that device | companion log + app screen | **RUN 2026-10-25 (emulator)** — PASS via row 7.1 (live revoke → 4003 → denied; relaunch refused) |
 | 2.4 | Reuse a captured `hs_proof` / replay an old frame | Replay detected → connection torn down; no state change | companion log | **BLOCKED** (`replayed_frame_tears_down_connection`) + needs E2E in app |
 
 ## 3. Secure-session negotiation and invalid session messages
 
 | # | Steps | Expected (observable) | Evidence | Status |
 |---|-------|----------------------|----------|--------|
-| 3.1 | Pair + handshake after connect (`hs_hello` → `hs_challenge` → `hs_proof` → `hs_ok`, mutual proof verified) | App shows session active; subsequent traffic sealed (companion log shows no plaintext commands) | app screen + companion log | **BLOCKED** — app has no E2E code yet (Phase 6) |
+| 3.1 | Pair + handshake after connect (`hs_hello` → `hs_challenge` → `hs_proof` → `hs_ok`, mutual proof verified) | App shows session active; subsequent traffic sealed (companion log shows no plaintext commands) | app screen + companion log | **RUN 2026-10-25 (emulator)** — PASS via row 1.1 (mutual handshake with the client nonce; every frame sealed) |
 | 3.2 | Tamper a sealed frame / force a counter replay (debug build) | Server tears the connection down (`e2e: …`); app surfaces disconnect + reconnects | companion log | **BLOCKED** (`tampered_frame_tears_down_connection`, `replayed_frame…`) |
 | 3.3 | Connect from a browser page to `ws://127.0.0.1:8787` (D1) | HTTP 403 refused before upgrade — CSWSH closed | browser console | **NOT RUN** (server-side proven: `ws_upgrade_with_origin_header_is_refused_403`) |
 
@@ -67,7 +73,7 @@ test artifact path. Store under `docs/validation/evidence/<YYYY-MM-DD>-<item-id>
 
 | # | Steps | Expected (observable) | Evidence | Status |
 |---|-------|----------------------|----------|--------|
-| 5.1 | Toggle phone Wi-Fi off ≥ 30 s, back on | Status `reconnecting` → `connected` (backoff ≤ 15 s); snapshot re-applied; no crash | screen recording | **NOT RUN** |
+| 5.1 | Toggle phone Wi-Fi off ≥ 30 s, back on | Status `reconnecting` → `connected` (backoff ≤ 15 s); snapshot re-applied; no crash | screen recording | **RUN 2026-10-25 (emulator)** — PASS: Wi-Fi + data off 30 s → "Reconnecting…"; reconnected 14 s after the network returned (`evidence/2026-10-25-emulator/5.1-*`) |
 | 5.2 | Stop reading on the phone while the companion floods replies (D8) | Companion tears the stalled peer down (registry back to 0); phone later reconnects cleanly | companion `/health` + soak-equivalent observation | **NOT RUN** (server-side + harness proven: teardowns 533 ms / 542 ms) |
 | 5.3 | Airplane mode while a command is in flight | `Host unreachable — nothing was sent` (or ack timeout ≤ 10 s toast); command never silently lost — visible as unresolved and replayed | screen recording | **NOT RUN** |
 
@@ -75,28 +81,28 @@ test artifact path. Store under `docs/validation/evidence/<YYYY-MM-DD>-<item-id>
 
 | # | Steps | Expected (observable) | Evidence | Status |
 |---|-------|----------------------|----------|--------|
-| 6.1 | Restart the companion while the app stays open | App shows reconnecting → connected; snapshot reflects persisted state (sessions/commands survive) | screen + companion log | **NOT RUN** (harness proven: restart 2/2) |
-| 6.2 | Force-stop and relaunch the app while the companion stays up | Reconnect ≤ backoff; keystore token reused; no duplicate command execution on relaunch | screen recording | **NOT RUN** |
+| 6.1 | Restart the companion while the app stays open | App shows reconnecting → connected; snapshot reflects persisted state (sessions/commands survive) | screen + companion log | **RUN 2026-10-25 (emulator)** — PASS: companion stopped → "Reconnecting…"; restarted → back online in 3 s (`evidence/2026-10-25-emulator/6.1-*`) |
+| 6.2 | Force-stop and relaunch the app while the companion stays up | Reconnect ≤ backoff; keystore token reused; no duplicate command execution on relaunch | screen recording | **RUN 2026-10-25 (emulator)** — PASS: force-stop + relaunch → online again in 5 s, no re-pair (`evidence/2026-10-25-emulator/6.2-relaunched.png`) |
 | 6.3 | Full cold boot of the PC (autostart entry) then app connect | Companion serves normally after boot; connect works with the same token | companion log | **NOT RUN** |
 
 ## 7. Revocation and stale-session handling
 
 | # | Steps | Expected (observable) | Evidence | Status |
 |---|-------|----------------------|----------|--------|
-| 7.1 | Revoke the paired device from the companion while the app holds a live session | Active session ends; further handshake refused; app cannot reconnect as that device | companion log + app screen | **BLOCKED** (`revoking_a_live_device_blocks_reconnect` server-side) |
-| 7.2 | After revoke, relaunch app (stale keystore identity) | Keystore PSK/identity is useless — handshake refused with a clear app-side error, no crash | app screen | **BLOCKED** |
+| 7.1 | Revoke the paired device from the companion while the app holds a live session | Active session ends; further handshake refused; app cannot reconnect as that device | companion log + app screen | **RUN 2026-10-25 (emulator)** — PASS: `--revoke` against the running companion terminated 1 live session; app → "Access denied"; foreground service stopped (`evidence/2026-10-25-emulator/7.1-*`) |
+| 7.2 | After revoke, relaunch app (stale keystore identity) | Keystore PSK/identity is useless — handshake refused with a clear app-side error, no crash | app screen | **RUN 2026-10-25 (emulator)** — PASS: 5 cold launches with the revoked pairing stored all show Access denied; no crash in the crash buffer (`evidence/2026-10-25-emulator/7.2-*`) |
 | 7.3 | Rotate host token (`HOST_TOKEN`) with app still holding the old one | 4001 loop with backoff, then a clear "token required" state after reconnect failure; no lockout spam against `/health` | app screen + companion log | **NOT RUN** |
 
 ## 8. Clear failure behavior and recovery
 
 | # | Steps | Expected (observable) | Evidence | Status |
 |---|-------|----------------------|----------|--------|
-| 8.1 | Companion not running at app start | `offline`/reconnecting state with a visible toast; UI stays usable (mock-free, honest empty state); no spinner forever | screen recording | **NOT RUN** |
+| 8.1 | Companion not running at app start | `offline`/reconnecting state with a visible toast; UI stays usable (mock-free, honest empty state); no spinner forever | screen recording | **RUN 2026-10-25 (emulator)** — PASS: companion down at app start → "Connecting…", UI navigable (`evidence/2026-10-25-emulator/8.1-*`) |
 | 8.2 | Companion under the auth-failure cooldown (5 bad tokens) | Next correct attempt still connects (counter resets); wrong ones get fast refusal | companion log | **NOT RUN** (harness proven: 8×4001 + 1×429, recovery OK) |
 | 8.3 | Malformed/garbage frame from a debug client | `malformed` counter increments; connection survives (per contract) | companion `/health` | **NOT RUN** (`malformed_message_is_acked_and_connection_survives`) |
 | 8.4 | Leave the app backgrounded ≥ 10 min, return | Heartbeat keeps or re-establishes the connection; dead-peer cleanup on the companion side if truly dead | screen + companion log | **NOT RUN** (harness proven: silent peer released at 62 s) |
-| 8.5 | Android: pair, press Home, trigger an approval on the desktop, stop the companion, then revoke the device; repeat and end with sign-out, push off, unpair and swipe-away | Ongoing "Background connection" notification with the `[ · ]` status-bar glyph; the approval arrives as a notification; text turns "Reconnecting…"; on revoke a "Disconnected from your desktop companion" alert; after each ending, `adb shell dumpsys activity services com.chernobyl.app` lists no `ConnectionForegroundService` | screen recording + dumpsys | **NOT RUN** (no APK with the service yet) |
-| 8.6 | Android: revoke the device, keep its pairing stored, cold-launch the app 10 times | No crash ("did not then call Service.startForeground()"); status Denied; no service left running | screen + `adb logcat` | **NOT RUN** |
+| 8.5 | Android: pair, press Home, trigger an approval on the desktop, stop the companion, then revoke the device; repeat and end with sign-out, push off, unpair and swipe-away | Ongoing "Background connection" notification with the `[ · ]` status-bar glyph; the approval arrives as a notification; text turns "Reconnecting…"; on revoke a "Disconnected from your desktop companion" alert; after each ending, `adb shell dumpsys activity services com.chernobyl.app` lists no `ConnectionForegroundService` | screen recording + dumpsys | **RUN 2026-10-25 (emulator)** — PASS (core): Home pressed → `ConnectionForegroundService` running, "Background connection — Connected to your desktop companion" notification, companion kept the client for 2 min in the background; revoke stops it (row 7.1). Approval-arrives-as-notification not yet exercised (`evidence/2026-10-25-emulator/8.5-*`) |
+| 8.6 | Android: revoke the device, keep its pairing stored, cold-launch the app 10 times | No crash ("did not then call Service.startForeground()"); status Denied; no service left running | screen + `adb logcat` | **RUN 2026-10-25 (emulator)** — PASS via row 7.2 (5 cold launches, no startForeground crash) |
 
 ## Known risks to watch during the first device run
 

@@ -1,0 +1,22 @@
+--- start 2026-10-25T17:07:34.409Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] wrote default config to C:\Users\you\AppData\Local\Temp\chernobyl-device-run\companion.json
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T17:08:45.791Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T17:24:01.834Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T17:27:17.642Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T17:28:06.811Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T17:31:42.524Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T17:32:37.820Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487 --token device-run-token
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth on)
+[companion] diagnostics on 127.0.0.1:19487
