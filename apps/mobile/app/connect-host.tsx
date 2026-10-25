@@ -148,7 +148,9 @@ export default function ConnectHostScreen() {
     useAppStore.getState().bumpTransport();
     useAppStore.getState().addToast('Paired — reconnecting', 'success');
     setPairBusy(false);
-    router.back();
+    // always land on home: after a deep link (system camera, shared link) a
+    // plain back() went to a stale screen or out of the app
+    router.replace('/');
   };
 
   const submit = zodHandler(hostSchema, form, (data) => {

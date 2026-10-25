@@ -85,7 +85,8 @@ async function freshPair(row, { token } = {}) {
   launch();
   await untilScreen(/Skip onboarding/);
   await a.tap('Skip onboarding');
-  await a.tap('Pair with a host');
+  await a.waitFor('Pair with a host');
+  // the pairing deep link opens the confirm step straight from the entry screen
   const { payload } = c.pair(comp);
   deviceId = JSON.parse(payload).dev;
   lastPayload = payload;
@@ -471,8 +472,19 @@ async function ensurePaired(row) {
   if (!t) throw new Error('phone not connected');
   await a.tap('Home').catch(() => {});
 }
+/** Finds an element below the fold by swiping the screen up (uiautomator
+ *  only lists on-screen views), then back to the top afterwards. */
+async function scrollTo(match, swipes = 6) {
+  for (let i = 0; i <= swipes; i++) {
+    const n = a.find(match);
+    if (n) return n;
+    a.shell('input swipe 360 1250 360 450 250');
+    await a.sleep(700);
+  }
+  throw new Error(`not found after scrolling: ${match}`);
+}
 async function newTask(title, message, { doubleTap = false, expectNavigate = true, afterTap } = {}) {
-  await a.tap('Start a new task');
+  await a.tap(await scrollTo('Start a new task'));
   await a.waitFor('Start session', 15_000);
   await a.tap('Fix flaky API tests');
   a.type(title);
