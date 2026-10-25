@@ -8,6 +8,8 @@
 //! model-runtime adapter), claude (Phase 7 hook ingress), companion
 //! (orchestration), server (WS/HTTP), client (test client), tui (Phase 8
 //! terminal UI), ffi (Windows console/memory).
+//! runtime_io: ADR-015 child process IO, env scrub, redaction, desktop
+//! opener and OAuth callback check.
 
 pub mod adapters;
 pub mod backup;
@@ -26,6 +28,7 @@ pub mod opencode;
 pub mod pairing;
 pub mod protocol;
 pub mod qr;
+pub mod runtime_io;
 pub mod seed;
 pub mod server;
 pub mod sha1;
