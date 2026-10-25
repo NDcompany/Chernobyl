@@ -54,3 +54,5 @@ The long-lived query token remains the production connection-admission credentia
   superseded by this re-scheduling.
 - When the web-app milestone lands, ADR-006's ticket flow is implemented there and
   this interim statement is retired.
+
+**Addendum 2026-10-25 (D9, option B):** the read side now matches this ADR's wording. Beyond loopback a token-only client gets admission, `ping` and counters-only `/health`; a pre-session `hello` is refused without a snapshot. State is readable only inside a live E2E session (threat model §5 D9).

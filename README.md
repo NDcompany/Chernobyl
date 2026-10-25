@@ -100,7 +100,8 @@ protocol-v2 the mobile app already emits:
 - **Version gate** — a `hello` with a mismatched `PROTOCOL_VERSION` is rejected and
   closed `4002`.
 - **Resume** — every `hello` returns a full snapshot, so a reconnecting client never
-  has to guess what it missed.
+  has to guess what it missed. Beyond loopback the snapshot is session-only: a
+  `hello` before the E2E handshake is refused (D9).
 - **Liveness** — server-side heartbeats; dead peers are torn down after 3 missed beats.
 - **Dedupe** — a replayed `commandId` returns `duplicate: true` instead of running twice.
 - **Pairing + E2E session (ADR-002/006/011)** — `--pair` prints a single-use, 5-minute

@@ -1347,6 +1347,15 @@ fn serve_ws(
                     break Ok(());
                 }
                 let reply: Option<ServerMsg> = match &msg {
+                    // D9 (option B, 2026-10-25): beyond loopback the state
+                    // snapshot is session-only. A pre-session hello still
+                    // passes the version gate above but gets no snapshot —
+                    // over an untrusted transport (ADR-011) a token-only
+                    // hello would hand hosts, prompts and commands to any
+                    // passive observer of the token-carrying URL.
+                    ClientMsg::Hello { .. } if require_e2e && !outbound.has_session() => Some(
+                        ServerMsg::ack_err("hello", "e2e session required (remote posture)"),
+                    ),
                     ClientMsg::Hello { .. } => Some(ServerMsg::HelloAck {
                         protocol: PROTOCOL_VERSION,
                         server_time: crate::protocol::now_ms(),
@@ -1832,13 +1841,15 @@ mod e2e_tests {
     fn remote_posture_gates_commands_until_the_session_is_handshaken() {
         let f = fixture_remote("d2-enforce");
         let mut c = connect_remote(&f);
-        // pre-session: version gate and liveness still work
+        // pre-session: liveness works; hello passes the version gate but
+        // returns no snapshot (D9 option B) — state is session-only
         c.send_text(&format!(
             r#"{{"type":"hello","clientId":"d2","protocol":{PROTOCOL_VERSION}}}"#
         ))
         .unwrap();
         let ack = c.next_text().unwrap();
-        assert!(ack.contains("hello_ack"), "got: {ack}");
+        assert!(ack.contains("e2e session required"), "got: {ack}");
+        assert!(!ack.contains("snapshot"), "no pre-session state: {ack}");
         c.send_text(r#"{"type":"ping","commandId":"d2-ping"}"#)
             .unwrap();
         assert!(c.next_text().unwrap().contains("pong"));
@@ -1858,6 +1869,16 @@ mod e2e_tests {
             .unwrap();
         let reply = sess.open(&c.next_text().unwrap()).unwrap();
         assert!(reply.contains("\"state\""), "got: {reply}");
+        // and the sealed hello now returns the full snapshot
+        c.send_text(&sess.seal(&format!(
+            r#"{{"type":"hello","clientId":"d2","protocol":{PROTOCOL_VERSION}}}"#
+        )))
+        .unwrap();
+        let hello = sess.open(&c.next_text().unwrap()).unwrap();
+        assert!(
+            hello.contains("hello_ack") && hello.contains("snapshot"),
+            "got: {hello}"
+        );
         shutdown(f);
     }
 

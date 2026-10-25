@@ -32,7 +32,7 @@ test artifact path. Store under `docs/validation/evidence/<YYYY-MM-DD>-<item-id>
 | # | Steps | Expected (observable) | Evidence | Status |
 |---|-------|----------------------|----------|--------|
 | 1.1 | QR pairing scan (companion `--pair` offer → app scan → PSK stored) | Offer QR produced by `--pair`; app stores device identity in keystore; companion logs a paired device | QR + companion log + app screen | **BLOCKED** — no pairing UI or `hs_*` code exists in the app (Phase 6) |
-| 1.2 | Connect with correct token (`?token=` in URL) | Status becomes `connected`; `hello` → `hello_ack` with snapshot; dashboard renders server state (not mock) | App screen + companion log | **NOT RUN** — note: at remote posture the pre-session `hello` snapshot exposure vs ADR-013 is tracked as decision **D9** (`PHASE5-THREAT-MODEL.md` §3.10/§5), awaiting owner ratification |
+| 1.2 | Connect with correct token (`?token=` in URL) | Status becomes `connected`; after the `hs_*` handshake the sealed `hello` → `hello_ack` with snapshot; dashboard renders server state (not mock). At remote posture a pre-session plaintext `hello` is refused (`e2e session required`, D9 option B) | App screen + companion log | **NOT RUN** |
 | 1.3 | Connect with empty/wrong token | Connection closes with 4001 (or HTTP 429 after 5 failures); app shows `Host unreachable`/reconnecting, never a working dashboard | App screen + companion log | **NOT RUN** |
 | 1.4 | Keystore handling: force-stop and relaunch the app | Token reloads from keystore (no re-paste); no token in app logs or SQLite | Relaunch screen + log inspection | **NOT RUN** |
 

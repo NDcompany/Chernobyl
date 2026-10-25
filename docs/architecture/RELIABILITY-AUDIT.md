@@ -110,7 +110,9 @@ production behavior. Status is updated once the fix lands (§12 verification per
 - **Regression layer:** `transport.test.ts` — delay falls inside `[base, jittered cap]`,
   attempts reset after a stable connection; Rust side asserted by a pure backoff helper test.
 
-### P6 — Shutdown never joins connection threads; the TUI's disconnect tears down the daemon (§8) · Status: open — fix next
+### P6 — Shutdown never joins connection threads; the TUI's disconnect tears down the daemon (§8) · Status: fixed (`74fd902`)
+
+- **Fix:** `ServerHandle` tracks connection threads; `stop()` shuts every live socket down and joins within 5 s, returning whether it finished; `companion.shutdown(graceful)` writes "shut down gracefully" only then, otherwise "N connection(s) still active". Connections see shutdown through a 250 ms idle `peek` poll (Windows does not wake a blocked `recv` when a cloned handle is shut down); `FrameReader` retries timeouts mid-frame so a slow frame is never split. Tests: `ordered_shutdown_joins_live_ws_and_graceful_line_is_last`, `a_frame_slower_than_the_idle_poll_is_not_split`.
 
 - **Where:** `server.rs:194-199` collects only the accept and scheduler threads, so
   `ServerHandle::stop()` (`server.rs:82-87`) returns while `conn`/`ws-writer` threads may
@@ -132,7 +134,9 @@ production behavior. Status is updated once the fix lands (§12 verification per
 - **Regression layer:** shutdown test asserting no post-shutdown appends (audit line order);
   TUI-level test that a disconnect does not stop the server.
 
-### P7 — No bound on concurrent connections (§2) · Status: documented, owner-facing
+### P7 — No bound on concurrent connections (§2) · Status: fixed (`74fd902`; numbers chosen under the owner's delegation 2026-10-25)
+
+- **Fix:** caps per listener, main 1024 (above the 400-connection burst test) and diagnostics 64; excess accepts are closed immediately; `connectionsActive` / `connectionsRejected` on `/health` and `/metrics`; spawn failures count as rejections.
 
 - **Where:** `server.rs:213-221` — one thread per accepted connection, no cap, and spawn
   failures are dropped with `let _ =`.
@@ -145,7 +149,9 @@ production behavior. Status is updated once the fix lands (§12 verification per
   capacity decision, and the thread-per-connection model is ADR-010's. Recorded here as an
   accepted, documented risk instead of a silent change.
 
-### P8 — TUI state is truthful but availability-coupled (§9) · Status: covered by P6
+### P8 — TUI state is truthful but availability-coupled (§9) · Status: fixed (`74fd902`)
+
+- **Fix:** a TUI socket error shows "disconnected from companion — reconnecting (attempt N)" and retries with 250 ms → 5 s backoff; only quit or Ctrl-C returns, so a flaky socket no longer ends the daemon.
 
 - **Where:** `tui.rs:611-616` sets `state.msg = "disconnected from companion"` then ends
   the loop; `main.rs:240-253` shuts the daemon down. **No fake success exists** (§9 is
@@ -154,7 +160,9 @@ production behavior. Status is updated once the fix lands (§12 verification per
 - **Required behavior:** truthful state (present) + no daemon teardown caused solely by a
   client-side read error (fixed with P6).
 
-### P9 — Storage outcome errors are discarded at one call site (§5) · Status: open — fix next
+### P9 — Storage outcome errors are discarded at one call site (§5) · Status: fixed (`74fd902`)
+
+- **Fix:** the failed append is logged with the commandId and counted (`outcomeWriteFailures` on `/health` and `/metrics`); test `outcome_write_failure_increments_counter_and_surfaces_in_health_and_metrics` injects the failure.
 
 - **Where:** `companion.rs:394` — `let _ = store.update_command_outcome(...)`.
 - **Failure scenario:** if that append fails, `append` latches `failed = true`
@@ -213,8 +221,15 @@ production behavior. Status is updated once the fix lands (§12 verification per
 
 ## 4. What was deliberately *not* decided here
 
-- **D4 / ADR-014 (live-session revocation), D9 (pre-session Hello snapshot), ticket
-  migration, crypto policy** — owner decisions, untouched.
-- **P4 code change (fsync-per-append) and P7's connection cap number** — capacity/durability
-  trade-offs for the owner; documented above rather than changed silently.
+- **Ticket migration, crypto policy** — owner decisions, untouched. (D4 and D9 were decided
+  2026-10-25 under the owner's delegation — see ADR-014 and threat model §5.)
+- **P4 code change (fsync-per-append)** — a durability/throughput trade-off, deliberately not
+  made. (P7's cap was set 2026-10-25 under the owner's delegation.)
 - **Harness changes** — none; the soak stays a dev/CI tool (`tools/soak.mjs` untouched).
+
+## 5. Additional findings during the fix round (2026-10-25)
+
+- **E2E nonce layout mismatch (critical, fixed `986f4e9`).** The TS client put the counter in nonce bytes 4–11, the Rust server in bytes 0–7. They agree only at counter 0, so every paired phone session died on its second sealed frame, and the 1 s reconnect plus a single-sample interop check hid it. Golden frames at n=1 are now pinned in both suites, and the interop churn check counts every status change.
+- **Duplicate socket on `connect()` during backoff (fixed `46bfa9f`).** The superseded retry timer opened a second socket and orphaned the first.
+- **Close 4001/4002 not terminal (fixed `3f0968d`).** The transport retried a bad token or protocol mismatch forever.
+- **Unbounded audit trails (fixed).** Desktop journal audit records and the phone's decision table now keep the newest 1000.
