@@ -492,6 +492,7 @@ impl Companion {
             .filter(|c| c.status == "unresolved")
             .count();
         let storage_failed = store.is_failed();
+        let journal_corrupt = store.corrupt_events;
         drop(store);
         let clients = self.shared.clients.lock().unwrap().len();
         let sat = &self.shared.saturation;
@@ -519,6 +520,12 @@ impl Companion {
                 ),
             ),
             ("storageFailed", crate::json::Json::Bool(storage_failed)),
+            // journal integrity (mandate §5): mid-file corruption latches a
+            // counter instead of truncating silently (a torn tail stays 0)
+            (
+                "journalCorrupt",
+                crate::json::Json::Int(journal_corrupt as i64),
+            ),
             // outbound saturation (mandate §4): production overload is
             // described by counters, never inferred from dropped clients
             (

@@ -15,7 +15,7 @@ use crate::json::{self, Json};
 use crate::protocol::now_ms;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: i64 = 1;
@@ -111,6 +111,24 @@ pub struct Storage {
     /// Latched after any write failure: the store refuses further writes and
     /// the companion fails closed (PRD §19.4).
     failed: bool,
+    /// Latched count of mid-file corruption events seen at boot (0 = clean).
+    /// A torn tail does NOT count: nothing follows it, so no record is lost
+    /// (the documented ADR-010 policy). Mandate §5: corruption is never
+    /// silent when records are actually discarded.
+    pub corrupt_events: u64,
+    /// Details of the corruption event(s) for `/health` consumers and the
+    /// audit record `open` writes after truncation.
+    pub corrupt: Option<CorruptLoss>,
+}
+
+/// Where the journal was corrupt and what the truncation discarded
+/// (mandate §5): byte offset of the corrupt line, its 1-based line number,
+/// and how many bytes — including the corrupt line itself — were dropped.
+#[derive(Clone, Copy, Debug)]
+pub struct CorruptLoss {
+    pub line: u64,
+    pub offset: u64,
+    pub discarded_bytes: u64,
 }
 
 fn record_line(kind: &str, body: &Json) -> String {
@@ -162,6 +180,8 @@ impl Storage {
             bytes_since_compact: 0,
             compact_trigger: JOURNAL_COMPACT_TRIGGER_BYTES,
             failed: false,
+            corrupt_events: 0,
+            corrupt: None,
         };
 
         // Load, then truncate any torn tail so future appends stay aligned.
@@ -177,6 +197,19 @@ impl Storage {
                 .map_err(|e| format!("reopen for truncate: {e}"))?;
             f.set_len(valid_bytes)
                 .map_err(|e| format!("truncate torn tail: {e}"))?;
+        }
+
+        // Mid-file corruption (mandate §5): `load` logged it to stderr and
+        // latched it; now that the file is truncated, record the loss in the
+        // audit log so the discarding is visible in the durable trail too.
+        if let Some(loss) = store.corrupt {
+            store.append_audit(
+                "storage",
+                &format!(
+                    "journal corrupt at line {}, byte offset {}: {} bytes discarded (truncated per ADR-010)",
+                    loss.line, loss.offset, loss.discarded_bytes
+                ),
+            )?;
         }
 
         // first compaction trigger must consider the whole file, not only
@@ -263,6 +296,7 @@ impl Storage {
         let mut reader = BufReader::new(file);
         let mut line = String::new();
         let mut valid_bytes = 0u64;
+        let mut line_no = 0u64;
         loop {
             line.clear();
             let n = reader
@@ -271,6 +305,7 @@ impl Storage {
             if n == 0 {
                 break;
             }
+            line_no += 1;
             let Some(text) = line.strip_suffix('\n') else {
                 // torn tail: last line has no newline terminator
                 break;
@@ -281,7 +316,28 @@ impl Storage {
                     valid_bytes += n as u64;
                 }
                 Err(_) => {
-                    // mid-file corruption or torn write — stop here, truncate
+                    // Corrupt line. If nothing follows it, this is the torn
+                    // tail ADR-010 documents (no record lost — stay quiet).
+                    // Valid bytes AFTER it mean real loss, which mandate §5
+                    // forbids hiding: log offset + line to stderr, latch the
+                    // counter, and `open` writes the audit record once the
+                    // truncation below has happened. The truncate-and-continue
+                    // policy itself is unchanged.
+                    let mut rest = Vec::new();
+                    // read error while probing: assume data was lost (visible)
+                    let trailing = reader.read_to_end(&mut rest).map_or(true, |b| b > 0);
+                    if trailing {
+                        let discarded = n as u64 + rest.len() as u64;
+                        self.corrupt_events += 1;
+                        self.corrupt = Some(CorruptLoss {
+                            line: line_no,
+                            offset: valid_bytes,
+                            discarded_bytes: discarded,
+                        });
+                        eprintln!(
+                            "[companion] journal corrupt at line {line_no}, byte offset {valid_bytes}: {discarded} bytes discarded (records after the corrupt line are lost; truncating per ADR-010)"
+                        );
+                    }
                     break;
                 }
             }
@@ -900,12 +956,74 @@ mod tests {
         let mut s2 = Storage::open(&dir, 500, 500).unwrap();
         assert_eq!(s2.last_seq, 1);
         assert_eq!(s2.events.len(), 1);
+        // a torn tail loses nothing after it: NOT counted as corruption
+        assert_eq!(s2.corrupt_events, 0);
+        assert!(s2.corrupt.is_none());
         // appends after recovery stay valid
         s2.append_event("e3", "{}", 2).unwrap();
         drop(s2);
         let s3 = Storage::open(&dir, 500, 500).unwrap();
         assert_eq!(s3.events.len(), 2);
         assert_eq!(s3.last_seq, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Mandate §5: mid-file corruption with valid records after it must be
+    /// visible — stderr log with offset/line, a latched counter for /health,
+    /// and an audit record — while the truncate-and-continue policy itself
+    /// (ADR-010) is unchanged. The torn-tail test above proves the silent
+    /// path stays silent only when nothing is lost.
+    #[test]
+    fn mid_file_corruption_is_latched_and_audited_not_silent() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join("companion.journal");
+        fs::create_dir_all(&dir).unwrap();
+        let event = |seq: i64| {
+            record_line(
+                "event",
+                &json::obj(vec![
+                    ("seq", Json::Int(seq)),
+                    ("eventKind", json::s("e")),
+                    ("payload", json::s("{}")),
+                    ("occurredAt", Json::Int(1)),
+                ]),
+            )
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(event(1).as_bytes());
+        bytes.extend_from_slice(event(2).as_bytes());
+        let corrupt_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"{not json at all\n");
+        bytes.extend_from_slice(event(3).as_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        let s = Storage::open(&dir, 500, 500).unwrap();
+        // records before the corrupt line survive; the valid record after it
+        // is discarded — policy unchanged (ADR-010), but now observable
+        assert_eq!(s.events.len(), 2);
+        assert_eq!(s.last_seq, 2);
+        assert_eq!(s.corrupt_events, 1);
+        let loss = s.corrupt.expect("corruption must be latched");
+        assert_eq!(loss.offset, corrupt_offset);
+        assert_eq!(loss.line, 3);
+        assert_eq!(loss.discarded_bytes, bytes.len() as u64 - corrupt_offset);
+        // the loss is in the durable audit trail, not only on stderr
+        assert!(
+            s.audit
+                .iter()
+                .any(|a| a.kind == "storage" && a.text.contains("journal corrupt at line 3"))
+        );
+        drop(s);
+
+        // next boot: garbage gone, audit record survives, counter back to 0
+        let s2 = Storage::open(&dir, 500, 500).unwrap();
+        assert_eq!(s2.corrupt_events, 0);
+        assert_eq!(s2.events.len(), 2);
+        assert!(
+            s2.audit
+                .iter()
+                .any(|a| a.kind == "storage" && a.text.contains("journal corrupt"))
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
