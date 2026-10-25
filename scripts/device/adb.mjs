@@ -13,7 +13,7 @@ export function adb(args, opts = {}) {
 export const shell = (cmd) => adb(['shell', cmd]);
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Every node of the current window: { text, desc, id, cls, clickable, x, y } (x,y = center). */
+/** Every node of the current window: { text, desc, id, cls, pkg, clickable, x, y } (x,y = center). */
 export function dump() {
   let xml = '';
   for (let i = 0; i < 3 && !xml.includes('<hierarchy'); i++) {
@@ -34,6 +34,7 @@ export function dump() {
       desc: a['content-desc'] ?? '',
       id: a['resource-id'] ?? '',
       cls: a.class ?? '',
+      pkg: a.package ?? '',
       clickable: a.clickable === 'true',
       x: (Number(b[1]) + Number(b[3])) >> 1,
       y: (Number(b[2]) + Number(b[4])) >> 1,

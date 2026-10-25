@@ -24,7 +24,7 @@ export function startCompanion({ home, port = 18787, diag = 19487, token, requir
   const fd = openSync(log, 'a');
   const child = spawn(BIN, args, { env, stdio: ['ignore', fd, fd], detached: true });
   child.unref();
-  return { child, home, port, diag, log };
+  return { child, home, port, diag, log, token };
 }
 
 export const logText = (c) => readFileSync(c.log, 'utf8');

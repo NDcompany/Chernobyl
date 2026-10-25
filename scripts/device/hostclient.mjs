@@ -22,8 +22,11 @@ export function connect(url, { headers } = {}) {
       ws,
       get closed() { return closed; },
       send: (o) => ws.send(typeof o === 'string' ? o : JSON.stringify(o)),
-      next(pred, ms = 10_000) {
-        const hit = inbox.find(pred);
+      /** First message matching `pred`, already received or arriving within
+       *  `ms`; `fresh` skips what already arrived (polling replies like `state`
+       *  carry no commandId). */
+      next(pred, ms = 10_000, fresh = false) {
+        const hit = fresh ? null : inbox.find(pred);
         if (hit) return Promise.resolve(hit);
         return new Promise((res) => {
           const w = { pred, res };

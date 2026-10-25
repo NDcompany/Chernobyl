@@ -1,25 +1,30 @@
---- start 2026-10-25T17:07:34.409Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
-[companion] wrote default config to C:\Users\you\AppData\Local\Temp\chernobyl-device-run\companion.json
-[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
-[companion] diagnostics on 127.0.0.1:19487
---- start 2026-10-25T17:08:45.791Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
-[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
-[companion] diagnostics on 127.0.0.1:19487
---- start 2026-10-25T17:24:01.834Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
-[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
-[companion] diagnostics on 127.0.0.1:19487
---- start 2026-10-25T17:27:17.642Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
-[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
-[companion] diagnostics on 127.0.0.1:19487
---- start 2026-10-25T17:28:06.811Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
-[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
-[companion] diagnostics on 127.0.0.1:19487
---- start 2026-10-25T17:31:42.524Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
-[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
-[companion] diagnostics on 127.0.0.1:19487
---- start 2026-10-25T17:32:37.820Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487 --token device-run-token
 [companion] listening on 127.0.0.1:18787 (protocol v2, token auth on)
 [companion] diagnostics on 127.0.0.1:19487
---- start 2026-10-25T18:11:24.690Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+--- start 2026-10-25T19:58:03.975Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T19:58:51.969Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T20:06:25.333Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T20:14:07.107Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T20:31:46.713Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T20:41:26.834Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+[ws] connection 1 ended: heartbeat miss limit
+--- start 2026-10-25T20:45:53.230Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T20:55:41.725Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+--- start 2026-10-25T21:03:00.602Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
 [companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
 [companion] diagnostics on 127.0.0.1:19487

@@ -31,3 +31,124 @@
 --- start 2026-10-25T18:11:24.690Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
 [companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
 [companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T19:50:25.476Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T19:58:00.803Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487 --token device-run-token
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth on)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T19:58:03.975Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T19:58:51.969Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T20:06:25.333Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T20:14:07.107Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T20:31:46.713Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T20:41:26.834Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+[ws] connection 1 ended: heartbeat miss limit
+
+--- start 2026-10-25T20:45:53.230Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T20:55:41.725Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:03:00.602Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:09:35.705Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:14:46.445Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:17:10.101Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:24:24.357Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:28:00.561Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:30:28.758Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:33:20.619Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:35:37.863Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:37:46.550Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:39:20.613Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:44:57.249Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487 --token device-run-token
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth on)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:45:53.513Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:49:12.515Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487 --token device-run-token
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth on)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:51:45.605Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487 --token device-run-token-rotated
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth on)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:56:22.533Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487 --token device-run-token
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth on)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T21:58:52.356Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T22:10:39.135Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487 --token device-run-token
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth on)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T22:13:05.941Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487 --token device-run-token-rotated
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth on)
+[companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T22:15:19.561Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487

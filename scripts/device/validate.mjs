@@ -53,13 +53,30 @@ async function home() {
   // home connection pill: "N hosts online" | Reconnecting… | Authorizing… | Access denied … | Offline
   return a.screenText();
 }
+/** A system dialog's button (runtime permission prompt, ANR "Wait"), never
+ *  one of the app's own: the conversation view has inline "Allow" approvals. */
+const systemButton = (nodes) => nodes.find((n) => n.pkg && n.pkg !== PKG && /^(Wait|Allow)$/.test(n.text));
+/** Taps a system prompt if one appears within `ms`. */
+async function allowSystemPrompt(ms) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const b = systemButton(a.dump());
+    if (b) return a.tap(b);
+    await a.sleep(500);
+  }
+}
+/** Waits for `re` in the screen text. System dialogs (the notification
+ *  permission prompt, ANR "Wait") cover the app and are dismissed on the way. */
 async function waitText(re, ms = 30_000) {
   const deadline = Date.now() + ms;
   for (;;) {
-    const t = a.screenText();
+    const nodes = a.dump();
+    const t = a.screenText(nodes);
     if (re.test(t)) return t;
     if (Date.now() > deadline) return null;
-    await a.sleep(1000);
+    const dialog = systemButton(nodes);
+    if (dialog) await a.tap(dialog);
+    else await a.sleep(1000);
   }
 }
 /** Waits for `re`, clearing SystemUI ANR and permission dialogs on the way. */
@@ -68,15 +85,15 @@ async function untilScreen(re, ms = 45_000) {
   while (Date.now() < deadline) {
     const nodes = a.dump();
     if (a.find(re, nodes)) return true;
-    const w = a.find(/^Wait$/, nodes) ?? a.find(/^Allow$/, nodes);
+    const w = systemButton(nodes);
     if (w) await a.tap(w);
     else await a.sleep(800);
   }
   throw new Error(`not on screen: ${re}`);
 }
 async function dismissSystemDialogs() {
-  for (const re of [/^Wait$/, /^Allow$/]) {
-    const n = a.find(re);
+  for (let i = 0; i < 2; i++) {
+    const n = systemButton(a.dump());
     if (n) await a.tap(n);
   }
 }
@@ -91,28 +108,26 @@ async function freshPair(row, { token } = {}) {
   deviceId = JSON.parse(payload).dev;
   lastPayload = payload;
   if (token) {
-    // the token travels in the manual form; it lands in the keystore (C14)
-    await a.tap('Studio Mac');
+    // the token travels in the manual form on the pairing screen; it lands in
+    // the keystore (C14), then the pairing link below brings the payload
+    await a.tap('Pair with a host');
+    await a.tap(await scrollTo('Studio Mac'));
     a.type('Device run PC');
     a.key('KEYCODE_BACK');
-    await a.tap('10.0.4.21:8787');
+    await a.tap(await scrollTo('10.0.4.21:8787'));
     a.type('10.0.2.2:18787');
     a.key('KEYCODE_BACK');
-    await a.tap('Paste the host token');
+    await a.tap(await scrollTo('Paste the host token'));
     a.type(token);
     a.key('KEYCODE_BACK');
-    await a.tap('Connect host');
+    await a.tap(await scrollTo('Connect host'));
     await a.sleep(2000);
-    if (!a.find('Pairing payload from the host')) {
-      a.shell('am start -a android.intent.action.VIEW -d chernobyl://connect-host');
-      await a.sleep(2500);
-    }
   }
   openPairingLink(payload);
   await a.waitFor(/Device: /, 10_000);
   shot(row, 'confirm');
   await a.tap('Pair with this host');
-  if (await a.waitFor(/^Allow$/, 8_000)) await a.tap(/^Allow$/);
+  await allowSystemPrompt(8_000);
 }
 
 const ROWS = {
@@ -275,25 +290,49 @@ const ROWS = {
     await newTask('Device run 4.3', 'Run the shell step');
     const host = await hc.connect(`ws://127.0.0.1:${comp.port}`);
     host.send({ type: 'hello', clientId: 'device-run-host', protocol: 2 });
+    // `state` replies carry no commandId: wait for the next one and look for
+    // a pending request on this row's session
     let perm = null;
     for (let i = 0; i < 30 && !perm; i++) {
       host.send({ type: 'list_state', commandId: `ls-${i}` });
-      const st = await host.next((t) => t.includes(`"ls-${i}"`) && t.includes('"state"'), 5000);
-      const p = st && JSON.parse(st).state?.permissions?.find((x) => x.status === 'pending' && /4\.3/.test(x.sessionTitle ?? '') || (x.status === 'pending' && i > 3));
-      if (p) perm = p;
-      else await a.sleep(1500);
+      const st = await host.next((t) => t.includes('"type":"state"'), 5000, true);
+      const snap = st ? JSON.parse(st).snapshot : null;
+      const sid = snap?.sessions?.find((s) => s.title === 'Device run 4.3')?.id;
+      perm = snap?.permissions?.find((x) => x.status === 'pending' && x.sessionId === sid) ?? null;
+      if (!perm) await a.sleep(1500);
     }
     if (!perm) return record('4.3', false, 'no pending permission appeared');
+    await goHome();
     await a.tap('Approvals');
     await a.sleep(1500);
     shot('4.3', 'pending-on-phone');
-    host.send({ type: 'permission_decision', commandId: 'host-approve', permissionId: perm.id, decision: 'reject', revision: perm.revision });
-    const ack = await host.next((t) => t.includes('"host-approve"'), 5000);
-    await a.sleep(2000);
+    const before = approvalsBadge();
+    // command ids are journaled across runs: a fixed id would replay an old ack
+    const run = Date.now();
+    const ask = (id, decision) => {
+      host.send({ type: 'permission_decision', commandId: `${id}-${run}`, permissionId: perm.id, decision, revision: perm.revision });
+      // the command_result event carries the same commandId: wait for the ack
+      return host.next((t) => t.includes('"type":"ack"') && t.includes(`"${id}-${run}"`), 5000).then((t) => (t ? JSON.parse(t) : null));
+    };
+    const first = await ask('host-reject', 'reject');
+    // the same (now stale) revision again, as a slower phone would send it
+    const late = await ask('late-approve', 'approve-once');
+    // the request must leave the pending section (decided ones list below "Decided")
+    let gone = false;
+    for (let i = 0; i < 10 && !gone; i++) {
+      await a.sleep(1000);
+      const nodes = a.dump();
+      const cut = nodes.findIndex((n) => n.text === 'Decided');
+      gone = !(cut >= 0 ? nodes.slice(0, cut) : nodes).some((n) => n.text === perm.command);
+    }
     shot('4.3', 'after-other-client');
-    const stillPending = a.screenText().includes(perm.command);
+    const after = approvalsBadge();
     host.close();
-    record('4.3', !!ack && JSON.parse(ack).ok === true, `host client resolved ${perm.id} (rev ${perm.revision}); phone list updated (request gone or resolved)=${!stillPending}; stale phone decisions are refused fail-closed by the server (revision rule, Rust tests)`);
+    record(
+      '4.3',
+      first?.ok === true && late?.ok === false && gone,
+      `other client rejected ${perm.id} (rev ${perm.revision}): ok=${first?.ok}; a late approve with the same revision: ok=${late?.ok} (${late?.error ?? 'no error'}); left the phone's pending list=${gone} (badge ${before} -> ${after})`,
+    );
     await a.tap('Home');
   },
   // 4.2: double-tap "Start session": exactly one execution
@@ -336,23 +375,24 @@ const ROWS = {
     await a.sleep(5000);
     const after = (await c.health(comp)).sessions;
     shot('4.4', 'after-restart');
-    record('4.4', after <= before + 1, `sessions ${before} -> ${after} (never +2); the phone kept the outcome honest`);
+    record('4.4', after <= before + 1, `sessions ${before} -> ${after} (never +2; the demo engine keeps sessions in memory, so a restart returns to its seed); the phone kept the outcome honest`);
   },
   // 2.2: the same pairing payload cannot pair a second time
   async '2.2'() {
     await start();
     await freshPair('2.2');
     await waitText(/hosts? online/, 45_000);
+    // the first session rotates the device key right after hs_ok (hs_rekey)
+    await a.sleep(3000);
     const reused = lastPayload;
     a.shell(`pm clear ${PKG}`);
     launch();
-    await a.waitFor(/Skip onboarding|^Allow$/, 30_000);
-    if (a.find(/^Allow$/)) await a.tap(/^Allow$/);
+    await untilScreen(/Skip onboarding/, 30_000);
     await a.tap('Skip onboarding');
     await a.tap('Pair with a host');
     openPairingLink(reused);
     await a.tap('Pair with this host');
-    if (await a.waitFor(/^Allow$/, 6000)) await a.tap(/^Allow$/);
+    await allowSystemPrompt(6000);
     const t = await waitText(/Access denied/, 45_000);
     shot('2.2', 'reused-offer');
     saveLog('2.2');
@@ -366,13 +406,12 @@ const ROWS = {
     await a.sleep(305_000);
     a.shell(`pm clear ${PKG}`);
     launch();
-    await a.waitFor(/Skip onboarding|^Allow$/, 30_000);
-    if (a.find(/^Allow$/)) await a.tap(/^Allow$/);
+    await untilScreen(/Skip onboarding/, 30_000);
     await a.tap('Skip onboarding');
     await a.tap('Pair with a host');
     openPairingLink(payload);
     await a.tap('Pair with this host');
-    if (await a.waitFor(/^Allow$/, 6000)) await a.tap(/^Allow$/);
+    await allowSystemPrompt(6000);
     const t = await waitText(/Access denied/, 45_000);
     shot('2.1', 'expired-offer');
     record('2.1', !!t, `offer used 5 min 5 s after creation -> ${t ? 'Access denied (expired)' : 'not denied'}`);
@@ -423,6 +462,15 @@ const ROWS = {
     good.close();
     record('8.2', !!pong, `wrong-token closes: ${codes.join(',')}; correct token afterwards answered=${!!pong}`);
   },
+  // 4.5 (host side): an unsupported protocol version is refused, then closed 4002 (D7)
+  async '4.5'() {
+    await start();
+    const cl = await hc.connect(`ws://127.0.0.1:${comp.port}`);
+    cl.send({ type: 'hello', clientId: 'old-client', protocol: 1 });
+    const reply = await cl.next((t) => t.includes('protocol mismatch'), 5000);
+    for (let i = 0; i < 20 && cl.closed == null; i++) await a.sleep(250);
+    record('4.5', !!reply && cl.closed === 4002, `hello with protocol 1 -> ${reply ? 'protocol mismatch refusal' : 'no refusal'}; close ${cl.closed}`);
+  },
   async '8.3'() {
     await start();
     const before = (await c.health(comp)).malformed;
@@ -462,15 +510,34 @@ function openPairingLink(payload) {
   a.shell(`am start -a android.intent.action.VIEW -d 'chernobyl://connect-host?payload=${encodeURIComponent(payload)}' ${PKG}`);
 }
 async function ensurePaired(row) {
-  if (!comp) await start();
+  // rows 1.3/7.3 leave a token-requiring companion behind
+  if (!comp || comp.token) {
+    await start();
+    deviceId = null;
+  }
   if (!deviceId) {
     await freshPair(row);
   } else {
     launch();
   }
+  await goHome();
   const t = await waitText(/hosts? online/, 45_000);
   if (!t) throw new Error('phone not connected');
-  await a.tap('Home').catch(() => {});
+}
+/** The pending count on the Approvals tab (the number badge above its label). */
+function approvalsBadge() {
+  const nodes = a.dump();
+  const tab = nodes.filter((n) => n.text === 'Approvals').sort((p, q) => q.y - p.y)[0];
+  if (!tab) return null;
+  const b = nodes.find((n) => /^\d+$/.test(n.text) && Math.abs(n.x - tab.x) < 80 && n.y < tab.y && n.y > tab.y - 140);
+  return b ? Number(b.text) : 0;
+}
+/** Returns to the tabs, where the connection pill lives (a previous row may
+ *  end on a pushed session screen). The root deep link does it from any
+ *  screen; Back presses raced screen transitions and closed the app. */
+async function goHome() {
+  a.shell(`am start -a android.intent.action.VIEW -d 'chernobyl:///' ${PKG}`);
+  await untilScreen(/^Home$/, 20_000);
 }
 /** Finds an element below the fold by swiping the screen up (uiautomator
  *  only lists on-screen views), then back to the top afterwards. */
@@ -499,9 +566,17 @@ async function newTask(title, message, { doubleTap = false, expectNavigate = tru
   if (expectNavigate) await a.sleep(2500);
 }
 
+// rows 5.1/5.3 switch the phone's network off; a row that fails midway must
+// not leave it off for every row after it
+const netOn = () => {
+  a.shell('svc wifi enable');
+  a.shell('svc data enable');
+};
+
 const pick = process.argv.slice(2);
 const order = pick.length ? pick : Object.keys(ROWS);
 try {
+  netOn();
   await dismissSystemDialogs();
   for (const row of order) {
     try {
@@ -509,6 +584,8 @@ try {
     } catch (e) {
       shot(row, 'error');
       record(row, false, `error: ${e.message.split('\n')[0]}`);
+    } finally {
+      netOn();
     }
   }
 } finally {

@@ -1,8 +1,8 @@
 {
   "1.1": {
     "pass": true,
-    "observed": "home: 2 hosts online; companion clients=1; device 84b546c5b97c69fd registered=true",
-    "at": "2026-10-25T18:12:09.331Z"
+    "observed": "home: 2 hosts online; companion clients=1; device 7e5f4dad37d80f87 registered=true",
+    "at": "2026-10-25T21:03:42.630Z"
   },
   "6.2": {
     "pass": true,
@@ -49,5 +49,75 @@
     "partial": true,
     "observed": "Scan QR opens the camera after the runtime permission grant and renders a live preview (1.1cam-scanned.png). Decoding was NOT verified: the emulator virtual-scene poster carrying a fresh pairing QR could not be brought into the camera view (two 360-degree sweeps, eye level and looking down). The scan feeds the same parse/confirm path the paste rows passed; QR decoding itself is ML Kit. Needs a physical phone.",
     "at": "2026-10-25T17:44:28.691Z"
+  },
+  "4.1": {
+    "pass": true,
+    "observed": "sessions 5 -> 6; live output on the session screen=true",
+    "at": "2026-10-25T21:04:36.715Z"
+  },
+  "8.5n": {
+    "pass": true,
+    "observed": "notification: Approval needed | Claude Code wants to run shell command: npm run check ",
+    "at": "2026-10-25T21:10:50.807Z"
+  },
+  "4.3": {
+    "pass": true,
+    "observed": "other client rejected p_1a174fe6daa12 (rev 1): ok=true; a late approve with the same revision: ok=false (request is no longer pending); left the phone's pending list=true (badge 4 -> 4)",
+    "at": "2026-10-25T21:37:20.611Z"
+  },
+  "4.2": {
+    "pass": true,
+    "observed": "sessions 6 -> 7 after a double tap",
+    "at": "2026-10-25T21:13:03.016Z"
+  },
+  "5.3": {
+    "pass": true,
+    "observed": "toast: Host unreachable — nothing was sent ; sessions 6 -> 6 after the network returned",
+    "at": "2026-10-25T21:27:46.119Z"
+  },
+  "4.4": {
+    "pass": true,
+    "observed": "sessions 7 -> 5 (never +2); the phone kept the outcome honest",
+    "at": "2026-10-25T21:15:53.402Z"
+  },
+  "8.2": {
+    "pass": true,
+    "observed": "wrong-token closes: 4001,4001,4001,4001,4001,429; correct token afterwards answered=true",
+    "at": "2026-10-25T19:58:03.157Z"
+  },
+  "8.3": {
+    "pass": true,
+    "observed": "malformed 0 -> 1; connection survived=true",
+    "at": "2026-10-25T19:58:04.468Z"
+  },
+  "2.2": {
+    "pass": false,
+    "observed": "second redemption of one offer -> not denied",
+    "at": "2026-10-25T21:39:19.678Z"
+  },
+  "2.1": {
+    "pass": true,
+    "observed": "offer used 5 min 5 s after creation -> Access denied (expired)",
+    "at": "2026-10-25T21:44:56.282Z"
+  },
+  "7.3": {
+    "pass": true,
+    "observed": "connected with token=true; after rotation -> Access denied; refusals logged in 15 s: 0",
+    "at": "2026-10-25T22:13:26.178Z"
+  },
+  "8.4": {
+    "pass": true,
+    "observed": "companion clients each minute in background: 1,1,1,1,1,1,1,1,1,1; foreground live=true",
+    "at": "2026-10-25T22:10:09.924Z"
+  },
+  "3.3": {
+    "pass": true,
+    "observed": "browser page result: WS-REFUSED 1006",
+    "at": "2026-10-25T21:46:41.066Z"
+  },
+  "4.5": {
+    "pass": true,
+    "observed": "hello with protocol 1 -> protocol mismatch refusal; close 4002",
+    "at": "2026-10-25T22:15:20.647Z"
   }
 }
