@@ -68,7 +68,17 @@ actions), `ModeChip` (Claude permission mode picker; `dark` variant for the blac
 add path to `PATHS`, never inline Svg in a screen.
 
 **`graphics.tsx`** — `Contours` (frame|top|bottom|ambient — decorative, clipped, never touchable,
-~0.5 opacity) and `AgentIcon` (kind). The two signature brand elements.
+~0.5 opacity) and `AgentIcon` (kind). The two signature brand elements. `LogoMark` (the owner's
+mark, one colour: `black` on light, `white` on the dark header) and `Wordmark` (mark + letterspaced
+CHERNOBYL).
+
+**Logo files** — the master is `design/Chernobyl Logo.png` (white tile, black mark). Never edit the
+derived files by hand: `node scripts/brand/make-logo-assets.mjs` regenerates all of them — the app
+icon, adaptive foreground/monochrome/background, splash, favicon, `src/ui/logoPath.ts` (the traced
+vector `LogoMark` draws), the status-bar glyph `ic_stat_chernobyl.xml`, the companion's
+`chernobyl.ico` and the `design/logo/` kit (tile, dark tile, mark, white mark; PNG + SVG). The mark
+always keeps the tile's proportion (68% of the tile) and is never recoloured beyond black/white.
+Plain-text surfaces (terminal TUI, logs) keep the `[·]` glyph as the text fallback.
 
 **`components/BottomNav.tsx`** — custom tab bar (`expo-router/js-tabs` `BottomTabBarProps`), live
 pending-permissions badge on Approvals.

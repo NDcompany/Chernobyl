@@ -11,6 +11,7 @@ import type { StyleProp, ViewStyle } from 'react-native';
 import { colors } from '@/theme/tokens';
 import type { AgentKind } from '@chernobyl/protocol';
 import { Icon, type IconName } from '@/ui/icons';
+import { LOGO_MARK_PATH } from '@/ui/logoPath';
 
 /* ------------------------------------------------------------------ */
 /* Contours                                                            */
@@ -149,23 +150,11 @@ export function BlackShape({ variant = 'header', style }: BlackShapeProps) {
 /* Wordmark + logo mark                                                 */
 /* ------------------------------------------------------------------ */
 
+/** The CHERNOBYL mark (design/Chernobyl Logo.png, traced): one colour, any size. */
 export function LogoMark({ size = 24, color = colors.black }: { size?: number; color?: string }) {
-  const u = size / 100;
-  const t = Math.max(9 * u, 1.4);
-  const arm = 30 * u;
-  const dot = 10 * u;
   return (
-    <Svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
-      {/* left bracket */}
-      <Rect x={0} y={0} width={t} height={size} fill={color} />
-      <Rect x={0} y={0} width={arm} height={t} fill={color} />
-      <Rect x={0} y={size - t} width={arm} height={t} fill={color} />
-      {/* right bracket */}
-      <Rect x={size - t} y={0} width={t} height={size} fill={color} />
-      <Rect x={size - arm} y={0} width={arm} height={t} fill={color} />
-      <Rect x={size - arm} y={size - t} width={arm} height={t} fill={color} />
-      {/* centre dot */}
-      <Rect x={(size - dot) / 2} y={(size - dot) / 2} width={dot} height={dot} fill={color} />
+    <Svg width={size} height={size} viewBox="0 0 100 100" accessible={false}>
+      <Path d={LOGO_MARK_PATH} fill={color} fillRule="evenodd" />
     </Svg>
   );
 }
@@ -177,7 +166,7 @@ export interface WordmarkProps {
   style?: StyleProp<ViewStyle>;
 }
 
-/** CHERNOBYL wordmark: bracket mark + letterspaced uppercase name. */
+/** CHERNOBYL wordmark: the mark + letterspaced uppercase name. */
 export function Wordmark({ size = 15, color = colors.black, showMark = true, style }: WordmarkProps) {
   return (
     <View style={[{ flexDirection: 'row', alignItems: 'center', gap: size * 0.55 }, style]}>

@@ -12,6 +12,10 @@ cargo build --release                 # target\release\chernobyl-companion.exe
 .\target\release\chernobyl-companion.exe --self-test # 9-check end-to-end probe
 ```
 
+The exe carries the CHERNOBYL logo as its icon: `build.rs` turns `assets/chernobyl.ico`
+(generated from `design/Chernobyl Logo.png` by `scripts/brand/make-logo-assets.mjs`) into a
+`.res` file for the MSVC linker, std-only like the rest of the crate.
+
 Flags (env in parentheses): `--config <path>` · `--port <n>` (`PORT`, 0 = ephemeral,
 default 8787) · `--bind <addr>` (default 127.0.0.1) · `--token <t>` (`HOST_TOKEN`) ·
 `--diagnostics-port <n>` (default 9487) · `--exit-after <ms>` · `--self-test` ·

@@ -20,7 +20,7 @@
     "android": {
       "package": "com.chernobyl.app",
       "adaptiveIcon": {
-        "backgroundColor": "#050505",
+        "backgroundColor": "#FFFFFF",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },

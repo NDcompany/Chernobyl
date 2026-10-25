@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="design/logo/chernobyl-tile-256.png">
+    <img src="design/logo/chernobyl-tile-dark-256.png" width="112" alt="CHERNOBYL logo">
+  </picture>
+</p>
+
 # CHERNOBYL
 
 One interface. Every agent. A mobile-first control app for AI agents: monitor hosts and
