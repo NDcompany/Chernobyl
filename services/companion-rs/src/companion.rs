@@ -16,6 +16,21 @@ use crate::server::Outbound;
 use crate::storage::{CommandRecord, Storage};
 use std::sync::{Arc, Mutex};
 
+/// Process-wide outbound saturation counters (mandate §4): the production
+/// overload story must be readable from `/health` and `/metrics` instead of
+/// inferred from client-side timing. Latched per connection — once a queue is
+/// saturated the connection is going down, so later refusals don't inflate
+/// the teardown count.
+#[derive(Default)]
+pub struct Saturation {
+    /// bulk (event fan-out) frames refused admission by the class bound
+    pub shed_bulk: std::sync::atomic::AtomicU64,
+    /// control (reply/ack) frames refused admission by the class bound
+    pub shed_ctrl: std::sync::atomic::AtomicU64,
+    /// connections torn down because an outbound bound was hit (D8)
+    pub teardowns: std::sync::atomic::AtomicU64,
+}
+
 pub struct Shared {
     pub storage: Mutex<Storage>,
     /// Outbound payload queues, one per live WS connection, keyed by a
@@ -23,6 +38,8 @@ pub struct Shared {
     /// Bounded by count and bytes (D8); a saturated queue marks its
     /// connection terminated and the broadcast drops the registration.
     pub clients: Mutex<Vec<(u64, Arc<Outbound>)>>,
+    /// Saturation counters aggregated across every connection (§4).
+    pub saturation: Arc<Saturation>,
     pub next_conn_id: std::sync::atomic::AtomicU64,
     pub adapters: Mutex<AdapterManager>,
     /// Phase 3: the attached OpenCode adapter, when configured (attach-only).
@@ -84,6 +101,7 @@ impl Companion {
         let shared = Arc::new(Shared {
             storage: Mutex::new(storage),
             clients: Mutex::new(Vec::new()),
+            saturation: Arc::new(Saturation::default()),
             next_conn_id: std::sync::atomic::AtomicU64::new(1),
             adapters: Mutex::new(AdapterManager::discover(&config.adapters)),
             opencode: Mutex::new(None),
@@ -135,9 +153,14 @@ impl Companion {
                 // from the registry; the engine is never parked by a slow
                 // client and no event is silently dropped for healthy ones.
                 // Events are sealed per connection (wire contract: from hs_ok
-                // on every frame is sealed) — enqueue_sealed seals for session
+                // on every frame is sealed) - enqueue_sealed seals for session
                 // clients and passes plaintext through for loopback parity.
-                clients.retain(|(_, q)| q.enqueue_sealed(text.clone().into_bytes()).is_ok());
+                // Classed Bulk (mandate §4): fan-out gets its own, lower bound
+                // so it can never starve reply/ack frames.
+                clients.retain(|(_, q)| {
+                    q.enqueue_sealed(text.clone().into_bytes(), crate::server::MsgClass::Bulk)
+                        .is_ok()
+                });
             }),
         );
 
@@ -471,6 +494,7 @@ impl Companion {
         let storage_failed = store.is_failed();
         drop(store);
         let clients = self.shared.clients.lock().unwrap().len();
+        let sat = &self.shared.saturation;
         crate::json::obj(vec![
             ("ok", crate::json::Json::Bool(true)),
             ("protocol", crate::json::Json::Int(PROTOCOL_VERSION as i64)),
@@ -495,6 +519,26 @@ impl Companion {
                 ),
             ),
             ("storageFailed", crate::json::Json::Bool(storage_failed)),
+            // outbound saturation (mandate §4): production overload is
+            // described by counters, never inferred from dropped clients
+            (
+                "outboundShedBulk",
+                crate::json::Json::Int(
+                    sat.shed_bulk.load(std::sync::atomic::Ordering::Relaxed) as i64
+                ),
+            ),
+            (
+                "outboundShedCtrl",
+                crate::json::Json::Int(
+                    sat.shed_ctrl.load(std::sync::atomic::Ordering::Relaxed) as i64
+                ),
+            ),
+            (
+                "outboundSatTeardowns",
+                crate::json::Json::Int(
+                    sat.teardowns.load(std::sync::atomic::Ordering::Relaxed) as i64
+                ),
+            ),
             (
                 "uptimeMs",
                 crate::json::Json::Int(now_ms() - self.shared.started_at),
@@ -527,6 +571,7 @@ impl Companion {
         drop(store);
         let clients = self.shared.clients.lock().unwrap().len();
         let auth_failures = *self.shared.auth_failures.lock().unwrap();
+        let sat = &self.shared.saturation;
         let uptime_ms = now_ms() - self.shared.started_at;
         let g = |name: &str, help: &str, kind: &str, v: i64| {
             format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}\n")
@@ -562,6 +607,24 @@ impl Companion {
             "consecutive WS auth failures since last success",
             "gauge",
             auth_failures as i64,
+        );
+        out += &g(
+            "chernobyl_outbound_shed_bulk_total",
+            "bulk (event fan-out) frames refused admission by the class bound",
+            "counter",
+            sat.shed_bulk.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        out += &g(
+            "chernobyl_outbound_shed_ctrl_total",
+            "control (reply/ack) frames refused admission by the class bound",
+            "counter",
+            sat.shed_ctrl.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        out += &g(
+            "chernobyl_outbound_saturation_teardowns_total",
+            "connections torn down because an outbound bound was hit",
+            "counter",
+            sat.teardowns.load(std::sync::atomic::Ordering::Relaxed) as i64,
         );
         out += &g(
             "chernobyl_clients",

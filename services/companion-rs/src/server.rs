@@ -26,7 +26,9 @@ pub const CLOSE_PROTOCOL_MISMATCH: u16 = 4002;
 
 const AUTH_FAILURE_LIMIT: u32 = 5;
 
-// Per-connection outbound bounds (D8). Typical event/ack frames are a few KB
+// Per-message-class outbound bounds (D8 + mandate §4): ONE FIFO, TWO admission
+// policies, so a bulk event burst can never consume the room a control frame
+// (reply, ack, refusal, close) needs. Typical event/ack frames are a few KB
 // (SessionOutput emits one line per event; hello snapshots are a few KB), while
 // a single frame may legally reach the 256 000-B codec cap (ws.rs). The count
 // bound caps per-message bookkeeping for tiny frames; the byte bound caps
@@ -38,7 +40,74 @@ const AUTH_FAILURE_LIMIT: u32 = 5;
 // 3-beat (45 s) dead-peer window.
 const OUTBOUND_QUEUE_MAX_MESSAGES: usize = 256;
 const OUTBOUND_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Bulk (event fan-out) is admitted only while its own depth and a 3 MiB
+/// shared byte budget hold: the last 64 queue slots and the last 1 MiB stay
+/// reserved for control frames. Overflowing either bound refuses admission —
+/// the connection tears down (never a silent drop; a shed event would be
+/// invisible loss because no client consumes `lastSeq` for gap detection).
+const BULK_QUEUE_MAX_MESSAGES: usize = 192;
+const BULK_QUEUE_MAX_BYTES: usize = 3 * 1024 * 1024;
+/// Channel capacity = both class caps summed: control stays admissible up to
+/// its own 256 even when bulk already holds its full 192 (reserved headroom).
+const CHANNEL_CAPACITY: usize = OUTBOUND_QUEUE_MAX_MESSAGES + BULK_QUEUE_MAX_MESSAGES;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Which admission policy a frame falls under (mandate §4: bounds and
+/// overflow policy are per message class, not one global limit).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MsgClass {
+    /// Replies, acks, refusals, handshake and side-channel frames — the
+    /// frames that keep a session honest; never shed because of bulk depth.
+    Control,
+    /// Engine event fan-out (session output, activity) — the flood source.
+    Bulk,
+}
+
+impl MsgClass {
+    fn max_messages(self) -> usize {
+        match self {
+            MsgClass::Control => OUTBOUND_QUEUE_MAX_MESSAGES,
+            MsgClass::Bulk => BULK_QUEUE_MAX_MESSAGES,
+        }
+    }
+    /// Byte budget checked against the shared `queued_bytes` counter: bulk
+    /// sees the whole queue, so its 3 MiB cap also reserves 1 MiB for control.
+    fn max_bytes(self) -> usize {
+        match self {
+            MsgClass::Control => OUTBOUND_QUEUE_MAX_BYTES,
+            MsgClass::Bulk => BULK_QUEUE_MAX_BYTES,
+        }
+    }
+}
+
+/// In-queue depth per class for one connection, shared with the writer
+/// thread, which releases a slot as each payload leaves the queue.
+#[derive(Default)]
+pub struct Depth {
+    bulk: AtomicUsize,
+    ctrl: AtomicUsize,
+}
+
+impl Depth {
+    fn get(&self, class: MsgClass) -> usize {
+        match class {
+            MsgClass::Control => self.ctrl.load(Ordering::SeqCst),
+            MsgClass::Bulk => self.bulk.load(Ordering::SeqCst),
+        }
+    }
+    fn add(&self, class: MsgClass) {
+        match class {
+            MsgClass::Control => self.ctrl.fetch_add(1, Ordering::SeqCst),
+            MsgClass::Bulk => self.bulk.fetch_add(1, Ordering::SeqCst),
+        };
+    }
+    fn release(&self, class: MsgClass) {
+        match class {
+            MsgClass::Control => self.ctrl.fetch_sub(1, Ordering::SeqCst),
+            MsgClass::Bulk => self.bulk.fetch_sub(1, Ordering::SeqCst),
+        };
+    }
+}
 
 /// Constant-time secret comparison (content comparison leaks nothing).
 fn ct_eq(a: &str, b: &str) -> bool {
@@ -467,6 +536,7 @@ fn hs_err(outbound: &Outbound, reason: &str) -> Result<(), EnqueueError> {
         }
         .to_text()
         .into_bytes(),
+        MsgClass::Control,
     )
 }
 
@@ -566,10 +636,12 @@ fn establish_session(
 /// stalled peer can never park the engine, the registry lock, or the read
 /// loop — no deadlock is possible between producers and the writer.
 pub struct Outbound {
-    tx: SyncSender<Vec<u8>>,
+    tx: SyncSender<(MsgClass, Vec<u8>)>,
     /// bytes reserved by queued payloads (not yet dequeued by the writer);
     /// shared with the writer thread so it can release on dequeue
     queued_bytes: Arc<AtomicUsize>,
+    /// per-class in-queue depth; released by the writer on dequeue
+    depth: Arc<Depth>,
     /// set on saturation/disconnect: the read loop must tear this connection down
     terminated: AtomicBool,
     /// The live E2E session for this connection (ADR-011). Shared with the
@@ -580,6 +652,9 @@ pub struct Outbound {
     /// Seal-then-enqueue happens under this lock so the AEAD counter order
     /// always matches the FIFO wire order.
     session: Mutex<Option<e2e::Session>>,
+    /// Process-wide saturation counters (mandate §4): shared so /health and
+    /// /metrics describe overload on any connection, including one already gone.
+    saturation: Arc<crate::companion::Saturation>,
 }
 
 /// Why an outbound message could not be queued. Both variants end the
@@ -593,14 +668,18 @@ pub enum EnqueueError {
 }
 
 impl Outbound {
-    fn new() -> (Arc<Outbound>, Receiver<Vec<u8>>) {
-        let (tx, rx) = sync_channel(OUTBOUND_QUEUE_MAX_MESSAGES);
+    fn new(
+        saturation: Arc<crate::companion::Saturation>,
+    ) -> (Arc<Outbound>, Receiver<(MsgClass, Vec<u8>)>) {
+        let (tx, rx) = sync_channel(CHANNEL_CAPACITY);
         (
             Arc::new(Outbound {
                 tx,
                 queued_bytes: Arc::new(AtomicUsize::new(0)),
+                depth: Arc::new(Depth::default()),
                 terminated: AtomicBool::new(false),
                 session: Mutex::new(None),
+                saturation,
             }),
             rx,
         )
@@ -625,7 +704,20 @@ impl Outbound {
     /// order always matches the FIFO wire order — the client's strict
     /// monotonic `open` would otherwise see a reordering as replay/desync.
     /// With no session the plaintext is enqueued verbatim (loopback parity).
-    pub(crate) fn enqueue_sealed(&self, plaintext: Vec<u8>) -> Result<(), EnqueueError> {
+    pub(crate) fn enqueue_sealed(
+        &self,
+        plaintext: Vec<u8>,
+        class: MsgClass,
+    ) -> Result<(), EnqueueError> {
+        // Admission BEFORE sealing (mandate §4): a frame that cannot be
+        // queued must never consume an AEAD counter, so the terminated latch
+        // and the class depth bound are checked while nothing has been spent.
+        // The byte bound is checked in `enqueue` under this same lock; if it
+        // fails there the connection terminates, so a spent counter can never
+        // be followed by further frames on a live session (no desync).
+        if self.terminated.load(Ordering::SeqCst) || self.depth.get(class) >= class.max_messages() {
+            return Err(self.refuse(class));
+        }
         let mut guard = self.session.lock().unwrap();
         let payload = match guard.as_mut() {
             Some(session) => {
@@ -637,42 +729,66 @@ impl Outbound {
         };
         // enqueue under the same lock so no other producer can interleave a
         // frame between this seal and its position on the wire
-        self.enqueue(payload)
+        self.enqueue(payload, class)
     }
 
-    /// Reserve payload bytes against the byte bound; fails without side
+    /// Refuse a frame: count it against its class and, on the first refusal
+    /// on this connection, latch termination + the saturation-teardown
+    /// counter. Refusal always means teardown — events are never dropped
+    /// silently (a shed event would be invisible loss: no client consumes
+    /// `lastSeq` for gap detection, so reconnect+resync is the recovery).
+    fn refuse(&self, class: MsgClass) -> EnqueueError {
+        if !self.terminated.swap(true, Ordering::SeqCst) {
+            match class {
+                MsgClass::Control => {
+                    self.saturation.shed_ctrl.fetch_add(1, Ordering::SeqCst);
+                }
+                MsgClass::Bulk => {
+                    self.saturation.shed_bulk.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            self.saturation.teardowns.fetch_add(1, Ordering::SeqCst);
+        }
+        EnqueueError::Full
+    }
+
+    /// Reserve payload bytes against the class byte bound; fails without side
     /// effects when the reservation cannot fit.
-    fn reserve(&self, len: usize) -> bool {
+    fn reserve(&self, len: usize, limit: usize) -> bool {
         self.queued_bytes
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
-                queued
-                    .checked_add(len)
-                    .filter(|total| *total <= OUTBOUND_QUEUE_MAX_BYTES)
+                queued.checked_add(len).filter(|total| *total <= limit)
             })
             .is_ok()
     }
 
-    /// Queue one payload for the writer thread (FIFO). On failure the
-    /// connection is marked terminated so the read loop starts teardown.
-    pub(crate) fn enqueue(&self, payload: Vec<u8>) -> Result<(), EnqueueError> {
+    /// Queue one payload for the writer thread (FIFO). On a bound being hit
+    /// the connection is marked terminated so the read loop starts teardown;
+    /// every class has its own bound (mandate §4), so a bulk flood is
+    /// refused while control still has reserved room in the same queue.
+    pub(crate) fn enqueue(&self, payload: Vec<u8>, class: MsgClass) -> Result<(), EnqueueError> {
         if self.terminated.load(Ordering::SeqCst) {
             return Err(EnqueueError::Full);
         }
         let len = payload.len();
-        if !self.reserve(len) {
-            self.terminated.store(true, Ordering::SeqCst);
-            return Err(EnqueueError::Full);
+        if self.depth.get(class) >= class.max_messages() || !self.reserve(len, class.max_bytes()) {
+            return Err(self.refuse(class));
         }
-        match self.tx.try_send(payload) {
-            Ok(()) => Ok(()),
+        match self.tx.try_send((class, payload)) {
+            Ok(()) => {
+                self.depth.add(class);
+                Ok(())
+            }
             Err(TrySendError::Full(p)) => {
-                self.queued_bytes.fetch_sub(p.len(), Ordering::SeqCst);
-                self.terminated.store(true, Ordering::SeqCst);
-                Err(EnqueueError::Full)
+                self.queued_bytes.fetch_sub(p.1.len(), Ordering::SeqCst);
+                Err(self.refuse(class))
             }
             Err(TrySendError::Disconnected(_)) => {
                 // the channel — and every payload it still held — is gone:
-                // every reservation against it is void
+                // every reservation against it is void. Writer death (write
+                // timeout, reset peer) is a liveness failure, not a class
+                // bound being hit, so it terminates without touching the
+                // saturation counters.
                 self.queued_bytes.store(0, Ordering::SeqCst);
                 self.terminated.store(true, Ordering::SeqCst);
                 Err(EnqueueError::Disconnected)
@@ -694,14 +810,16 @@ impl Outbound {
 /// the socket; only the kernel's bounded send buffer remains beyond it.
 fn run_writer(
     mut stream: TcpStream,
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<(MsgClass, Vec<u8>)>,
     stop: Arc<AtomicBool>,
     queued_bytes: Arc<AtomicUsize>,
+    depth: Arc<Depth>,
 ) {
     while !stop.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(payload) => {
+            Ok((class, payload)) => {
                 queued_bytes.fetch_sub(payload.len(), Ordering::SeqCst);
+                depth.release(class);
                 let frame = ws::encode_frame(ws::OP_TEXT, &payload, false);
                 if write_frame(&mut stream, &frame).is_err() {
                     break;
@@ -768,7 +886,7 @@ fn serve_ws(
     // longer park the writer forever and teardown's join() is always bounded
     writer.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
-    let (outbound, rx) = Outbound::new();
+    let (outbound, rx) = Outbound::new(companion.shared.saturation.clone());
     let conn_id = companion
         .shared
         .next_conn_id
@@ -778,9 +896,10 @@ fn serve_ws(
     let writer_stop = Arc::new(AtomicBool::new(false));
     let wstop = writer_stop.clone();
     let wbytes = outbound.queued_bytes.clone();
+    let wdepth = outbound.depth.clone();
     let writer_thread = thread::Builder::new()
         .name("ws-writer".into())
-        .spawn(move || run_writer(writer, rx, wstop, wbytes))
+        .spawn(move || run_writer(writer, rx, wstop, wbytes, wdepth))
         .map_err(|_| io::Error::other("writer spawn"))?;
     // register only now: a spawn failure above leaves nothing behind, and
     // any event missed between spawn and registration is recovered by the
@@ -892,7 +1011,10 @@ fn serve_ws(
                                 nonce: base64::encode(&nonce),
                                 salt: base64::encode(&salt),
                             };
-                            if outbound.enqueue(reply.to_text().into_bytes()).is_err() {
+                            if outbound
+                                .enqueue(reply.to_text().into_bytes(), MsgClass::Control)
+                                .is_err()
+                            {
                                 break Err(io::Error::other("outbound queue saturated"));
                             }
                             continue;
@@ -911,6 +1033,7 @@ fn serve_ws(
                                     if outbound
                                         .enqueue(
                                             ServerMsg::HsOk { server_proof }.to_text().into_bytes(),
+                                            MsgClass::Control,
                                         )
                                         .is_err()
                                     {
@@ -944,7 +1067,10 @@ fn serve_ws(
                     let cid = msg.command_id().unwrap_or("unknown").to_string();
                     let refusal =
                         ServerMsg::ack_err(&cid, "e2e session required (remote posture)").to_text();
-                    if outbound.enqueue(refusal.into_bytes()).is_err() {
+                    if outbound
+                        .enqueue(refusal.into_bytes(), MsgClass::Control)
+                        .is_err()
+                    {
                         break Err(io::Error::other("outbound queue saturated"));
                     }
                     continue;
@@ -995,7 +1121,10 @@ fn serve_ws(
                 };
                 if let Some(reply) = reply {
                     let text = reply.to_text();
-                    if outbound.enqueue_sealed(text.into_bytes()).is_err() {
+                    if outbound
+                        .enqueue_sealed(text.into_bytes(), MsgClass::Control)
+                        .is_err()
+                    {
                         break Err(io::Error::other("outbound queue saturated"));
                     }
                 }
@@ -1036,6 +1165,7 @@ fn send_malformed(outbound: &Outbound, companion: &Companion) -> Result<(), Enqu
         ServerMsg::ack_err("invalid", "malformed message")
             .to_text()
             .into_bytes(),
+        MsgClass::Control,
     )
 }
 
@@ -1632,34 +1762,43 @@ mod e2e_tests {
         (server, client)
     }
 
+    /// Fresh Outbound with its own saturation counters (class-policy tests
+    /// that read the counters back build theirs via `Outbound::new` directly).
+    fn test_outbound() -> (Arc<Outbound>, Receiver<(MsgClass, Vec<u8>)>) {
+        Outbound::new(Arc::new(crate::companion::Saturation::default()))
+    }
+
     #[test]
     fn outbound_queue_bounds_count_releases_on_dequeue_and_preserves_fifo() {
-        let (outbound, rx) = Outbound::new();
+        let (outbound, rx) = test_outbound();
         for i in 0..OUTBOUND_QUEUE_MAX_MESSAGES {
-            outbound.enqueue(vec![i as u8]).unwrap();
+            outbound.enqueue(vec![i as u8], MsgClass::Control).unwrap();
         }
         assert_eq!(
             outbound.queued_bytes.load(Ordering::SeqCst),
             OUTBOUND_QUEUE_MAX_MESSAGES
         );
         // count bound hit: explicit failure, connection marked terminated
-        assert!(matches!(outbound.enqueue(vec![0]), Err(EnqueueError::Full)));
+        assert!(matches!(
+            outbound.enqueue(vec![0], MsgClass::Control),
+            Err(EnqueueError::Full)
+        ));
         assert!(outbound.is_terminated());
         // queue drains in FIFO order (byte release on dequeue is the writer's
         // job — asserted in run_writer_writes_queued_frames_in_order)
         for i in 0..OUTBOUND_QUEUE_MAX_MESSAGES {
-            assert_eq!(rx.try_recv().unwrap(), vec![i as u8]);
+            assert_eq!(rx.try_recv().unwrap().1, vec![i as u8]);
         }
     }
 
     #[test]
     fn outbound_queue_bounds_total_bytes() {
-        let (outbound, rx) = Outbound::new();
+        let (outbound, rx) = test_outbound();
         let msg = vec![b'x'; 2_000_000];
-        outbound.enqueue(msg.clone()).unwrap();
-        outbound.enqueue(msg).unwrap(); // 4 MB of 4.19 MB budget
+        outbound.enqueue(msg.clone(), MsgClass::Control).unwrap();
+        outbound.enqueue(msg, MsgClass::Control).unwrap(); // 4 MB of 4.19 MB budget
         assert!(matches!(
-            outbound.enqueue(vec![b'x'; 2_000_000]),
+            outbound.enqueue(vec![b'x'; 2_000_000], MsgClass::Control),
             Err(EnqueueError::Full)
         ));
         assert!(outbound.is_terminated());
@@ -1672,21 +1811,24 @@ mod e2e_tests {
 
     #[test]
     fn outbound_byte_bound_is_inclusive_at_the_cap() {
-        let (outbound, _rx) = Outbound::new();
+        let (outbound, _rx) = test_outbound();
         // a payload exactly at the cap fits; anything more does not
         outbound
-            .enqueue(vec![b'x'; OUTBOUND_QUEUE_MAX_BYTES])
+            .enqueue(vec![b'x'; OUTBOUND_QUEUE_MAX_BYTES], MsgClass::Control)
             .unwrap();
-        assert!(matches!(outbound.enqueue(vec![0]), Err(EnqueueError::Full)));
+        assert!(matches!(
+            outbound.enqueue(vec![0], MsgClass::Control),
+            Err(EnqueueError::Full)
+        ));
     }
 
     #[test]
     fn outbound_queue_reports_disconnected_and_resets_bytes_after_receiver_drops() {
-        let (outbound, rx) = Outbound::new();
-        outbound.enqueue(vec![1, 2, 3]).unwrap();
+        let (outbound, rx) = test_outbound();
+        outbound.enqueue(vec![1, 2, 3], MsgClass::Control).unwrap();
         drop(rx);
         assert!(matches!(
-            outbound.enqueue(vec![9]),
+            outbound.enqueue(vec![9], MsgClass::Control),
             Err(EnqueueError::Disconnected)
         ));
         assert!(outbound.is_terminated());
@@ -1697,13 +1839,14 @@ mod e2e_tests {
     #[test]
     fn run_writer_writes_queued_frames_in_order() {
         let (server_sock, mut peer) = tcp_pair();
-        let (outbound, rx) = Outbound::new();
+        let (outbound, rx) = test_outbound();
         let wbytes = outbound.queued_bytes.clone();
+        let wdepth = outbound.depth.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let wstop = stop.clone();
-        let writer = thread::spawn(move || run_writer(server_sock, rx, wstop, wbytes));
+        let writer = thread::spawn(move || run_writer(server_sock, rx, wstop, wbytes, wdepth));
         for i in 0..3u8 {
-            outbound.enqueue(vec![b'0' + i]).unwrap();
+            outbound.enqueue(vec![b'0' + i], MsgClass::Control).unwrap();
         }
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         for i in 0..3u8 {
@@ -1721,10 +1864,11 @@ mod e2e_tests {
     #[test]
     fn run_writer_exits_when_all_senders_drop() {
         let (server_sock, _peer) = tcp_pair();
-        let (outbound, rx) = Outbound::new();
+        let (outbound, rx) = test_outbound();
         let wbytes = outbound.queued_bytes.clone();
+        let wdepth = outbound.depth.clone();
         let stop = Arc::new(AtomicBool::new(false));
-        let writer = thread::spawn(move || run_writer(server_sock, rx, stop, wbytes));
+        let writer = thread::spawn(move || run_writer(server_sock, rx, stop, wbytes, wdepth));
         // last sender gone → the writer must wake and exit (no stop flag, no leak)
         drop(outbound);
         writer.join().unwrap();
@@ -1737,15 +1881,22 @@ mod e2e_tests {
         // path, not the Outbound accounting
         let (tx, rx) = sync_channel(64);
         let stop = Arc::new(AtomicBool::new(false));
-        let writer =
-            thread::spawn(move || run_writer(server_sock, rx, stop, Arc::new(AtomicUsize::new(0))));
+        let writer = thread::spawn(move || {
+            run_writer(
+                server_sock,
+                rx,
+                stop,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(Depth::default()),
+            )
+        });
         drop(peer); // peer gone: once the reset lands, every write fails
         // keep the writer fed until it dies on the write error; the socket
         // buffers cannot absorb 32 MiB, so a live writer would never let
         // this loop finish — the bounded spin is the failure detector
         let mut spins = 0;
         while !writer.is_finished() {
-            match tx.try_send(vec![b'x'; 65_536]) {
+            match tx.try_send((MsgClass::Control, vec![b'x'; 65_536])) {
                 Ok(()) | Err(TrySendError::Full(_)) => std::thread::yield_now(),
                 Err(TrySendError::Disconnected(_)) => break,
             }
@@ -1777,7 +1928,7 @@ mod e2e_tests {
         // one oversized payload cannot be reserved: explicit Full + terminated
         assert!(
             outbound
-                .enqueue(vec![b'x'; OUTBOUND_QUEUE_MAX_BYTES + 1])
+                .enqueue(vec![b'x'; OUTBOUND_QUEUE_MAX_BYTES + 1], MsgClass::Control)
                 .is_err()
         );
         assert!(outbound.is_terminated());
@@ -1953,7 +2104,7 @@ mod e2e_tests {
         c.data_dir = dir.clone();
         let companion = Companion::boot(c).unwrap();
 
-        let (outbound, _rx) = Outbound::new();
+        let (outbound, _rx) = Outbound::new(companion.shared.saturation.clone());
         companion.shared.clients.lock().unwrap().push((7, outbound));
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1998,6 +2149,110 @@ mod e2e_tests {
         again.teardown();
         drop(again);
         assert_eq!(companion.shared.clients.lock().unwrap().len(), 0);
+
+        companion.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ---- mandate §4: per-class bounds + saturation visibility ------- */
+
+    #[test]
+    fn control_keeps_reserved_headroom_when_bulk_fills_the_queue() {
+        // Regression for P2: bulk (event fan-out) at its own cap must not
+        // consume the room control frames need — the old single 256-message
+        // bound let one class starve the other.
+        let (outbound, rx) = test_outbound();
+        for _ in 0..BULK_QUEUE_MAX_MESSAGES {
+            outbound.enqueue(vec![b'b'; 8], MsgClass::Bulk).unwrap();
+        }
+        // bulk is at its cap, yet control is still admitted to ITS cap
+        for _ in 0..OUTBOUND_QUEUE_MAX_MESSAGES {
+            outbound.enqueue(vec![b'c'; 8], MsgClass::Control).unwrap();
+        }
+        assert!(!outbound.is_terminated());
+        assert_eq!(
+            outbound.depth.get(MsgClass::Bulk) + outbound.depth.get(MsgClass::Control),
+            CHANNEL_CAPACITY,
+            "both class caps must fit the shared channel"
+        );
+        // first refusal is the class cap itself (257th control frame)
+        assert!(matches!(
+            outbound.enqueue(vec![b'c'; 8], MsgClass::Control),
+            Err(EnqueueError::Full)
+        ));
+        assert!(outbound.is_terminated());
+        // one FIFO: both classes drain in arrival order
+        let (mut bulk, mut ctrl) = (0usize, 0usize);
+        while let Ok((class, _)) = rx.try_recv() {
+            match class {
+                MsgClass::Bulk => bulk += 1,
+                MsgClass::Control => ctrl += 1,
+            }
+        }
+        assert_eq!(
+            (bulk, ctrl),
+            (BULK_QUEUE_MAX_MESSAGES, OUTBOUND_QUEUE_MAX_MESSAGES)
+        );
+    }
+
+    #[test]
+    fn shed_seal_consumes_no_aead_counter() {
+        // Admission is checked BEFORE sealing: a refused frame must never
+        // spend an AEAD counter, or counter order would diverge from wire
+        // order on a session that survives the refusal.
+        let (outbound, _rx) = test_outbound();
+        let keys = e2e::derive_keys(&[7u8; 32], &[9u8; 16]);
+        let peer_keys = e2e::derive_keys(&[7u8; 32], &[9u8; 16]);
+        *outbound.session.lock().unwrap() = Some(e2e::Session::host(keys));
+        let mut peer = e2e::Session::client(peer_keys);
+        // fill the bulk class to its cap (depth admission only, no sealing)
+        for _ in 0..BULK_QUEUE_MAX_MESSAGES {
+            outbound.enqueue(vec![b'b'; 8], MsgClass::Bulk).unwrap();
+        }
+        assert!(matches!(
+            outbound.enqueue_sealed(br#"{"type":"event"}"#.to_vec(), MsgClass::Bulk),
+            Err(EnqueueError::Full)
+        ));
+        // the shed frame spent no counter: the next seal still starts at 0,
+        // so a peer at counter 0 opens it (a consumed counter would desync)
+        let payload = outbound
+            .session
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("session installed above")
+            .seal("post-shed frame");
+        assert_eq!(
+            peer.open(&payload)
+                .expect("shed frame must not consume a counter"),
+            "post-shed frame"
+        );
+    }
+
+    #[test]
+    fn saturation_counters_surface_in_health_and_metrics() {
+        // Regression for P2: production overload must be readable from
+        // /health and /metrics, never inferred from dropped clients.
+        let dir = temp_dir("sat-obs");
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Companion::boot(c).unwrap();
+        let (outbound, _rx) = Outbound::new(companion.shared.saturation.clone());
+        for _ in 0..BULK_QUEUE_MAX_MESSAGES {
+            outbound.enqueue(vec![b'b'; 8], MsgClass::Bulk).unwrap();
+        }
+        assert!(outbound.enqueue(vec![b'b'; 8], MsgClass::Bulk).is_err());
+
+        let health = companion.health();
+        let get = |key: &str| json::as_i64(json::get(&health, key).expect(key)).expect(key);
+        assert_eq!(get("outboundShedBulk"), 1);
+        assert_eq!(get("outboundShedCtrl"), 0);
+        assert_eq!(get("outboundSatTeardowns"), 1);
+
+        let metrics = companion.metrics_text();
+        assert!(metrics.contains("chernobyl_outbound_shed_bulk_total"));
+        assert!(metrics.contains("chernobyl_outbound_shed_ctrl_total"));
+        assert!(metrics.contains("chernobyl_outbound_saturation_teardowns_total"));
 
         companion.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
