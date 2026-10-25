@@ -2,10 +2,129 @@
 //! mock-only scope). Unknown types are recorded as discovery-failed and the
 //! engine serves as the in-process mock adapter. Process adapters (OpenCode
 //! etc.) arrive with Phase 3+; the manager shape is already here.
+//!
+//! ADR-015 §3.3 adds [`LiveRuntime`], the trait the companion routes live
+//! sessions through, and [`AdapterError`], the error set every runtime shares.
 
 use crate::config::AdapterEntryConfig;
 use crate::json::{self, Json};
+use crate::protocol::{Agent, ClientMsg, ServerMsg, Session};
 use std::collections::HashMap;
+
+/* ------------------------------------------------------------------ */
+/* Errors (adapter-sdk code set)                                       */
+/* ------------------------------------------------------------------ */
+
+/// Adapter-sdk error codes. Lives here since ADR-015 step 4 so every runtime
+/// shares one type; `opencode::AdapterError` re-exports it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdapterError {
+    Unsupported(String),
+    RuntimeUnavailable(String),
+    InvalidResponse(String),
+    Unknown(String),
+}
+
+impl AdapterError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            AdapterError::Unsupported(_) => "unsupported",
+            AdapterError::RuntimeUnavailable(_) => "runtime-unavailable",
+            AdapterError::InvalidResponse(_) => "invalid-response",
+            AdapterError::Unknown(_) => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for AdapterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            AdapterError::Unsupported(m)
+            | AdapterError::RuntimeUnavailable(m)
+            | AdapterError::InvalidResponse(m)
+            | AdapterError::Unknown(m) => m,
+        };
+        write!(f, "{}: {}", self.code(), msg)
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Live runtimes (ADR-015 §3.3, §4.1)                                  */
+/* ------------------------------------------------------------------ */
+
+/// A runtime that owns live sessions: OpenCode today, the Claude and Codex
+/// drivers next. The companion keeps one `Arc<dyn LiveRuntime>` per attached
+/// adapter (`Companion::runtimes`) and routes client messages by it:
+///
+/// - `create_session` goes to the runtime hosting the agent: one of its
+///   `agents()` has that id and `host_id == id()`;
+/// - session-scoped commands (`submit_prompt`, `interrupt`, `session_end`,
+///   `set_permission_mode`, `mcp_*`) go to the runtime whose `owns_session`
+///   is true;
+/// - `permission_decision` goes to the runtime whose `knows_permission` is
+///   true, and only after the engine validated it (G2, see `send`);
+/// - everything else stays with the engine, and so does anything no runtime
+///   claims. `session_subscribe`/`session_unsubscribe` never reach `send`:
+///   the server handles them per connection.
+///
+/// Only healthy runtimes are routed to. While any runtime is healthy, the
+/// snapshot shows the healthy runtimes' agents and sessions instead of the
+/// engine's demo ones (ADR-009).
+///
+/// Contract for implementors:
+/// - Ids must not collide across runtimes. A session or permission id two
+///   runtimes claim is refused and logged, never guessed. New runtimes mint
+///   permission ids as `<adapterId>:<nativeId>` (PRD §8.3); OpenCode keeps its
+///   native `per_…` ids.
+/// - `send` is acceptance only (G1/G4.1): `Ok(ack)` never claims an outcome,
+///   which arrives later as engine events. `Err` is a transport or
+///   validation fault; the companion turns it into an error ack.
+/// - A live message the runtime does not support gets an error ack
+///   (`Err(AdapterError::Unsupported)` or `Ok` with `ok: false`), never
+///   silence.
+/// - Runtimes stream transcripts through the hub handle they are given at
+///   construction (the transcript hub, ADR-015 step 2).
+/// - Every method may be called from any thread, and must not block on the
+///   network for long: routing calls `is_healthy`, `agents`, `owns_session`
+///   and `knows_permission` on the WS read path.
+pub trait LiveRuntime: Send + Sync {
+    /// The adapter id from the config; equals `host_id` on its agents and
+    /// sessions.
+    fn id(&self) -> &str;
+    fn is_healthy(&self) -> bool;
+    fn agents(&self) -> Vec<Agent>;
+    fn sessions(&self) -> Vec<Session>;
+    fn owns_session(&self, session_id: &str) -> bool;
+    /// True while the runtime surfaced this permission request and still
+    /// holds it natively (the routing gate for `permission_decision`).
+    fn knows_permission(&self, permission_id: &str) -> bool;
+    /// Executes one routed command: `create_session`, `submit_prompt`,
+    /// `interrupt`, `permission_decision`, `session_end`,
+    /// `set_permission_mode`, `mcp_auth`, `mcp_auth_callback`,
+    /// `mcp_reconnect`. A `permission_decision` arrives here only after the
+    /// engine validated it (pending, expiry, revision, option bucket,
+    /// message, answers), with `option_id` set to the option the engine
+    /// selected (a legacy tap without one included) and `message`/`answers`
+    /// verbatim: write exactly that option's native answer. On `Ok` with
+    /// `ok: true` the engine records the resolution; a request the runtime
+    /// no longer holds is answered `ok: false` ("request is no longer
+    /// pending"), and one resolved natively goes through
+    /// `Engine::resolve_native` (publish `PermissionResolved`).
+    fn send(&self, msg: &ClientMsg) -> Result<ServerMsg, AdapterError>;
+    /// The first subscriber for one of this runtime's sessions arrived:
+    /// hydrate history, start MCP polling. Called outside every companion
+    /// lock.
+    fn on_subscribe(&self, _session_id: &str) {}
+    /// Probe loop (`probeIntervalMs`): re-check health and refresh the cached
+    /// lists. `Err` marks the adapter unhealthy in `/adapters`.
+    fn refresh(&self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    /// PRD §7.3 honest capability declaration.
+    fn capabilities(&self) -> Vec<Capability>;
+    /// Stops threads and children. Idempotent; called once at shutdown.
+    fn dispose(&self);
+}
 
 /// PRD §7.3 capability declaration — what an adapter honestly supports
 /// (TS `@chernobyl/domain` `Capability`, mirrored). `status` values are the

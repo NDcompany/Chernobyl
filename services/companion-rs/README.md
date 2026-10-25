@@ -211,7 +211,7 @@ matrix covers those).
 | `ws` | RFC 6455 handshake + framing, 256 000-byte cap, hostile-input tests |
 | `seed` / `engine` | deterministic seed state + the MockEngine port (plans, G1/G2, ack cache) |
 | `storage` | append-only JSONL journal: torn-tail recovery, atomic compaction, retention |
-| `config` / `adapters` / `companion` | Node-parity config, adapter discovery, boot/reconcile/idempotency |
+| `config` / `adapters` / `companion` | Node-parity config, adapter discovery, boot/reconcile/idempotency; the `LiveRuntime` trait and router (ADR-015 §4.1): `create_session` by the agent's `hostId`, session commands to the owning runtime, `permission_decision` to the runtime that surfaced it, the rest to the engine; demo data hidden while any runtime is healthy |
 | `server` | accept loops, auth (4001/429), origin refusal (403), posture gates (D1/D2/D6), version gate (4002), live session revocation (4003, D4), heartbeat, diagnostics HTTP, E2E handshake + sealed-frame dispatch |
 | `client` | test WS client + loopback `http_get` (used by `--self-test`) |
 | `crypto` | std-only SHA-256, HMAC, HKDF, ChaCha20, Poly1305, AEAD (official RFC/NIST KATs) |

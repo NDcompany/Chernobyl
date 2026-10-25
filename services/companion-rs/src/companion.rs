@@ -4,16 +4,17 @@
 //! boot reconciliation, latched fail-closed on write failure, event seq
 //! continuity (C2).
 
-use crate::adapters::AdapterManager;
+use crate::adapters::{AdapterManager, LiveRuntime};
 use crate::claude::ClaudeAdapter;
 use crate::config::CompanionConfig;
 use crate::engine::Engine;
 use crate::ffi;
 use crate::ollama::OllamaAdapter;
 use crate::opencode::OpenCodeAdapter;
-use crate::protocol::{ClientMsg, EventKind, PROTOCOL_VERSION, ServerMsg, now_ms};
+use crate::protocol::{Agent, ClientMsg, EventKind, PROTOCOL_VERSION, ServerMsg, Session, now_ms};
 use crate::server::Outbound;
 use crate::storage::{CommandRecord, Storage};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 /// Process-wide outbound saturation counters (mandate §4): the production
@@ -64,6 +65,14 @@ pub enum RevokeResult {
     Revoked { terminated: usize },
 }
 
+/// Where `Companion::route` sends one client message.
+enum Route {
+    Engine,
+    Runtime(Arc<dyn LiveRuntime>),
+    /// Two healthy runtimes claim the same agent, session or permission id.
+    Ambiguous,
+}
+
 pub struct Shared {
     pub storage: Mutex<Storage>,
     /// Outbound payload queues, one per live WS connection, keyed by a
@@ -76,6 +85,8 @@ pub struct Shared {
     pub next_conn_id: std::sync::atomic::AtomicU64,
     pub adapters: Mutex<AdapterManager>,
     /// Phase 3: the attached OpenCode adapter, when configured (attach-only).
+    /// A typed handle for OpenCode-only surfaces (`diff`, `messages`) and
+    /// their tests; routing goes through `Companion::runtimes` (ADR-015).
     pub opencode: Mutex<Option<Arc<OpenCodeAdapter>>>,
     /// Phase 7: the attached Ollama model-runtime adapter, when configured
     /// (attach-only — PRD §7.7, a model provider not a session manager).
@@ -100,6 +111,9 @@ pub struct Companion {
     /// Arc'd so the adapter's event thread can publish into the same
     /// sequence/pipeline (single seq authority).
     engine: Arc<Mutex<Engine>>,
+    /// ADR-015 §4.1: every attached live runtime, in config order. Filled at
+    /// boot and never changed afterwards, so routing needs no lock.
+    runtimes: Vec<Arc<dyn LiveRuntime>>,
     /// Last adapter probe timestamp for the probe-interval gate.
     last_probe: Mutex<i64>,
     pub events_total: Arc<std::sync::atomic::AtomicU64>,
@@ -220,9 +234,10 @@ impl Companion {
             engine.drop_seed();
         }
 
-        let companion = Companion {
+        let mut companion = Companion {
             shared,
             engine: Arc::new(Mutex::new(engine)),
+            runtimes: Vec::new(),
             last_probe: Mutex::new(now_ms()),
             events_total,
             malformed_total: std::sync::atomic::AtomicU64::new(0),
@@ -271,6 +286,7 @@ impl Companion {
                 }
             });
             *companion.shared.opencode.lock().unwrap() = Some(oc.clone());
+            companion.runtimes.push(oc.clone());
             if let Err(e) = oc.start_events() {
                 // thread spawn failure: HTTP attach still works, but the
                 // failure channel doesn't — fail the status visible.
@@ -395,23 +411,18 @@ impl Companion {
             }
         }
 
-        // Phase 3 routing: a HEALTHY attached adapter owns the session-
-        // scoped mutating commands (the native runtime is the truth for
-        // sessions it knows); permission decisions go native only when the
-        // adapter surfaced that request — otherwise engine authority (G2).
-        // Session-neutral messages always stay with the engine.
-        let oc = self.shared.opencode.lock().unwrap().clone();
-        let to_adapter = matches!(
-            (&oc, &msg),
-            (Some(oc), m) if oc.is_healthy() && Self::routes_to_adapter(m, oc)
-        );
-        let reply = if to_adapter {
-            let oc = oc.as_ref().expect("routed only when attached");
-            match &msg {
+        // ADR-015 §4.1 routing: a HEALTHY live runtime that claims the
+        // command runs it (the native runtime is the truth for sessions it
+        // owns); permission decisions go native only when a runtime surfaced
+        // that request — otherwise engine authority (G2). Unclaimed and
+        // session-neutral messages stay with the engine.
+        let reply = match self.route(&msg) {
+            Route::Runtime(rt) => match &msg {
                 // G2 stays with the engine: it validates the decision
-                // (native metadata, pending, expiry, revision), the native
-                // runtime only EXECUTES it, then the engine records the
-                // accepted outcome — success can never outrun validation.
+                // (native metadata, pending, expiry, revision, option bucket,
+                // message, answers), the native runtime only EXECUTES it,
+                // then the engine records the accepted outcome — success can
+                // never outrun validation.
                 ClientMsg::PermissionDecision {
                     command_id,
                     permission_id,
@@ -432,27 +443,40 @@ impl Companion {
                             *revision,
                         )
                     };
-                    if let Err(e) = verdict {
-                        Some(ServerMsg::ack_err(command_id, &e))
-                    } else {
-                        match oc.send(&msg) {
-                            Ok(ack @ ServerMsg::Ack { ok: true, .. }) => {
-                                let mut engine = self.engine.lock().unwrap();
-                                engine.complete_native_decision(
-                                    command_id,
-                                    permission_id,
-                                    decision,
-                                );
-                                Some(ack)
+                    match verdict {
+                        Err(e) => Some(ServerMsg::ack_err(command_id, &e)),
+                        Ok(selected) => {
+                            // the runtime writes exactly the option the engine
+                            // selected, a legacy tap (no optionId) included
+                            let mut forwarded = msg.clone();
+                            if let (
+                                Some(option),
+                                ClientMsg::PermissionDecision {
+                                    option_id: chosen, ..
+                                },
+                            ) = (selected, &mut forwarded)
+                            {
+                                *chosen = Some(option.id);
                             }
-                            // native refused → record stays pending; the
-                            // engine's expiry sweep resolves it honestly
-                            Ok(ack) => Some(ack),
-                            Err(e) => Some(ServerMsg::ack_err(command_id, &e.to_string())),
+                            match rt.send(&forwarded) {
+                                Ok(ack @ ServerMsg::Ack { ok: true, .. }) => {
+                                    let mut engine = self.engine.lock().unwrap();
+                                    engine.complete_native_decision(
+                                        command_id,
+                                        permission_id,
+                                        decision,
+                                    );
+                                    Some(ack)
+                                }
+                                // native refused → record stays pending; the
+                                // engine's expiry sweep resolves it honestly
+                                Ok(ack) => Some(ack),
+                                Err(e) => Some(ServerMsg::ack_err(command_id, &e.to_string())),
+                            }
                         }
                     }
                 }
-                _ => Some(match oc.send(&msg) {
+                _ => Some(match rt.send(&msg) {
                     Ok(reply) => reply,
                     // transport/validation faults surface as refusals — never
                     // as a fabricated engine outcome
@@ -460,10 +484,15 @@ impl Companion {
                         ServerMsg::ack_err(msg_cmd_id.as_deref().unwrap_or(""), &e.to_string())
                     }
                 }),
+            },
+            Route::Ambiguous => Some(ServerMsg::ack_err(
+                msg_cmd_id.as_deref().unwrap_or(""),
+                "claimed by more than one runtime — refused",
+            )),
+            Route::Engine => {
+                let mut engine = self.engine.lock().unwrap();
+                engine.handle(msg)
             }
-        } else {
-            let mut engine = self.engine.lock().unwrap();
-            engine.handle(msg)
         };
 
         // capture the ORIGINAL ack outcome (ok, error, ids) so replays —
@@ -509,45 +538,100 @@ impl Companion {
 
     pub fn snapshot(&self) -> crate::protocol::Snapshot {
         let mut snap = self.engine.lock().unwrap().snapshot().clone();
-        if let Some(oc) = self.shared.opencode.lock().unwrap().as_ref()
-            && oc.is_healthy()
-        {
-            // A healthy real runtime is the truth for entities it owns;
+        if let Some((agents, sessions, _)) = self.live_lists() {
+            // Healthy real runtimes are the truth for entities they own;
             // mock seed sessions/agents shown beside real ones would pass
-            // demo data off as live (PRD §13.1). Permissions/activity/hosts
-            // stay engine-owned — adapter permissions ARE engine records
-            // (ingested at subscribe time).
-            snap.sessions = oc.sessions();
-            snap.agents = oc.agents();
+            // demo data off as live (PRD §13.1, ADR-009). Permissions/
+            // activity/hosts stay engine-owned — adapter permissions ARE
+            // engine records (ingested at subscribe time).
+            snap.sessions = sessions;
+            snap.agents = agents;
         }
         snap
     }
 
-    /// Phase 3 routing rule (one place so tests can pin it).
-    fn routes_to_adapter(msg: &ClientMsg, oc: &OpenCodeAdapter) -> bool {
-        match msg {
-            ClientMsg::CreateSession { .. }
-            | ClientMsg::SubmitPrompt { .. }
-            | ClientMsg::Interrupt { .. } => true,
-            // engine-authoritative unless the adapter surfaced the request
+    /// Agents and sessions of every healthy runtime, concatenated in config
+    /// order, plus the session ids two runtimes both claim: those are left
+    /// out (refused, never guessed). `None` while no runtime is healthy.
+    fn live_lists(&self) -> Option<(Vec<Agent>, Vec<Session>, Vec<String>)> {
+        let healthy: Vec<_> = self.runtimes.iter().filter(|r| r.is_healthy()).collect();
+        if healthy.is_empty() {
+            return None;
+        }
+        let agents = healthy.iter().flat_map(|r| r.agents()).collect();
+        let mut sessions: Vec<Session> = healthy.iter().flat_map(|r| r.sessions()).collect();
+        let mut seen = HashSet::new();
+        let mut dupes: Vec<String> = sessions
+            .iter()
+            .filter(|s| !seen.insert(s.id.as_str()))
+            .map(|s| s.id.clone())
+            .collect();
+        dupes.sort();
+        dupes.dedup();
+        sessions.retain(|s| !dupes.contains(&s.id));
+        Some((agents, sessions, dupes))
+    }
+
+    /// ADR-015 §4.1 routing rule (one place so tests can pin it). Only
+    /// healthy runtimes claim anything; two claimants are refused and logged.
+    fn route(&self, msg: &ClientMsg) -> Route {
+        let claims = |claimed: &dyn Fn(&dyn LiveRuntime) -> bool| -> Vec<Arc<dyn LiveRuntime>> {
+            self.runtimes
+                .iter()
+                .filter(|r| r.is_healthy() && claimed(r.as_ref()))
+                .cloned()
+                .collect()
+        };
+        let (what, id, claimants) = match msg {
+            // by the agent's host: the runtime whose id is the agent's hostId
+            ClientMsg::CreateSession { agent_id, .. } => (
+                "agent",
+                agent_id,
+                claims(&|r| {
+                    r.agents()
+                        .iter()
+                        .any(|a| a.id == *agent_id && a.host_id == r.id())
+                }),
+            ),
+            ClientMsg::SubmitPrompt { session_id, .. }
+            | ClientMsg::Interrupt { session_id, .. }
+            | ClientMsg::SessionEnd { session_id, .. }
+            | ClientMsg::SetPermissionMode { session_id, .. }
+            | ClientMsg::McpAuth { session_id, .. }
+            | ClientMsg::McpAuthCallback { session_id, .. }
+            | ClientMsg::McpReconnect { session_id, .. } => (
+                "session",
+                session_id,
+                claims(&|r| r.owns_session(session_id)),
+            ),
+            // engine-authoritative unless a runtime surfaced the request
             // natively (revision/expiry checked by the engine either way)
-            ClientMsg::PermissionDecision { permission_id, .. } => {
-                oc.knows_permission(permission_id)
-            }
+            ClientMsg::PermissionDecision { permission_id, .. } => (
+                "permission",
+                permission_id,
+                claims(&|r| r.knows_permission(permission_id)),
+            ),
+            // session-neutral; subscriptions need the connection, so the
+            // server answers those itself (never journaled, never routed)
             ClientMsg::Hello { .. }
             | ClientMsg::Ping { .. }
             | ClientMsg::ListState { .. }
             | ClientMsg::HsHello { .. }
-            | ClientMsg::HsProof { .. } => false,
-            // ADR-015: the engine refuses these until the LiveRuntime router
-            // (step 4) hands them to the runtime that owns the session
-            ClientMsg::SessionSubscribe { .. }
-            | ClientMsg::SessionUnsubscribe { .. }
-            | ClientMsg::SessionEnd { .. }
-            | ClientMsg::SetPermissionMode { .. }
-            | ClientMsg::McpAuth { .. }
-            | ClientMsg::McpAuthCallback { .. }
-            | ClientMsg::McpReconnect { .. } => false,
+            | ClientMsg::HsProof { .. }
+            | ClientMsg::SessionSubscribe { .. }
+            | ClientMsg::SessionUnsubscribe { .. } => return Route::Engine,
+        };
+        match claimants.as_slice() {
+            [] => Route::Engine,
+            [one] => Route::Runtime(one.clone()),
+            many => {
+                let ids: Vec<&str> = many.iter().map(|r| r.id()).collect();
+                eprintln!(
+                    "[companion] {what} {id} is claimed by runtimes {}: refused",
+                    ids.join(", ")
+                );
+                Route::Ambiguous
+            }
         }
     }
 
@@ -905,16 +989,20 @@ impl Companion {
             }
         };
         if due {
-            // clone the Arc out first: no companion lock is held across
-            // the HTTP probe (a dead endpoint costs its connect timeout)
-            let oc = self.shared.opencode.lock().unwrap().clone();
-            if let Some(oc) = oc {
-                let err = oc.refresh().err().map(|e| e.to_string());
+            // no companion lock is held across a probe (a dead OpenCode
+            // endpoint costs its connect timeout)
+            for rt in &self.runtimes {
+                let err = rt.refresh().err().map(|e| e.to_string());
                 self.shared
                     .adapters
                     .lock()
                     .unwrap()
-                    .probe_result(&oc.id, err);
+                    .probe_result(rt.id(), err);
+            }
+            if let Some((_, _, dupes)) = self.live_lists() {
+                for id in dupes {
+                    eprintln!("[companion] session {id} is claimed by several runtimes: hidden");
+                }
             }
             // Phase 7: same probe cadence for Ollama (poll-only model runtime)
             let ol = self.shared.ollama.lock().unwrap().clone();
@@ -930,9 +1018,9 @@ impl Companion {
     }
 
     pub fn shutdown(&self, graceful: bool) {
-        // stop the adapter's event thread before the audit line
-        if let Some(oc) = self.shared.opencode.lock().unwrap().take() {
-            oc.dispose();
+        // stop the runtimes' event threads before the audit line
+        for rt in &self.runtimes {
+            rt.dispose();
         }
         let mut store = self.shared.storage.lock().unwrap();
         let fallback;
@@ -1847,5 +1935,385 @@ mod tests {
             .and_then(crate::json::as_arr)
             .map(|a| a.len())
             .unwrap_or(0)
+    }
+
+    // ---- ADR-015 step 4: LiveRuntime router ----
+
+    use crate::adapters::{AdapterError, Capability};
+    use crate::protocol::{PermissionOption, PermissionRequest};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Test-only runtime: canned agent, session and permission ids; accepts
+    /// and records every message routed to it.
+    struct FakeRuntime {
+        id: String,
+        healthy: AtomicBool,
+        agents: Vec<String>,
+        sessions: Vec<String>,
+        permissions: Vec<String>,
+        sent: Mutex<Vec<ClientMsg>>,
+    }
+
+    impl FakeRuntime {
+        fn new(id: &str, agents: &[&str], sessions: &[&str], perms: &[&str]) -> Arc<FakeRuntime> {
+            let owned = |l: &[&str]| l.iter().map(|s| s.to_string()).collect();
+            Arc::new(FakeRuntime {
+                id: id.into(),
+                healthy: AtomicBool::new(true),
+                agents: owned(agents),
+                sessions: owned(sessions),
+                permissions: owned(perms),
+                sent: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Command ids routed here, in order.
+        fn got(&self) -> Vec<String> {
+            let sent = self.sent.lock().unwrap();
+            sent.iter()
+                .filter_map(|m| m.command_id().map(str::to_string))
+                .collect()
+        }
+    }
+
+    impl LiveRuntime for FakeRuntime {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn is_healthy(&self) -> bool {
+            self.healthy.load(Ordering::SeqCst)
+        }
+        fn agents(&self) -> Vec<Agent> {
+            let agent = |id: &String| Agent {
+                id: id.clone(),
+                host_id: self.id.clone(),
+                kind: "fake".into(),
+                name: id.clone(),
+                state: "online".into(),
+                capabilities: vec![],
+                accepts_new_session: true,
+                simulated: false,
+                live: None,
+            };
+            self.agents.iter().map(agent).collect()
+        }
+        fn sessions(&self) -> Vec<Session> {
+            let session = |id: &String| Session {
+                id: id.clone(),
+                agent_id: "fake".into(),
+                host_id: self.id.clone(),
+                title: id.clone(),
+                project: "p".into(),
+                status: "idle".into(),
+                progress: 0,
+                created_at: 0,
+                last_activity_at: 0,
+                prompt: None,
+                timeline: vec![],
+                output: vec![],
+                files: vec![],
+                transcript: false,
+            };
+            self.sessions.iter().map(session).collect()
+        }
+        fn owns_session(&self, session_id: &str) -> bool {
+            self.sessions.iter().any(|s| s == session_id)
+        }
+        fn knows_permission(&self, permission_id: &str) -> bool {
+            self.permissions.iter().any(|p| p == permission_id)
+        }
+        fn send(&self, msg: &ClientMsg) -> Result<ServerMsg, AdapterError> {
+            self.sent.lock().unwrap().push(msg.clone());
+            Ok(ServerMsg::ack_ok(msg.command_id().unwrap_or(""), None))
+        }
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+        fn dispose(&self) {}
+    }
+
+    fn ok(reply: Option<ServerMsg>) -> bool {
+        matches!(reply, Some(ServerMsg::Ack { ok: true, .. }))
+    }
+
+    fn refusal(reply: Option<ServerMsg>) -> String {
+        match reply {
+            Some(ServerMsg::Ack {
+                ok: false,
+                error: Some(e),
+                ..
+            }) => e,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_session_routes_by_agent_host() {
+        let c = temp_config("route-create");
+        let mut comp = Companion::boot(c.clone()).unwrap();
+        let a = FakeRuntime::new("rt-a", &["alpha"], &[], &[]);
+        let b = FakeRuntime::new("rt-b", &["beta"], &[], &[]);
+        comp.runtimes.push(a.clone());
+        comp.runtimes.push(b.clone());
+        let create = |id: &str, agent: &str| ClientMsg::CreateSession {
+            command_id: id.into(),
+            agent_id: agent.into(),
+            title: "T".into(),
+            prompt: "p".into(),
+            project: None,
+        };
+        assert!(ok(comp.handle_client_msg(create("cr-1", "beta"))));
+        assert!(ok(comp.handle_client_msg(create("cr-2", "alpha"))));
+        assert_eq!(
+            (a.got(), b.got()),
+            (vec!["cr-2".into()], vec!["cr-1".into()])
+        );
+        // an agent no runtime hosts stays with the engine (demo agent a4)
+        assert!(ok(comp.handle_client_msg(create("cr-3", "a4"))));
+        // an unhealthy host claims nothing: the engine does not know its agent
+        b.healthy.store(false, Ordering::SeqCst);
+        let refused = refusal(comp.handle_client_msg(create("cr-4", "beta")));
+        assert_eq!(refused, "unknown agent");
+        assert_eq!((a.got().len(), b.got().len()), (1, 1));
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    #[test]
+    fn session_commands_route_to_owner() {
+        let c = temp_config("route-session");
+        let mut comp = Companion::boot(c.clone()).unwrap();
+        let a = FakeRuntime::new("rt-a", &[], &["ses-a"], &[]);
+        let b = FakeRuntime::new("rt-b", &[], &["ses-b"], &["rt-b:p1", "rt-b:p2"]);
+        comp.runtimes.push(a.clone());
+        comp.runtimes.push(b.clone());
+        let (cmd, sid) = (|n: u32| format!("sc-{n}"), "ses-b".to_string());
+        for msg in [
+            ClientMsg::SubmitPrompt {
+                command_id: cmd(1),
+                session_id: sid.clone(),
+                text: "go".into(),
+            },
+            ClientMsg::Interrupt {
+                command_id: cmd(2),
+                session_id: sid.clone(),
+            },
+            ClientMsg::SessionEnd {
+                command_id: cmd(3),
+                session_id: sid.clone(),
+            },
+            ClientMsg::SetPermissionMode {
+                command_id: cmd(4),
+                session_id: sid.clone(),
+                mode: "plan".into(),
+            },
+            ClientMsg::McpAuth {
+                command_id: cmd(5),
+                session_id: sid.clone(),
+                server: "sentry".into(),
+                flow: "desktop".into(),
+            },
+            ClientMsg::McpAuthCallback {
+                command_id: cmd(6),
+                session_id: sid.clone(),
+                server: "sentry".into(),
+                callback_url: "http://localhost:1/cb?code=c&state=s".into(),
+            },
+            ClientMsg::McpReconnect {
+                command_id: cmd(7),
+                session_id: sid.clone(),
+                server: "sentry".into(),
+            },
+        ] {
+            assert!(ok(comp.handle_client_msg(msg)));
+        }
+        assert!(ok(comp.handle_client_msg(ClientMsg::SubmitPrompt {
+            command_id: cmd(8),
+            session_id: "ses-a".into(),
+            text: "go".into(),
+        })));
+        assert_eq!(b.got(), (1..=7).map(cmd).collect::<Vec<_>>());
+        assert_eq!(a.got(), vec![cmd(8)]);
+        // a session no runtime owns stays with the engine, which refuses it
+        let refused = refusal(comp.handle_client_msg(ClientMsg::SubmitPrompt {
+            command_id: cmd(9),
+            session_id: "ses-none".into(),
+            text: "go".into(),
+        }));
+        assert!(!refused.is_empty());
+        assert_eq!((a.got().len(), b.got().len()), (1, 7));
+
+        // permissions the runtime surfaced: the engine validates each decision
+        // first (G2), then the runtime gets it with the option the engine
+        // selected
+        let now = now_ms();
+        for native in ["p1", "p2"] {
+            let option = |id: &str, decision: &str, takes_message| PermissionOption {
+                id: id.into(),
+                decision: decision.into(),
+                label: id.into(),
+                rule: None,
+                scope: "once",
+                destination: None,
+                takes_message,
+                stops_turn: false,
+            };
+            comp.engine
+                .lock()
+                .unwrap()
+                .ingest_permission(PermissionRequest {
+                    id: format!("rt-b:{native}"),
+                    native_request_id: native.into(),
+                    session_id: sid.clone(),
+                    agent_id: "rt-b".into(),
+                    host_id: "rt-b".into(),
+                    action: "shell".into(),
+                    title: "Run ls".into(),
+                    command: "ls".into(),
+                    args: vec![],
+                    directory: None,
+                    risk: "high".into(),
+                    status: "pending".into(),
+                    supported_decisions: vec![],
+                    revision: 1,
+                    fingerprint: None,
+                    requested_at: now,
+                    expires_at: now,
+                    context: String::new(),
+                    decided_at: None,
+                    decision: None,
+                    tool_item_id: Some("tool-1".into()),
+                    options: vec![
+                        option("allow", "approve-once", false),
+                        option("deny", "reject", true),
+                    ],
+                    detail: None,
+                });
+        }
+        let decide =
+            |id: &str, perm: &str, decision: &str, revision: f64| ClientMsg::PermissionDecision {
+                command_id: id.into(),
+                permission_id: format!("rt-b:{perm}"),
+                decision: decision.into(),
+                revision,
+                option_id: None,
+                message: None,
+                answers: vec![],
+            };
+        let last_sent = || b.sent.lock().unwrap().last().cloned();
+        assert!(
+            !refusal(comp.handle_client_msg(decide("pd-1", "p1", "approve-once", 9.0))).is_empty()
+        );
+        assert_eq!(
+            b.got().len(),
+            7,
+            "a stale decision never reaches the runtime"
+        );
+        // a legacy tap (no optionId) reaches the runtime as the selected option
+        assert!(ok(comp.handle_client_msg(decide(
+            "pd-2",
+            "p1",
+            "approve-once",
+            1.0
+        ))));
+        let mut forwarded = decide("pd-2", "p1", "approve-once", 1.0);
+        if let ClientMsg::PermissionDecision { option_id, .. } = &mut forwarded {
+            *option_id = Some("allow".into());
+        }
+        assert_eq!(last_sent(), Some(forwarded));
+        // an explicit option travels with its message verbatim
+        let mut with_reason = decide("pd-3", "p2", "reject", 1.0);
+        if let ClientMsg::PermissionDecision {
+            option_id, message, ..
+        } = &mut with_reason
+        {
+            *option_id = Some("deny".into());
+            *message = Some("use staging".into());
+        }
+        assert!(ok(comp.handle_client_msg(with_reason.clone())));
+        assert_eq!(last_sent(), Some(with_reason));
+        let snap = comp.snapshot();
+        let state = |id: &str| {
+            let p = snap.permissions.iter().find(|p| p.id == id).unwrap();
+            (p.status.clone(), p.revision)
+        };
+        assert_eq!(state("rt-b:p1"), ("approved".to_string(), 2));
+        assert_eq!(state("rt-b:p2"), ("rejected".to_string(), 2));
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    #[test]
+    fn duplicate_session_id_across_runtimes_is_refused() {
+        let c = temp_config("route-dupe");
+        let mut comp = Companion::boot(c.clone()).unwrap();
+        let a = FakeRuntime::new("rt-a", &[], &["ses-dup", "ses-a"], &[]);
+        let b = FakeRuntime::new("rt-b", &[], &["ses-dup"], &[]);
+        comp.runtimes.push(a.clone());
+        comp.runtimes.push(b.clone());
+        let refused = refusal(comp.handle_client_msg(ClientMsg::SubmitPrompt {
+            command_id: "dup-1".into(),
+            session_id: "ses-dup".into(),
+            text: "which one?".into(),
+        }));
+        assert!(refused.contains("more than one runtime"), "{refused}");
+        assert!(a.got().is_empty() && b.got().is_empty());
+        {
+            let store = comp.shared.storage.lock().unwrap();
+            assert_eq!(store.commands["dup-1"].status, "refused");
+        }
+        // the snapshot never shows the ambiguous id
+        let ids: Vec<String> = comp.snapshot().sessions.into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["ses-a".to_string()]);
+        // the uniquely owned session still routes
+        assert!(ok(comp.handle_client_msg(ClientMsg::Interrupt {
+            command_id: "dup-2".into(),
+            session_id: "ses-a".into(),
+        })));
+        assert_eq!(a.got(), vec!["dup-2".to_string()]);
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    #[test]
+    fn demo_data_hidden_when_any_live_runtime_is_healthy() {
+        let c = temp_config("route-demo");
+        let mut comp = Companion::boot(c.clone()).unwrap();
+        let demo = comp.snapshot();
+        assert!(demo.agents.iter().any(|a| a.simulated));
+        assert!(!demo.sessions.is_empty());
+        let a = FakeRuntime::new("rt-a", &["alpha"], &["ses-a"], &[]);
+        let b = FakeRuntime::new("rt-b", &["beta"], &["ses-b"], &[]);
+        a.healthy.store(false, Ordering::SeqCst);
+        b.healthy.store(false, Ordering::SeqCst);
+        comp.runtimes.push(a.clone());
+        comp.runtimes.push(b.clone());
+        let lists = |comp: &Companion| {
+            let snap = comp.snapshot();
+            let agents: Vec<String> = snap.agents.into_iter().map(|a| a.id).collect();
+            let sessions: Vec<String> = snap.sessions.into_iter().map(|s| s.id).collect();
+            (agents, sessions)
+        };
+        // no runtime is healthy: the demo data stays
+        let demo_lists = lists(&comp);
+        assert_eq!(demo_lists.0.len(), demo.agents.len());
+        // one healthy runtime hides it: only real entities are shown
+        b.healthy.store(true, Ordering::SeqCst);
+        assert_eq!(lists(&comp), (vec!["beta".into()], vec!["ses-b".into()]));
+        // every healthy runtime's lists, concatenated in config order
+        a.healthy.store(true, Ordering::SeqCst);
+        assert_eq!(
+            lists(&comp),
+            (
+                vec!["alpha".into(), "beta".into()],
+                vec!["ses-a".into(), "ses-b".into()]
+            )
+        );
+        // hosts and permissions stay engine-owned
+        let snap = comp.snapshot();
+        assert_eq!(snap.hosts.len(), demo.hosts.len());
+        assert_eq!(snap.permissions.len(), demo.permissions.len());
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 }

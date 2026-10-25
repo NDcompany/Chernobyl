@@ -20,7 +20,7 @@
 //! `subscribe` and answers `send` with acceptance acks; sequence numbers,
 //! persistence and fan-out stay with the companion (Phase 3 wiring step).
 
-use crate::adapters::Capability;
+use crate::adapters::{Capability, LiveRuntime};
 use crate::client::{HttpResponse, http_request, split_url};
 use crate::json::{self, Json};
 use crate::protocol::{
@@ -34,40 +34,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/* ------------------------------------------------------------------ */
-/* Errors (adapter-sdk code set)                                       */
-/* ------------------------------------------------------------------ */
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum AdapterError {
-    Unsupported(String),
-    RuntimeUnavailable(String),
-    InvalidResponse(String),
-    Unknown(String),
-}
-
-impl AdapterError {
-    pub fn code(&self) -> &'static str {
-        match self {
-            AdapterError::Unsupported(_) => "unsupported",
-            AdapterError::RuntimeUnavailable(_) => "runtime-unavailable",
-            AdapterError::InvalidResponse(_) => "invalid-response",
-            AdapterError::Unknown(_) => "unknown",
-        }
-    }
-}
-
-impl std::fmt::Display for AdapterError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let msg = match self {
-            AdapterError::Unsupported(m)
-            | AdapterError::RuntimeUnavailable(m)
-            | AdapterError::InvalidResponse(m)
-            | AdapterError::Unknown(m) => m,
-        };
-        write!(f, "{}: {}", self.code(), msg)
-    }
-}
+/// Moved to `adapters` with the `LiveRuntime` trait (ADR-015 step 4); the
+/// old path keeps working for `ollama`, `claude` and external callers.
+pub use crate::adapters::AdapterError;
 
 type Sub = Arc<dyn Fn(EventKind) + Send + Sync>;
 
@@ -284,7 +253,9 @@ impl OpenCodeAdapter {
             | ClientMsg::HsProof { .. } => Err(AdapterError::Unsupported(
                 "session-neutral messages stay with the engine".into(),
             )),
-            // ADR-015 live messages: never routed here yet (rich parts, step 5)
+            // ADR-015 live messages for OpenCode sessions land here: no
+            // end/mode equivalent (§4.4), MCP arrives with rich parts (step 5).
+            // Subscriptions never do (the server owns them per connection).
             ClientMsg::SessionSubscribe { .. }
             | ClientMsg::SessionUnsubscribe { .. }
             | ClientMsg::SessionEnd { .. }
@@ -380,6 +351,44 @@ impl OpenCodeAdapter {
             let _ = s.shutdown(Shutdown::Both);
         }
         self.inner.subs.lock().unwrap().clear();
+    }
+}
+
+/// ADR-015 step 4: OpenCode behind the router, behaviour unchanged. Each
+/// method delegates to the inherent one of the same name.
+impl LiveRuntime for OpenCodeAdapter {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn is_healthy(&self) -> bool {
+        OpenCodeAdapter::is_healthy(self)
+    }
+    fn agents(&self) -> Vec<Agent> {
+        OpenCodeAdapter::agents(self)
+    }
+    fn sessions(&self) -> Vec<Session> {
+        OpenCodeAdapter::sessions(self)
+    }
+    /// The cached list (re-listed on every probe and SSE reconnect, upserted
+    /// by `session.created` and by our own create).
+    fn owns_session(&self, session_id: &str) -> bool {
+        let st = self.inner.state.lock().unwrap();
+        st.sessions.iter().any(|s| s.id == session_id)
+    }
+    fn knows_permission(&self, permission_id: &str) -> bool {
+        OpenCodeAdapter::knows_permission(self, permission_id)
+    }
+    fn send(&self, msg: &ClientMsg) -> Result<ServerMsg, AdapterError> {
+        OpenCodeAdapter::send(self, msg)
+    }
+    fn refresh(&self) -> Result<(), AdapterError> {
+        OpenCodeAdapter::refresh(self)
+    }
+    fn capabilities(&self) -> Vec<Capability> {
+        OpenCodeAdapter::capabilities(self)
+    }
+    fn dispose(&self) {
+        OpenCodeAdapter::dispose(self)
     }
 }
 
