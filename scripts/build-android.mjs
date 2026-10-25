@@ -8,7 +8,8 @@
 // build-tools 36, NDK 27.1 and a CMake >= 3.31: React Native object paths pass
 // Windows' 260-character limit, and only the ninja shipped with CMake 3.31+
 // is long-path aware (LongPathsEnabled must be 1 as well). The APK lands in
-// apps/mobile/dist-android/ where scripts/package-release.mjs hashes it.
+// release/ where scripts/package-release.mjs hashes it (not dist-android:
+// expo export wipes that folder).
 // It is signed with the debug keystore of Expo's template: installable, not a
 // Play Store identity (same disclosure stance as ADR-007).
 import { spawnSync } from 'node:child_process';
@@ -55,7 +56,7 @@ run(gradlew, ['assembleRelease', `-PreactNativeArchitectures=${abis}`, '--consol
 const apk = join(android, 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk');
 if (!existsSync(apk)) fail(`build finished but ${apk} is missing`);
 const version = JSON.parse(readFileSync(join(mobile, 'app.json'), 'utf8')).expo.version;
-const outDir = join(mobile, 'dist-android');
+const outDir = join(root, 'release');
 mkdirSync(outDir, { recursive: true });
 const out = join(outDir, `chernobyl-${version}-${abis.replace(/,/g, '+')}.apk`);
 copyFileSync(apk, out);

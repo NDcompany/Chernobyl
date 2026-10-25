@@ -31,8 +31,7 @@ node scripts/build-android.mjs --abi x86_64    # emulator only
 ```
 
 It compiles the shared packages, runs `expo prebuild` if `apps/mobile/android` is missing,
-then builds the release APK into `apps/mobile/dist-android/`, where `package-release` hashes
-it. The APK is signed with the debug keystore from Expo's template. It installs on any
+then builds the release APK into `release/`, where `package-release` hashes it. The APK is signed with the debug keystore from Expo's template. It installs on any
 device (`adb install -r …`), but it is not a Play Store identity.
 
 To test on an emulator, `scripts/device/validate.mjs` runs the phone checklist against the
@@ -45,7 +44,7 @@ evidence. The emulator reaches the PC's loopback as `10.0.2.2`.
 node scripts/package-release.mjs
 ```
 
-This hashes the release binary (and any `apps/mobile/dist-android/*.apk`) and
+This hashes the release binary (and any `release/*.apk`) and
 writes `release/SHA256SUMS.txt` in the standard `<hex>  <path>` format. It also
 prints an explicit note that these are **unsigned** binaries — checksums prove
 integrity, not authorship.

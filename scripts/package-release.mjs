@@ -12,7 +12,7 @@
 //
 // Artifacts (when present, each is hashed):
 //   services/companion-rs/target/release/chernobyl-companion[.exe]
-//   apps/mobile/dist-android/*.apk
+//   release/*.apk (from scripts/build-android.mjs)
 //
 // Checksums land in `release/SHA256SUMS.txt` in the standard `<hex>  <path>`
 // format (verifiable with `sha256sum -c` on Linux/macOS or this script's
@@ -35,7 +35,7 @@ function candidates() {
   const list = [
     join(root, 'services/companion-rs/target/release', `chernobyl-companion${exe}`),
   ];
-  const apkDir = join(root, 'apps/mobile/dist-android');
+  const apkDir = releaseDir; // scripts/build-android.mjs puts the APK here
   if (existsSync(apkDir)) {
     for (const f of readdirSync(apkDir)) {
       if (f.endsWith('.apk')) list.push(join(apkDir, f));

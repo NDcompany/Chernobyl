@@ -47,4 +47,15 @@ and all its findings are fixed; a human third-party audit is still owed before a
 
 ## Final verification run
 
-Filled in by the final pass.
+Run on 2026-10-25 (night) against the commit that updates this file:
+
+| Suite | Result |
+|---|---|
+| `npm run verify` | exit 0. Tests: domain 13/13, host 24/24, adapter-sdk 9/9, e2e 37/37. Lint: 0 errors (2 pre-existing RHF `watch` warnings). Android export builds |
+| `npm run verify:rust` | 241 unit + 7 CLI + 5 lifecycle integration tests, 0 failed (4 + 1 ignored microbench/live); clippy `-D warnings` and fmt clean; `--self-test` ALL CHECKS PASSED |
+| Interop (Node client vs the real binary) | 19/19 PASS, including live revoke → 4003 |
+| `npm run soak:smoke` | 10/10, `pass: true` (the 24 h S11 run passed 2026-10-24 on `f47c4f6`; later builds have smoke evidence only) |
+| Emulator, release APK | 14 checklist rows pass (`evidence/2026-10-25-emulator/results.json`); the final dual-ABI APK was reinstalled and re-passed row 1.1 |
+| `node scripts/build-android.mjs` | `release/chernobyl-0.1.0-arm64-v8a+x86_64.apk` (71 MB, both native ABIs) |
+| `node scripts/package-release.mjs` + `--verify` | exe + APK hashed into `release/SHA256SUMS.txt`, both verified |
+| `git diff --check` | clean |
