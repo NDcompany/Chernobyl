@@ -27,3 +27,7 @@
 --- start 2026-10-25T17:32:37.820Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487 --token device-run-token
 [companion] listening on 127.0.0.1:18787 (protocol v2, token auth on)
 [companion] diagnostics on 127.0.0.1:19487
+
+--- start 2026-10-25T18:11:24.690Z --bind 127.0.0.1 --port 18787 --diagnostics-port 19487
+[companion] listening on 127.0.0.1:18787 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19487
