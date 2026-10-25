@@ -1,6 +1,6 @@
 # CHERNOBYL — TODO
 
-Updated: 2026-10-25 late (reliability mandate closed: audit P1–P10 + extra findings, D4 live revoke, D9 option B, pairing-while-running fix, Phase 6 camera QR / host records / outcome honesty, Phase 9 gate assessed in `docs/validation/RELEASE-GATE.md`). Earlier: 24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria, `pass: true`; Phase 8 complete: TUI + pairing overlay + windowless autostart + packaging ADR-007; client read-timeout cross-handle fix). Status of the Rust companion rewrite + everything left.
+Updated: 2026-10-25 night (emulator validation of the release APK: 14 checklist rows pass; 95-agent independent security review, 22 findings fixed — `docs/security/INDEPENDENT-REVIEW-2026-10-25.md`; Android foreground service built and device-tested; simulated-data provenance; D1 app-Origin allow-list; cleartext ws:// in release). Before that, 2026-10-25 late (reliability mandate closed: audit P1–P10 + extra findings, D4 live revoke, D9 option B, pairing-while-running fix, Phase 6 camera QR / host records / outcome honesty, Phase 9 gate assessed in `docs/validation/RELEASE-GATE.md`). Earlier: 24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria, `pass: true`; Phase 8 complete: TUI + pairing overlay + windowless autostart + packaging ADR-007; client read-timeout cross-handle fix). Status of the Rust companion rewrite + everything left.
 
 ## Done
 
@@ -295,8 +295,10 @@ Updated: 2026-10-25 late (reliability mandate closed: audit P1–P10 + extra fin
       forever mid-match) — timeouts now set on the reading handle at all three sites.
 - [~] Phase 9: release gate — **assessed 2026-10-25** (`docs/validation/RELEASE-GATE.md`): code-side
       items ✅ (security suites, revocation incl. live 4003, privacy/retention doc, backup/restore,
-      credential scan, integrations doc, no mock advertised as real). Blocked on external
-      conditions only: physical-device rows (S4), Android APK build (no SDK), independent audit (S9).
+      credential scan, integrations doc, no mock advertised as real). **Update 2026-10-25 night:**
+      the release APK builds (`scripts/build-android.mjs`) and passes 14 checklist rows on an Android
+      15 emulator; independent agent review done and fixed. Still owed (external): one physical-phone
+      run incl. a real camera QR scan (S4), a human third-party audit (S9), and release signing.
 
 ## Explicitly not done (honesty)
 

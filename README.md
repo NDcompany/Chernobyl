@@ -142,17 +142,17 @@ production backend — use the companion for real connections.
   installed here, deliberately not stubbed). When no healthy real runtime is
   attached, sessions/agents fall back to the mock seed — the UI must not present that
   as live activity.
-- **The mobile E2E client is built but never validated on a physical device**
-  (Phase 6 code complete: pure-JS crypto per ADR-012, pairing scan, sealed frames,
-  endpoint-list reconnect). Every row in `docs/validation/PHONE-VALIDATION-CHECKLIST.md`
-  is NOT RUN/BLOCKED until someone scans a QR with a real Android phone.
-- **Background notifications are written but not yet built or device-tested.** On Android
-  a foreground service (`apps/mobile/modules/connection-service`) keeps the paired
-  WebSocket alive while the app is in the background, but not after it is swiped away from
-  Recents, and the app posts local notifications (ADR-011 §4; FCM/APNs deliberately dropped).
-  Its Kotlin compiles, but no APK with it has been built yet. Nothing is delivered while the
-  socket is down. iOS shows
-  alerts only while the app is open; APNs is out of scope.
+- **The release APK is validated on an Android 15 emulator, not yet on a physical phone.**
+  `node scripts/device/validate.mjs` drives the real APK against a real companion: pairing
+  and E2E handshake, relaunch, companion restart, network loss, the background service,
+  live revoke and token refusal all pass (14 checklist rows,
+  `docs/validation/evidence/2026-10-25-emulator/`). Camera QR decoding and OEM battery
+  behaviour need a real phone.
+- **Background connection on Android.** A foreground service
+  (`apps/mobile/modules/connection-service`) keeps the paired WebSocket and its timers alive
+  while the app is in the background, but not after the app is swiped away from Recents. The
+  app posts local notifications (ADR-011 §4; FCM/APNs deliberately dropped). Nothing is
+  delivered while the socket is down. iOS shows alerts only while the app is open.
 - **Transport encryption is app-layer E2E**, not TLS — the std-only Rust companion has
   no TLS crate, so security lives in the per-device PSK session (ADR-011). The
   companion's own socket is plain `ws://`; a middleman sees ciphertext only.
@@ -182,10 +182,9 @@ Two suites, both green on the current tree:
 
 The WebSocket/E2E layer is exercised against a live companion end-to-end (handshake,
 snapshot, command → ack, token rejection `4001`, and the pairing → handshake → sealed-frame
-path) in the Rust integration tests. There is no Android SDK on this machine, so there is
-no `expo run:android` device build here; the export bundle is the build check, and
-physical phone validation is tracked in `docs/validation/PHONE-VALIDATION-CHECKLIST.md`
-(all rows currently NOT RUN / BLOCKED).
+path) in the Rust integration tests, and by the emulator run above. The APK builds with
+`node scripts/build-android.mjs` (`docs/INSTALL.md`). Physical-phone validation is tracked
+in `docs/validation/PHONE-VALIDATION-CHECKLIST.md`.
 
 ## Remaining work (honest status)
 
