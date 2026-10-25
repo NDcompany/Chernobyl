@@ -3,7 +3,12 @@
 //! The durable state is a single append-only journal (`companion.journal`).
 //! Backup copies it to a target path and writes a `<name>.sha256` sidecar;
 //! restore verifies that sidecar before copying back, so a truncated or
-//! tampered backup is refused rather than silently promoted to live state.
+//! corrupted backup is refused rather than silently promoted to live state.
+//! The sidecar is an unkeyed checksum stored beside the backup: it detects
+//! corruption, not deliberate edits. Whoever can rewrite the backup can
+//! rewrite the sidecar, so keep backups in a folder only you can write
+//! (security review 2026-10-25). Restore never un-revokes a device: every
+//! revocation in the journal it replaces is re-applied to the restored one.
 //!
 //! Honest limitation (documented, not hidden): PSKs inside the journal are
 //! DPAPI-bound to this machine + user. A restore onto a DIFFERENT machine will
@@ -11,6 +16,7 @@
 //! same-machine durability aid, not a portable secrets export.
 
 use crate::crypto;
+use crate::storage::{self, Storage};
 use std::fs;
 use std::path::Path;
 
@@ -31,8 +37,10 @@ pub fn backup(data_dir: &Path, dest: &Path) -> Result<String, String> {
 }
 
 /// Verify `src` against its `.sha256` sidecar, then copy it to
-/// `<data_dir>/companion.journal`. Refuses on any checksum mismatch.
-pub fn restore(src: &Path, data_dir: &Path) -> Result<String, String> {
+/// `<data_dir>/companion.journal`. Refuses on any checksum mismatch, and while
+/// a companion holds the journal. Returns the hex SHA-256 and the ids of the
+/// devices whose revocation was re-applied.
+pub fn restore(src: &Path, data_dir: &Path) -> Result<(String, Vec<String>), String> {
     let bytes = fs::read(src).map_err(|e| format!("read backup: {e}"))?;
     let digest = hex(&crypto::sha256(&bytes));
     let sidecar = sidecar_path(src);
@@ -46,10 +54,57 @@ pub fn restore(src: &Path, data_dir: &Path) -> Result<String, String> {
             "checksum mismatch: manifest {expected}, file {digest} — refusing to restore"
         ));
     }
-    fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
-    let dest = data_dir.join(JOURNAL_NAME);
-    fs::write(&dest, &bytes).map_err(|e| format!("write journal: {e}"))?;
-    Ok(digest)
+    // A running companion keeps appending to the journal it opened and
+    // compacts its own state back over the restore (security review
+    // 2026-10-25).
+    let _lock = storage::lock_data_dir(data_dir)?;
+    // Revocations are monotonic: a device revoked since the backup was taken
+    // stays revoked, or the restore would re-admit a lost phone.
+    let revoked: Vec<String> = Storage::open_read_only(data_dir)?
+        .devices
+        .into_values()
+        .filter(|d| d.revoked)
+        .map(|d| d.device_id)
+        .collect();
+    // Staged beside the journal and swapped in with one rename, so a failure
+    // part-way (a revocation not yet re-applied) leaves the live journal as is.
+    let stage = data_dir.join("restore.tmp");
+    let _ = fs::remove_dir_all(&stage);
+    let staged = stage_restore(&stage, &bytes, &revoked).and_then(|reapplied| {
+        fs::rename(stage.join(JOURNAL_NAME), data_dir.join(JOURNAL_NAME))
+            .map_err(|e| format!("write journal: {e}"))?;
+        Ok(reapplied)
+    });
+    let _ = fs::remove_dir_all(&stage);
+    Ok((digest, staged?))
+}
+
+/// Writes the backup into `stage` and re-applies `revoked` to it; returns the
+/// ids whose revocation the backup had lost.
+fn stage_restore(stage: &Path, bytes: &[u8], revoked: &[String]) -> Result<Vec<String>, String> {
+    fs::create_dir_all(stage).map_err(|e| format!("create staging dir: {e}"))?;
+    fs::write(stage.join(JOURNAL_NAME), bytes).map_err(|e| format!("write journal: {e}"))?;
+    let mut reapplied = Vec::new();
+    if revoked.is_empty() {
+        return Ok(reapplied);
+    }
+    // a full open drops a torn tail first, so the records land on a clean
+    // line; no pruning here, retention is the next boot's job
+    let mut store = Storage::open(stage, usize::MAX, usize::MAX)?;
+    for id in revoked {
+        if let Some(mut d) = store.devices.get(id).cloned()
+            && !d.revoked
+        {
+            d.revoked = true;
+            store.put_device(&d)?;
+            let _ = store.append_audit(
+                "revoke",
+                &format!("device {id} revocation re-applied after restore"),
+            );
+            reapplied.push(id.clone());
+        }
+    }
+    Ok(reapplied)
 }
 
 fn sidecar_path(p: &Path) -> std::path::PathBuf {
@@ -91,12 +146,89 @@ mod tests {
         let d1 = backup(&data, &bak).unwrap();
         // clobber the live journal, then restore
         fs::write(data.join(JOURNAL_NAME), b"garbage").unwrap();
-        let d2 = restore(&bak, &store).unwrap();
+        let (d2, reapplied) = restore(&bak, &store).unwrap();
         assert_eq!(d1, d2, "checksum must match on a clean round-trip");
+        assert!(reapplied.is_empty());
         let restored = fs::read(store.join(JOURNAL_NAME)).unwrap();
         assert!(String::from_utf8_lossy(&restored).contains("hostId"));
+        assert_eq!(
+            restored,
+            fs::read(&bak).unwrap(),
+            "nothing to re-apply: exact bytes"
+        );
         let _ = fs::remove_dir_all(&data);
         let _ = fs::remove_dir_all(&store);
+    }
+
+    /// Security review 2026-10-25: restoring a backup taken before a phone was
+    /// revoked must not re-admit that phone.
+    #[test]
+    fn restore_keeps_revocations_made_after_the_backup() {
+        use crate::storage::DeviceRecord;
+        let data = temp_dir("revoked");
+        let device = |id: &str, revoked| DeviceRecord {
+            device_id: id.into(),
+            name: "phone".into(),
+            psk_protected: "P".into(),
+            paired_at: 1,
+            revoked,
+        };
+        {
+            let mut s = Storage::open(&data, 500, 500).unwrap();
+            s.put_device(&device("lost", false)).unwrap();
+            s.put_device(&device("kept", false)).unwrap();
+        }
+        let bak = data.join("snap.journal");
+        backup(&data, &bak).unwrap();
+        {
+            let mut s = Storage::open(&data, 500, 500).unwrap();
+            s.put_device(&device("lost", true)).unwrap();
+        }
+
+        let (_, reapplied) = restore(&bak, &data).unwrap();
+        assert_eq!(reapplied, vec!["lost".to_string()]);
+        let s = Storage::open_read_only(&data).unwrap();
+        assert!(s.devices["lost"].revoked, "a restore must never un-revoke");
+        assert!(
+            !s.devices["kept"].revoked,
+            "other devices come back as backed up"
+        );
+        assert!(
+            s.audit
+                .iter()
+                .any(|a| a.text.contains("re-applied after restore"))
+        );
+        assert!(!data.join("restore.tmp").exists(), "staging dir removed");
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_is_refused_while_a_companion_holds_the_journal() {
+        let data = temp_dir("locked");
+        let journal = data.join(JOURNAL_NAME);
+        fs::write(
+            &journal,
+            "{\"kind\":\"kv\",\"k\":\"hostId\",\"v\":\"old\"}\n",
+        )
+        .unwrap();
+        let bak = data.join("snap.journal");
+        backup(&data, &bak).unwrap();
+        let live = "{\"kind\":\"kv\",\"k\":\"hostId\",\"v\":\"live\"}\n";
+        fs::write(&journal, live).unwrap();
+
+        let held = storage::lock_data_dir(&data).unwrap();
+        let err = restore(&bak, &data).unwrap_err();
+        assert!(err.contains("already running"), "got: {err}");
+        assert_eq!(
+            fs::read_to_string(&journal).unwrap(),
+            live,
+            "journal untouched"
+        );
+        drop(held);
+        restore(&bak, &data).unwrap();
+        assert!(fs::read_to_string(&journal).unwrap().contains("old"));
+        let _ = fs::remove_dir_all(&data);
     }
 
     #[test]

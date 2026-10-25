@@ -96,7 +96,8 @@ pub struct DeviceRecord {
 
 pub struct Storage {
     dir: PathBuf,
-    journal: File,
+    /// `None` for `open_read_only`: no write handle, so nothing can change the file.
+    journal: Option<File>,
     pub commands: HashMap<String, CommandRecord>,
     pub events: Vec<EventRecord>,
     pub approvals: HashMap<String, ApprovalRecord>,
@@ -162,39 +163,47 @@ fn record_line(kind: &str, body: &Json) -> String {
     line
 }
 
+/// Takes `<dir>/companion.lock`, the journal's single-writer lock (security
+/// review 2026-10-25): the daemon holds it for its lifetime, an offline CLI
+/// write (--pair, --revoke, --restore) for the length of that write. A record
+/// written behind a running companion's back is never loaded, and its next
+/// compaction erases it. Windows: share_mode(0) makes every other open fail
+/// while the handle lives; the OS releases it when the holder exits, even on
+/// a crash. A no-op elsewhere.
+pub fn lock_data_dir(dir: &Path) -> Result<File, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("create data dir: {e}"))?;
+    let path = dir.join("companion.lock");
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+    }
+    opts.open(&path).map_err(|e| {
+        // ERROR_SHARING_VIOLATION: another handle holds the lock
+        if e.raw_os_error() == Some(32) {
+            format!(
+                "a companion is already running on {} (it holds companion.lock)",
+                dir.display()
+            )
+        } else {
+            format!("cannot take {}: {e}", path.display())
+        }
+    })
+}
+
 impl Storage {
     /// Opens (creating if absent) the journal at `<dir>/companion.journal`.
     pub fn open(dir: &Path, event_cap: usize, command_cap: usize) -> Result<Storage, String> {
         fs::create_dir_all(dir).map_err(|e| format!("create data dir: {e}"))?;
         let path = dir.join("companion.journal");
-
-        let mut store = Storage {
-            dir: dir.to_path_buf(),
-            journal: OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|e| format!("open journal: {e}"))?,
-            commands: HashMap::new(),
-            events: Vec::new(),
-            approvals: HashMap::new(),
-            audit: Vec::new(),
-            kv: HashMap::new(),
-            pairings: HashMap::new(),
-            devices: HashMap::new(),
-            last_seq: 0,
-            event_cap,
-            command_cap,
-            bytes_since_compact: 0,
-            compact_trigger: JOURNAL_COMPACT_TRIGGER_BYTES,
-            failed: false,
-            corrupt_events: 0,
-            corrupt: None,
-            #[cfg(test)]
-            fail_after_appends: None,
-            #[cfg(test)]
-            appends_count: 0,
-        };
+        let journal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("open journal: {e}"))?;
+        let mut store = Storage::empty(dir, event_cap, command_cap, Some(journal));
 
         // Load, then truncate any torn tail so future appends stay aligned.
         let valid_bytes = store.load(&path)?;
@@ -251,6 +260,46 @@ impl Storage {
         }
 
         Ok(store)
+    }
+
+    /// Loads the journal without changing it (security review 2026-10-25): no
+    /// torn-tail truncation, schema marker, corruption audit, pruning or
+    /// compaction, and every write on the result is refused. For CLI reads
+    /// that may run while a companion owns the journal (`--devices`, restore's
+    /// revocation carry-forward). A missing journal reads as empty.
+    pub fn open_read_only(dir: &Path) -> Result<Storage, String> {
+        let mut store = Storage::empty(dir, usize::MAX, usize::MAX, None);
+        let path = dir.join("companion.journal");
+        if path.exists() {
+            store.load(&path)?;
+        }
+        Ok(store)
+    }
+
+    fn empty(dir: &Path, event_cap: usize, command_cap: usize, journal: Option<File>) -> Storage {
+        Storage {
+            dir: dir.to_path_buf(),
+            journal,
+            commands: HashMap::new(),
+            events: Vec::new(),
+            approvals: HashMap::new(),
+            audit: Vec::new(),
+            kv: HashMap::new(),
+            pairings: HashMap::new(),
+            devices: HashMap::new(),
+            last_seq: 0,
+            event_cap,
+            command_cap,
+            bytes_since_compact: 0,
+            compact_trigger: JOURNAL_COMPACT_TRIGGER_BYTES,
+            failed: false,
+            corrupt_events: 0,
+            corrupt: None,
+            #[cfg(test)]
+            fail_after_appends: None,
+            #[cfg(test)]
+            appends_count: 0,
+        }
     }
 
     /// Evicts the oldest completed command records while over `command_cap`;
@@ -475,10 +524,12 @@ impl Storage {
             }
             self.appends_count += 1;
         }
-        match self
-            .journal
+        let Some(journal) = self.journal.as_mut() else {
+            return Err("journal opened read-only — refusing writes".into());
+        };
+        match journal
             .write_all(line.as_bytes())
-            .and_then(|_| self.journal.flush())
+            .and_then(|_| journal.flush())
         {
             Ok(()) => {
                 self.bytes_since_compact += line.len() as u64;
@@ -731,6 +782,9 @@ impl Storage {
 
     /// Rewrites the journal with only live records (atomic: tmp + rename).
     pub fn compact(&mut self) -> Result<(), String> {
+        if self.journal.is_none() {
+            return Err("journal opened read-only — refusing to compact".into());
+        }
         let tmp = self.dir.join("companion.journal.tmp");
         {
             let mut f = File::create(&tmp).map_err(|e| format!("compact create: {e}"))?;
@@ -807,10 +861,12 @@ impl Storage {
         // swap: std::fs::rename replaces the destination on Windows too
         fs::rename(&tmp, self.dir.join("companion.journal"))
             .map_err(|e| format!("compact rename: {e}"))?;
-        self.journal = OpenOptions::new()
-            .append(true)
-            .open(self.dir.join("companion.journal"))
-            .map_err(|e| format!("compact reopen: {e}"))?;
+        self.journal = Some(
+            OpenOptions::new()
+                .append(true)
+                .open(self.dir.join("companion.journal"))
+                .map_err(|e| format!("compact reopen: {e}"))?,
+        );
         Ok(())
     }
 }
@@ -1254,6 +1310,56 @@ mod tests {
         drop(s);
         let s2 = Storage::open(&dir, 500, 500).unwrap();
         assert_eq!(s2.commands.len(), 50);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Security review 2026-10-25: `--devices` reads a journal the daemon may
+    /// be appending to. A full open of this file would truncate the torn tail
+    /// and append the schema marker; the read-only open must change no byte.
+    #[test]
+    fn read_only_open_leaves_the_journal_byte_identical() {
+        let dir = temp_dir("read-only");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("companion.journal");
+        let device = DeviceRecord {
+            device_id: "d1".into(),
+            name: "phone".into(),
+            psk_protected: "P".into(),
+            paired_at: 1,
+            revoked: false,
+        };
+        let mut bytes = record_line("device", &Storage::device_body(&device)).into_bytes();
+        bytes.extend_from_slice(b"{\"kind\":\"event\",\"seq\":2,\"p"); // torn tail
+        fs::write(&path, &bytes).unwrap();
+
+        let mut s = Storage::open_read_only(&dir).unwrap();
+        assert_eq!(s.devices["d1"], device);
+        assert!(s.put_device(&device).is_err(), "writes must be refused");
+        assert!(s.compact().is_err(), "compaction must be refused");
+        drop(s);
+        assert_eq!(fs::read(&path).unwrap(), bytes, "the journal changed");
+
+        // a missing journal reads as empty and creates nothing
+        let missing = temp_dir("read-only-missing");
+        assert!(
+            Storage::open_read_only(&missing)
+                .unwrap()
+                .devices
+                .is_empty()
+        );
+        assert!(!missing.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn data_dir_lock_is_exclusive_until_dropped() {
+        let dir = temp_dir("lock");
+        let held = lock_data_dir(&dir).unwrap();
+        let err = lock_data_dir(&dir).unwrap_err();
+        assert!(err.contains("already running"), "got: {err}");
+        drop(held);
+        drop(lock_data_dir(&dir).expect("the lock is free once its holder drops it"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

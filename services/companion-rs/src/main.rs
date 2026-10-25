@@ -180,11 +180,18 @@ fn run(args: &[String]) -> i32 {
         return backup_main(&cfg, backup_path.as_deref(), restore_path.as_deref());
     }
 
-    // Secure-by-default: exposing beyond loopback requires a token.
+    // Secure-by-default: exposing beyond loopback requires a token, and so does
+    // remote posture on loopback: --require-e2e is the tunnel recipe, where
+    // loopback is reachable from the internet (security review 2026-10-25).
     let public_bind = cfg.server_bind != "127.0.0.1" && cfg.server_bind != "localhost";
-    if public_bind && token_override.is_none() {
+    if (public_bind || cfg.server_require_e2e) && token_override.is_none() {
+        let what = if public_bind {
+            "bind"
+        } else {
+            "require E2E (--require-e2e / server.requireE2e) on"
+        };
         eprintln!(
-            "[companion] refusing to bind {} without a token (set HOST_TOKEN or --token)",
+            "[companion] refusing to {what} {} without a token (set HOST_TOKEN or --token)",
             cfg.server_bind
         );
         return 1;
@@ -194,6 +201,16 @@ fn run(args: &[String]) -> i32 {
     if created {
         eprintln!("[companion] wrote default config to {}", cfg_path.display());
     }
+    // The journal's single writer for as long as this daemon runs (security
+    // review 2026-10-25): CLI --pair/--revoke/--restore then refuse to write
+    // offline, and --devices reads without touching the file.
+    let _journal_lock = match chernobyl_companion::storage::lock_data_dir(&cfg.data_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("[companion] refusing to boot: {e}");
+            return 1;
+        }
+    };
     let companion = match Companion::boot(cfg.clone()) {
         Ok(c) => Arc::new(c),
         Err(e) => {
@@ -364,6 +381,14 @@ fn pair_offline(
 ) -> Result<PairingBlock, String> {
     use chernobyl_companion::{pairing, storage};
 
+    // Offline only while no companion holds the journal (security review
+    // 2026-10-25): a running one would never load this offer.
+    let _lock = storage::lock_data_dir(&cfg.data_dir).map_err(|e| {
+        format!(
+            "no answer on 127.0.0.1:{} and not writing offline: {e} — no offer created",
+            cfg.diagnostics_port
+        )
+    })?;
     let mut store = storage::Storage::open(&cfg.data_dir, cfg.events_cap, cfg.commands_cap)
         .map_err(|e| format!("cannot open store: {e}"))?;
 
@@ -431,10 +456,12 @@ fn pair_main(cfg: &config::CompanionConfig, endpoints: &[String]) -> i32 {
 }
 
 /// `companion devices` — list the paired-device registry (id, name, paired-at,
-/// state) so an operator knows what to revoke.
+/// state) so an operator knows what to revoke. Read-only (security review
+/// 2026-10-25): a full open could truncate, prune and compact the journal
+/// under a running companion, orphaning its append handle.
 fn devices_main(cfg: &config::CompanionConfig) -> i32 {
     use chernobyl_companion::storage;
-    let store = match storage::Storage::open(&cfg.data_dir, cfg.events_cap, cfg.commands_cap) {
+    let store = match storage::Storage::open_read_only(&cfg.data_dir) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[companion] devices: cannot open store: {e}");
@@ -492,6 +519,19 @@ fn revoke_main(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
 
 fn revoke_offline(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
     use chernobyl_companion::storage;
+    // Offline only while no companion holds the journal (security review
+    // 2026-10-25): a running one never re-reads the file and its next
+    // compaction erases the record, so the revocation would never apply.
+    let _lock = match storage::lock_data_dir(&cfg.data_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!(
+                "[companion] revoke: no answer on 127.0.0.1:{} and not writing offline: {e} — revocation NOT applied",
+                cfg.diagnostics_port
+            );
+            return 1;
+        }
+    };
     let mut store = match storage::Storage::open(&cfg.data_dir, cfg.events_cap, cfg.commands_cap) {
         Ok(s) => s,
         Err(e) => {
@@ -528,9 +568,10 @@ fn claude_hooks_main(cfg: &config::CompanionConfig) -> i32 {
 }
 
 /// Phase 8: `companion backup <path>` / `companion restore <path>`. Copies the
-/// durable journal with a SHA-256 sidecar; restore refuses a checksum mismatch.
-/// Socket-free (no server started). Caveat: PSKs are DPAPI-bound to this
-/// machine+user, so a restore on another machine needs re-pairing.
+/// durable journal with a SHA-256 sidecar; restore refuses a checksum mismatch
+/// or a running companion, and keeps every revocation of the journal it
+/// replaces. Socket-free (no server started). Caveat: PSKs are DPAPI-bound to
+/// this machine+user, so a restore on another machine needs re-pairing.
 fn backup_main(cfg: &config::CompanionConfig, backup: Option<&str>, restore: Option<&str>) -> i32 {
     use chernobyl_companion::backup;
     use std::path::Path;
@@ -548,12 +589,15 @@ fn backup_main(cfg: &config::CompanionConfig, backup: Option<&str>, restore: Opt
         }
     } else if let Some(src) = restore {
         match backup::restore(Path::new(src), &cfg.data_dir) {
-            Ok(digest) => {
+            Ok((digest, reapplied)) => {
                 println!(
                     "restored {src} -> {}",
                     cfg.data_dir.join(backup::JOURNAL_NAME).display()
                 );
                 println!("sha256 {digest}");
+                for id in reapplied {
+                    println!("re-applied revocation of device {id} (revoked after this backup)");
+                }
                 0
             }
             Err(e) => {
@@ -1200,15 +1244,152 @@ mod tests {
         std::fs::write(&cfg_path, cfg_json).unwrap();
         let cfg_str = cfg_path.to_str().unwrap().to_string();
 
-        // Run with --require-e2e and --exit-after 50ms smoke
+        // Run with --require-e2e and --exit-after 50ms smoke. The token is
+        // required since the security review 2026-10-25 (see
+        // cli_require_e2e_without_token_is_refused).
         let exit = run(&[
             "--config".into(),
             cfg_str,
             "--require-e2e".into(),
+            "--token".into(),
+            "e2e-secret".into(),
             "--exit-after".into(),
             "50".into(),
         ]);
         assert_eq!(exit, 0);
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A fresh data dir holding a companion.json that points at it (ephemeral
+    /// ports); returns the dir and the config path.
+    fn temp_config(
+        tag: &str,
+        edit: impl FnOnce(&mut chernobyl_companion::config::CompanionConfig),
+    ) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "chernobyl-cli-{tag}-{}-{}",
+            std::process::id(),
+            chernobyl_companion::protocol::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = chernobyl_companion::config::default_config();
+        cfg.data_dir = dir.clone();
+        cfg.server_port = 0;
+        cfg.diagnostics_port = 0; // the online attempt fails at once
+        edit(&mut cfg);
+        let path = dir.join("companion.json");
+        let text = chernobyl_companion::json::stringify(
+            &chernobyl_companion::config::config_to_json(&cfg),
+        );
+        std::fs::write(&path, text).unwrap();
+        (dir, path.to_str().unwrap().to_string())
+    }
+
+    fn cli(cfg_path: &str, args: &[&str]) -> i32 {
+        let mut argv = vec!["--config".to_string(), cfg_path.to_string()];
+        argv.extend(args.iter().map(|a| a.to_string()));
+        super::run(&argv)
+    }
+
+    /// Security review 2026-10-25: remote posture on loopback is the tunnel
+    /// recipe, so it needs a token exactly like a non-loopback bind.
+    #[test]
+    fn cli_require_e2e_without_token_is_refused() {
+        let (dir, cfg_path) = temp_config("e2e-no-token", |_| {});
+        assert_eq!(cli(&cfg_path, &["--require-e2e", "--exit-after", "50"]), 1);
+        let (dir2, cfg_path2) = temp_config("e2e-no-token-cfg", |c| c.server_require_e2e = true);
+        assert_eq!(cli(&cfg_path2, &["--exit-after", "50"]), 1);
+        // refused before boot: no journal was ever opened
+        assert!(!dir.join("companion.journal").exists());
+        assert!(!dir2.join("companion.journal").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// Security review 2026-10-25: the daemon holds the data-dir lock from
+    /// before boot until after shutdown, and refuses to boot on a held one.
+    #[cfg(windows)]
+    #[test]
+    fn cli_daemon_holds_the_journal_lock_while_it_runs() {
+        use chernobyl_companion::storage::lock_data_dir;
+        let (dir, cfg_path) = temp_config("daemon-lock", |_| {});
+        let daemon = ["--token", "t", "--exit-after", "1500"];
+
+        let other = lock_data_dir(&dir).unwrap();
+        assert_eq!(cli(&cfg_path, &daemon), 1, "booted on a held journal");
+        drop(other);
+
+        let path = cfg_path.clone();
+        let running = std::thread::spawn(move || cli(&path, &daemon));
+        // the journal only appears at boot, which follows taking the lock
+        let t0 = std::time::Instant::now();
+        while !dir.join("companion.journal").exists() {
+            assert!(t0.elapsed().as_secs() < 10, "daemon never booted");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let err = lock_data_dir(&dir).unwrap_err();
+        assert!(err.contains("already running"), "got: {err}");
+        assert_eq!(running.join().unwrap(), 0);
+        drop(lock_data_dir(&dir).expect("released once the daemon exits"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Security review 2026-10-25: while a companion holds the journal the CLI
+    /// never writes it. Offline --revoke / --pair / --restore refuse, and
+    /// --devices reads without changing a byte of a journal that a full open
+    /// would prune, compact and truncate.
+    #[cfg(windows)]
+    #[test]
+    fn cli_never_writes_a_journal_a_companion_holds() {
+        use chernobyl_companion::storage::{DeviceRecord, Storage, lock_data_dir};
+        use std::io::Write;
+        let (dir, cfg_path) = temp_config("held-journal", |c| c.events_cap = 100);
+        {
+            let mut store = Storage::open(&dir, 1_000, 1_000).unwrap();
+            store
+                .put_device(&DeviceRecord {
+                    device_id: "dev-1".into(),
+                    name: "phone".into(),
+                    psk_protected: "P".into(),
+                    paired_at: 1,
+                    revoked: false,
+                })
+                .unwrap();
+            for seq in 1..=101 {
+                store.append_event("e", "{}", seq).unwrap(); // over retention.events
+            }
+        }
+        let bak = dir.join("snap.journal");
+        chernobyl_companion::backup::backup(&dir, &bak).unwrap();
+        let journal = dir.join("companion.journal");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(b"{\"kind\":\"ev") // torn tail
+            .unwrap();
+        let before = std::fs::read(&journal).unwrap();
+
+        let companion = lock_data_dir(&dir).unwrap();
+        assert_eq!(cli(&cfg_path, &["--revoke", "dev-1"]), 1, "offline revoke");
+        assert_eq!(cli(&cfg_path, &["--pair"]), 1, "offline pair");
+        assert_eq!(
+            cli(&cfg_path, &["--restore", bak.to_str().unwrap()]),
+            1,
+            "restore"
+        );
+        assert_eq!(cli(&cfg_path, &["--devices"]), 0, "--devices still lists");
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            before,
+            "a held journal changed"
+        );
+
+        // control: once the companion is gone the offline revoke applies
+        drop(companion);
+        assert_eq!(cli(&cfg_path, &["--revoke", "dev-1"]), 0);
+        assert!(Storage::open_read_only(&dir).unwrap().devices["dev-1"].revoked);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
