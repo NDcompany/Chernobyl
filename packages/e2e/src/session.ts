@@ -34,11 +34,15 @@ export function deriveKeys(psk: Uint8Array, salt: Uint8Array): SessionKeys {
   };
 }
 
-/** 8-byte big-endian counter, zero-padded to the 12-byte ChaCha20 nonce. */
-function counterNonce(counter: number): Uint8Array {
+/**
+ * Bytes 0-7 = big-endian counter, bytes 8-11 = zero — byte-exact with
+ * e2e.rs `counter_nonce`. (Counter 0 is all-zero in any layout, so only a
+ * counter > 0 vector catches a mismatch: see session.test.ts.)
+ */
+export function counterNonce(counter: number): Uint8Array {
   const nonce = new Uint8Array(12);
   let c = counter;
-  for (let i = 11; i >= 4; i -= 1) {
+  for (let i = 7; i >= 0; i -= 1) {
     nonce[i] = c % 256;
     c = Math.floor(c / 256);
   }

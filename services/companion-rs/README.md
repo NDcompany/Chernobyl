@@ -75,7 +75,7 @@ After `hs_ok` both sides switch to sealed frames. Each frame payload is:
 - **Keys** (per connection, from PSK + the `salt` from step 2): client→host =
   `HKDF-SHA256(PRK = HMAC(salt, psk), info = "chernobyl-e2e-c2h", 32B)`; host→client uses
   `"chernobyl-e2e-h2c"`.
-- **AEAD nonce** = 8-byte big-endian `n`, zero-padded to 12 bytes; no AAD.
+- **AEAD nonce** = bytes 0–7 big-endian `n`, bytes 8–11 zero (12 bytes); no AAD. Golden frames at n=0 and n=1 are pinned in both suites (`e2e.rs` `golden_sealed_frames_match_the_ts_client`, `session.test.ts`).
 - **Counter** `n` starts at 0 per direction and increments by exactly 1 per frame. The server
   requires strict sequence: a lower `n` is a replay, a higher one is desync — both close the
   connection. A bad tag (tamper) also closes it.

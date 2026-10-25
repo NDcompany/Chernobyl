@@ -26,6 +26,15 @@ function expectCode(code: string, fn: () => unknown): void {
   assert.fail(`expected E2eError(${code}) but nothing was thrown`);
 }
 
+test('golden frames byte-exact with e2e.rs (golden_sealed_frames_match_the_ts_client)', () => {
+  // n=1 pins the nonce byte order: counter 0 is all-zero in any layout
+  const { host, client } = pair();
+  assert.equal(client.seal('hello'), '{"n":0,"d":"pHJWBpPogJEypK0zkXSNTZ6RP9ex"}');
+  assert.equal(client.seal('ping'), '{"n":1,"d":"o2o3yaauc3zeHJPBlu6re3PJ/XU="}');
+  assert.equal(host.seal('hello_ack'), '{"n":0,"d":"WiQGjPTOkuC2RIdhMi7W7QfZo2o2B77krQ=="}');
+  assert.equal(host.seal('pong'), '{"n":1,"d":"XlS628RS80APu4NAG+/BcEhrhfE="}');
+});
+
 test('seal/open round-trips both directions with counters counting up', () => {
   const { host, client } = pair();
   const f0 = host.seal('hello');

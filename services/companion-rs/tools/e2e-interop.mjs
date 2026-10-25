@@ -258,9 +258,19 @@ async function main() {
     check('real handshake reaches connected', connected, `status=${t.status()}`);
     const gotAck = await waitFor(() => msgs.includes('hello_ack'), 5000);
     check('sealed hello produced hello_ack (server decrypted + replied)', gotAck, msgs.join(','));
-    // ~2.5s with 500 ms heartbeats: unanswered pongs would force a reconnect
+    // ~2.5s with 500 ms heartbeats: count every status change, not one
+    // sample — a session that dies and silently re-handshakes between two
+    // samples once hid a nonce-layout bug that killed it on frame 2
+    const changes = [];
+    const unsubChurn = t.subscribeStatus((s) => changes.push(s));
+    changes.length = 0; // drop the immediate replay of the current status
     await sleep(2500);
-    check('heartbeat pongs keep the session alive (no churn)', t.status() === 'connected', `status=${t.status()}`);
+    unsubChurn();
+    check(
+      'heartbeat pongs keep the session alive (no churn)',
+      t.status() === 'connected' && changes.length === 0,
+      `status=${t.status()} changes=[${changes.join(',')}]`,
+    );
   }
 
   /* 3. replayed sealed frame -> server tears the connection down */

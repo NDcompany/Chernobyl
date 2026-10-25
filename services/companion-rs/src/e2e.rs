@@ -218,6 +218,34 @@ mod tests {
         assert!(!proof_ok(&a, &wrong));
     }
 
+    /// Cross-language golden vectors, pinned byte-for-byte in
+    /// packages/e2e/src/session.test.ts. Counter 0 is an all-zero nonce in
+    /// any layout, so the n=1 frames are what pin the nonce byte order — a
+    /// client that put the counter in bytes 4-11 broke every phone session
+    /// on its second frame while every counter-0 check still passed.
+    #[test]
+    fn golden_sealed_frames_match_the_ts_client() {
+        let keys = derive_keys(&psk(), b"SALTSALTSALTSALT");
+        let mut client = Session::client(keys.clone());
+        let mut host = Session::host(keys);
+        assert_eq!(
+            client.seal("hello"),
+            r#"{"n":0,"d":"pHJWBpPogJEypK0zkXSNTZ6RP9ex"}"#
+        );
+        assert_eq!(
+            client.seal("ping"),
+            r#"{"n":1,"d":"o2o3yaauc3zeHJPBlu6re3PJ/XU="}"#
+        );
+        assert_eq!(
+            host.seal("hello_ack"),
+            r#"{"n":0,"d":"WiQGjPTOkuC2RIdhMi7W7QfZo2o2B77krQ=="}"#
+        );
+        assert_eq!(
+            host.seal("pong"),
+            r#"{"n":1,"d":"XlS628RS80APu4NAG+/BcEhrhfE="}"#
+        );
+    }
+
     #[test]
     fn seal_open_round_trips_and_counts_up() {
         let keys = derive_keys(&psk(), b"SALTSALTSALTSALT");
