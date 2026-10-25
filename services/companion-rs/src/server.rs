@@ -25,6 +25,10 @@ pub const CLOSE_UNAUTHORIZED: u16 = 4001;
 pub const CLOSE_PROTOCOL_MISMATCH: u16 = 4002;
 pub const CLOSE_DEVICE_REVOKED: u16 = 4003;
 
+/// The only Origin a WebSocket upgrade may carry: the phone app's explicit
+/// non-web origin (D1). Mirrored by `APP_ORIGIN` in packages/e2e.
+pub const APP_ORIGIN: &str = "chernobyl://app";
+
 const AUTH_FAILURE_LIMIT: u32 = 5;
 
 // Per-message-class outbound bounds (D8 + mandate §4): ONE FIFO, TWO admission
@@ -572,12 +576,17 @@ fn handle_conn(
 
     // WS upgrade ----------------------------------------------------------
     // D1: browsers are unsupported until the web app ships (ADR-011 §5).
-    // An Origin header marks a browser-initiated upgrade, which is refused
-    // outright — this closes cross-site WebSocket hijacking in the default
-    // config (loopback, token-less, plaintext commands). Non-browser clients
-    // (phone app, CLI, test tooling) send no Origin, so nothing else is
-    // affected. When the web app ships this becomes an Origin allow-list.
-    if handshake.header("origin").is_some() {
+    // A browser always sends its page's real Origin (http/https, or "null")
+    // and a page cannot forge the header, so every Origin is refused except
+    // APP_ORIGIN: React Native's Android WebSocket adds a default
+    // "http://host:port" Origin to every connection, so the phone app sets
+    // this non-web value explicitly (found on the first emulator run). This
+    // closes cross-site WebSocket hijacking, DNS rebinding included, in the
+    // default config (loopback, token-less, plaintext commands).
+    if handshake
+        .header("origin")
+        .is_some_and(|o| o.trim() != APP_ORIGIN)
+    {
         let _ = ws::write_http_error(&mut writer, 403, "Forbidden", "");
         return Ok(());
     }
@@ -2199,6 +2208,29 @@ mod e2e_tests {
         }
         assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
         drop(s);
+        // the phone app's explicit non-web origin upgrades (101); a browser's
+        // "null" origin (sandboxed iframe, file://) is still refused
+        for (origin, status) in [("chernobyl://app", "101"), ("null", "403")] {
+            let mut s =
+                std::net::TcpStream::connect(format!("127.0.0.1:{}", f.handle.port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let req = format!(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n\
+                 Sec-WebSocket-Version: 13\r\nOrigin: {origin}\r\n\r\n"
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            while !resp.contains("\r\n") {
+                let n = s.read(&mut buf).unwrap();
+                assert!(n > 0, "connection closed before a status line");
+                resp.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            assert!(
+                resp.starts_with(&format!("HTTP/1.1 {status}")),
+                "{origin}: {resp}"
+            );
+        }
         // control: the identical upgrade without Origin still connects
         let mut c = connect(&f);
         c.send_text(r#"{"type":"ping","commandId":"d1-ping"}"#)

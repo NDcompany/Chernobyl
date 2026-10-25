@@ -9,6 +9,7 @@ export { handshakeProof, performHandshake, proofOk, type HandshakeIo } from './h
 export { PairingError, parsePairingPayload, type PairingCredential } from './pairing.js';
 export { SealedSession, deriveKeys, type SessionKeys } from './session.js';
 export {
+  APP_ORIGIN,
   createE2eTransport,
   retryDelayMs,
   type Ack,

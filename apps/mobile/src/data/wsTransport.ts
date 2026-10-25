@@ -12,7 +12,7 @@ import {
   type ClientMessage,
   type ServerMessage,
 } from '@chernobyl/protocol';
-import { retryDelayMs } from '@chernobyl/e2e';
+import { APP_ORIGIN, retryDelayMs } from '@chernobyl/e2e';
 import type { Ack, Transport, TransportStatus } from './transport';
 
 const MAX_BACKOFF_MS = 15_000;
@@ -59,7 +59,12 @@ export function createWsTransport(url: string): Transport {
     setStatus(attempts === 0 ? 'connecting' : 'reconnecting');
     let socket: WebSocket;
     try {
-      socket = new WebSocket(url);
+      // RN's WebSocket takes headers as a third argument (D1, see APP_ORIGIN)
+      socket = new (WebSocket as unknown as new (
+        u: string,
+        p?: string[],
+        o?: { headers: Record<string, string> },
+      ) => WebSocket)(url, undefined, { headers: { origin: APP_ORIGIN } });
     } catch {
       scheduleRetry();
       return;

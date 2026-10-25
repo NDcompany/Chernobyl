@@ -121,10 +121,23 @@ export function retryDelayMs(
   return cap / 2 + rand() * (cap / 2);
 }
 
+/**
+ * The Origin the app sends (D1): React Native's Android WebSocket otherwise
+ * adds a default "http://host:port" Origin, which the companion refuses as a
+ * browser. Browsers cannot forge Origin, so this non-web value is the one
+ * the companion accepts (server.rs APP_ORIGIN).
+ */
+export const APP_ORIGIN = 'chernobyl://app';
+
 function defaultOpenSocket(url: string): SocketLike {
-  const ctor = (globalThis as { WebSocket?: new (url: string) => SocketLike }).WebSocket;
+  // the third argument is React Native's options bag; browsers ignore it
+  const ctor = (
+    globalThis as {
+      WebSocket?: new (url: string, protocols?: string[], options?: { headers: Record<string, string> }) => SocketLike;
+    }
+  ).WebSocket;
   if (!ctor) throw new Error('no WebSocket implementation available');
-  return new ctor(url);
+  return new ctor(url, undefined, { headers: { origin: APP_ORIGIN } });
 }
 
 export function createE2eTransport(opts: E2eTransportOptions): E2eTransport {
