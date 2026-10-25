@@ -322,9 +322,14 @@ export default function ConnectHostScreen() {
             <Text variant="xs" color={colors.text2}>
               Device: {pairing.deviceId}
             </Text>
-            <Text variant="xs" color={colors.text2}>
-              Endpoint: {pairing.endpoints[0]}
-            </Text>
+            {/* every endpoint, in dial order: the stored token is sent to each,
+                so the user must be able to see all of them (security review) */}
+            {pairing.endpoints.map((ep, i) => (
+              <Text key={ep} variant="xs" color={colors.text2}>
+                {pairing.endpoints.length > 1 ? `Endpoint ${i + 1}: ` : 'Endpoint: '}
+                {ep}
+              </Text>
+            ))}
             <Text variant="xs" color={colors.text2}>
               Expires: {new Date(pairing.expiresAtSec * 1000).toLocaleString()}
             </Text>
