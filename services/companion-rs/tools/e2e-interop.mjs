@@ -11,9 +11,9 @@
  *   4. tampered sealed frame-> server tears the connection down
  *   5. redeem second offer  -> second device pairs (single-use offers work)
  *   6. server restart       -> connected transport re-handshakes (stored PSK)
- *   7. revoked device       -> after --revoke + restart: hs_err 'device revoked'
- *      (also asserts today's D4 semantic: revocation takes effect at restart,
- *       not live — documented, deliberately not changed here)
+ *   7. revoked device       -> --revoke against the RUNNING companion closes the
+ *      live session with 4003 (transport 'denied', D4/ADR-014); after a
+ *      restart the device is still refused (hs_err 'device revoked')
  *   8. S10 ordered endpoints -> multi --endpoint payload keeps CLI order, and
  *      the client fails over from a dead first endpoint to the live one
  *
@@ -125,11 +125,16 @@ function runPair(home, { endpoints, expectQrOverflow = false } = {}) {
   return parsePairingPayload(m[1]);
 }
 
-function revoke(home, deviceId) {
+/** --revoke routed to the running server's diagnostics listener (D4). */
+function revoke(home, deviceId, srv) {
   const env = { ...process.env };
   env.CHERNOBYL_HOME = home;
-  const r = spawnSync(BIN, ['--revoke', deviceId], { env, encoding: 'utf8' });
+  const m = /diagnostics on 127\.0\.0\.1:(\d+)/.exec(srv.stderrBuf);
+  assert.ok(m, `no diagnostics port in server log:
+${srv.stderrBuf}`);
+  const r = spawnSync(BIN, ['--diagnostics-port', m[1], '--revoke', deviceId], { env, encoding: 'utf8' });
   assert.equal(r.status, 0, `revoke failed: ${r.stderr}`);
+  return r.stdout;
 }
 
 /* raw-socket handshake helper (for the tear-down scenarios) */
@@ -321,14 +326,16 @@ async function main() {
 
   /* 7. revocation: redeem-check, --revoke, D4 restart semantic, refused handshake */
   {
-    // 7a: revoke device B while the server runs (journal write)
-    revoke(home, pairB.deviceId);
-    // 7b: D4 semantic — today revocation applies at (re)start, not live:
+    // 7a: device B holds a live session
     const tLive = createE2eTransport({ url, pairing: pairB, retryBaseMs: 200, retryMaxMs: 400 });
     transports.push(tLive);
     tLive.connect();
-    const stillConnects = await waitFor(() => tLive.status() === 'connected', 6000);
-    check('D4 documented semantic: revoke takes effect at restart (still connects live)', stillConnects);
+    check('device B is live before revocation', await waitFor(() => tLive.status() === 'connected', 6000));
+    // 7b: --revoke reaches the running companion, which closes B's session (4003)
+    const out = revoke(home, pairB.deviceId, srv);
+    check('--revoke used the running companion', /via running companion/.test(out), out.trim());
+    const cut = await waitFor(() => tLive.status() === 'denied', 6000);
+    check('D4: revoked live session is terminated (4003, denied)', cut, `status=${tLive.status()}`);
     tLive.close();
 
     // 7c: after restart the revoked device is refused with hs_err
