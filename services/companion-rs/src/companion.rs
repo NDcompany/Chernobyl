@@ -526,6 +526,20 @@ impl Companion {
                     match verdict {
                         Err(e) => Some(ServerMsg::ack_err(command_id, &e)),
                         Ok(selected) => {
+                            // T4: a persistent grant (a rule the runtime writes to
+                            // a settings file) gets its own audit record
+                            let grant =
+                                selected
+                                    .as_ref()
+                                    .filter(|o| o.scope == "persistent")
+                                    .map(|o| {
+                                        format!(
+                                            "{permission_id}: {} -> {} ({})",
+                                            o.rule.as_deref().unwrap_or("-"),
+                                            o.destination.as_deref().unwrap_or("-"),
+                                            o.label
+                                        )
+                                    });
                             // the runtime writes exactly the option the engine
                             // selected, a legacy tap (no optionId) included
                             let mut forwarded = msg.clone();
@@ -540,12 +554,19 @@ impl Companion {
                             }
                             match rt.send(&forwarded) {
                                 Ok(ack @ ServerMsg::Ack { ok: true, .. }) => {
-                                    let mut engine = self.engine.lock().unwrap();
-                                    engine.complete_native_decision(
+                                    self.engine.lock().unwrap().complete_native_decision(
                                         command_id,
                                         permission_id,
                                         decision,
                                     );
+                                    if let Some(text) = grant {
+                                        let _ = self
+                                            .shared
+                                            .storage
+                                            .lock()
+                                            .unwrap()
+                                            .append_audit("permission-rule", &text);
+                                    }
                                     Some(ack)
                                 }
                                 // native refused → record stays pending; the
@@ -2425,6 +2446,102 @@ mod tests {
         };
         assert_eq!(state("rt-b:p1"), ("approved".to_string(), 2));
         assert_eq!(state("rt-b:p2"), ("rejected".to_string(), 2));
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    /// T4: a persistent grant leaves a `permission-rule` audit record naming
+    /// the rule and the settings file; a one-off allow leaves none.
+    #[test]
+    fn persistent_grant_is_audited() {
+        let c = temp_config("route-audit");
+        let mut comp = Companion::boot(c.clone()).unwrap();
+        let rt = FakeRuntime::new("rt-b", &[], &["ses-b"], &["rt-b:p1", "rt-b:p2"]);
+        comp.runtimes.push(rt.clone());
+        let now = now_ms();
+        let option = |id: &str, decision: &str, scope| PermissionOption {
+            id: id.into(),
+            decision: decision.into(),
+            label: format!("label {id}"),
+            rule: (scope == "persistent").then(|| "Bash(npm test:*)".into()),
+            scope,
+            destination: (scope == "persistent").then(|| ".claude/settings.local.json".into()),
+            takes_message: false,
+            stops_turn: false,
+        };
+        for native in ["p1", "p2"] {
+            comp.engine
+                .lock()
+                .unwrap()
+                .ingest_permission(PermissionRequest {
+                    id: format!("rt-b:{native}"),
+                    native_request_id: native.into(),
+                    session_id: "ses-b".into(),
+                    agent_id: "rt-b".into(),
+                    host_id: "rt-b".into(),
+                    action: "shell".into(),
+                    title: "Run npm test".into(),
+                    command: "npm test".into(),
+                    args: vec![],
+                    directory: None,
+                    risk: "high".into(),
+                    status: "pending".into(),
+                    supported_decisions: vec![],
+                    revision: 1,
+                    fingerprint: None,
+                    requested_at: now,
+                    expires_at: now,
+                    context: String::new(),
+                    decided_at: None,
+                    decision: None,
+                    tool_item_id: None,
+                    options: vec![
+                        option("once", "approve-once", "once"),
+                        option("always", "approve-session", "persistent"),
+                        option("deny", "reject", "once"),
+                    ],
+                    detail: None,
+                });
+        }
+        let decide =
+            |cmd: &str, perm: &str, decision: &str, opt: &str| ClientMsg::PermissionDecision {
+                command_id: cmd.into(),
+                permission_id: format!("rt-b:{perm}"),
+                decision: decision.into(),
+                revision: 1.0,
+                option_id: Some(opt.into()),
+                message: None,
+                answers: vec![],
+            };
+        assert!(ok(comp.handle_client_msg(decide(
+            "ga-1",
+            "p1",
+            "approve-once",
+            "once"
+        ))));
+        assert!(ok(comp.handle_client_msg(decide(
+            "ga-2",
+            "p2",
+            "approve-session",
+            "always"
+        ))));
+        {
+            let store = comp.shared.storage.lock().unwrap();
+            let rules: Vec<&str> = store
+                .audit
+                .iter()
+                .filter(|a| a.kind == "permission-rule")
+                .map(|a| a.text.as_str())
+                .collect();
+            assert_eq!(rules.len(), 1, "{rules:?}");
+            assert!(rules[0].contains("rt-b:p2"), "{}", rules[0]);
+            assert!(rules[0].contains("Bash(npm test:*)"), "{}", rules[0]);
+            assert!(
+                rules[0].contains(".claude/settings.local.json"),
+                "{}",
+                rules[0]
+            );
+        }
         comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }

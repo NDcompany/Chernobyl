@@ -37,6 +37,25 @@ type Spawn = Box<dyn Fn(&Path) -> io::Result<(ChildIo, Receiver<ChildEvent>)> + 
 
 /// `create_session` waits this long for `thread/start` before refusing.
 const START_TIMEOUT: Duration = Duration::from_secs(20);
+/// T1 bounds (ADR-015 §6), the Claude runtime's defaults.
+const CREATE_EVERY_MS: i64 = 5_000;
+const MAX_OPEN_SESSIONS: usize = 8;
+
+/// Whether a new session may start: the rate limit, then the open-session cap.
+fn admit(
+    last_create: Option<i64>,
+    now: i64,
+    every_ms: i64,
+    open: usize,
+) -> Result<(), &'static str> {
+    if last_create.is_some_and(|t| now - t < every_ms) {
+        return Err("wait a few seconds before starting another session");
+    }
+    if open >= MAX_OPEN_SESSIONS {
+        return Err("too many open Codex sessions: end one first");
+    }
+    Ok(())
+}
 
 pub struct CodexRuntime {
     inner: Arc<Inner>,
@@ -51,6 +70,8 @@ struct Inner {
     spawn: Spawn,
     /// Production health = the binary resolves; injected spawners are healthy.
     probe_binary: bool,
+    /// T1: at most one new session per this many ms (0 for injected test spawners).
+    create_every_ms: i64,
     healthy: AtomicBool,
     st: Mutex<State>,
 }
@@ -70,6 +91,8 @@ struct State {
     dropped: HashSet<String>,
     /// Permissions ingested and not resolved yet, for a withdrawal's record.
     perms: HashMap<String, PermissionRequest>,
+    /// When the last `create_session` was accepted (rate limit, T1).
+    last_create: Option<i64>,
 }
 
 struct Creating {
@@ -107,6 +130,7 @@ impl CodexRuntime {
             opener,
             spawn,
             probe_binary,
+            create_every_ms: if probe_binary { CREATE_EVERY_MS } else { 0 },
             healthy: AtomicBool::new(false),
             st: Mutex::new(State::default()),
         });
@@ -292,6 +316,19 @@ impl Inner {
         let (reply, started) = mpsc::channel();
         {
             let mut st = self.st.lock().unwrap();
+            // T1: a stolen phone cannot fan out agents — a session cap and a
+            // create rate limit, like the Claude runtime
+            let now = now_ms();
+            let open = st
+                .sessions
+                .iter()
+                .filter(|s| !matches!(s.status.as_str(), "completed" | "failed" | "interrupted"))
+                .count()
+                + st.creating.len();
+            if let Err(e) = admit(st.last_create, now, self.create_every_ms, open) {
+                return Ok(ServerMsg::ack_err(command_id, e));
+            }
+            st.last_create = Some(now);
             self.running(&mut st, Path::new(&ws.path))?
                 .start_session(&ws.path, prompt, command_id)
                 .map_err(|e| AdapterError::RuntimeUnavailable(e.into()))?;
@@ -560,6 +597,15 @@ pub(crate) mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
     use std::time::Instant;
+
+    #[test]
+    fn session_cap_and_create_rate_limit_refuse() {
+        assert!(admit(None, 10_000, CREATE_EVERY_MS, 0).is_ok());
+        assert!(admit(Some(8_000), 10_000, CREATE_EVERY_MS, 0).is_err());
+        assert!(admit(Some(5_000), 10_000, CREATE_EVERY_MS, 0).is_ok());
+        assert!(admit(None, 10_000, CREATE_EVERY_MS, MAX_OPEN_SESSIONS - 1).is_ok());
+        assert!(admit(None, 10_000, CREATE_EVERY_MS, MAX_OPEN_SESSIONS).is_err());
+    }
 
     pub(crate) const WAIT: Duration = Duration::from_secs(10);
 
