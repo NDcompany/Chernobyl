@@ -6,6 +6,7 @@
 
 use crate::adapters::{AdapterManager, LiveRuntime};
 use crate::claude::ClaudeAdapter;
+use crate::codex_runtime::{CodexRuntime, Sink};
 use crate::config::CompanionConfig;
 use crate::engine::Engine;
 use crate::ffi;
@@ -272,6 +273,33 @@ impl Companion {
         // with `companion.hub()` to stream its transcripts (ADR-015 §3.3);
         // OpenCode streams once its rich parts land (step 5).
 
+        // ADR-015 §4.3: Codex app-server runtimes. The child is spawned on
+        // the first session; the boot probe only resolves the binary.
+        let codex_cfgs: Vec<_> = companion
+            .shared
+            .config
+            .adapters
+            .iter()
+            .filter(|e| e.enabled && e.kind == "codex")
+            .filter_map(|e| Some((e.id.clone(), e.codex.clone()?)))
+            .collect();
+        for (id, cfg) in codex_cfgs {
+            let opener = Arc::new(crate::runtime_io::open_url_on_desktop);
+            let rt = Arc::new(CodexRuntime::new(
+                &id,
+                cfg,
+                companion.hub(),
+                companion.engine_sink(),
+                opener,
+            ));
+            let probe = rt.refresh();
+            let mut mgr = companion.shared.adapters.lock().unwrap();
+            mgr.attach(&id, rt.capabilities());
+            mgr.probe_result(&id, probe.err().map(|e| e.to_string()));
+            drop(mgr);
+            companion.runtimes.push(rt);
+        }
+
         // Phase 3: attach the OpenCode adapter (attach-only — G4.3 forbids
         // spawning a competing server on a possibly-shared data dir).
         if let Some((id, endpoint, auth)) = oc_cfg {
@@ -289,14 +317,8 @@ impl Companion {
             // Native events enter the SAME seq/persist/fan-out pipeline as
             // engine events; permissions are ingested first so the engine
             // stays the G2 authority over them.
-            let cb_engine = companion.engine.clone();
-            oc.subscribe(move |kind| {
-                let mut engine = cb_engine.lock().unwrap();
-                match kind {
-                    EventKind::PermissionRequested(pr) => engine.ingest_permission(pr),
-                    other => engine.publish_external(other),
-                }
-            });
+            let sink = companion.engine_sink();
+            oc.subscribe(move |kind| sink(kind));
             *companion.shared.opencode.lock().unwrap() = Some(oc.clone());
             companion.runtimes.push(oc.clone());
             if let Err(e) = oc.start_events() {
@@ -572,6 +594,21 @@ impl Companion {
     /// The handle live runtimes get at construction to stream transcripts.
     pub fn hub(&self) -> HubHandle {
         HubHandle::new(self.shared.hub.clone())
+    }
+
+    /// Where a live runtime's engine-side events go: permissions are
+    /// ingested (the engine stays the G2 authority and sets the runtime
+    /// TTL); everything else enters the same seq/persist/fan-out pipeline as
+    /// engine events. Never call it while holding the engine lock.
+    pub fn engine_sink(&self) -> Sink {
+        let engine = self.engine.clone();
+        Arc::new(move |kind| {
+            let mut engine = engine.lock().unwrap();
+            match kind {
+                EventKind::PermissionRequested(pr) => engine.ingest_permission(pr),
+                other => engine.publish_external(other),
+            }
+        })
     }
 
     /// ADR-015 `session_subscribe` for one connection (the server calls it:
@@ -1643,6 +1680,7 @@ mod tests {
             enabled: true,
             endpoint: Some(endpoint.into()),
             basic_auth: None,
+            codex: None,
         });
         c
     }
@@ -2427,5 +2465,275 @@ mod tests {
         assert_eq!(snap.permissions.len(), demo.permissions.len());
         comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    // ---- ADR-015 step 7: the Codex runtime behind the router ----
+
+    use crate::codex_runtime::tests as cx;
+
+    fn decision(
+        cid: &str,
+        pid: &str,
+        decision: &str,
+        option: Option<&str>,
+        revision: f64,
+    ) -> ClientMsg {
+        ClientMsg::PermissionDecision {
+            command_id: cid.into(),
+            permission_id: pid.into(),
+            decision: decision.into(),
+            revision,
+            option_id: option.map(str::to_string),
+            message: None,
+            answers: vec![],
+        }
+    }
+
+    fn permission(comp: &Companion, pid: &str) -> Option<crate::protocol::PermissionRequest> {
+        comp.snapshot()
+            .permissions
+            .into_iter()
+            .find(|p| p.id == pid)
+    }
+
+    fn command_status(comp: &Companion, cid: &str) -> String {
+        let store = comp.shared.storage.lock().unwrap();
+        store
+            .commands
+            .get(cid)
+            .map_or(String::new(), |c| c.status.clone())
+    }
+
+    #[test]
+    fn codex_decisions_route_through_the_engine() {
+        let c = temp_config("codex-route");
+        let mut comp = Companion::boot(c.clone()).unwrap();
+        let opener: crate::codex_runtime::Opener = Arc::new(|_| Err("no browser in tests"));
+        let (rt, peers) = cx::piped(
+            cx::launch(r"C:\work"),
+            comp.hub(),
+            comp.engine_sink(),
+            opener,
+        );
+        comp.runtimes.push(Arc::new(rt));
+        // create_session routes by the agent's host and acks with the thread
+        let mut peer = cx::started(&peers, || comp.handle_client_msg(cx::create("c1")));
+        let snap = comp.snapshot();
+        let session = snap.sessions.iter().find(|s| s.id == "thr_1").unwrap();
+        assert!(session.transcript);
+        assert!(
+            snap.sessions.iter().all(|s| s.host_id == "codex-1"),
+            "demo sessions are hidden behind a healthy runtime"
+        );
+        assert!(
+            snap.agents
+                .iter()
+                .any(|a| a.id == "codex-1" && a.live.is_some())
+        );
+
+        // an approval becomes an engine record with codex's options
+        peer.line(cx::ASK);
+        cx::wait_until("the engine record", || {
+            permission(&comp, "codex-1:0").is_some()
+        });
+        let p = permission(&comp, "codex-1:0").unwrap();
+        assert_eq!(p.options.len(), 5);
+        assert_eq!(
+            p.supported_decisions,
+            ["approve-once", "approve-session", "reject"]
+        );
+        assert!(
+            p.expires_at - p.requested_at >= 23 * 60 * 60 * 1000,
+            "runtime TTL"
+        );
+        // the engine refuses a stale revision and a mismatched bucket; codex hears nothing
+        let stale = decision("d0", "codex-1:0", "approve-once", Some("accept"), 0.0);
+        refusal(comp.handle_client_msg(stale));
+        let mismatch = decision("d1", "codex-1:0", "approve-session", Some("accept"), 1.0);
+        refusal(comp.handle_client_msg(mismatch));
+        let accept = decision("d2", "codex-1:0", "approve-once", Some("accept"), 1.0);
+        assert!(ok(comp.handle_client_msg(accept)));
+        assert_eq!(peer.recv(), r#"{"id":0,"result":{"decision":"accept"}}"#);
+        let p = permission(&comp, "codex-1:0").unwrap();
+        assert_eq!((p.status.as_str(), p.revision), ("approved", 2));
+
+        // a legacy tap (no option) gets the engine's legacy-selectable option
+        let ask = |n: &str| {
+            cx::ASK
+                .replace(r#""id":0"#, &format!(r#""id":{n}"#))
+                .replace("call_0", &format!("call_{n}"))
+        };
+        peer.line(&ask("1"));
+        cx::wait_until("the second record", || {
+            permission(&comp, "codex-1:1").is_some()
+        });
+        let legacy = decision("d3", "codex-1:1", "reject", None, 1.0);
+        assert!(ok(comp.handle_client_msg(legacy)));
+        assert_eq!(peer.recv(), r#"{"id":1,"result":{"decision":"decline"}}"#);
+
+        // answered elsewhere: the record goes stale and a late decision fails
+        peer.line(&ask("2"));
+        cx::wait_until("the third record", || {
+            permission(&comp, "codex-1:2").is_some()
+        });
+        peer.note(
+            "serverRequest/resolved",
+            r#"{"threadId":"thr_1","requestId":2}"#,
+        );
+        cx::wait_until("the withdrawal", || {
+            permission(&comp, "codex-1:2").is_some_and(|p| p.status == "stale")
+        });
+        let late = decision("d4", "codex-1:2", "approve-once", Some("accept"), 2.0);
+        refusal(comp.handle_client_msg(late));
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    /// The real boot and spawn path: a `codex` entry runs node with the
+    /// committed fake app-server, which logs any protocol violation ("!!").
+    #[test]
+    fn codex_fake_app_server_through_the_companion() {
+        let mut c = temp_config("codex-fake");
+        let ws = c.data_dir.with_extension("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let log = c.data_dir.with_extension("log");
+        let log_arg = log.to_string_lossy().into_owned();
+        let Some(fake) = cx::fake_codex(&ws, &["--transcript", &log_arg]) else {
+            return;
+        };
+        let strings =
+            |v: Vec<String>| crate::json::Json::Arr(v.iter().map(|a| crate::json::s(a)).collect());
+        let entry = crate::json::obj(vec![
+            ("type", crate::json::s("codex")),
+            (
+                "workspaces",
+                strings(vec![ws.to_string_lossy().into_owned()]),
+            ),
+            ("binary", crate::json::s("node")),
+            ("args", strings(fake.args.clone())),
+        ]);
+        let launch = crate::codex::launch_config(&entry, &c.data_dir).unwrap();
+        c.adapters.push(crate::config::AdapterEntryConfig {
+            id: "codex-1".into(),
+            kind: "codex".into(),
+            enabled: true,
+            endpoint: None,
+            basic_auth: None,
+            codex: Some(launch),
+        });
+        let comp = Companion::boot(c.clone()).unwrap();
+        let status = crate::json::stringify(&comp.adapters_json());
+        assert!(
+            status.contains(r#""id":"codex-1","type":"codex","supported":true,"healthy":true"#),
+            "{status}"
+        );
+        let agent = comp
+            .snapshot()
+            .agents
+            .into_iter()
+            .find(|a| a.id == "codex-1")
+            .unwrap();
+        let ws_id = agent.live.unwrap().workspaces[0].id.clone();
+        let violations = || {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            text.lines()
+                .filter(|l| l.contains(" !! "))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let wait = |what: &str, cid: &str, want: &str| {
+            cx::wait_until(what, || command_status(&comp, cid) == want);
+        };
+        let prompt = |cid: &str, session: &str, text: &str| {
+            comp.handle_client_msg(ClientMsg::SubmitPrompt {
+                command_id: cid.into(),
+                session_id: session.into(),
+                text: text.into(),
+            })
+        };
+
+        // create → a command approval and a file-change approval, decided via the router
+        let create = ClientMsg::CreateSession {
+            command_id: "c1".into(),
+            agent_id: "codex-1".into(),
+            title: "fake".into(),
+            prompt: "run edit".into(),
+            project: Some(ws_id),
+        };
+        let thread = match comp.handle_client_msg(create) {
+            Some(ServerMsg::Ack {
+                ok: true,
+                session_id: Some(s),
+                ..
+            }) => s,
+            other => panic!("{other:?}"),
+        };
+        let pending = || {
+            comp.snapshot()
+                .permissions
+                .into_iter()
+                .find(|p| p.session_id == thread && p.status == "pending")
+        };
+        for (n, option) in [Some("accept"), None].into_iter().enumerate() {
+            cx::wait_until("an approval", || pending().is_some());
+            let p = pending().unwrap();
+            assert!(!p.options.is_empty() && p.tool_item_id.is_some());
+            let cid = format!("d{n}");
+            let msg = decision(&cid, &p.id, "approve-once", option, 1.0);
+            assert!(ok(comp.handle_client_msg(msg)));
+        }
+        wait("the first turn", "c1", "completed");
+        let ops = comp.hub().ops(&thread).join("\n");
+        for want in [
+            r#""name":"shell""#,
+            r#""name":"apply_patch""#,
+            "«redacted:anthropic-key»",
+        ] {
+            assert!(ops.contains(want), "{want} missing");
+        }
+        assert!(!ops.contains("sk-ant-"));
+
+        // a follow-up while busy steers the running turn
+        assert!(ok(prompt("p1", &thread, "slow")));
+        // one streamed delta per slow turn carries its first chunk
+        let chunks = |n: usize| {
+            let ops = comp.hub().ops(&thread);
+            let first = |o: &&String| o.contains(r#""op":"append""#) && o.contains("chunk 1/25");
+            ops.iter().filter(first).count() >= n
+        };
+        cx::wait_until("the slow turn", || chunks(1));
+        assert!(ok(prompt("p2", &thread, "more please")));
+        wait("the steered turn", "p1", "completed");
+        wait("the steer", "p2", "completed");
+        let ops = comp.hub().ops(&thread).join("");
+        assert!(ops.contains("Following up on: more please"));
+
+        // interrupt the active turn
+        assert!(ok(prompt("p3", &thread, "slow")));
+        cx::wait_until("the second slow turn", || chunks(2));
+        let interrupt = ClientMsg::Interrupt {
+            command_id: "i1".into(),
+            session_id: thread.clone(),
+        };
+        assert!(ok(comp.handle_client_msg(interrupt)));
+        wait("the interrupt", "i1", "completed");
+        wait("the interrupted prompt", "p3", "cancelled");
+
+        // answered by another client: the engine record goes stale
+        assert!(ok(prompt("p4", &thread, "withdraw")));
+        wait("the withdraw turn", "p4", "completed");
+        let snap = comp.snapshot();
+        let stale = snap
+            .permissions
+            .iter()
+            .filter(|p| p.session_id == thread && p.status == "stale");
+        assert_eq!(stale.count(), 1);
+        assert_eq!(violations(), Vec::<String>::new());
+        comp.shutdown(true);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(violations(), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_file(&log);
     }
 }

@@ -23,12 +23,20 @@
  *      -> a client that ignores hs_rekey keeps connecting on the QR key; once
  *      a client stores the rotated key and acks, the QR key is refused and
  *      the rotated key connects
+ *  11. ADR-015 live transcripts (step 10) -> a second companion whose
+ *      companion.json configures the `codex` adapter against the fake
+ *      app-server (tools/fake-codex-app-server.mjs, real spawn path):
+ *      session_subscribe gets a snapshot then live ops, every frame sealed;
+ *      a reconnect with the cursor replays with no gap or duplicate; a stale
+ *      cursor gets a snapshot; an inline decision by optionId + revision is
+ *      accepted and a stale revision refused; a client that never subscribes
+ *      receives zero transcript frames; the fake logs no protocol violation
  *
  * No device claim: this is Node-vs-real-companion evidence only.
  */
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -44,6 +52,7 @@ import {
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const BIN = resolve(HERE, '..', 'target', 'debug', 'chernobyl-companion.exe');
 const TOKEN = 'interop-token';
+const FAKE_CODEX = resolve(HERE, 'fake-codex-app-server.mjs');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(fn, ms, step = 25) {
@@ -460,6 +469,258 @@ async function main() {
     check('rotation: the QR key is refused once the rotated key was acked (row 2.2)', barrier && replay === 'handshake-rejected', `barrier=${barrier} replay=${replay}`);
     const rotated = stored ? await handshake({ ...pairD, psk: b64decode(stored) }) : 'no key';
     check('rotation: the rotated key connects', rotated === 'connected', rotated);
+  }
+
+  /* 11. ADR-015 live transcripts against the Codex runtime (fake app-server) */
+  {
+    const home2 = mkdtempSync(join(tmpdir(), 'chernobyl-e2e-codex-'));
+    const ws = mkdtempSync(join(tmpdir(), 'chernobyl-e2e-codex-ws-'));
+    const fakeLog = join(home2, 'fake-codex.log');
+    writeFileSync(
+      join(home2, 'companion.json'),
+      JSON.stringify({
+        version: 1,
+        name: 'interop codex',
+        dataDir: home2,
+        adapters: [
+          {
+            id: 'codex-1',
+            type: 'codex',
+            enabled: true,
+            workspaces: [ws],
+            binary: process.execPath,
+            args: [FAKE_CODEX, '--transcript', fakeLog],
+          },
+        ],
+        retention: { events: 5000, eventsMaxAgeMs: 604800000 },
+        diagnostics: { port: 0 },
+        probeIntervalMs: 15000,
+      }),
+    );
+    const port2 = await freePort();
+    const url2 = `ws://127.0.0.1:${port2}`;
+    const pairLive = runPair(home2, { endpoints: [url2] });
+    const srv2 = spawnServer(home2, port2);
+    await waitListening(srv2, port2);
+    const live = [];
+    const open = (onMsg) => {
+      const t = createE2eTransport({ url: url2, pairing: pairLive, retryBaseMs: 200, retryMaxMs: 400 });
+      live.push(t);
+      transports.push(t);
+      t.subscribe(onMsg);
+      t.connect();
+      return t;
+    };
+    const isTranscript = (m) => m.type === 'transcript' || m.type === 'transcript_snapshot';
+
+    // a client that never subscribes: events yes, transcript frames never
+    const observed = [];
+    const observer = open((m) => observed.push(m));
+    // the main client
+    const msgs = [];
+    const a = open((m) => msgs.push(m));
+    check(
+      'codex: clients connect',
+      await waitFor(() => a.status() === 'connected' && observer.status() === 'connected', 8000),
+    );
+    await waitFor(() => msgs.some((m) => m.type === 'hello_ack'), 5000);
+    const helloAck = msgs.find((m) => m.type === 'hello_ack');
+    const agent = helloAck?.snapshot.agents.find((x) => x.id === 'codex-1');
+    const wsId = agent?.live?.workspaces?.[0]?.id;
+    check(
+      'codex: hello_ack advertises transcript.v1 and the codex agent with its workspace',
+      (helloAck?.features ?? []).includes('transcript.v1') && agent?.live?.promptWhileBusy === 'merge' && typeof wsId === 'string',
+      JSON.stringify(agent?.live ?? null),
+    );
+
+    const created = await a.send({
+      type: 'create_session',
+      commandId: 'cx-create',
+      agentId: 'codex-1',
+      title: 'interop',
+      prompt: 'run edit slow',
+      project: wsId,
+    });
+    const sid = created.sessionId;
+    check('codex: create_session acks with the thread as session id', created.ok && typeof sid === 'string', JSON.stringify(created));
+
+    // follows one session's stream the way applyTranscript does: any gap,
+    // duplicate or epoch change is recorded
+    const follow = (out) => {
+      const view = { epoch: null, seq: null, snapshots: 0, batches: 0, first: null, problems: [] };
+      out.view = view;
+      return (m) => {
+        if (!isTranscript(m) || m.sessionId !== sid) return;
+        view.first ??= m.type;
+        if (m.type === 'transcript_snapshot') {
+          Object.assign(view, { epoch: m.epoch, seq: m.seq, snapshots: view.snapshots + 1 });
+          return;
+        }
+        view.batches += 1;
+        if (m.epoch !== view.epoch) view.problems.push(`epoch ${m.epoch} != ${view.epoch}`);
+        for (const op of m.ops) {
+          if (op.seq !== view.seq + 1) view.problems.push(`seq ${op.seq} after ${view.seq}`);
+          view.seq = op.seq;
+        }
+      };
+    };
+    const s1 = {};
+    a.subscribe(follow(s1));
+    const sub = await a.send({ type: 'session_subscribe', commandId: 'cx-sub-1', sessionId: sid });
+    check('codex: session_subscribe is acked', sub.ok, JSON.stringify(sub));
+    const snapshotFirst = await waitFor(() => s1.view.first === 'transcript_snapshot', 8000);
+
+    // inline approvals: a stale revision is refused, optionId + revision accepted
+    const requests = () => msgs.filter((m) => m.type === 'permission_requested' && m.permission.sessionId === sid);
+    check('codex: the command approval arrives', await waitFor(() => requests().length >= 1, 8000));
+    const p1 = requests()[0].permission;
+    const stale = await a.send({
+      type: 'permission_decision',
+      commandId: 'cx-d0',
+      permissionId: p1.id,
+      decision: 'approve-once',
+      optionId: 'accept',
+      revision: p1.revision - 1,
+    });
+    check('codex: a decision on a stale revision is refused', stale.ok === false, JSON.stringify(stale));
+    const d1 = await a.send({
+      type: 'permission_decision',
+      commandId: 'cx-d1',
+      permissionId: p1.id,
+      decision: 'approve-once',
+      optionId: 'accept',
+      revision: p1.revision,
+    });
+    check(
+      'codex: an inline decision by optionId + revision is accepted',
+      d1.ok && (p1.options ?? []).some((o) => o.id === 'accept') && typeof p1.toolItemId === 'string',
+      JSON.stringify(d1),
+    );
+    check('codex: the file-change approval arrives', await waitFor(() => requests().length >= 2, 8000));
+    const p2 = requests()[1].permission;
+    const d2 = await a.send({
+      type: 'permission_decision',
+      commandId: 'cx-d2',
+      permissionId: p2.id,
+      decision: 'approve-session',
+      optionId: 'acceptForSession',
+      revision: p2.revision,
+    });
+    check('codex: a session-scoped option is accepted', d2.ok, JSON.stringify(d2));
+    // the turn goes on past the approvals: live ops follow the snapshot
+    check(
+      'codex: subscribe gets a snapshot, then contiguous live ops',
+      snapshotFirst && (await waitFor(() => s1.view.batches > 0, 8000)) && s1.view.problems.length === 0,
+      JSON.stringify(s1.view),
+    );
+
+    // every frame on the wire is sealed (a raw client of the same device)
+    {
+      const { c, session } = await rawSession(url2, pairLive);
+      c.send(session.seal(JSON.stringify({ type: 'session_subscribe', commandId: 'cx-raw', sessionId: sid })));
+      const frames = [];
+      const deadline = Date.now() + 1500;
+      while (Date.now() < deadline) {
+        const t = await Promise.race([c.recv(), sleep(deadline - Date.now()).then(() => null)]);
+        if (t === null) break;
+        frames.push(t);
+      }
+      c.close();
+      let sealed = 0;
+      let transcripts = 0;
+      for (const f of frames) {
+        try {
+          if (!/^\{"n":\d+,"d":"/.test(f)) continue;
+          const m = JSON.parse(session.open(f));
+          sealed += 1;
+          if (isTranscript(m)) transcripts += 1;
+        } catch {
+          /* not sealed, or not ours */
+        }
+      }
+      check(
+        'codex: every transcript frame is sealed',
+        frames.length > 0 && sealed === frames.length && transcripts > 0,
+        `frames=${frames.length} sealed=${sealed} transcript=${transcripts}`,
+      );
+    }
+
+    // reconnect with the cursor: replay with no gap or duplicate
+    const cursor = { epoch: s1.view.epoch, seq: s1.view.seq };
+    a.close();
+    await sleep(800); // the slow reply keeps streaming meanwhile
+    const msgs2 = [];
+    const s2 = {};
+    const b = open((m) => msgs2.push(m));
+    b.subscribe(follow(s2));
+    s2.view.epoch = cursor.epoch;
+    s2.view.seq = cursor.seq;
+    await waitFor(() => b.status() === 'connected', 8000);
+    const resub = await b.send({
+      type: 'session_subscribe',
+      commandId: 'cx-sub-2',
+      sessionId: sid,
+      epoch: cursor.epoch,
+      afterSeq: cursor.seq,
+    });
+    const again = await b.send({ type: 'submit_prompt', commandId: 'cx-p1', sessionId: sid, text: 'hello again' });
+    check(
+      'codex: reconnect with the cursor replays with no gap or duplicate',
+      resub.ok &&
+        again.ok &&
+        (await waitFor(() => s2.view.batches > 0, 8000)) &&
+        s2.view.first === 'transcript' &&
+        s2.view.snapshots === 0 &&
+        s2.view.problems.length === 0,
+      JSON.stringify({ cursor, ...s2.view }),
+    );
+    const results = () => [...msgs, ...msgs2].filter((m) => m.type === 'command_result');
+    check(
+      'codex: the session prompt and the steered follow-up complete',
+      await waitFor(
+        () => ['cx-create', 'cx-p1'].every((id) => results().some((m) => m.commandId === id && m.status === 'completed')),
+        15_000,
+      ),
+      JSON.stringify(results().map((m) => [m.commandId, m.status])),
+    );
+
+    // a stale cursor gets a snapshot
+    const s3 = {};
+    const c3 = open(follow(s3));
+    await waitFor(() => c3.status() === 'connected', 8000);
+    const resub3 = await c3.send({
+      type: 'session_subscribe',
+      commandId: 'cx-sub-3',
+      sessionId: sid,
+      epoch: 'not-the-epoch',
+      afterSeq: 1,
+    });
+    check(
+      'codex: a stale cursor gets a snapshot',
+      resub3.ok && (await waitFor(() => s3.view.first === 'transcript_snapshot', 5000)),
+      JSON.stringify(s3.view),
+    );
+
+    check(
+      'codex: a client that never subscribes receives zero transcript frames',
+      observed.some((m) => m.type === 'permission_requested') && !observed.some(isTranscript),
+      `messages=${observed.length}`,
+    );
+    const violations = readFileSync(fakeLog, 'utf8')
+      .split('\n')
+      .filter((l) => l.includes(' !! '));
+    check('codex: the fake app-server logged no protocol violation', violations.length === 0, violations.join(' | '));
+
+    for (const t of live) t.close();
+    srv2.child.kill();
+    await sleep(300);
+    for (const dir of [home2, ws]) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* best effort: the fake may hold its log for a moment */
+      }
+    }
   }
 
   for (const t of transports) t.close();

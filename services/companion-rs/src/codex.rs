@@ -1,7 +1,8 @@
-//! Codex app-server adapter core (ADR-015 §4.3, step 7 part 1): the JSON-RPC
+//! Codex app-server adapter core (ADR-015 §4.3, step 7): the JSON-RPC
 //! client for a `codex app-server` child, the notification decoder (§3.6
 //! Codex table) and the approval mapping (§4.5). Protocol code only; the
-//! companion wiring (LiveRuntime, transcript hub, engine) is part 2.
+//! companion wiring (LiveRuntime, transcript hub, engine) is
+//! `codex_runtime.rs`.
 //!
 //! Wire (schema pin openai/codex@970111f): one JSON object per line,
 //! JSON-RPC 2.0 shapes without the `"jsonrpc"` field. Codex numbers its own
@@ -18,6 +19,10 @@ use crate::crypto;
 use crate::json::{self, Json};
 use crate::protocol::{AgentLive, LiveWorkspace, PermissionOption, PermissionRequest, now_ms};
 use crate::runtime_io::{ChildEvent, ChildIo, redact};
+use crate::transcript::{
+    Field, FileDiff, Item, ItemKind, LiveState, McpAuthState, McpServer, Op, PlanStep, ToolCall,
+    ToolStatus, TurnState, Usage,
+};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -25,8 +30,6 @@ use std::path::{Path, PathBuf};
 /// Every Codex capability stays `limited` until a live run (`INTEGRATIONS.md` rule).
 const HONESTY: &str = "implemented from openai/codex@970111f schema; verified against fake \
                        app-server processes only; no live run";
-/// ADR §4.1 `LIVE_PERMISSION_TTL_MS`: codex never expires a request.
-const PERMISSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// §3.5 tool output: forwarding stops here; completion keeps head + tail.
 const OUTPUT_CAP: usize = 32 << 10;
 /// A partial output line longer than this is forwarded without its newline.
@@ -42,150 +45,15 @@ const DETAIL_CAP: usize = 64 << 10;
 /// What codex itself answers to requests it cannot serve, unknown methods
 /// included (its message_processor uses -32600, not -32601).
 const INVALID_REQUEST: i64 = -32600;
-
-/* ------------------------------------------------------------------ */
-/* Normalized transcript shapes: ADR §3.3 field for field. Stand-ins   */
-/* for `crate::transcript` (written in parallel); part 2 swaps them in */
-/* with a rename.                                                      */
-/* ------------------------------------------------------------------ */
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ItemKind {
-    User,
-    Text,
-    Thinking,
-    Tool,
-    Plan,
-    Notice,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolStatus {
-    Pending,
-    Running,
-    AwaitingApproval,
-    Completed,
-    Failed,
-    Denied,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct FileDiff {
-    pub path: String,
-    pub status: &'static str,
-    pub additions: i64,
-    pub deletions: i64,
-    pub patch: String,
-    pub truncated: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PlanStep {
-    pub text: String,
-    pub status: &'static str,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolCall {
-    pub name: String,
-    pub title: Option<String>,
-    pub status: ToolStatus,
-    pub input: String,
-    pub output: String,
-    pub output_truncated: bool,
-    pub error: Option<String>,
-    pub diffs: Vec<FileDiff>,
-    pub permission_id: Option<String>,
-    pub auto_approved: Option<String>,
-    pub duration_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Item {
-    pub id: String,
-    pub kind: ItemKind,
-    pub ts: i64,
-    pub turn_id: Option<String>,
-    pub parent_id: Option<String>,
-    pub text: String,
-    pub done: bool,
-    pub truncated: bool,
-    pub queued: bool,
-    pub level: Option<&'static str>,
-    pub tool: Option<ToolCall>,
-    pub steps: Vec<PlanStep>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Field {
-    Text,
-    Input,
-    Output,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TurnState {
-    pub id: String,
-    pub status: &'static str,
-    pub started_at: i64,
-    pub ended_at: Option<i64>,
-    pub usage: Option<Usage>,
-    pub cost_usd: Option<f64>,
-    pub error: Option<String>,
-    pub diffs: Vec<FileDiff>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Usage {
-    pub input: i64,
-    pub output: i64,
-    pub cache_read: Option<i64>,
-    pub reasoning: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct LiveState {
-    pub status: &'static str,
-    pub permission_mode: Option<String>,
-    pub model: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct McpServer {
-    pub name: String,
-    pub status: &'static str,
-    pub error: Option<String>,
-    pub auth_flows: Vec<&'static str>,
-    pub auth: Option<McpAuthState>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct McpAuthState {
-    pub state: &'static str,
-    pub url: Option<String>,
-    pub callback_prefix: Option<String>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Op {
-    Item(Item),
-    Append {
-        id: String,
-        field: Field,
-        text: String,
-    },
-    Turn(TurnState),
-    State(LiveState),
-    Mcp(Vec<McpServer>),
-}
+/// `mcpServerStatus/list` pages are followed up to this many servers (the
+/// hub keeps 32 anyway).
+const MCP_SERVERS_MAX: usize = 256;
 
 /* ------------------------------------------------------------------ */
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */
 
-/// What the companion does with codex's output (part 2 wires each one).
+/// What the companion does with codex's output (`codex_runtime` wires each one).
 // most events are ops (one per streamed delta): boxing them would allocate per delta
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
@@ -251,13 +119,15 @@ enum Pending {
         thread: String,
         turn: String,
     },
-    McpList,
+    /// One `mcpServerStatus/list` page; the servers of the pages before it.
+    McpList(Vec<McpServer>),
     McpLogin {
         tag: String,
         server: String,
     },
     McpReload {
         tag: String,
+        server: String,
     },
 }
 
@@ -265,13 +135,13 @@ impl Pending {
     /// The phone command riding on this request, and whether it is an interrupt.
     fn tag(self) -> Option<(String, bool)> {
         match self {
-            Pending::Init | Pending::McpList => None,
+            Pending::Init | Pending::McpList(_) => None,
             Pending::Interrupt { tag, .. } => Some((tag, true)),
             Pending::ThreadStart { tag, .. }
             | Pending::TurnStart { tag, .. }
             | Pending::Steer { tag, .. }
             | Pending::McpLogin { tag, .. }
-            | Pending::McpReload { tag } => Some((tag, false)),
+            | Pending::McpReload { tag, .. } => Some((tag, false)),
         }
     }
 }
@@ -322,7 +192,7 @@ struct Live {
 }
 
 /// One `codex app-server` process: its JSON-RPC state and every session
-/// (thread) inside it. Not thread-safe by itself; part 2 holds it in a Mutex,
+/// (thread) inside it. Not thread-safe by itself; the runtime holds it in a Mutex,
 /// feeds it from the `ChildIo` receiver and calls the command methods.
 pub struct Codex {
     io: ChildIo,
@@ -342,6 +212,9 @@ pub struct Codex {
     relist: bool,
     /// MCP server → its `mcp_auth` command while codex waits for the browser.
     logins: HashMap<String, String>,
+    /// `mcp_reconnect` commands after their reload: (server, tag, armed).
+    /// Armed once a list started after the reload; settled by that list.
+    reconnects: Vec<(String, String, bool)>,
     seq: u64,
     malformed: u64,
     exited: bool,
@@ -365,6 +238,7 @@ impl Codex {
             listing: false,
             relist: false,
             logins: HashMap::new(),
+            reconnects: Vec::new(),
             seq: 0,
             malformed: 0,
             exited: false,
@@ -502,13 +376,15 @@ impl Codex {
         self.call("mcpServer/oauth/login", Some(params), pending)
     }
 
-    /// `mcp_reconnect`: codex's closest equivalent reloads every server (§4.7).
-    pub fn mcp_reload(&mut self, tag: &str) -> Result<(), &'static str> {
-        self.call(
-            "config/mcpServer/reload",
-            None,
-            Pending::McpReload { tag: tag.into() },
-        )
+    /// `mcp_reconnect`: codex's closest equivalent reloads every server
+    /// (§4.7). Done when a list after the reload shows `server` connected
+    /// (completed) or settled otherwise (failed).
+    pub fn mcp_reload(&mut self, server: &str, tag: &str) -> Result<(), &'static str> {
+        let pending = Pending::McpReload {
+            tag: tag.into(),
+            server: server.into(),
+        };
+        self.call("config/mcpServer/reload", None, pending)
     }
 
     pub fn owns_session(&self, id: &str) -> bool {
@@ -678,12 +554,27 @@ impl Codex {
                     self.send(frame);
                 }
             }
-            (Pending::McpList, res) => {
+            (Pending::McpList(mut servers), res) => {
+                if let Ok(r) = &res {
+                    let data = json::get(r, "data").and_then(json::as_arr).unwrap_or(&[]);
+                    servers.extend(data.iter().filter_map(mcp_server));
+                    // follow the cursor; the page cap stops a codex that repeats itself
+                    if let Some(cursor) = json::get_str(r, "nextCursor")
+                        && servers.len() < MCP_SERVERS_MAX
+                    {
+                        let cursor = cursor.to_string();
+                        if self.page(Some(&cursor), servers).is_ok() {
+                            return;
+                        }
+                        // codex exited meanwhile: Exit settles the rest
+                        self.listing = false;
+                        return;
+                    }
+                    self.mcp = servers;
+                }
                 self.listing = false;
-                if let Ok(r) = res {
-                    // ponytail: first page only; follow nextCursor if someone runs more servers than a page
-                    let data = json::get(&r, "data").and_then(json::as_arr).unwrap_or(&[]);
-                    self.mcp = data.iter().filter_map(mcp_server).collect();
+                if res.is_ok() {
+                    self.settle_reconnects(out);
                     self.emit_mcp(out);
                 }
                 if std::mem::take(&mut self.relist) {
@@ -751,7 +642,10 @@ impl Codex {
                     None => out.push(failed(tag, "codex returned no sign-in URL".into())),
                 }
             }
-            (Pending::McpReload { tag }, Ok(_)) => out.push(done(tag, "completed", None)),
+            (Pending::McpReload { tag, server }, Ok(_)) => {
+                self.reconnects.push((server, tag, false));
+                self.list();
+            }
             (pending, Err(e)) => {
                 if let Some((tag, _)) = pending.tag() {
                     out.push(failed(tag, e));
@@ -944,7 +838,8 @@ impl Codex {
             revision: 1,
             fingerprint: None,
             requested_at: now,
-            expires_at: now + PERMISSION_TTL_MS,
+            // `Engine::ingest_permission` sets the runtime TTL (ADR §4.1)
+            expires_at: now,
             context: clip(&reason, CONTEXT_CAP).0,
             decided_at: None,
             decision: None,
@@ -1406,6 +1301,9 @@ impl Codex {
         for (_, tag) in self.logins.drain() {
             out.push(fail(tag, false));
         }
+        for (_, tag, _) in self.reconnects.drain(..) {
+            out.push(fail(tag, false));
+        }
         for (_, mut t) in self.turns.drain() {
             for (tag, interrupt) in std::mem::take(&mut t.tags) {
                 out.push(fail(tag, interrupt));
@@ -1435,16 +1333,51 @@ impl Codex {
     fn list(&mut self) {
         if self.listing {
             self.relist = true;
-        } else if self
-            .call(
-                "mcpServerStatus/list",
-                Some(json::obj(vec![])),
-                Pending::McpList,
-            )
-            .is_ok()
-        {
+        } else if self.page(None, Vec::new()).is_ok() {
             self.listing = true;
+            // what this list reports comes after every reload answered so far
+            for r in &mut self.reconnects {
+                r.2 = true;
+            }
         }
+    }
+
+    fn page(&mut self, cursor: Option<&str>, servers: Vec<McpServer>) -> Result<(), &'static str> {
+        let params = match cursor {
+            Some(c) => json::obj(vec![("cursor", json::s(c))]),
+            None => json::obj(vec![]),
+        };
+        self.call(
+            "mcpServerStatus/list",
+            Some(params),
+            Pending::McpList(servers),
+        )
+    }
+
+    /// `mcp_reconnect` outcomes (§4.6): connected → completed; still
+    /// starting → wait for the next list; anything else → failed.
+    fn settle_reconnects(&mut self, out: &mut Vec<Event>) {
+        let mcp = &self.mcp;
+        self.reconnects.retain(|(server, tag, armed)| {
+            if !*armed {
+                return true;
+            }
+            let status = mcp.iter().find(|s| s.name == *server).map(|s| s.status);
+            let (status, error) = match status {
+                Some("pending") => return true,
+                Some("connected") => ("completed", None),
+                Some(other) => (
+                    "failed",
+                    Some(format!("{server} is {other} after the reload")),
+                ),
+                None => (
+                    "failed",
+                    Some(format!("Codex has no MCP server named {server}")),
+                ),
+            };
+            out.push(done(tag.clone(), status, error));
+            false
+        });
     }
 
     /// The servers as the phone sees them: a sign-in in progress shows on its server.
@@ -1884,8 +1817,7 @@ fn answer(kind: &AskKind, option: &str, answers: &[(String, Vec<String>)]) -> Js
     }
 }
 
-// ADR §3.3 puts detail_shell()/detail_edit()/… in transcript.rs; these are
-// their stand-ins until the merge.
+// PermissionDetail builders (ADR §3.2); only codex uses them so far.
 
 fn detail_shell(command: &str, cwd: Option<&str>, reason: &str) -> Json {
     let mut fields = vec![
@@ -3348,16 +3280,65 @@ mod tests {
         let events = peer.note(&mut codex, "mcpServer/oauthLogin/completed", refused);
         assert_eq!(dones(&events), [("m2", "failed", Some("access_denied"))]);
         peer.recv();
-        // reconnect is codex's config reload
-        codex.mcp_reload("r1").unwrap();
+        peer.send(
+            &mut codex,
+            &list_reply(8, vec![linear("authenticationRequired", "notLoggedIn")]),
+        );
+        // reconnect is codex's config reload, done when a later list settles
+        codex.mcp_reload("fake-linear", "r1").unwrap();
+        codex.mcp_reload("nope", "r2").unwrap();
         assert_eq!(
             peer.recv(),
             r#"{"id":9,"method":"config/mcpServer/reload"}"#
         );
+        peer.recv();
+        assert!(dones(&peer.send(&mut codex, r#"{"id":9,"result":{}}"#)).is_empty());
         assert_eq!(
-            dones(&peer.send(&mut codex, r#"{"id":9,"result":{}}"#)),
-            [("r1", "completed", None)]
+            peer.recv(),
+            r#"{"id":11,"method":"mcpServerStatus/list","params":{}}"#
         );
+        // r2's reload is answered while that list runs: it waits for the next one
+        peer.send(&mut codex, r#"{"id":10,"result":{}}"#);
+        // still starting: nothing settles; the coalesced list comes in pages
+        let first = list_reply(11, vec![linear("starting", "oAuth")]);
+        assert!(dones(&peer.send(&mut codex, &first)).is_empty());
+        assert_eq!(
+            peer.recv(),
+            r#"{"id":12,"method":"mcpServerStatus/list","params":{}}"#
+        );
+        let page = |id: i64, servers: Vec<Json>, next: Json| {
+            let result = json::obj(vec![("data", Json::Arr(servers)), ("nextCursor", next)]);
+            json::stringify(&json::obj(vec![("id", Json::Int(id)), ("result", result)]))
+        };
+        let events = peer.send(
+            &mut codex,
+            &page(
+                12,
+                vec![server("fake-docs", s("connected"), false, "unsupported")],
+                s("p2"),
+            ),
+        );
+        assert!(events.is_empty());
+        assert_eq!(
+            peer.recv(),
+            r#"{"id":13,"method":"mcpServerStatus/list","params":{"cursor":"p2"}}"#
+        );
+        let events = peer.send(
+            &mut codex,
+            &page(13, vec![linear("connected", "oAuth")], Json::Null),
+        );
+        assert_eq!(
+            dones(&events),
+            [
+                ("r1", "completed", None),
+                ("r2", "failed", Some("Codex has no MCP server named nope"))
+            ]
+        );
+        let names: Vec<String> = match events.last() {
+            Some(Event::Op(_, Op::Mcp(list))) => list.iter().map(|m| m.name.clone()).collect(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(names, ["fake-docs", "fake-linear"]);
     }
 
     #[test]

@@ -615,7 +615,18 @@ impl Storage {
         let Some(mut rec) = self.commands.get(command_id).cloned() else {
             return Ok(());
         };
-        rec.status = status.to_string();
+        // G1: a runtime can finish a command before its ack is recorded
+        // (an interrupt with no turn running): the ack must not hide that
+        // outcome behind "executed"
+        let raced = status == "executed"
+            && matches!(
+                rec.status.as_str(),
+                "completed" | "failed" | "cancelled" | "expired" | "unknown"
+            );
+        if !raced {
+            rec.status = status.to_string();
+            rec.error = error.map(str::to_string);
+        }
         if ok.is_some() {
             rec.ok = ok;
         }
@@ -626,7 +637,6 @@ impl Storage {
         if permission_id.is_some() {
             rec.permission_id = permission_id.map(str::to_string);
         }
-        rec.error = error.map(str::to_string);
         self.put_command(&rec)
     }
 

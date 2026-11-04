@@ -12,7 +12,8 @@
 //! opener and OAuth callback check. transcript: ADR-015 transcript hub
 //! (memory-only live transcripts, subscriptions, backpressure).
 //! codex: ADR-015 step 7 Codex app-server adapter core (JSON-RPC client,
-//! notification decoder, approvals).
+//! notification decoder, approvals); codex_runtime: its LiveRuntime (one
+//! app-server child per adapter, sessions as threads).
 //! claude_live: ADR-015 Claude Code driver core (frame decoder, permission
 //! options, stdin encoders, launch and workspace policy).
 
@@ -23,6 +24,7 @@ pub mod claude;
 pub mod claude_live;
 pub mod client;
 pub mod codex;
+pub mod codex_runtime;
 pub mod companion;
 pub mod config;
 pub mod crypto;

@@ -19,6 +19,9 @@ pub struct AdapterEntryConfig {
     /// `opencode` entries: `user:pass` for a server started with
     /// `OPENCODE_SERVER_PASSWORD` (sent as HTTP Basic on loopback).
     pub basic_auth: Option<String>,
+    /// `codex` entries (ADR-015 §4.3): `workspaces`, `binary`, `args`,
+    /// validated at load (workspace policy §4.2.3).
+    pub codex: Option<crate::codex::LaunchConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +67,7 @@ pub fn default_config() -> CompanionConfig {
             enabled: true,
             endpoint: None,
             basic_auth: None,
+            codex: None,
         }],
         events_cap: 5_000,
         commands_cap: 5_000,
@@ -114,6 +118,8 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
         .map(PathBuf::from)
         .ok_or("'dataDir' must be a non-empty string")?;
 
+    // codex workspaces must never contain it (§4.2.3)
+    let data_dir_ref = data_dir.clone();
     let Some(Json::Arr(entries)) = json::get(raw, "adapters") else {
         return Err("'adapters' must be an array".into());
     };
@@ -150,12 +156,22 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
                  (e.g. \"http://127.0.0.1:11434\" — attach to an existing serve)"
             ));
         }
+        // a spawning runtime: its folder allow-list is checked here, fail closed
+        let codex = if enabled && kind == "codex" {
+            Some(
+                crate::codex::launch_config(entry, &data_dir_ref)
+                    .map_err(|e| format!("adapters[{i}]: {e}"))?,
+            )
+        } else {
+            None
+        };
         adapters.push(AdapterEntryConfig {
             id,
             kind,
             enabled,
             endpoint,
             basic_auth,
+            codex,
         });
     }
     let ids: Vec<&str> = adapters
@@ -253,6 +269,13 @@ pub fn config_to_json(c: &CompanionConfig) -> Json {
                         }
                         if let Some(b) = &a.basic_auth {
                             fields.push(("basicAuth", json::s(b)));
+                        }
+                        if let Some(cx) = &a.codex {
+                            let paths = cx.workspaces.iter().map(|w| json::s(&w.path));
+                            fields.push(("workspaces", Json::Arr(paths.collect())));
+                            fields.push(("binary", json::s(&cx.binary.to_string_lossy())));
+                            let args = cx.args.iter().map(|a| json::s(a));
+                            fields.push(("args", Json::Arr(args.collect())));
                         }
                         json::obj(fields)
                     })
@@ -357,6 +380,34 @@ mod tests {
         let out = crate::json::stringify(&config_to_json(&parsed));
         assert!(out.contains("http://127.0.0.1:4096"), "{out}");
         assert!(out.contains("\"basicAuth\""), "{out}");
+    }
+
+    #[test]
+    fn codex_entry_is_checked_at_load_and_round_trips() {
+        let root = std::env::temp_dir().join(format!("chernobyl-cfg-codex-{}", std::process::id()));
+        let ws = root.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let config = |dir: &Path, folder: &Path| {
+            let text = format!(
+                r#"{{"version":1,"name":"x","dataDir":{},"adapters":[{{"id":"codex-1","type":"codex","workspaces":[{}],"binary":"node","args":["fake.mjs"]}}],"retention":{{"events":5000,"eventsMaxAgeMs":600000}},"diagnostics":{{"port":9487}},"probeIntervalMs":15000}}"#,
+                json::stringify(&json::s(&dir.to_string_lossy())),
+                json::stringify(&json::s(&folder.to_string_lossy())),
+            );
+            validate_config(&json::parse(&text).unwrap())
+        };
+        // the data folder inside a workspace fails closed
+        let err = config(&ws.join("data"), &ws).unwrap_err();
+        assert!(
+            err.contains("adapters[0]") && err.contains("data folder"),
+            "{err}"
+        );
+        let parsed = config(&root.join("data"), &ws).unwrap();
+        let cx = parsed.adapters[0].codex.clone().unwrap();
+        assert_eq!(cx.argv(), ["fake.mjs", "app-server"]);
+        // written back, it loads to the same launch config
+        let again = validate_config(&config_to_json(&parsed)).unwrap();
+        assert_eq!(again.adapters[0].codex, Some(cx));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -193,6 +193,7 @@ fn live_opencode_end_to_end() {
         enabled: true,
         endpoint: Some(addr.clone()),
         basic_auth: None,
+        codex: None,
     });
     let comp = Companion::boot(c.clone()).unwrap();
     let oc = comp

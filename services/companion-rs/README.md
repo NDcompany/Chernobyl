@@ -142,6 +142,34 @@ items or 2 MiB per session; text is redacted and capped as ADR-015 §3.5 lists (
 100 ms, at most 8 KiB per append). `/health` reports `transcriptSessions`, `transcriptSubs`
 and `runtimeMalformed`.
 
+### Codex adapter (ADR-015 §4.3)
+
+An adapter entry in `companion.json` with `"type": "codex"` drives `codex app-server`:
+
+```json
+{ "id": "codex-1", "type": "codex", "enabled": true,
+  "workspaces": ["G:\\Chernobyl"], "binary": null, "args": [] }
+```
+
+- `workspaces` (required, at least one): absolute, existing folders, checked at config load.
+  A drive root, the user-profile folder (or a folder containing it) and any folder containing
+  the CHERNOBYL data directory are refused. The phone sees them as
+  `Agent.live.workspaces` (`id` = first 12 hex chars of sha256 of the canonical path) and
+  `create_session.project` must be one of those ids. **Listing a folder trusts it**: Codex
+  runs there with `approvalPolicy: on-request`, `sandbox: workspace-write`.
+- `binary`: `null` = `codex.exe` on `PATH`. It is spawned directly, never through a shell,
+  so npm's `codex.cmd` shim is refused: point `binary` at the real `codex.exe` (inside the
+  npm package's `vendor` folder). Health (`/adapters`) is whether the binary resolves.
+- `args`: put before `app-server`. Tests use `"binary": "node"` (or node's full path) with
+  `"args": ["<repo>/services/companion-rs/tools/fake-codex-app-server.mjs"]`.
+
+One app-server child per adapter, spawned on the first `create_session` (acked once Codex
+names the thread, which is the session id) with the companion's environment minus
+`HOST_TOKEN`, `CHERNOBYL_*` and `NODE_OPTIONS`. Prompts travel on stdin only. If the child
+exits, open approvals turn `stale`, running prompts fail, a pending interrupt is `unknown`
+and its sessions end; the next `create_session` respawns it. Capabilities are all `limited`
+(no live run; see `docs/INTEGRATIONS.md`).
+
 ## Verify
 
 ```powershell
@@ -244,6 +272,7 @@ matrix covers those).
 | `config` / `adapters` / `companion` | Node-parity config, adapter discovery, boot/reconcile/idempotency; the `LiveRuntime` trait and router (ADR-015 §4.1): `create_session` by the agent's `hostId`, session commands to the owning runtime, `permission_decision` to the runtime that surfaced it, the rest to the engine; demo data hidden while any runtime is healthy |
 | `server` | accept loops, auth (4001/429), origin refusal (403), posture gates (D1/D2/D6), version gate (4002), live session revocation (4003, D4), heartbeat, diagnostics HTTP, E2E handshake + sealed-frame dispatch, `session_subscribe`/`session_unsubscribe` per connection |
 | `transcript` | ADR-015 transcript hub: per-session op ring + compacted items, coalesced deltas, subscriptions, half-bulk backpressure, snapshots, redaction and caps; `HubHandle` is what live runtimes push through |
+| `codex` / `codex_runtime` | ADR-015 Codex app-server: JSON-RPC core (decoder, approvals, MCP) and its `LiveRuntime` (spawn, sessions as threads, hub/engine wiring) |
 | `runtime_io` | ADR-015 child process IO, env scrub, secret redaction, desktop URL opener, OAuth callback check |
 | `client` | test WS client + loopback `http_get` (used by `--self-test`) |
 | `crypto` | std-only SHA-256, HMAC, HKDF, ChaCha20, Poly1305, AEAD (official RFC/NIST KATs) |

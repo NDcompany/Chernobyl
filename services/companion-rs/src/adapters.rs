@@ -226,6 +226,15 @@ impl AdapterManager {
                 // whether a bridge is actually delivering is a runtime signal
                 // the adapter reports, not a discovery-time claim.
                 (true, true, None, Vec::new())
+            } else if entry.kind == "codex" {
+                // ADR-015 §4.3: spawned on the first session; health comes
+                // from the boot binary probe, never from discovery alone.
+                (
+                    true,
+                    false,
+                    Some("spawnable — binary probe runs at boot".into()),
+                    Vec::new(),
+                )
             } else {
                 (
                     false,
@@ -274,6 +283,14 @@ impl AdapterManager {
     /// Phase 7: record the Claude hook-ingress capability declaration (boot).
     /// The ingress has no probe; its honest §7.3 list replaces discovery's.
     pub fn attach_claude(&mut self, id: &str, capabilities: Vec<Capability>) {
+        if let Some(s) = self.statuses.get_mut(id) {
+            s.supported = true;
+            s.capabilities = capabilities;
+        }
+    }
+
+    /// ADR-015: record a spawned runtime's capability declaration (Codex).
+    pub fn attach(&mut self, id: &str, capabilities: Vec<Capability>) {
         if let Some(s) = self.statuses.get_mut(id) {
             s.supported = true;
             s.capabilities = capabilities;
@@ -329,6 +346,7 @@ mod tests {
             enabled: true,
             endpoint: None,
             basic_auth: None,
+            codex: None,
         }
     }
 
@@ -343,6 +361,7 @@ mod tests {
                 enabled: false,
                 endpoint: None,
                 basic_auth: None,
+                codex: None,
             },
         ]);
         let list = m.list();
