@@ -279,23 +279,15 @@ fn live_opencode_end_to_end() {
     // 6) turn terminal on the real runtime — EITHER a healthy turn (session
     //    idle/completed) OR the correlated failure channel (G4.1; the
     //    provider may reject 1.17.7 with 426, probe §8). Never mock either.
+    // The prompt command's own outcome (ADR-015 step 5 closes it on idle),
+    // not the session status: a freshly idle session already reads
+    // "completed" before the prompt has run.
     let terminal = wait_until(Duration::from_secs(60), || {
-        let failed = {
-            let store = comp.shared.storage.lock().unwrap();
-            store
-                .commands
-                .get("e2e-turn-1")
-                .map(|r| r.status.as_str() == "failed")
-                .unwrap_or(false)
-        };
-        if failed {
-            return true;
-        }
-        comp.snapshot()
-            .sessions
-            .iter()
-            .find(|s| s.id == sid)
-            .map(|s| s.status == "completed" || s.status == "interrupted")
+        let store = comp.shared.storage.lock().unwrap();
+        store
+            .commands
+            .get("e2e-turn-1")
+            .map(|r| matches!(r.status.as_str(), "completed" | "failed" | "cancelled"))
             .unwrap_or(false)
     });
     let msgs = oc.messages(&sid).expect("real messages endpoint");
@@ -600,6 +592,19 @@ fn live_opencode_rich_parts() {
         &work,
         &base.join("serve.log"),
     ));
+    // Hard budget for the whole live run: one run once hung for hours on an
+    // unbounded call. Past it, kill the isolated server tree and fail.
+    let pid = guard.server.as_ref().map(|s| s.id());
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(900));
+        eprintln!("live opencode test: 15 min budget exceeded");
+        if let Some(pid) = pid {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+        }
+        std::process::exit(1);
+    });
     let probe = OpenCodeAdapter::new("live-probe", &addr, None);
     assert!(
         wait_until(Duration::from_secs(60), || probe.refresh().is_ok()),
