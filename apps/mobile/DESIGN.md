@@ -34,7 +34,8 @@ label/colors), `RiskPill` (low|medium|high), `SimulatedTag` (grey "Simulated" pr
 
 **`surface.tsx`** — `Screen` (layout shell: safe-area + scroll + `header`/`footer` slots +
 `safeTop=false` when the screen draws its own dark header + `bottomInset` for tab clearance +
-`scrollRef` for live-output autoscroll), `PageHeader` (`onBack`: undefined→`router.back()`, null→no
+`scrollRef` for live-output autoscroll; a `KeyboardAvoidingView` with `padding` on both platforms
+keeps the footer above the keyboard, since edge-to-edge Android no longer resizes the window), `PageHeader` (`onBack`: undefined→`router.back()`, null→no
 button; `dark` variant for black headers), `Card` (`strong` = black outline), `EmptyState` (default
 `contour="bottom"`), `ToastHost` (global, reads `appStore.toasts`, tab-bar aware — mounted once in
 root layout), `ConfirmModal` (destructive confirmations; `note` = scope/safety line).
@@ -48,8 +49,10 @@ system→italic), `FileRow` (+add/−del), `DetailRow`, `SegmentedTabs`.
 **`transcript.tsx`** — ADR-015 conversation view, presentational only (data + callbacks as props;
 pure logic in `src/utils/transcript.ts`, unit-tested by `npm test -w @chernobyl/mobile`).
 `TranscriptList` (FlatList keyed by item id; footer after each ended turn; standalone approval
-cards at the end for pending requests whose tool item is not in view; sticks to the bottom while
-the user is there, else a "Jump to latest" pill; announces turn ends only, never deltas;
+cards at the end for pending requests whose tool item is not in view; a notice that repeats its
+turn's footer ("Stopped") is dropped; sticks to the bottom (native `scrollToEnd`, so new cards and
+text growing in place stay in view) until the user's own drag or fling leaves it, then a "Jump to
+latest" pill; announces turn ends only, never deltas;
 `focusItemId` = deep link: once that item is in view it scrolls its card (or the top-level card it
 is nested in, or its standalone approval) into the upper third and gives it a brief `surface2`
 halo),
@@ -61,7 +64,8 @@ turn"), `ThinkingRow` (collapsed one-line preview → `text2` italic), `ToolCard
 a status mark per `ToolStatus`; expands to input `MonoBlock`, output with truncated marker, `DiffView`,
 "Auto-approved (…)", nested subagent items; a pending approval outlines it black and keeps it open;
 `awaiting-approval` without a record shows "Waiting for approval…"), `DiffView` (+/− in
-`success`/`error`, hunks `text3`, first 200 lines then "Show more"), `InlineApproval` /
+`success`/`error`, hunks `text3`, first 200 lines then "Show more"; like code blocks, each line
+ends in a space so Android's pixel rounding cannot wrap the widest line out of the box), `InlineApproval` /
 `StandaloneApproval` (detail by kind; primary + secondary + "More…" with session/persistent grants and
 "Deny and tell <agent> why"; persistent grants confirm the exact rule and file), `PlanCard`,
 `NoticeRow`, `TurnFooter`, `McpChip` ("MCP 4/5" + warning dot), `McpSheet` (status + §4.7 sign-in

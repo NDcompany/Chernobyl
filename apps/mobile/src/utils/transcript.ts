@@ -660,7 +660,16 @@ export function buildTranscript(
   turns: TurnState[],
   permissions: PermissionRequest[],
 ): TranscriptModel {
-  const known = items.filter((it) => KINDS.has(it.kind));
+  const turnById = new Map(turns.map((t) => [t.id, t]));
+  // a notice that repeats its ended turn's footer ("Stopped" after an interrupt) shows once, as the
+  // footer; kept when it is the turn's only item, since the footer hangs off the turn's last item
+  const echo = (it: TranscriptItem) => {
+    const turn = it.kind === 'notice' && it.turnId ? turnById.get(it.turnId) : undefined;
+    return turn !== undefined && it.kind === 'notice' && it.text === turnFooter(turn)?.text;
+  };
+  const known = items.filter(
+    (it) => KINDS.has(it.kind) && !(echo(it) && items.some((o) => o.turnId === it.turnId && KINDS.has(o.kind) && !echo(o))),
+  );
   const byId = new Map(known.map((it) => [it.id, it]));
   const toolParent = (it: TranscriptItem) =>
     it.parentId && byId.get(it.parentId)?.kind === 'tool' ? it.parentId : undefined;
@@ -698,7 +707,6 @@ export function buildTranscript(
     for (let cur: string | undefined = id; cur && !attention.has(cur); cur = parentOf.get(cur)) attention.add(cur);
   }
 
-  const turnById = new Map(turns.map((t) => [t.id, t]));
   const lastOfTurn = new Map<string, string>();
   for (const it of top) if (it.turnId) lastOfTurn.set(it.turnId, it.id);
   const rows: TranscriptRow[] = [];

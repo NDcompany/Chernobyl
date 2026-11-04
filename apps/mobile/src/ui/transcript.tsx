@@ -95,6 +95,14 @@ export interface MessageTextProps {
 }
 
 /** No HTML, no images, no remote loads. A link opens only on tap, after a confirm showing its URL. */
+/**
+ * Appended to each line of mono text in a sideways ScrollView. Android sizes such a Text to its
+ * measured width, which pixel rounding can leave a pixel short: the longest line then wraps its
+ * last word and pushes the final line out of the clipped box (a one-line Write lost its `+hi`).
+ * A trailing space counts in the measured width but may overhang when the line is laid out.
+ */
+const NO_WRAP_SLACK = ' ';
+
 export const MessageText = memo(function MessageText({ text, streaming = false, onOpenLink }: MessageTextProps) {
   const blocks = useMemo(() => parseMarkdown(text, streaming), [text, streaming]);
   const [link, setLink] = useState<string | null>(null);
@@ -169,7 +177,7 @@ const MdBlockView = memo(
             ) : null}
             <ScrollView horizontal showsHorizontalScrollIndicator={false} nestedScrollEnabled>
               <Text variant="mono" color={colors.white} selectable>
-                {block.text || ' '}
+                {block.text.replace(/$/gm, NO_WRAP_SLACK)}
               </Text>
             </ScrollView>
           </View>
@@ -416,7 +424,7 @@ export const DiffView = memo(function DiffView({ diff }: DiffViewProps) {
           <Text variant="mono" selectable>
             {shown.map((l, i) => (
               <RNText key={i} style={{ color: DIFF_COLOR[l.kind] }}>
-                {i < shown.length - 1 ? `${l.text}\n` : l.text}
+                {`${l.text}${NO_WRAP_SLACK}${i < shown.length - 1 ? '\n' : ''}`}
               </RNText>
             ))}
           </Text>
@@ -1080,21 +1088,30 @@ export function TranscriptList({
     }
   }, [turns]);
 
+  // Only the user's own drag or fling unpins; growth and our own scrolls never do.
+  const userScrolling = useRef(false);
   const onScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
     const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
     const bottom = contentOffset.y + layoutMeasurement.height >= contentSize.height - spacing.huge;
-    if (bottom !== atBottom.current) {
-      atBottom.current = bottom;
-      setShowJump(!bottom);
-    }
+    if (bottom === atBottom.current || (!bottom && !userScrolling.current)) return;
+    atBottom.current = bottom;
+    setShowJump(!bottom);
   }, []);
+  const scrollStart = useCallback(() => {
+    userScrolling.current = true;
+  }, []);
+  const scrollEnd = useCallback(() => {
+    userScrolling.current = false;
+  }, []);
+  // The native scrollToEnd: FlatList's own uses the last cell's cached frame, which lags
+  // behind a card that just arrived or text that grew in place.
   const stick = useCallback(() => {
-    if (atBottom.current) listRef.current?.scrollToEnd({ animated: false });
+    if (atBottom.current) listRef.current?.getNativeScrollRef()?.scrollToEnd({ animated: false });
   }, []);
   const jump = useCallback(() => {
     atBottom.current = true;
     setShowJump(false);
-    listRef.current?.scrollToEnd({ animated: true });
+    listRef.current?.getNativeScrollRef()?.scrollToEnd({ animated: true });
   }, []);
 
   const renderItem = (item: TranscriptItem): ReactNode => (
@@ -1132,6 +1149,10 @@ export function TranscriptList({
         renderItem={renderRow}
         onScrollToIndexFailed={onScrollToIndexFailed}
         onScroll={onScroll}
+        onScrollBeginDrag={scrollStart}
+        onScrollEndDrag={scrollEnd}
+        onMomentumScrollBegin={scrollStart}
+        onMomentumScrollEnd={scrollEnd}
         scrollEventThrottle={32}
         onContentSizeChange={stick}
         onLayout={stick}

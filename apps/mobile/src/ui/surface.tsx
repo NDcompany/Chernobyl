@@ -6,7 +6,6 @@ import type { ReactNode, RefObject } from 'react';
 import {
   KeyboardAvoidingView,
   Modal,
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -88,10 +87,8 @@ export function Screen({
       style={{ flex: 1, backgroundColor: background }}
     >
       {header}
-      <KeyboardAvoidingView
-        style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      >
+      {/* Android too: edge-to-edge (edgeToEdgeEnabled) means adjustResize no longer shrinks the window */}
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding">
         {body}
         {footer ? (
           <View

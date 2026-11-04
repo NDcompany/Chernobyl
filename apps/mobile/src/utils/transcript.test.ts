@@ -170,6 +170,12 @@ test('diff: lines classify by first character; headers only before the first hun
   );
 });
 
+test('diff: a one-line Write (hunk count omitted, no trailing newline) keeps its added line', () => {
+  const lines = parseDiff('@@ -0,0 +1 @@\n+hi');
+  assert.deepEqual(lines.map((l) => [l.kind, l.text]), [['hunk', '@@ -0,0 +1 @@'], ['add', '+hi']]);
+  assert.deepEqual(diffCounts(lines), { additions: 1, deletions: 0 });
+});
+
 test('footer: done with duration, tokens and optional cost; stopped; error', () => {
   const turn: TurnState = {
     id: 't1',
@@ -350,6 +356,28 @@ test('rows: item order, turn footers, nesting, inline vs standalone approvals', 
   assert.deepEqual(m.children.get('T')?.map((c) => c.id), ['c1']);
   assert.equal(m.approvals.get('c1')?.id, 'p1');
   assert.deepEqual([...m.attention].sort(), ['T', 'c1']);
+});
+
+test('rows: a "Stopped" notice in an interrupted turn shows once, as the footer', () => {
+  const stopped = (id: string, turnId: string): TranscriptItem => ({ id, ts: 0, turnId, kind: 'notice', level: 'info', text: 'Stopped' });
+  const items: TranscriptItem[] = [
+    { id: 'u1', ts: 0, turnId: 't1', kind: 'user', text: 'count' },
+    { id: 'x1', ts: 0, turnId: 't1', kind: 'text', text: '1 2 3', done: true },
+    stopped('n1', 't1'),
+    { id: 'u2', ts: 0, turnId: 't2', kind: 'user', text: 'go' },
+    stopped('n2', 't2'),
+    stopped('n3', 't3'),
+  ];
+  const turns: TurnState[] = [
+    { id: 't1', status: 'interrupted', startedAt: 0, endedAt: 1 },
+    { id: 't2', status: 'completed', startedAt: 2, endedAt: 3 },
+    { id: 't3', status: 'interrupted', startedAt: 4, endedAt: 5 },
+  ];
+  assert.deepEqual(
+    buildTranscript(items, turns, []).rows.map((r) => r.key),
+    ['u1', 'x1', 'turn:t1', 'u2', 'n2', 'turn:t2', 'n3', 'turn:t3'],
+    'dropped only where the footer says the same; kept when it is all the turn has',
+  );
 });
 
 test('rows: the row that shows an item (Approvals and notification deep links)', () => {
