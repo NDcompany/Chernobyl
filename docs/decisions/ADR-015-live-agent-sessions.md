@@ -21,7 +21,7 @@
 | Text / thinking | Token deltas / ~5-word summarized thinking deltas | Token deltas / reasoning summary deltas | Token deltas for both |
 | Tool calls | Streaming input JSON; whole result with `structuredPatch` diffs | Typed items, streaming command output, unified diffs | pending → running → completed/error; diff in the edit permission and the turn summary |
 | Approval | `control_request can_use_tool` keyed by `tool_use_id`; answer `control_response` | Server→client request keyed by `itemId`; answer `{decision}` | `permission.asked` keyed by `tool.callID`; `POST /permission/{id}/reply` |
-| Follow-up while busy | Merged into the running turn | `turn/steer` (merged) | Queued as its own turn |
+| Follow-up while busy | Usually its own next turn (merged only sometimes, at a tool boundary) | `turn/steer` (merged) | Queued as its own turn |
 | Interrupt | `control_request interrupt`; process survives | `turn/interrupt` | `POST /session/{id}/abort` |
 | MCP | `mcp_status` (poll), `mcp_authenticate` → URL, `mcp_oauth_callback_url` | `mcpServerStatus/list`, `mcpServer/oauth/login` → URL | `GET /mcp` (poll), `POST /mcp/{name}/auth`, `/auth/callback` |
 | Verifiable here | Yes (CLI 2.1.310, Haiku) | No (not installed) | Yes (1.19.4 + local Ollama) |
@@ -707,7 +707,7 @@ The companion TUI's approval keys go through the same `handle_client_msg` path, 
 
 Follow-up behaviour, which the phone shows in the composer through `Agent.live.promptWhileBusy`:
 
-- Claude `merge`: a prompt sent mid-turn is folded into the running turn, and both commands complete with that turn's `result`.
+- Claude `queue` (changed from `merge` after emulator row 9.5 on 2026-11-04): the CLI folds a mid-turn prompt into the running turn only sometimes, at a tool boundary; usually it runs as its own turn. The driver completes the command either way, so the phone promises only "Queued".
 - Codex `merge` via `turn/steer`.
 - OpenCode `queue`: the prompt runs as its own turn after the current one.
 
@@ -831,7 +831,7 @@ Order matters: each step is one commit with both gates green (`npm run verify`, 
     | 9.2 | Tool card shows streaming input, then output; the Edit card shows the diff |
     | 9.3 | Inline approval inside the card → Allow → the tool completes; the Approvals tab entry clears |
     | 9.4 | "Deny and tell Claude why" → Claude continues and mentions the reason |
-    | 9.5 | Follow-up sent mid-turn shows "Joins the current turn" and is answered in that turn |
+    | 9.5 | Follow-up sent mid-turn shows "Queued" and is answered (in that turn or the next) |
     | 9.6 | Stop mid-stream → "Stopped"; the next prompt works in the same session |
     | 9.7 | App in the background, an approval arrives as a notification; tapping it opens the conversation at the card |
     | 9.8 | Airplane mode on and off mid-stream → the transcript resumes with no gap or duplicate |

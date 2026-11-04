@@ -15,7 +15,7 @@ Everything a machine without a phone can prove has been proven. The release APK 
 Android 15 emulator against the real companion: 30 of the 31 checklist rows in sections 1-8
 were run and all pass (row 6.3 needs a PC reboot). An independent adversarial review by 95
 agents found 22 issues; all are fixed. The ADR-015 live agent sessions landed on 2026-11-04;
-their emulator rows (section 9, 9.1-9.13) are NOT RUN, so no row below counts them.
+their emulator rows ran on 2026-11-04: 11 of 13 pass. 9.5 failed (follow-up merge), and the fix (advertise `queue`) still needs a re-run. 9.9 sign-in and 9.13 (old APK) were not run.
 
 | # | PRD Phase 9 requirement | Status | Evidence |
 |---|---|---|---|
@@ -40,8 +40,8 @@ and all its findings are fixed; a human third-party audit is still owed before a
 
 | Runtime | Evidence | Status |
 |---|---|---|
-| Claude Code (driven `claude.exe`) | Unit and fake-process tests; live round trip `live_claude_haiku_inline_permission_round_trip` against Haiku, CLI 2.1.310, about $0.01 | ✅ live on the desktop; ⛔ emulator rows 9.1-9.11 NOT RUN |
-| OpenCode (attach) | `live_opencode_rich_parts` and `live_opencode_end_to_end` passed on an isolated `opencode serve` 1.19.4 with `qwen3.5:4b` (24k context) on local Ollama | ✅ live on the desktop; ⛔ emulator row 9.12 NOT RUN |
+| Claude Code (driven `claude.exe`) | Unit and fake-process tests; live round trip `live_claude_haiku_inline_permission_round_trip` against Haiku, CLI 2.1.310, about $0.01 | ✅ live on the desktop; ✅ emulator rows 9.1-9.4, 9.6-9.8, 9.10-9.11 pass; ⚠ 9.5 fixed, re-run owed; 9.9 sign-in not run |
+| OpenCode (attach) | `live_opencode_rich_parts` and `live_opencode_end_to_end` passed on an isolated `opencode serve` 1.19.4 with `qwen3.5:4b` (24k context) on local Ollama | ✅ live on the desktop; ✅ emulator row 9.12 passes |
 | Codex (driven `codex app-server`) | Unit, fake-process and interop scenario 11 tests against `tools/fake-codex-app-server.mjs` | ⚠️ `limited`: no live run |
 | Old APK against the new companion | — | ⛔ row 9.13 NOT RUN |
 
@@ -58,7 +58,7 @@ never journaled (`docs/PRIVACY.md`).
    model, ADR-011 to ADR-014 and the golden vectors.
 3. Signing: a release keystore for the APK (and a Play `specialUse` foreground-service
    declaration if it ever ships on Play); Windows code signing stays an ADR-007 decision.
-4. Run the live-session rows 9.1-9.13 on the emulator, then on the physical phone.
+4. Re-run row 9.5 on the emulator, then run the live-session rows on the physical phone (9.9 sign-in included).
 5. A live Codex run before Codex is described as anything but `limited`.
 
 ## Final verification run
@@ -71,7 +71,7 @@ Run on 2026-10-25 (night) against the commit that updates this file:
 | `npm run verify:rust` | 241 unit + 7 CLI + 5 lifecycle integration tests, 0 failed (4 + 1 ignored microbench/live); clippy `-D warnings` and fmt clean; `--self-test` ALL CHECKS PASSED. **2026-11-04 at `62c0aba`** (`cargo test` only): 369 unit + 13 CLI + 5 lifecycle, 0 failed (6 + 2 ignored) |
 | Interop (Node client vs the real binary) | 19/19 PASS, including live revoke → 4003 |
 | `npm run soak:smoke` | 10/10, `pass: true` (the 24 h S11 run passed 2026-10-24 on `f47c4f6`; later builds have smoke evidence only) |
-| Emulator, release APK | 30 of 31 rows in sections 1-8 run, all pass (row 2.2 on 2026-10-26 after the device key rotation; 6.3 NOT RUN, needs a PC reboot; `evidence/2026-10-25-emulator/results.json`); row 1.1 re-passed on the APK with the new logo and live wiring (`ae7d47b`). Section 9 (live sessions): NOT RUN |
+| Emulator, release APK | 30 of 31 rows in sections 1-8 run, all pass (row 2.2 on 2026-10-26 after the device key rotation; 6.3 NOT RUN, needs a PC reboot; `evidence/2026-10-25-emulator/results.json`); row 1.1 re-passed on the APK with the new logo and live wiring (`ae7d47b`). Section 9 (live sessions, 2026-11-04): 11 of 13 pass; 9.5 fixed after a FAIL, re-run owed; 9.9 sign-in and 9.13 not run |
 | `node scripts/build-android.mjs` | `release/chernobyl-0.1.0-arm64-v8a+x86_64.apk` (71 MB, both native ABIs) |
 | `node scripts/package-release.mjs` + `--verify` | exe + APK hashed into `release/SHA256SUMS.txt`, both verified |
 | `git diff --check` | clean |

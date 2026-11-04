@@ -1,6 +1,6 @@
 # CHERNOBYL — TODO
 
-Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Code driven sessions live-verified against Haiku, OpenCode rich parts live-verified on 1.19.4 + local Ollama, Codex `limited` against a fake app-server only; pairing QR replay fixed by device key rotation, emulator row 2.2 passes; checklist 30 of 31 rows run on the emulator, all pass; soak built into the binary; the owner's logo everywhere; emulator rows 9.1-9.13 not run yet). Before that, 2026-10-25 night (emulator validation of the release APK: 14 checklist rows pass; 95-agent independent security review, 22 findings fixed — `docs/security/INDEPENDENT-REVIEW-2026-10-25.md`; Android foreground service built and device-tested; simulated-data provenance; D1 app-Origin allow-list; cleartext ws:// in release). Before that, 2026-10-25 late (reliability mandate closed: audit P1–P10 + extra findings, D4 live revoke, D9 option B, pairing-while-running fix, Phase 6 camera QR / host records / outcome honesty, Phase 9 gate assessed in `docs/validation/RELEASE-GATE.md`). Earlier: 24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria, `pass: true`; Phase 8 complete: TUI + pairing overlay + windowless autostart + packaging ADR-007; client read-timeout cross-handle fix). Status of the Rust companion rewrite + everything left.
+Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Code driven sessions live-verified against Haiku, OpenCode rich parts live-verified on 1.19.4 + local Ollama, Codex `limited` against a fake app-server only; pairing QR replay fixed by device key rotation, emulator row 2.2 passes; checklist 30 of 31 rows run on the emulator, all pass; soak built into the binary; the owner's logo everywhere; emulator rows 9.1-9.13 run 2026-11-04: 11 of 13 pass, 9.5 fixed after a FAIL). Before that, 2026-10-25 night (emulator validation of the release APK: 14 checklist rows pass; 95-agent independent security review, 22 findings fixed — `docs/security/INDEPENDENT-REVIEW-2026-10-25.md`; Android foreground service built and device-tested; simulated-data provenance; D1 app-Origin allow-list; cleartext ws:// in release). Before that, 2026-10-25 late (reliability mandate closed: audit P1–P10 + extra findings, D4 live revoke, D9 option B, pairing-while-running fix, Phase 6 camera QR / host records / outcome honesty, Phase 9 gate assessed in `docs/validation/RELEASE-GATE.md`). Earlier: 24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria, `pass: true`; Phase 8 complete: TUI + pairing overlay + windowless autostart + packaging ADR-007; client read-timeout cross-handle fix). Status of the Rust companion rewrite + everything left.
 
 ## Done
 
@@ -303,7 +303,7 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
       run incl. a real camera QR scan (S4), a human third-party audit (S9), and release signing.
       **Update 2026-11-04:** 30 of 31 checklist rows (sections 1-8) run on the emulator, all pass
       (row 2.2 after the device key rotation `9e460d7`; 6.3 needs a PC reboot). The live-session
-      rows 9.1-9.13 are NOT RUN.
+      rows 9.1-9.13 ran 2026-11-04: 11 of 13 pass (see the open items).
 - [x] ADR-015 live agent sessions — **implemented on main 2026-11-04**
       (`docs/decisions/ADR-015-live-agent-sessions.md`; deviations in its §10; threats T1-T11 as
       built in threat model §3.12):
@@ -323,15 +323,17 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
   - [x] Step 9: phone conversation UI, transcript store, subscribe lifecycle, workspace picker,
         approval deep links, simulated demo transcript (`ca5ed96`, `43714df`).
   - [x] Step 10: interop scenario 11 against the fake Codex app-server (`05b3481`); no fake Claude in interop.
-  - [ ] Step 11: emulator rows 9.1-9.13 (`docs/validation/PHONE-VALIDATION-CHECKLIST.md`
-        section 9), NOT RUN.
+  - [x] Step 11: emulator rows 9.1-9.13 (`docs/validation/PHONE-VALIDATION-CHECKLIST.md`
+        section 9) ran 2026-11-04 (`ea2f970`): 11 pass, 9.5 FAIL (fixed: Claude advertises
+        `queue`), 9.13 not run. Four app bugs and one companion bug found there are fixed.
   - [x] Step 12: docs (INTEGRATIONS, PRIVACY, threat model §3.12, README, this file, release
         gate, checklist section 9).
 
 ### Open items (2026-11-04)
 
-- [ ] Emulator rows 9.1-9.13 (live sessions: Claude, OpenCode, an old APK against the new
-      companion).
+- [ ] Emulator: re-run row 9.5 (now "Queued"), 9.9 sign-in on a throwaway MCP server, and 9.13
+      (needs a pre-ADR-015 APK build). Also eyeball the keyboard and list-follow fixes (`9bf315d`) in a live session;
+      only the diff fix was seen on the emulator.
 - [ ] Codex: `thread/resume` after the app-server exits, the 30 s interrupt-unknown timer and
       the 10-min `mcp_auth` expiry (none built; ADR-015 §10).
 - [ ] A live Codex run, when someone has Codex installed and signed in; capabilities stay

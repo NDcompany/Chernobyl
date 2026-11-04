@@ -111,19 +111,19 @@ OpenCode configured (ADR-015 §7 step 11).
 
 | # | Check | Status |
 |---|-------|--------|
-| 9.1 | Claude session from the phone: "Starting Claude Code…", then streaming text grows in place | **NOT RUN** |
-| 9.2 | Tool card shows streaming input, then output; the Edit card shows the diff | **NOT RUN** |
-| 9.3 | Inline approval inside the card → Allow → the tool completes; the Approvals tab entry clears | **NOT RUN** |
-| 9.4 | "Deny and tell Claude why" → Claude continues and mentions the reason | **NOT RUN** |
-| 9.5 | Follow-up sent mid-turn shows "Joins the current turn" and is answered in that turn | **NOT RUN** |
-| 9.6 | Stop mid-stream → "Stopped"; the next prompt works in the same session | **NOT RUN** |
-| 9.7 | App in the background, an approval arrives as a notification; tapping it opens the conversation at the card | **NOT RUN** |
-| 9.8 | Airplane mode on and off mid-stream → the transcript resumes with no gap or duplicate | **NOT RUN** |
-| 9.9 | MCP chip shows needs-auth → "Sign in on PC" opens the desktop browser → the chip turns connected | **NOT RUN** |
-| 9.10 | A persistent "always allow" option shows the confirm with the rule and `.claude/settings.local.json` | **NOT RUN** |
-| 9.11 | `echo` of a fake `sk-ant-` key appears as `«redacted:anthropic-key»` | **NOT RUN** |
-| 9.12 | OpenCode session (Ollama): streaming, inline bash approval, abort shown as Stopped | **NOT RUN** |
-| 9.13 | An old (pre-ADR-015) APK against the new companion: dashboard, approvals and sessions behave as before | **NOT RUN** |
+| 9.1 | Claude session from the phone: "Starting Claude Code…", then streaming text grows in place | **RUN 2026-11-04 (emulator, Haiku)** — PASS: "Starting Claude Code…", phone text grew in place in step with the companion (375 → 5867 chars), footer "Done · 12.3 s" (`evidence/2026-10-25-emulator/9.1-*`) |
+| 9.2 | Tool card shows streaming input, then output; the Edit card shows the diff | **RUN 2026-11-04 (emulator, Haiku)** — PASS: Write card shows input and output; Edit card shows "1 added, 1 removed". The one-line Write diff dropped its `+` line (app bug, fixed after the run) (`evidence/2026-10-25-emulator/9.2-*`) |
+| 9.3 | Inline approval inside the card → Allow → the tool completes; the Approvals tab entry clears | **RUN 2026-11-04 (emulator, Haiku)** — PASS: "awaiting approval" inline and on the Approvals tab; Allow completed the tool and cleared the entry (`evidence/2026-10-25-emulator/9.3-*`) |
+| 9.4 | "Deny and tell Claude why" → Claude continues and mentions the reason | **RUN 2026-11-04 (emulator, Haiku)** — PASS: card "denied", Claude quoted the reason and finished the turn (`evidence/2026-10-25-emulator/9.4-*`) |
+| 9.5 | Follow-up sent mid-turn shows "Queued" and is answered (in that turn or the next) | **RUN 2026-11-04 (emulator, Haiku)** — **FAIL**: the CLI usually answered the follow-up as its own turn, not merged. Fixed by advertising `queue` for Claude (caption "Queued" / "Runs after this turn"); re-run pending (`evidence/2026-10-25-emulator/9.5*`) |
+| 9.6 | Stop mid-stream → "Stopped"; the next prompt works in the same session | **RUN 2026-11-04 (emulator, Haiku)** — PASS: Stop at 171 of 3000 numbers → "Stopped"; the next prompt completed in the same session. "Stopped" showed twice (app bug, fixed after the run) (`evidence/2026-10-25-emulator/9.6-*`) |
+| 9.7 | App in the background, an approval arrives as a notification; tapping it opens the conversation at the card | **RUN 2026-11-04 (emulator, Haiku)** — PASS: "Approval needed" notification in the background; tapping it opened the conversation at the card (`evidence/2026-10-25-emulator/9.7-*`) |
+| 9.8 | Airplane mode on and off mid-stream → the transcript resumes with no gap or duplicate | **RUN 2026-11-04 (emulator, Haiku)** — PASS: network cut at 456 of 3999 chars; after reconnect the phone text equals the companion item, no gap, one copy (`evidence/2026-10-25-emulator/9.8-*`) |
+| 9.9 | MCP chip shows needs-auth → "Sign in on PC" opens the desktop browser → the chip turns connected | **RUN 2026-11-04 (emulator, Haiku)** — PARTIAL: the MCP chip ("15 of 32 connected, needs attention") and mode chip render and the sheet opens; sign-in NOT RUN (it would start OAuth on the owner's real MCP servers) (`evidence/2026-10-25-emulator/9.9-*`) |
+| 9.10 | A persistent "always allow" option shows the confirm with the rule and `.claude/settings.local.json` | **RUN 2026-11-04 (emulator, Haiku)** — PASS: confirm shows "Rule: Bash(cp fake.txt k.txt; cat k.txt)" and ".claude/settings.local.json"; Cancel wrote nothing (`evidence/2026-10-25-emulator/9.10-*`) |
+| 9.11 | `echo` of a fake `sk-ant-` key appears as `«redacted:anthropic-key»` | **RUN 2026-11-04 (emulator, Haiku)** — PASS: the phone and the companion transcript show `«redacted:anthropic-key»`, never the key (`evidence/2026-10-25-emulator/9.11-*`) |
+| 9.12 | OpenCode session (Ollama): streaming, inline bash approval, abort shown as Stopped | **RUN 2026-11-04 (emulator, OpenCode 1.19.4 + Ollama qwen3.5:4b)** — PASS: streaming, inline bash approval → Allow once, Stop → "Stopped". Home showed "0 hosts online" (companion bug, fixed after the run) (`evidence/2026-10-25-emulator/9.12-*`) |
+| 9.13 | An old (pre-ADR-015) APK against the new companion: dashboard, approvals and sessions behave as before | **NOT RUN** — no pre-ADR-015 APK was kept |
 
 ## Known risks to watch during the first device run
 
