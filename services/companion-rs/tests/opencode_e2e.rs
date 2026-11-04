@@ -614,7 +614,7 @@ fn live_opencode_rich_parts() {
         enabled: true,
         endpoint: Some(addr.clone()),
         basic_auth: None,
-        codex: None,
+        ..Default::default()
     });
     let comp = Companion::boot(c).unwrap();
     let sid = match comp.handle_client_msg(ClientMsg::CreateSession {
