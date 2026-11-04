@@ -56,7 +56,7 @@ page records **which versions were verified** and the limits that matter in prac
   config reload) work. Not offered: ending a session, permission modes, phone-side MCP
   sign-in. A session dies with its app-server process and is not resumed; the next new
   session respawns the app-server. An interrupt has no 30 s timeout and a desktop sign-in
-  no 10-min expiry. There is no session cap or rate limit. **Adding a folder to `workspaces`
+  no 10-min expiry. Sessions are capped at 8 open per adapter and one new session per 5 s. **Adding a folder to `workspaces`
   is trusting it:** Codex runs with `approvalPolicy: on-request` and
   `sandbox: workspace-write` there. Workspaces are checked when the config loads, and a bad
   folder stops the companion from starting. Set `binary` to the real `codex.exe`; npm's

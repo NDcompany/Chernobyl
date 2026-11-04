@@ -333,7 +333,7 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
 - [ ] Emulator rows 9.1-9.13 (live sessions: Claude, OpenCode, an old APK against the new
       companion).
 - [ ] Codex: `thread/resume` after the app-server exits, the 30 s interrupt-unknown timer and
-      the 10-min `mcp_auth` expiry (none built; ADR-015 §10). Also no session cap or rate limit.
+      the 10-min `mcp_auth` expiry (none built; ADR-015 §10).
 - [ ] A live Codex run, when someone has Codex installed and signed in; capabilities stay
       `limited` until then.
 - [ ] Rare server-test flake `control_routes_refuse_a_missing_or_wrong_control_key`
