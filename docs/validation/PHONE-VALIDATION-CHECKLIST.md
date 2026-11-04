@@ -1,6 +1,6 @@
 # Phone-to-companion manual validation checklist (Phase 5′ / Phase 6 gate S4)
 
-**Status:** emulator run 2026-10-25 (Android 15 x86_64, release APK, real companion): 30 of 31 rows RUN, all PASS (row 2.2 after the device-key rotation fix; 6.3 needs a PC reboot), see each row and `evidence/2026-10-25-emulator/results.json`. **No physical device yet** — the emulator does not exercise a real camera, radio or OEM battery policy.
+**Status:** emulator run 2026-10-25 (Android 15 x86_64, release APK, real companion): 30 of the 31 rows in sections 1-8 RUN, all PASS (row 2.2 after the device-key rotation fix; 6.3 needs a PC reboot), see each row and `evidence/2026-10-25-emulator/results.json`. Section 9 (ADR-015 live sessions, 13 rows, added 2026-11-04): all NOT RUN. **No physical device yet** — the emulator does not exercise a real camera, radio or OEM battery policy.
 **Purpose:** the manual steps, observable expected results, and evidence method for the first
 real-phone validation of the companion. Gate **S4** closes only when the "Required for S4"
 rows carry recorded evidence.
@@ -103,6 +103,27 @@ pairing UI.
 | 8.4 | Leave the app backgrounded ≥ 10 min, return | Heartbeat keeps or re-establishes the connection; dead-peer cleanup on the companion side if truly dead | screen + companion log | **RUN 2026-10-26 (emulator)** — PASS: app backgrounded 10 min with the foreground service; the companion saw 1 client at every minute; foreground was live at once (`evidence/2026-10-25-emulator/8.4-after-10-min.png`) |
 | 8.5 | Android: pair, press Home, trigger an approval on the desktop, stop the companion, then revoke the device; repeat and end with sign-out, push off, unpair and swipe-away | Ongoing "Background connection" notification with the `[ · ]` status-bar glyph; the approval arrives as a notification; text turns "Reconnecting…"; on revoke a "Disconnected from your desktop companion" alert; after each ending, `adb shell dumpsys activity services com.chernobyl.app` lists no `ConnectionForegroundService` | screen recording + dumpsys | **RUN 2026-10-25 (emulator)** — PASS (core): Home pressed → `ConnectionForegroundService` running, "Background connection — Connected to your desktop companion" notification, companion kept the client for 2 min in the background; revoke stops it (row 7.1). Approval-arrives-as-notification not yet exercised (`evidence/2026-10-25-emulator/8.5-*`) |
 | 8.6 | Android: revoke the device, keep its pairing stored, cold-launch the app 10 times | No crash ("did not then call Service.startForeground()"); status Denied; no service left running | screen + `adb logcat` | **RUN 2026-10-25 (emulator)** — PASS via row 7.2 (5 cold launches, no startForeground crash) |
+
+## 9. Live agent sessions (ADR-015)
+
+Run with `scripts/device/validate.mjs` against the real companion with Claude Code and
+OpenCode configured (ADR-015 §7 step 11).
+
+| # | Check | Status |
+|---|-------|--------|
+| 9.1 | Claude session from the phone: "Starting Claude Code…", then streaming text grows in place | **NOT RUN** |
+| 9.2 | Tool card shows streaming input, then output; the Edit card shows the diff | **NOT RUN** |
+| 9.3 | Inline approval inside the card → Allow → the tool completes; the Approvals tab entry clears | **NOT RUN** |
+| 9.4 | "Deny and tell Claude why" → Claude continues and mentions the reason | **NOT RUN** |
+| 9.5 | Follow-up sent mid-turn shows "Joins the current turn" and is answered in that turn | **NOT RUN** |
+| 9.6 | Stop mid-stream → "Stopped"; the next prompt works in the same session | **NOT RUN** |
+| 9.7 | App in the background, an approval arrives as a notification; tapping it opens the conversation at the card | **NOT RUN** |
+| 9.8 | Airplane mode on and off mid-stream → the transcript resumes with no gap or duplicate | **NOT RUN** |
+| 9.9 | MCP chip shows needs-auth → "Sign in on PC" opens the desktop browser → the chip turns connected | **NOT RUN** |
+| 9.10 | A persistent "always allow" option shows the confirm with the rule and `.claude/settings.local.json` | **NOT RUN** |
+| 9.11 | `echo` of a fake `sk-ant-` key appears as `«redacted:anthropic-key»` | **NOT RUN** |
+| 9.12 | OpenCode session (Ollama): streaming, inline bash approval, abort shown as Stopped | **NOT RUN** |
+| 9.13 | An old (pre-ADR-015) APK against the new companion: dashboard, approvals and sessions behave as before | **NOT RUN** |
 
 ## Known risks to watch during the first device run
 

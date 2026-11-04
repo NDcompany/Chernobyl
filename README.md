@@ -19,8 +19,9 @@ packages/protocol   Shared TypeScript protocol: types, message envelopes,
 services/companion-rs
                     The real backend (Rust, std-only, one binary): protocol-v2
                     WebSocket server + pairing/QR + E2E session layer +
-                    OpenCode adapter + loopback diagnostics. This is the
-                    production runtime the phone talks to.
+                    OpenCode, Claude Code and Codex live runtimes + loopback
+                    diagnostics. This is the production runtime the phone
+                    talks to.
 services/host       TypeScript reference host (Node + ws): MockEngine + the
                     protocol conformance/differential suite the Rust engine was
                     ported test-for-test from. Still built and tested by `verify`;
@@ -73,12 +74,12 @@ commands (decision D2): the E2E session handshake must complete first (see
 | Agents | `/agents` | search + full list |
 | Agent details | `/agent/[id]` | capabilities, sessions, activity, start session |
 | Sessions | `/sessions` | All / Running / Waiting / Completed filters + search |
-| Session workspace | `/session/[id]` | Output / Files / Activity, send, interrupt |
+| Session workspace | `/session/[id]` | live conversation for transcript sessions (see below); otherwise Output / Files / Activity, send, interrupt |
 | Approvals | `/approvals` | pending (live countdowns) + decided history |
 | Permission request | `/permission/[id]` | exact command, risk, Approve once / Reject, separate "approve for session" |
 | Profile | `/profile` | settings entries, sign out (confirmed) |
 | Settings | `/settings/[section]` | hosts, integrations, notifications, appearance, security, audit |
-| New task | `/new-task` (modal) | pick agent, describe the job |
+| New task | `/new-task` (modal) | pick agent (and a workspace for live agents), describe the job |
 | Connect host | `/connect-host` (modal) | token → SecureStore keystore |
 
 ## How state works
@@ -92,8 +93,41 @@ commands (decision D2): the E2E session handshake must complete first (see
   concurrent sends, and the WS transport replays unresolved commands with the *same*
   `commandId` on reconnect — the host answers duplicates with `duplicate: true` acks
   instead of executing twice.
-- **Permission requests** expire after 2 minutes (protocol `PERMISSION_TTL_MS`); stale
-  requests are never decidable, on either side.
+- **Permission requests** expire after 2 minutes (protocol `PERMISSION_TTL_MS`) for the mock
+  and demo, and after 24 hours for live runtime requests (none of the runtimes expires its own);
+  stale requests are never decidable, on either side.
+- **Live transcripts** arrive on the same transport stream and fold into a second, memory-only
+  store (`src/data/live.ts`) while a conversation screen is open.
+
+## Live agent sessions
+
+ADR-015. On a transcript session the phone shows a live conversation: streaming text and
+thinking, tool cards with input, output and diffs, approvals inside the tool card (with the
+runtime's own options, such as allow once, allow for the session, a persistent rule after a
+confirm that names the rule and file, or deny with a reason), follow-up prompts, a Stop
+button, and MCP server status with sign-in and reconnect. Transcripts are held in memory only,
+on both sides, and are never journaled (`docs/PRIVACY.md`).
+
+| Runtime | How | Status |
+| --- | --- | --- |
+| Claude Code | **driven**: the companion starts `claude.exe` (stream-json on stdio) in an allow-listed folder; also permission mode and end session | live round trip passed against Haiku, CLI 2.1.310 (about $0.01 per run) |
+| OpenCode | **attach** to a running `opencode serve` (HTTP + SSE), as before | live tests passed on 1.19.4 with local Ollama (`qwen3.5:4b`, 24k context) |
+| Codex | **driven**: one `codex app-server` per adapter, each session a thread | every capability `limited`: tested only against a fake app-server, no live run |
+
+To enable them, add to `companion.json` (keys documented in `services/companion-rs/README.md`):
+
+- Claude Code: `"workspaces": ["C:\\path\\to\\project"]` on the existing `claude` entry
+  (optional `binary`, `maxSessions` 1-16, default 3, and `permissionMode`: `default`,
+  `acceptEdits` or `plan`). Without `workspaces` the entry stays a hook ingress only.
+- Codex: a new entry `{ "id": "codex-1", "type": "codex", "enabled": true, "workspaces": [...] }`
+  with `binary` pointing at the real `codex.exe` (the npm `.cmd` shim is refused).
+
+**Allow-listing a folder means trusting it.** The phone can start an agent in it, and Claude
+runs in print mode, which skips its folder-trust dialog, so that folder's project hooks and MCP
+servers load when the session starts. Drive roots, your user-profile root and any folder that
+contains the CHERNOBYL data directory are refused. Bypass-permissions modes are never reachable
+from the phone. Per-runtime limits: `docs/INTEGRATIONS.md`; threats and controls:
+`docs/decisions/PHASE5-THREAT-MODEL.md` §3.12.
 
 ## Backend runtime
 
@@ -116,9 +150,10 @@ protocol-v2 the mobile app already emits:
   QR carrying a per-device 256-bit PSK (DPAPI-protected at rest). A handshake
   (`hs_hello → hs_challenge → hs_proof → hs_ok`) proves mutual PSK knowledge; from
   `hs_ok` on every frame is ChaCha20-Poly1305-sealed with HKDF directional keys and a
-  monotonic counter nonce (replay/tamper-proof). Revocation blocks a device at its next
-  handshake (an already-established session survives until the companion restarts —
-  ADR-014 proposes terminate-on-revoke and awaits product-owner ratification).
+  monotonic counter nonce (replay/tamper-proof). The first connection rotates the device
+  key, so a pairing QR cannot be replayed after the phone has acked it (`hs_rekey`).
+  Revocation closes the device's live connections with `4003` and refuses its next
+  handshake (ADR-014).
   See `services/companion-rs/README.md` for the exact wire format.
 - **Posture policies (decisions D1/D2/D6)** — a WS upgrade carrying a browser `Origin`
   is refused `403` (no browsers until the web app); beyond loopback every command
@@ -126,7 +161,8 @@ protocol-v2 the mobile app already emits:
   execution); and `/health` on the main listener beyond loopback requires the token.
 - **Adapters** — an attach-only OpenCode adapter (HTTP/SSE to an existing
   `opencode serve`), an Ollama model-runtime adapter (attach-only, explicit endpoint),
-  a Claude Code hook ingress (loopback diagnostics POST only), and the in-process
+  Claude Code as a hook ingress (loopback diagnostics POST only) plus driven sessions in
+  allow-listed workspaces, a Codex app-server runtime (`limited`), and the in-process
   `mock` engine. Hermes is deferred by ADR-008 (not installed on this machine —
   not stubbed). Phase 7 complete.
 
@@ -143,17 +179,18 @@ production backend — use the companion for real connections.
   ADR-009: mock mode is a permanent, first-class dev/test mode; the mobile app shows a
   persistent **"Simulation"** badge while the mock is active so demo data is never
   mistaken for a real agent.
-- **Real agent integration**: the OpenCode adapter is wired end-to-end (attach-only
-  HTTP/SSE to an existing `opencode serve`, no spawned server); Ollama (model runtime)
-  and Claude Code (hook ingress) landed in Phase 7; Hermes is deferred (ADR-008 — not
-  installed here, deliberately not stubbed). When no healthy real runtime is
+- **Real agent integration**: OpenCode (attach-only HTTP/SSE, no spawned server) and
+  Claude Code driven sessions are live-verified; Codex is implemented from its schema and
+  tested only against a fake app-server; Ollama is a model runtime; Hermes is deferred
+  (ADR-008 — not installed here, deliberately not stubbed). The live-session emulator rows
+  (checklist 9.1-9.13) are not run yet. When no healthy real runtime is
   attached, sessions/agents fall back to the mock seed — the UI must not present that
   as live activity.
 - **The release APK is validated on an Android 15 emulator, not yet on a physical phone.**
   `node scripts/device/validate.mjs` drives the real APK against a real companion: pairing
   and E2E handshake, relaunch, companion restart, network loss, the background service,
-  live revoke and token refusal all pass (14 checklist rows,
-  `docs/validation/evidence/2026-10-25-emulator/`). Camera QR decoding and OEM battery
+  live revoke and token refusal all pass (30 of the 31 rows in checklist sections 1-8 run,
+  all pass; 6.3 needs a PC reboot; `docs/validation/evidence/2026-10-25-emulator/`). Camera QR decoding and OEM battery
   behaviour need a real phone.
 - **Background connection on Android.** A foreground service
   (`apps/mobile/modules/connection-service`) keeps the paired WebSocket and its timers alive
@@ -172,10 +209,12 @@ Two suites, both green on the current tree:
 
 - `npm run verify` (TypeScript): strict typecheck across the TS workspaces, ESLint
   (0 errors; 2 known warnings from React Compiler skipping `react-hook-form.watch`),
-  **44 tests** (13 domain + 22 host + 9 adapter-sdk via `node --test`), workspace builds,
-  and `expo export --platform android` → `dist-android` (Hermes bundle).
-- `npm run verify:rust` (the real runtime): **219 unit + 4 CLI + 5 lifecycle
-  integration tests, 0 failed** (4 + 1 ignored microbench/live tests), incl. the crypto
+  `node --test` suites for domain, protocol, host, adapter-sdk, e2e and mobile, workspace
+  builds, and `expo export --platform android` → `dist-android` (Hermes bundle). Last
+  recorded counts: `docs/validation/RELEASE-GATE.md`.
+- `npm run verify:rust` (the real runtime): `cargo test` on 2026-11-04 at `62c0aba`:
+  **369 unit + 13 CLI + 5 lifecycle integration tests, 0 failed** (6 + 2 ignored
+  microbench/live tests), incl. the crypto
   known-answer tests, golden E2E frames shared with the TS client, the D1/D2/D6/D9 posture
   and E2E adversarial matrix, live revocation (4003), ordered shutdown and adapter fault
   injection; `cargo clippy -D warnings`, `cargo fmt --check`, and the binary's
@@ -202,12 +241,15 @@ The Rust backend, protocol, crypto, pairing, adapters and Phase 8 (ops core,
 packaging, windowless autostart, terminal TUI) are implemented and tested
 (Phases 0–8 complete). What is left:
 
-1. **Physical-device validation** — `docs/validation/PHONE-VALIDATION-CHECKLIST.md`,
-   all rows NOT RUN/BLOCKED (needs a real Android phone).
-2. **Independent security assessment** (S9) — automated tests + review are not a
+1. **Physical-device validation** — `docs/validation/PHONE-VALIDATION-CHECKLIST.md`:
+   30 of 31 rows in sections 1-8 pass on the emulator; no physical phone yet.
+2. **Live-session emulator rows** — checklist section 9 (rows 9.1-9.13), NOT RUN.
+3. **Codex live run** — Codex stays `limited` until someone runs it against a real
+   `codex app-server`; session resume and the interrupt and sign-in timeouts are not built.
+4. **Independent security assessment** (S9) — automated tests + review are not a
    substitute for it.
-3. **D4 / S8** — live-session revocation awaits product-owner ratification of the
-   ADR-014 recommendation (terminate-on-revoke via an in-process revoke path).
+5. **Release signing** — the APK is debug-signed; Windows code signing is an ADR-007
+   decision.
 
 The S11 24-hour soak **passed on 2026-10-24** (all 10 criteria, evidence in
 `docs/decisions/PHASE5-THREAT-MODEL.md` §6) — it is gate evidence, not a

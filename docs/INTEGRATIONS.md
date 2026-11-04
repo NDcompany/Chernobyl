@@ -27,7 +27,8 @@ page records **which versions were verified** and the limits that matter in prac
   mapped, but no populated capture yet), MCP sign-in (completing a real OAuth login is not
   verified live). Not offered: ending a session, permission modes. There is no SSE replay:
   after a reconnect, state is re-listed and watched transcripts are rebuilt from
-  `GET /session/{id}/message`. Conversation text is never journaled.
+  `GET /session/{id}/message`. OpenCode's conversation text is not journaled (prompts sent
+  from the phone are, as part of their command records: `PRIVACY.md`).
 - **Ollama.** It is a model provider, not an agent. Session operations report
   `unavailable` (PRD §7.7).
 - **Claude Code.** Without `workspaces` it is ingress only: the companion observes hook
@@ -42,16 +43,24 @@ page records **which versions were verified** and the limits that matter in prac
   CLI runs in print mode, which skips Claude's folder-trust dialog, so the folder's
   project hooks and MCP servers load on spawn. Hooks of a driven session are ignored, so it
   is not shown twice. Set `binary` only to a real `claude.exe` (no `.cmd` shim).
+  Workspaces are checked when the companion starts: a bad folder leaves the entry
+  ingress-only with `lastError` on `GET /adapters`. `maxSessions` (1-16, default 3) caps live
+  processes; one new session per 5 s. A process idle for 30 min with no phone watching is
+  closed and resumed on the next prompt. A companion restart drops driven sessions from the
+  phone (their transcripts stay in Claude's own files).
 - **Codex.** Every capability is `limited`: "implemented from openai/codex@970111f schema;
   verified against fake app-server processes only; no live run". Sessions stream a live
   transcript; approvals carry Codex's own options (allow, allow for this session, the
   proposed exec-policy amendment as a persistent option, deny, deny and stop); follow-ups
   steer the running turn; interrupt, MCP status, desktop MCP sign-in and reconnect (a
   config reload) work. Not offered: ending a session, permission modes, phone-side MCP
-  sign-in. A session dies with its app-server process; the next new session respawns it.
-  **Adding a folder to `workspaces` is the folder-trust decision:** Codex runs with
-  `approvalPolicy: on-request` and `sandbox: workspace-write` there. Set `binary` to the real
-  `codex.exe`; npm's `codex.cmd` shim is refused (no shell is ever used).
+  sign-in. A session dies with its app-server process and is not resumed; the next new
+  session respawns the app-server. An interrupt has no 30 s timeout and a desktop sign-in
+  no 10-min expiry. There is no session cap or rate limit. **Adding a folder to `workspaces`
+  is trusting it:** Codex runs with `approvalPolicy: on-request` and
+  `sandbox: workspace-write` there. Workspaces are checked when the config loads, and a bad
+  folder stops the companion from starting. Set `binary` to the real `codex.exe`; npm's
+  `codex.cmd` shim is refused (no shell is ever used).
 
 ## Updating this page
 

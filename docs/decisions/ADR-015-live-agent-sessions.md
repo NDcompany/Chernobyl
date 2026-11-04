@@ -1,8 +1,8 @@
 # ADR-015: Live agent sessions on the phone (streaming transcript, inline approvals, follow-ups, interrupt, MCP)
 
-**Status:** Accepted 2026-10-26 (ratification delegated by the owner); implementation in progress (step 1 landed).
+**Status:** Accepted 2026-10-26 (ratification delegated by the owner). Implemented on main 2026-11-04 (steps 1-10 and 12; deviations in §10). Step 11, the emulator rows 9.1-9.13, is pending until they are run.
 **Date:** 2026-10-26
-**Relates to:** PRD §7.2-7.5, §7.8, §12.5, §13, §14.4-14.5; gates G1, G2, G4.3 (amended in §4.2.1); ADR-009 (mock honesty), ADR-010 (std-only Rust), ADR-011 (E2E), ADR-014 (revocation); threat model `PHASE5-THREAT-MODEL.md` §3.1, §3.8, §3.10; `apps/mobile/DESIGN.md`.
+**Relates to:** PRD §7.2-7.5, §7.8, §12.5, §13, §14.4-14.5; gates G1, G2, G4.3 (amended in §4.2.1); ADR-009 (mock honesty), ADR-010 (std-only Rust), ADR-011 (E2E), ADR-014 (revocation); threat model `PHASE5-THREAT-MODEL.md` §3.1, §3.8, §3.10, §3.12 (T1-T11 as built); `apps/mobile/DESIGN.md`.
 **Research this builds on:** `docs/reverse-engineering/claude-code-streaming.md`, `claude-agent-sdk.md`, `codex-and-antigravity.md`, `opencode-live-events.md` (all 2026-10-26).
 
 ---
@@ -779,7 +779,7 @@ Follows `apps/mobile/DESIGN.md`: monochrome, hairlines, tokens only, state color
 
 **Residuals stated honestly.** A secret split across two streaming text deltas can appear on screen until its block completes, when the authoritative replace re-redacts it. Tool output arrives whole (Claude, OpenCode) or line-buffered (Codex), so it is redacted before display. Redaction recognises known shapes only. The desktop JSONL transcripts keep everything; they belong to the runtimes, not to CHERNOBYL.
 
-**Doc corrections in the same change.** `PRIVACY.md`: today OpenCode text parts are republished as journaled activity, which contradicts "does not store conversation history". The new adapter stops that, and the doc gains "live transcripts are held in memory only" plus the MCP callback redaction. The threat model gets a §3.11 with T1-T11. `INTEGRATIONS.md`: Claude becomes "ingress + driven sessions", Codex is added as `limited`.
+**Doc corrections in the same change.** `PRIVACY.md`: today OpenCode text parts are republished as journaled activity, which contradicts "does not store conversation history". The new adapter stops that, and the doc gains "live transcripts are held in memory only" plus the MCP callback redaction. The threat model gets T1-T11 as §3.12 (§3.11 went to the pairing-QR device key rotation, `9e460d7`). `INTEGRATIONS.md`: Claude becomes "ingress + driven sessions", Codex is added as `limited`.
 
 ---
 
@@ -841,7 +841,7 @@ Order matters: each step is one commit with both gates green (`npm run verify`, 
     | 9.12 | OpenCode session (Ollama): streaming, inline bash approval, abort shown as Stopped |
     | 9.13 | An old (pre-ADR-015) APK against the new companion: dashboard, approvals and sessions behave as before |
 
-12. **Docs.** `INTEGRATIONS.md`, `PRIVACY.md`, threat model §3.11, `services/companion-rs/README.md` wire contract, `README.md`, `TODO.md`, and the memory project note.
+12. **Docs.** `INTEGRATIONS.md`, `PRIVACY.md`, threat model §3.12, `services/companion-rs/README.md` wire contract, `README.md`, `TODO.md`, and the memory project note.
 
 **Live verification here:** Claude Code yes (CLI 2.1.310, Haiku, temp workspace, about $0.01 per run); OpenCode yes (1.19.4 on local Ollama, since the free models are exhausted; isolated env); Codex no (not installed, no credentials; fake processes only, capabilities stay `limited`); Antigravity deferred.
 
@@ -868,3 +868,21 @@ Order matters: each step is one commit with both gates green (`npm run verify`, 
 - OpenCode: `docs/reverse-engineering/opencode-live-events.md`, `opencode.md`; <https://opencode.ai/docs/server/>, <https://opencode.ai/docs/mcp-servers/>.
 - Antigravity: `docs/reverse-engineering/codex-and-antigravity.md` Topic B.
 - CHERNOBYL code read for this design: `packages/protocol/src/index.ts`, `services/companion-rs/src/{protocol,adapters,companion,engine,server,opencode,claude,config,e2e,ws}.rs`, `packages/e2e/src/transport.ts`, `apps/mobile/app/session/[id].tsx`, `apps/mobile/src/data/{reducer,state,commands,transport}.ts`, `apps/mobile/src/ui/lists.tsx`, `apps/mobile/DESIGN.md`.
+
+## 10. Implementation notes (2026-11-04)
+
+Where the code on main differs from the text above, as recorded in the commit messages (`85c54db` to `62c0aba`). The code is the authority.
+
+- **Codex.** There is no `thread/resume`: a session ends with its `codex app-server` process, and the next `create_session` spawns a new one (the app-server starts on the first session, not at boot). The 30 s interrupt timer and the 10-min `mcp_auth` expiry from §4.6 are not built for Codex: an interrupt becomes `unknown` only when the process exits under it, and a desktop sign-in waits for `oauthLogin/completed` with no timeout. Phone-callback sign-in is refused ("Codex signs MCP servers in on the desktop only"). No live run (§7).
+- **Workspace policy timing.** Claude workspaces are checked at boot, not at config load: a bad folder keeps the `claude` entry ingress-only with `lastError` set, and the companion still starts. Codex workspaces are checked at config load, and a bad folder fails the load.
+- **Claude config bounds.** `maxSessions` accepts 1-16 (default 3); `permissionMode` accepts `default`, `acceptEdits` or `plan`.
+- **Claude capabilities.** As §8, plus `session.list` and `server.spawn` `limited`, and `mcp.auth` `limited` (phone-callback verified against a mock OAuth server; whether the CLI's own desktop listener reconnects by itself is unverified, so the companion polls and sends `mcp_reconnect`).
+- **`list_state`** returns the merged snapshot, the same one `hello_ack` carries, instead of the engine's alone.
+- **Journal redaction.** Besides `mcp_auth_callback.callbackUrl` (§6 T5), each value in `permission_decision.answers` is journaled as `<redacted>`; the in-memory message is what executes. `permission_decision.message` (a deny reason) and prompt text are journaled as sent, as every command record is.
+- **Module layout.** `ChildIo`, `child_env`, `redact`, the desktop opener and the callback check live in `src/runtime_io.rs`, not `adapters.rs` / `transcript.rs`. `ChildIo` also refuses `.cmd` and `.bat` binaries. The runtimes are `claude_runtime.rs` and `codex_runtime.rs` over the protocol cores `claude_live.rs` and `codex.rs`.
+- **Transcript caps beyond §3.5:** 256 KiB of diffs per item or turn, 256-byte ids (longer ops are dropped and counted), 1 KiB labels and errors, 100 plan steps, 32 MCP servers, so every op fits the 512 KiB snapshot cap.
+- **Subscriptions** (`session_subscribe`, `session_unsubscribe`) are handled in `server.rs` next to `hello`, acked and never journaled.
+- **Storage.** An ack recorded after its command already finished keeps the recorded outcome (an interrupt with no running turn completes before its ack).
+- **Interop (step 10).** Scenario 11 of `tools/e2e-interop.mjs` runs the real companion against the fake Codex app-server only; there is no fake Claude process in the interop suite. It covers subscribe → snapshot → contiguous sealed ops, cursor replay, stale cursor → snapshot, an inline decision by `optionId` with a stale revision refused, and a client that never subscribes getting zero transcript frames. The wrong-`state` `mcp_auth_callback` refusal is covered by unit tests (`mcp_callback_checks_host_port_path_state`), not by interop.
+- **Phone demo.** The scripted transcript runs only on the app's own mock transport (`MockEngine({ live: true })`). The Node reference host keeps the classic engine, matching the Rust mock.
+- **Live tests.** Claude: `live_claude_haiku_protocol_round_trip` (`claude_live.rs`) and `live_claude_haiku_inline_permission_round_trip` (`claude_runtime.rs`), CLI 2.1.310 with Haiku, about $0.01 per run. OpenCode: `live_opencode_rich_parts` and `live_opencode_end_to_end` (`tests/opencode_e2e.rs`) passed on an isolated `opencode serve` 1.19.4 with `qwen3.5:4b` at 24k context on local Ollama; a 15-min watchdog now fails a hung run instead of waiting. Codex: none.

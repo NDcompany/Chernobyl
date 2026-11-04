@@ -1,7 +1,7 @@
 # CHERNOBYL — privacy and data retention
 
 **Applies to:** the desktop companion (`chernobyl-companion.exe`) and the CHERNOBYL phone app.
-**Last reviewed:** 2026-10-25 against the code at the commit that adds this file.
+**Last reviewed:** 2026-11-04 against `62c0aba` (ADR-015 live agent sessions).
 
 ## The short version
 
@@ -10,7 +10,7 @@ analytics, crash reporting or telemetry. Data moves only between your desktop an
 paired phone, over a connection that is end-to-end encrypted after pairing (ADR-011). Nothing
 is sent to us, because there is no "us" server to send it to.
 
-The agent runtimes you connect (OpenCode, Ollama, Claude Code) keep their own data under
+The agent runtimes you connect (OpenCode, Ollama, Claude Code, Codex) keep their own data under
 their own policies. CHERNOBYL reads from them on your machine. It does not copy their history
 anywhere else.
 
@@ -35,10 +35,14 @@ conversation history, or file contents. Live transcripts (prompts, replies, reas
 input and output, diffs) that a subscribed phone watches are held **in memory only**: redacted
 for known secret shapes, size-capped, and dropped an hour after a session ends. They are never
 journaled. OpenCode conversation text used to be republished as journaled activity events;
-since ADR-015 step 5 it is not. Permission requests are journaled as before, with their
-command or patterns and, for an edit, the diff OpenCode shows, redacted and capped. An
-`mcp_auth_callback` command is journaled with its callback URL replaced by `<redacted>`, because
-it carries a one-time authorization code. Two credentials are stored in plaintext: the OpenCode
+since ADR-015 step 5 it is not. What you type on the phone is different: a prompt
+(`create_session`, `submit_prompt`) and a deny reason (`permission_decision.message`) are part
+of the command record, journaled as sent and kept with the newest 5 000 commands. Permission
+requests are journaled as before, with their command or patterns and, for an edit, the diff
+the runtime shows, redacted and capped. An `mcp_auth_callback` command is journaled with its
+callback URL replaced by `<redacted>`, because it carries a one-time authorization code. The
+answers to an agent's question (`permission_decision.answers`) are journaled with each value
+replaced by `<redacted>`. Two credentials are stored in plaintext: the OpenCode
 `basicAuth` in `companion.json` and the control key. Only the folder's permissions protect
 them. The default `%APPDATA%\CHERNOBYL` is readable by your Windows account and administrators
 only, but the files go wherever a copy of the folder goes: a roaming profile, a support bundle,
