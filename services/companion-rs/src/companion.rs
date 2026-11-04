@@ -642,11 +642,28 @@ impl Companion {
         if let Some((agents, sessions, _)) = self.live_lists() {
             // Healthy real runtimes are the truth for entities they own;
             // mock seed sessions/agents shown beside real ones would pass
-            // demo data off as live (PRD §13.1, ADR-009). Permissions/
-            // activity/hosts stay engine-owned — adapter permissions ARE
+            // demo data off as live (PRD §13.1, ADR-009). Permissions and
+            // activity stay engine-owned — adapter permissions ARE
             // engine records (ingested at subscribe time).
             snap.sessions = sessions;
             snap.agents = agents;
+            // a live runtime is a host on this machine; without a record the
+            // phone shows "0 hosts online" while it drives a session (row 9.12)
+            snap.hosts.retain(|h| !h.simulated);
+            for a in &snap.agents {
+                if !snap.hosts.iter().any(|h| h.id == a.host_id) {
+                    snap.hosts.push(crate::protocol::Host {
+                        id: a.host_id.clone(),
+                        name: a.name.clone(),
+                        kind: "local".into(),
+                        platform: std::env::consts::OS.into(),
+                        address: "127.0.0.1".into(),
+                        status: "connected".into(),
+                        last_seen_at: now_ms(),
+                        simulated: false,
+                    });
+                }
+            }
         }
         // ADR-015: a session with a transcript stream says so, which is how
         // the phone picks its conversation view
@@ -2633,9 +2650,11 @@ mod tests {
                 vec!["ses-a".into(), "ses-b".into()]
             )
         );
-        // hosts and permissions stay engine-owned
+        // each runtime is a real host; demo hosts go; permissions stay engine-owned
         let snap = comp.snapshot();
-        assert_eq!(snap.hosts.len(), demo.hosts.len());
+        let hosts: Vec<&str> = snap.hosts.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(hosts, ["rt-a", "rt-b"]);
+        assert!(snap.hosts.iter().all(|h| !h.simulated && h.status == "connected"));
         assert_eq!(snap.permissions.len(), demo.permissions.len());
         comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);

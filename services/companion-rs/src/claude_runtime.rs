@@ -342,7 +342,7 @@ impl LiveRuntime for ClaudeRuntime {
             accepts_new_session: healthy,
             simulated: false,
             live: Some(AgentLive {
-                prompt_while_busy: "merge",
+                prompt_while_busy: "queue", // the CLI usually runs a mid-turn follow-up as its own turn (emulator row 9.5)
                 interrupt: true,
                 end: true,
                 permission_modes: PERMISSION_MODES.iter().map(|m| m.to_string()).collect(),
