@@ -1209,7 +1209,9 @@ pub enum EnqueueError {
 }
 
 impl Outbound {
-    pub(crate) fn new(
+    /// Public for the live runtime tests (`tests/opencode_e2e.rs`), which
+    /// subscribe a connection without a socket.
+    pub fn new(
         saturation: Arc<crate::companion::Saturation>,
         require_e2e: bool,
     ) -> (Arc<Outbound>, Receiver<(MsgClass, Vec<u8>)>) {
@@ -1409,14 +1411,11 @@ impl Outbound {
     }
 }
 
-#[cfg(test)]
 impl Outbound {
     /// Takes one queued frame with the writer's accounting (byte and depth
-    /// release), for tests that drain a queue without a socket.
-    pub(crate) fn test_dequeue(
-        &self,
-        rx: &Receiver<(MsgClass, Vec<u8>)>,
-    ) -> Option<(MsgClass, Vec<u8>)> {
+    /// release), for tests that drain a queue without a socket (unit tests
+    /// and the live runtime tests in `tests/`).
+    pub fn test_dequeue(&self, rx: &Receiver<(MsgClass, Vec<u8>)>) -> Option<(MsgClass, Vec<u8>)> {
         let (class, payload) = rx.try_recv().ok()?;
         self.queued_bytes.fetch_sub(payload.len(), Ordering::SeqCst);
         self.depth.release(class);

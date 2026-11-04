@@ -7,7 +7,7 @@ page records **which versions were verified** and the limits that matter in prac
 
 | Integration | Kind | Verified against | Source | How it connects |
 |---|---|---|---|---|
-| OpenCode | agent runtime | `opencode` **1.19.4** (live e2e PASS 2026-10-24), 1.17.7 (Phase 3) | `services/companion-rs/src/opencode.rs` | attach-only HTTP + SSE to a running `opencode serve`; never spawns a second server |
+| OpenCode | agent runtime (live sessions) | `opencode` **1.19.4** (rich parts live run PASS 2026-11-04 on local Ollama; live e2e PASS 2026-10-24), 1.17.7 (Phase 3) | `services/companion-rs/src/opencode.rs` | attach-only HTTP + SSE to a running `opencode serve`; never spawns a second server |
 | Ollama | model runtime | Ollama **0.40.9** | `services/companion-rs/src/ollama.rs` | attach-only HTTP (`/api/version`, `/api/tags`, `/api/ps`) |
 | Claude Code | hook ingress + driven sessions | Claude Code **2.1.309** (`SessionStart` captured live); driven sessions **2.1.310** (live Haiku run through the companion server) | `services/companion-rs/src/claude.rs`, `claude_live.rs`, `claude_runtime.rs` | hooks POST to the loopback diagnostics listener (install the snippet from `chernobyl-companion --claude-hooks` yourself, never auto-written); with `workspaces`, the phone also starts `claude.exe` sessions (stream-json on stdio) in allow-listed folders |
 | Codex | agent runtime (live sessions) | **no live run**: openai/codex `970111f` schema, fake app-server processes only | `services/companion-rs/src/codex.rs`, `codex_runtime.rs` | spawns one `codex app-server` (stdio JSON-RPC) per adapter on the first session, in an allow-listed workspace; each phone session is a thread |
@@ -16,11 +16,18 @@ page records **which versions were verified** and the limits that matter in prac
 
 ## Limits that matter
 
-- **OpenCode.** Sessions can be listed, created and prompted. These are `limited`:
-  interrupt (stopping a healthy long generation is not yet re-verified), diff (no populated
-  capture yet), permission reply (the contract is verified from OpenAPI, but no live
-  asked/reply exchange yet) and output (text parts only). There is no SSE replay: after a
-  reconnect, state is re-listed.
+- **OpenCode.** Sessions stream a live transcript: text and reasoning as they are
+  generated, tool cards keyed by OpenCode's `callID`, approvals inline on their card (allow
+  once; always allow the offered pattern until OpenCode restarts; deny, optionally with a
+  reason the model reads), questions from OpenCode's `question` tool, the todo list as a plan,
+  retries as notices, per-turn usage. A prompt sent mid-turn runs as its own turn afterwards.
+  Stop shows the turn as interrupted, not failed. MCP status is polled every 30 s while a
+  phone watches; sign-in works on the desktop or by pasting the dead callback page from the
+  phone browser, and failed servers can be reconnected. `limited`: diff (summary diffs are
+  mapped, but no populated capture yet), MCP sign-in (completing a real OAuth login is not
+  verified live). Not offered: ending a session, permission modes. There is no SSE replay:
+  after a reconnect, state is re-listed and watched transcripts are rebuilt from
+  `GET /session/{id}/message`. Conversation text is never journaled.
 - **Ollama.** It is a model provider, not an agent. Session operations report
   `unavailable` (PRD §7.7).
 - **Claude Code.** Without `workspaces` it is ingress only: the companion observes hook

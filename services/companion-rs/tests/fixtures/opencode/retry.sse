@@ -1,0 +1,4 @@
+data: {"directory":"<tmp>\\work","project":"global","payload":{"id":"evt_retry1","type":"session.status","properties":{"sessionID":"ses_e590d63d1ffeINRRRmnvST2KP5","status":{"type":"retry","attempt":1,"message":"Provider response headers timed out after 300000ms","next":1792958044313}}}}
+
+data: {"directory":"<tmp>\\work","project":"global","payload":{"id":"evt_retry2","type":"session.status","properties":{"sessionID":"ses_e590d63d1ffeINRRRmnvST2KP5","status":{"type":"retry","attempt":2,"message":"Free usage exceeded, subscribe to Go","action":{"reason":"free_tier_limit","provider":"opencode","title":"Free limit reached","message":"Subscribe to OpenCode Go","label":"subscribe","link":"https://opencode.ai/go"},"next":1792972799390}}}}
+

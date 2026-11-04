@@ -267,6 +267,37 @@ pub fn http_request(
     auth: Option<&str>,
     body: Option<&str>,
 ) -> Result<HttpResponse, String> {
+    request_within(
+        method,
+        url,
+        auth,
+        body,
+        Duration::from_secs(15),
+        RESPONSE_DEADLINE,
+    )
+}
+
+/// `http_request` for a call the server answers only when something else
+/// happened first (OpenCode's `/mcp/{name}/auth/authenticate` returns after
+/// the desktop browser sign-in): silence is allowed for all of `wait`.
+pub fn http_request_waiting(
+    method: &str,
+    url: &str,
+    auth: Option<&str>,
+    body: Option<&str>,
+    wait: Duration,
+) -> Result<HttpResponse, String> {
+    request_within(method, url, auth, body, wait, wait)
+}
+
+fn request_within(
+    method: &str,
+    url: &str,
+    auth: Option<&str>,
+    body: Option<&str>,
+    per_read: Duration,
+    deadline: Duration,
+) -> Result<HttpResponse, String> {
     let (authority, path) = split_url(url)?;
     let authority = authority.as_str();
     let path = path.as_str();
@@ -279,7 +310,7 @@ pub fn http_request(
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
         .map_err(|e| format!("connect {addr}: {e}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(15)))
+        .set_read_timeout(Some(per_read))
         .map_err(|e| e.to_string())?;
     let _ = stream.set_nodelay(true);
 
@@ -302,7 +333,7 @@ pub fn http_request(
         .write_all(req.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     let mut reader = BufReader::new(stream);
-    let raw = read_http_response(&mut reader, RESPONSE_DEADLINE)?;
+    let raw = read_http_response(&mut reader, deadline)?;
     parse_response(&raw)
 }
 

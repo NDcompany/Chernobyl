@@ -19,20 +19,38 @@
 //! The adapter is transport + normalization only: it emits `EventKind`s via
 //! `subscribe` and answers `send` with acceptance acks; sequence numbers,
 //! persistence and fan-out stay with the companion (Phase 3 wiring step).
+//!
+//! ADR-015 step 5 (§3.6 OpenCode table, §4.4): rich parts. Text and
+//! reasoning parts become transcript items that grow by `message.part.delta`
+//! appends; tool parts become tool items keyed by `callID`, which is what a
+//! `permission.asked` or `question.asked` names, so approvals sit inline on
+//! their card. Conversation text goes to the transcript hub only (memory),
+//! never to journaled Activity. Turns close on idle (prompt commands
+//! `completed`), on `MessageAbortedError` (interrupted, prompts `cancelled`)
+//! or on another `session.error` (failed). A watched session is hydrated
+//! from `GET /session/{id}/message` on its first subscriber and after every
+//! SSE reconnect (deltas are not replayable), and `GET /mcp` is polled while
+//! anyone watches. Verified against 1.19.4 captures
+//! (`tests/fixtures/opencode/`).
 
 use crate::adapters::{Capability, LiveRuntime};
-use crate::client::{HttpResponse, http_request, split_url};
+use crate::client::{HttpResponse, http_request, http_request_waiting, split_url};
 use crate::json::{self, Json};
 use crate::protocol::{
-    ActivityEvent, Agent, ClientMsg, EventKind, PermissionRequest, ServerMsg, Session, next_id,
-    now_ms,
+    ActivityEvent, Agent, AgentLive, ClientMsg, EventKind, FileChange, LIVE_PERMISSION_TTL_MS,
+    PermissionOption, PermissionRequest, ServerMsg, Session, next_id, now_ms,
 };
-use std::collections::HashMap;
+use crate::runtime_io::{AUTH_TTL_MS, PendingAuth, check_callback_url, form_decode, redact};
+use crate::transcript::{
+    Field, FileDiff, HubHandle, Item, ItemKind, LiveState, McpAuthState, McpServer, Op, PlanStep,
+    ToolCall, ToolStatus, TurnState, Usage,
+};
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Moved to `adapters` with the `LiveRuntime` trait (ADR-015 step 4); the
 /// old path keeps working for `ollama`, `claude` and external callers.
@@ -55,13 +73,69 @@ struct OcState {
     /// `session.idle`). Sessions listed before attach have no observed
     /// status and default to `completed` — see `capabilities()`.
     statuses: HashMap<String, String>,
-    /// In-flight prompt turns: (session_id, command_id) — the correlation
-    /// that turns a later `session.error` into the right `command_result`.
-    pending: Vec<(String, String)>,
-    /// Native permission requests we surfaced (native id → record), so a
-    /// `permission.replied` can be resolved without fabricating state.
+    /// In-flight prompt commands: (session_id, command_id, running sent) —
+    /// the correlation that turns the turn end into the right
+    /// `command_result` (G1). A prompt sent mid-turn is queued natively and
+    /// the session goes idle only after every queued turn ran, so the turn
+    /// end closes all of the session's prompts.
+    pending: Vec<(String, String, bool)>,
+    /// Native permission requests and questions we surfaced (native id →
+    /// record), so a reply from elsewhere resolves without fabricating state.
     asked: HashMap<String, PermissionRequest>,
+    /// partID → kind of the assistant text and reasoning parts:
+    /// `message.part.delta` names its part by id only (the delta itself
+    /// carries the messageID).
+    parts: HashMap<String, ItemKind>,
+    /// messageID → (is a user message, its turn id = the user messageID).
+    roles: HashMap<String, (bool, String)>,
+    /// sessionID → its recent turns and the interrupt awaiting a turn end.
+    live: HashMap<String, Live>,
+    /// callID → the permission or question asked for that tool call.
+    perms: HashMap<String, String>,
+    /// callIDs whose request was rejected: their tool `error` is a denial.
+    rejected: HashSet<String>,
+    /// Sessions a phone subscribed to (MCP polling, re-hydration on
+    /// reconnect); the poller drops the ones nobody watches any more.
+    watched: HashSet<String>,
+    poller: bool,
+    /// MCP sign-ins in flight (§4.7), keyed (session, server).
+    auths: PendingAuth<Auth>,
+    /// The last `GET /mcp`, mapped.
+    mcp: Vec<McpServer>,
+    /// server → the sign-in URL OpenCode could not open on the desktop.
+    open_failed: HashMap<String, String>,
 }
+
+#[derive(Default)]
+struct Live {
+    /// Newest last, at most `TURNS_KEPT`.
+    turns: Vec<TurnState>,
+    /// The `interrupt` command waiting for the turn to end.
+    interrupt: Option<String>,
+    /// The last `state` op status pushed ("" = none yet).
+    state: &'static str,
+}
+
+/// One MCP sign-in (§4.7). `callback` is set for the phone flow: the
+/// redirect port and path, and OpenCode's `oauthState`.
+struct Auth {
+    command_id: String,
+    state: &'static str,
+    url: Option<String>,
+    prefix: Option<String>,
+    callback: Option<(u16, String, String)>,
+}
+
+/// Bounds for the id maps (ids are creation-ordered; the older half goes).
+const MAP_MAX: usize = 4096;
+const TURNS_KEPT: usize = 8;
+const SESSIONS_KEPT: usize = 64;
+const MCP_POLL: Duration = Duration::from_secs(30);
+/// §4.6: an interrupt with no turn end in this long ends `unknown`.
+const INTERRUPT_WAIT: Duration = Duration::from_secs(30);
+/// Permission records are journaled: legacy command and detail stay small.
+const COMMAND_CAP: usize = 2 << 10;
+const DETAIL_CAP: usize = 64 << 10;
 
 struct Inner {
     /// Adapter id (also the `host_id` of every entity it maps).
@@ -79,6 +153,10 @@ struct Inner {
     started: AtomicBool,
     sse_read_timeout: Mutex<Duration>,
     malformed_events: AtomicU64,
+    /// ADR-015: transcripts of the sessions a phone watches.
+    hub: HubHandle,
+    /// Asks the MCP poller for a poll now (auth calls, MCP toasts).
+    poke: AtomicBool,
 }
 
 pub struct OpenCodeAdapter {
@@ -91,7 +169,18 @@ pub struct OpenCodeAdapter {
 /* ------------------------------------------------------------------ */
 
 impl OpenCodeAdapter {
+    /// An adapter streaming into a detached hub (probes, tests).
     pub fn new(id: &str, endpoint: &str, basic_auth: Option<&str>) -> OpenCodeAdapter {
+        OpenCodeAdapter::with_hub(id, endpoint, basic_auth, HubHandle::default())
+    }
+
+    /// The companion's adapter: transcripts go to `hub` (`Companion::hub`).
+    pub fn with_hub(
+        id: &str,
+        endpoint: &str,
+        basic_auth: Option<&str>,
+        hub: HubHandle,
+    ) -> OpenCodeAdapter {
         let ep = endpoint.trim();
         let ep = if ep.starts_with("http://") || ep.starts_with("https://") {
             ep.to_string()
@@ -112,6 +201,8 @@ impl OpenCodeAdapter {
                 started: AtomicBool::new(false),
                 sse_read_timeout: Mutex::new(Duration::from_secs(90)),
                 malformed_events: AtomicU64::new(0),
+                hub,
+                poke: AtomicBool::new(false),
             }),
         }
     }
@@ -137,39 +228,32 @@ impl OpenCodeAdapter {
             Capability::new("agent.list", "available", None),
             Capability::new("session.create", "available", None),
             Capability::new("session.prompt", "available", None),
-            Capability::new(
-                "session.interrupt",
-                "limited",
-                Some(
-                    "abort confirmed on idle and mid-turn probes; stopping a healthy long generation still needs release-gate re-verification (opencode.md §5)",
-                ),
-            ),
+            // ADR-015 step 5: live-verified on 1.19.4 (tests/opencode_e2e.rs
+            // `live_opencode_rich_parts`): abort mid-stream, inline replies
+            // once/reject+message, streaming text/reasoning/tool parts
+            Capability::new("session.interrupt", "available", None),
+            Capability::new("permission.reply", "available", None),
+            Capability::new("session.output", "available", None),
+            Capability::new("mcp.status", "available", None),
             Capability::new(
                 "session.diff",
                 "limited",
                 Some(
-                    "endpoint verified; the probe's turn produced an empty diff, populated capture pending (opencode.md §6)",
+                    "summary.diffs are mapped to turn diffs and Session.files; no populated capture yet (opencode-live-events.md §2.7)",
                 ),
             ),
             Capability::new(
-                "permission.reply",
+                "mcp.auth",
                 "limited",
                 Some(
-                    "reply contract once|always|reject verified from the served OpenAPI; a live asked→reply exchange still needs a policy that asks (opencode.md §7)",
-                ),
-            ),
-            Capability::new(
-                "session.output",
-                "limited",
-                Some(
-                    "text parts normalized only; tool-call parts have no protocol representation yet",
+                    "start, callback check and reconnect verified against the served API shapes; completing a real OAuth login is not verified live",
                 ),
             ),
             Capability::new(
                 "event.replay",
                 "unavailable",
                 Some(
-                    "SSE has no cursor/ack on 1.17.x: after reconnect state is re-listed instead of replayed",
+                    "SSE has no cursor: after reconnect state is re-listed and watched transcripts are rebuilt from GET /session/{id}/message",
                 ),
             ),
             Capability::new(
@@ -227,11 +311,7 @@ impl OpenCodeAdapter {
                 text,
             } => {
                 self.inner.prompt_accept(session_id, text)?;
-                let mut st = self.inner.state.lock().unwrap();
-                // one tracked turn per session; a superseded entry can never
-                // surface as a command_result for the wrong command
-                st.pending.retain(|(sid, _)| sid != session_id);
-                st.pending.push((session_id.clone(), command_id.clone()));
+                self.inner.track_prompt(session_id, command_id);
                 Ok(ack(command_id, true, None, Some(session_id), None))
             }
             ClientMsg::Interrupt {
@@ -242,10 +322,43 @@ impl OpenCodeAdapter {
                 command_id,
                 permission_id,
                 decision,
+                option_id,
+                message,
+                answers,
                 ..
+            } => self.inner.permission_decision(
+                command_id,
+                permission_id,
+                // the engine always selects an option; a bare legacy bucket
+                // only reaches here from callers without one
+                option_id.as_deref().unwrap_or(match decision.as_str() {
+                    "approve-once" => "once",
+                    "approve-session" => "always",
+                    "reject" => "reject",
+                    _ => "",
+                }),
+                message.as_deref(),
+                answers,
+            ),
+            ClientMsg::McpAuth {
+                command_id,
+                session_id,
+                server,
+                flow,
+            } => self.inner.mcp_auth(command_id, session_id, server, flow),
+            ClientMsg::McpAuthCallback {
+                command_id,
+                session_id,
+                server,
+                callback_url,
             } => self
                 .inner
-                .permission_decision(command_id, permission_id, decision),
+                .mcp_auth_callback(command_id, session_id, server, callback_url),
+            ClientMsg::McpReconnect {
+                command_id,
+                session_id,
+                server,
+            } => Ok(self.inner.mcp_reconnect(command_id, session_id, server)),
             ClientMsg::Hello { .. }
             | ClientMsg::Ping { .. }
             | ClientMsg::ListState { .. }
@@ -253,19 +366,35 @@ impl OpenCodeAdapter {
             | ClientMsg::HsProof { .. } => Err(AdapterError::Unsupported(
                 "session-neutral messages stay with the engine".into(),
             )),
-            // ADR-015 live messages for OpenCode sessions land here: no
-            // end/mode equivalent (§4.4), MCP arrives with rich parts (step 5).
-            // Subscriptions never do (the server owns them per connection).
+            // No end or permission-mode equivalent (§4.4). Subscriptions
+            // never land here (the server owns them per connection).
             ClientMsg::SessionSubscribe { .. }
             | ClientMsg::SessionUnsubscribe { .. }
             | ClientMsg::SessionEnd { .. }
-            | ClientMsg::SetPermissionMode { .. }
-            | ClientMsg::McpAuth { .. }
-            | ClientMsg::McpAuthCallback { .. }
-            | ClientMsg::McpReconnect { .. } => Err(AdapterError::Unsupported(
+            | ClientMsg::SetPermissionMode { .. } => Err(AdapterError::Unsupported(
                 "not supported by this agent".into(),
             )),
         }
+    }
+
+    /// ADR-015: the first subscriber of one of our sessions arrived. Hydrate
+    /// its transcript on a short-lived thread and keep `GET /mcp` polled
+    /// while anyone watches.
+    pub fn on_subscribe(&self, session_id: &str) {
+        let inner = &self.inner;
+        {
+            let mut st = inner.state.lock().unwrap();
+            st.watched.insert(session_id.to_string());
+            if !st.poller {
+                let poller = inner.clone();
+                st.poller = std::thread::Builder::new()
+                    .name("opencode-mcp".into())
+                    .spawn(move || poller.poll_loop())
+                    .is_ok();
+            }
+        }
+        inner.poke.store(true, Ordering::SeqCst);
+        inner.spawn_hydrate(session_id.to_string());
     }
 
     /// `GET /session/:id/diff` — validated raw payload (shape mapping lands
@@ -354,8 +483,8 @@ impl OpenCodeAdapter {
     }
 }
 
-/// ADR-015 step 4: OpenCode behind the router, behaviour unchanged. Each
-/// method delegates to the inherent one of the same name.
+/// ADR-015 §3.3: OpenCode behind the router. Each method delegates to the
+/// inherent one of the same name.
 impl LiveRuntime for OpenCodeAdapter {
     fn id(&self) -> &str {
         &self.id
@@ -380,6 +509,9 @@ impl LiveRuntime for OpenCodeAdapter {
     }
     fn send(&self, msg: &ClientMsg) -> Result<ServerMsg, AdapterError> {
         OpenCodeAdapter::send(self, msg)
+    }
+    fn on_subscribe(&self, session_id: &str) {
+        OpenCodeAdapter::on_subscribe(self, session_id)
     }
     fn refresh(&self) -> Result<(), AdapterError> {
         OpenCodeAdapter::refresh(self)
@@ -514,9 +646,15 @@ impl Inner {
                 st.detail = None;
                 st.version = version;
             }
-            let sessions = self.fetch_sessions()?;
+            let mut sessions = self.fetch_sessions()?;
             let agents = self.fetch_agents()?;
             let mut st = self.state.lock().unwrap();
+            // `files` come from turn diffs, which the list does not carry
+            for s in &mut sessions {
+                if let Some(old) = st.sessions.iter().find(|o| o.id == s.id) {
+                    s.files = old.files.clone();
+                }
+            }
             st.sessions = sessions;
             st.agents = agents;
             Ok(())
@@ -607,7 +745,9 @@ impl Inner {
             timeline: vec![],
             output: vec![],
             files: vec![],
-            transcript: false,
+            // ADR-015: every OpenCode session streams on demand (the first
+            // subscriber hydrates it), so the phone opens the conversation
+            transcript: true,
         })
     }
 
@@ -627,13 +767,26 @@ impl Inner {
             capabilities: caps,
             accepts_new_session: mode == "primary" && healthy,
             simulated: false,
-            live: None,
+            // §4.4/§4.6: a mid-turn prompt runs as its own turn afterwards;
+            // abort works; no end-session or permission-mode equivalent
+            live: Some(AgentLive {
+                prompt_while_busy: "queue",
+                interrupt: true,
+                end: false,
+                permission_modes: Vec::new(),
+                workspaces: Vec::new(),
+            }),
         })
     }
 
-    fn upsert_session(list: &mut Vec<Session>, s: Session) {
+    fn upsert_session(list: &mut Vec<Session>, mut s: Session) {
         match list.iter_mut().find(|e| e.id == s.id) {
-            Some(e) => *e = s,
+            Some(e) => {
+                if s.files.is_empty() {
+                    s.files = std::mem::take(&mut e.files);
+                }
+                *e = s
+            }
             None => list.push(s),
         }
     }
@@ -684,6 +837,12 @@ impl Inner {
                 None,
             ));
         }
+        // the phone opens this session next: stream it from the first event
+        self.hub.push(&session_id, Op::State(LiveState::default()));
+        if !prompt.trim().is_empty() {
+            // §4.6: create_session ends with its first turn
+            self.track_prompt(&session_id, command_id);
+        }
         Ok(ack(command_id, true, None, Some(&session_id), None))
     }
 
@@ -720,7 +879,91 @@ impl Inner {
         )))
     }
 
-    fn interrupt(&self, command_id: &str, session_id: &str) -> Result<ServerMsg, AdapterError> {
+    /// G1: a prompt (or a create's first prompt) is tracked until its turn
+    /// ends.
+    fn track_prompt(&self, session_id: &str, command_id: &str) {
+        let mut st = self.state.lock().unwrap();
+        st.pending
+            .push((session_id.to_string(), command_id.to_string(), false));
+        if st.pending.len() > MAP_MAX {
+            st.pending.remove(0);
+        }
+    }
+
+    /// §4.6: acked once OpenCode accepts the abort, `accepted` then, and
+    /// `completed` when the running turn ends (at once when none ran);
+    /// `unknown` when no turn end follows within 30 s.
+    fn interrupt(
+        self: &Arc<Self>,
+        command_id: &str,
+        session_id: &str,
+    ) -> Result<ServerMsg, AdapterError> {
+        // registered BEFORE the call: the abort's session.error can arrive
+        // on the SSE thread before the HTTP answer does
+        let running = {
+            let mut st = self.state.lock().unwrap();
+            let running = st.statuses.get(session_id).is_some_and(|s| s == "running");
+            if running {
+                st.live.entry(session_id.to_string()).or_default().interrupt =
+                    Some(command_id.to_string());
+            }
+            running
+        };
+        let outcome = self.abort(session_id);
+        // still ours = no turn end yet (taking it back on failure, too)
+        let waiting = {
+            let mut st = self.state.lock().unwrap();
+            let live = st.live.entry(session_id.to_string()).or_default();
+            let ours = live.interrupt.as_deref() == Some(command_id);
+            if ours && !matches!(outcome, Ok(true)) {
+                live.interrupt = None;
+            }
+            ours
+        };
+        match outcome? {
+            false => Ok(ack(
+                command_id,
+                false,
+                Some("native abort reported it did nothing (turn already finished?)".into()),
+                Some(session_id),
+                None,
+            )),
+            true => {
+                let sid = Some(session_id.to_string());
+                if !running || waiting {
+                    self.emit(vec![EventKind::CommandProgress {
+                        command_id: command_id.to_string(),
+                        state: "accepted".into(),
+                        session_id: sid.clone(),
+                    }]);
+                }
+                if !running {
+                    self.emit(vec![result(command_id, "completed", None, sid)]);
+                } else if waiting {
+                    let (inner, cmd, ses) =
+                        (self.clone(), command_id.to_string(), session_id.to_string());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(INTERRUPT_WAIT);
+                        let late = {
+                            let mut st = inner.state.lock().unwrap();
+                            let live = st.live.entry(ses.clone()).or_default();
+                            let late = live.interrupt.as_deref() == Some(cmd.as_str());
+                            if late {
+                                live.interrupt = None;
+                            }
+                            late
+                        };
+                        if late {
+                            inner.emit(vec![result(&cmd, "unknown", None, Some(ses))]);
+                        }
+                    });
+                }
+                Ok(ack(command_id, true, None, Some(session_id), None))
+            }
+        }
+    }
+
+    fn abort(&self, session_id: &str) -> Result<bool, AdapterError> {
         // OpenAPI: abort has NO requestBody — sending none is contract-
         // faithful. (The Phase-3 live run's apparent ">15 s wedge" was the
         // old read-to-end client: the server delivered a complete 200 `true`
@@ -740,14 +983,7 @@ impl Inner {
         // Shape check, header not required: an HTML body can't parse as a
         // boolean, which is the same guarantee G4.2 buys with the header.
         match json::parse(resp.body.trim()) {
-            Ok(Json::Bool(true)) => Ok(ack(command_id, true, None, Some(session_id), None)),
-            Ok(Json::Bool(false)) => Ok(ack(
-                command_id,
-                false,
-                Some("native abort reported it did nothing (turn already finished?)".into()),
-                Some(session_id),
-                None,
-            )),
+            Ok(Json::Bool(b)) => Ok(b),
             _ => Err(AdapterError::InvalidResponse(format!(
                 "abort answered HTTP {} with a non-boolean body",
                 resp.status
@@ -755,28 +991,64 @@ impl Inner {
         }
     }
 
+    /// Writes the option the engine selected (§4.4): a permission goes to
+    /// `POST /permission/{id}/reply {reply, message?}`, a question to
+    /// `POST /question/{id}/reply {answers}` or `/reject`.
     fn permission_decision(
         &self,
         command_id: &str,
         permission_id: &str,
-        decision: &str,
+        option: &str,
+        message: Option<&str>,
+        answers: &[(String, Vec<String>)],
     ) -> Result<ServerMsg, AdapterError> {
-        let reply = match decision {
-            "approve-once" => "once",
-            "approve-session" => "always",
-            "reject" => "reject",
-            other => {
+        let question = {
+            let st = self.state.lock().unwrap();
+            st.asked
+                .get(permission_id)
+                .and_then(|p| p.detail.as_ref())
+                .filter(|d| json::get_str(d, "kind") == Some("question"))
+                .and_then(|d| json::get(d, "questions").and_then(json::as_arr))
+                .map(<[Json]>::len)
+        };
+        let (url, body, rejects) = match (question, option) {
+            (Some(n), "answer" | "once" | "always") => {
+                // one array of labels per question, in order; ids are indexes
+                let picked = (0..n)
+                    .map(|i| {
+                        let labels = answers
+                            .iter()
+                            .find(|(id, _)| *id == i.to_string())
+                            .map_or(&[][..], |(_, a)| a.as_slice());
+                        Json::Arr(labels.iter().map(|l| json::s(l)).collect())
+                    })
+                    .collect();
+                let body = json::obj(vec![("answers", Json::Arr(picked))]);
+                (format!("question/{permission_id}/reply"), Some(body), false)
+            }
+            (Some(_), "skip" | "reject") => {
+                (format!("question/{permission_id}/reject"), None, true)
+            }
+            (None, "once" | "always" | "reject") => {
+                let mut fields = vec![("reply", json::s(option))];
+                if let (Some(m), "reject") = (message, option) {
+                    fields.push(("message", json::s(m)));
+                }
+                let body = json::obj(fields);
+                (
+                    format!("permission/{permission_id}/reply"),
+                    Some(body),
+                    option == "reject",
+                )
+            }
+            _ => {
                 return Err(AdapterError::Unsupported(format!(
-                    "unknown decision '{other}'"
+                    "unknown option '{option}'"
                 )));
             }
         };
-        let body = json::stringify(&json::obj(vec![("reply", json::s(reply))]));
-        let resp = self.req(
-            "POST",
-            &format!("{}/permission/{permission_id}/reply", self.endpoint),
-            Some(&body),
-        )?;
+        let body = body.map(|b| json::stringify(&b));
+        let resp = self.req("POST", &format!("{}/{url}", self.endpoint), body.as_deref())?;
         if resp.status == 404 {
             // Real path, real answer: stale/unknown request. A refusal on
             // the outcome side is safe even before body validation.
@@ -797,7 +1069,16 @@ impl Inner {
         let v = validate_json(&resp)?;
         match v {
             Json::Bool(true) => {
-                self.state.lock().unwrap().asked.remove(permission_id);
+                let mut st = self.state.lock().unwrap();
+                // our own reply: the `replied` event finds nothing to resolve
+                if let Some(call) = st
+                    .asked
+                    .remove(permission_id)
+                    .and_then(|p| p.tool_item_id)
+                    .filter(|_| rejects)
+                {
+                    st.rejected.insert(call);
+                }
                 Ok(ack(command_id, true, None, None, Some(permission_id)))
             }
             Json::Bool(false) => Ok(ack(
@@ -811,6 +1092,405 @@ impl Inner {
                 "permission reply answered with a non-boolean body".into(),
             )),
         }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* MCP status and sign-in (§4.7)                                       */
+/* ------------------------------------------------------------------ */
+
+impl Inner {
+    /// `mcp_auth`. Desktop: `POST /mcp/{name}/auth/authenticate` on a thread
+    /// (OpenCode opens the desktop browser and answers once signed in).
+    /// Phone: `POST /mcp/{name}/auth` returns the URL the phone opens and
+    /// the loopback redirect whose dead page the user pastes back.
+    fn mcp_auth(
+        self: &Arc<Self>,
+        command_id: &str,
+        session_id: &str,
+        server: &str,
+        flow: &str,
+    ) -> Result<ServerMsg, AdapterError> {
+        let name = urlencode(server);
+        let auth = if flow == "desktop" {
+            Auth {
+                command_id: command_id.to_string(),
+                state: "awaiting-browser",
+                url: None,
+                prefix: None,
+                callback: None,
+            }
+        } else {
+            let resp = self.req("POST", &format!("{}/mcp/{name}/auth", self.endpoint), None)?;
+            let v = validate_json(&resp)?;
+            if resp.status != 200 {
+                let e = json::get_str(&v, "error")
+                    .or_else(|| json::get_str(&v, "message"))
+                    .map_or_else(
+                        || format!("sign-in start answered HTTP {}", resp.status),
+                        str::to_string,
+                    );
+                return Ok(ack(
+                    command_id,
+                    false,
+                    Some(clip(e)),
+                    Some(session_id),
+                    None,
+                ));
+            }
+            let (Some(url), Some(state)) = (
+                json::get_str(&v, "authorizationUrl"),
+                json::get_str(&v, "oauthState"),
+            ) else {
+                return Err(AdapterError::InvalidResponse(
+                    "sign-in start has no authorizationUrl/oauthState".into(),
+                ));
+            };
+            let (prefix, port, path) = loopback_redirect(url).ok_or_else(|| {
+                AdapterError::InvalidResponse("sign-in URL has no loopback redirect_uri".into())
+            })?;
+            Auth {
+                command_id: command_id.to_string(),
+                state: "awaiting-callback",
+                url: Some(url.to_string()),
+                prefix: Some(prefix),
+                callback: Some((port, path, state.to_string())),
+            }
+        };
+        let replaced = {
+            let mut st = self.state.lock().unwrap();
+            st.auths.insert(session_id, server, auth, now_ms())
+        };
+        let sid = Some(session_id.to_string());
+        let mut events = Vec::new();
+        if let Some(old) = replaced {
+            events.push(result(&old.command_id, "cancelled", None, sid.clone()));
+        }
+        events.push(EventKind::CommandProgress {
+            command_id: command_id.to_string(),
+            state: "running".into(),
+            session_id: sid,
+        });
+        self.emit(events);
+        self.push_mcp();
+        if flow == "desktop" {
+            let (inner, cmd, ses, srv) = (
+                self.clone(),
+                command_id.to_string(),
+                session_id.to_string(),
+                server.to_string(),
+            );
+            std::thread::spawn(move || {
+                let url = format!(
+                    "{}/mcp/{}/auth/authenticate",
+                    inner.endpoint,
+                    urlencode(&srv)
+                );
+                let wait = Duration::from_millis(AUTH_TTL_MS as u64);
+                let outcome = http_request_waiting("POST", &url, inner.auth.as_deref(), None, wait)
+                    .map_err(clip)
+                    .and_then(|r| mcp_outcome(&r));
+                if inner.end_auth(&ses, &srv, &cmd) {
+                    inner.emit(vec![done(&cmd, outcome, &ses)]);
+                }
+                let _ = inner.poll_mcp();
+            });
+        }
+        Ok(ack(command_id, true, None, Some(session_id), None))
+    }
+
+    /// Takes the sign-in when `command_id` still owns it (not replaced,
+    /// expired or finished): its command is then ours to close.
+    fn end_auth(&self, session_id: &str, server: &str, command_id: &str) -> bool {
+        let mut st = self.state.lock().unwrap();
+        let ours = st
+            .auths
+            .get(session_id, server, now_ms())
+            .is_some_and(|a| a.command_id == command_id);
+        if ours {
+            st.auths.take(session_id, server, now_ms());
+        }
+        ours
+    }
+
+    /// `mcp_auth_callback` (T5): the pasted dead-page URL must match the
+    /// sign-in's loopback port and path and carry OpenCode's `oauthState`;
+    /// single use. Then `POST /mcp/{name}/auth/callback {code}` on a thread.
+    fn mcp_auth_callback(
+        self: &Arc<Self>,
+        command_id: &str,
+        session_id: &str,
+        server: &str,
+        callback_url: &str,
+    ) -> Result<ServerMsg, AdapterError> {
+        let auth = self
+            .state
+            .lock()
+            .unwrap()
+            .auths
+            .take(session_id, server, now_ms());
+        let Some(auth) = auth else {
+            return Ok(ServerMsg::ack_err(
+                command_id,
+                "no sign-in is pending for this server",
+            ));
+        };
+        let checked = match &auth.callback {
+            Some((port, path, state)) => check_callback_url(callback_url, *port, path, state),
+            None => Err("this sign-in finishes in the desktop browser"),
+        };
+        let sid = Some(session_id.to_string());
+        let code = match checked {
+            Ok(params) => params.code,
+            Err(e) => {
+                self.emit(vec![result(
+                    &auth.command_id,
+                    "failed",
+                    Some(e.into()),
+                    sid,
+                )]);
+                self.push_mcp();
+                return Ok(ServerMsg::ack_err(command_id, e));
+            }
+        };
+        self.push_mcp();
+        let (inner, cmd, ses, srv) = (
+            self.clone(),
+            command_id.to_string(),
+            session_id.to_string(),
+            server.to_string(),
+        );
+        std::thread::spawn(move || {
+            let body = json::stringify(&json::obj(vec![("code", json::s(&code))]));
+            let url = format!("{}/mcp/{}/auth/callback", inner.endpoint, urlencode(&srv));
+            let outcome = inner
+                .req("POST", &url, Some(&body))
+                .map_err(|e| clip(e.to_string()))
+                .and_then(|r| mcp_outcome(&r));
+            inner.emit(vec![
+                done(&auth.command_id, outcome.clone(), &ses),
+                done(&cmd, outcome, &ses),
+            ]);
+            let _ = inner.poll_mcp();
+        });
+        Ok(ack(command_id, true, None, Some(session_id), None))
+    }
+
+    /// `mcp_reconnect`: `POST /mcp/{name}/connect`, then the server's status
+    /// in a fresh `GET /mcp` decides the outcome.
+    fn mcp_reconnect(
+        self: &Arc<Self>,
+        command_id: &str,
+        session_id: &str,
+        server: &str,
+    ) -> ServerMsg {
+        let (inner, cmd, ses, srv) = (
+            self.clone(),
+            command_id.to_string(),
+            session_id.to_string(),
+            server.to_string(),
+        );
+        std::thread::spawn(move || {
+            let url = format!("{}/mcp/{}/connect", inner.endpoint, urlencode(&srv));
+            let outcome = match inner.req("POST", &url, None) {
+                Err(e) => Err(clip(e.to_string())),
+                Ok(_) => match inner.poll_mcp() {
+                    Err(e) => Err(clip(e.to_string())),
+                    Ok(list) => match list.iter().find(|s| s.name == srv) {
+                        Some(s) if s.status == "connected" => Ok(()),
+                        Some(s) => Err(s
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| format!("{srv} is {}", s.status))),
+                        None => Err(format!("{srv} is not configured")),
+                    },
+                },
+            };
+            inner.emit(vec![done(&cmd, outcome, &ses)]);
+        });
+        ack(command_id, true, None, Some(session_id), None)
+    }
+
+    /// `GET /mcp` → the list every watched session shows. Connected servers
+    /// lose their failed-browser URL.
+    fn poll_mcp(&self) -> Result<Vec<McpServer>, AdapterError> {
+        let resp = self.req("GET", &format!("{}/mcp", self.endpoint), None)?;
+        if resp.status != 200 {
+            return Err(AdapterError::InvalidResponse(format!(
+                "mcp status answered HTTP {}",
+                resp.status
+            )));
+        }
+        let list = mcp_servers(&validate_json(&resp)?);
+        {
+            let mut st = self.state.lock().unwrap();
+            for s in list.iter().filter(|s| s.status == "connected") {
+                st.open_failed.remove(&s.name);
+            }
+            st.mcp = list.clone();
+        }
+        self.push_mcp();
+        Ok(list)
+    }
+
+    /// Pushes each watched session its MCP view: the polled list plus the
+    /// sign-in that session started.
+    fn push_mcp(&self) {
+        let now = now_ms();
+        let views: Vec<(String, Vec<McpServer>)> = {
+            let st = self.state.lock().unwrap();
+            st.watched
+                .iter()
+                .map(|sid| {
+                    let view = st
+                        .mcp
+                        .iter()
+                        .map(|s| {
+                            let auth = match st.auths.get(sid, &s.name, now) {
+                                Some(a) => Some(McpAuthState {
+                                    state: a.state,
+                                    url: a.url.clone(),
+                                    callback_prefix: a.prefix.clone(),
+                                    error: None,
+                                }),
+                                None => st.open_failed.get(&s.name).map(|url| McpAuthState {
+                                    state: "awaiting-browser",
+                                    url: Some(url.clone()),
+                                    ..Default::default()
+                                }),
+                            };
+                            McpServer { auth, ..s.clone() }
+                        })
+                        .collect();
+                    (sid.clone(), view)
+                })
+                .collect()
+        };
+        for (sid, view) in views {
+            self.hub.push(&sid, Op::Mcp(view));
+        }
+    }
+
+    /// While a phone watches: polls `GET /mcp` every 30 s or when poked,
+    /// expires sign-ins after 10 min, exits when nobody watches.
+    fn poll_loop(self: Arc<Self>) {
+        let mut last: Option<Instant> = None;
+        loop {
+            let poked = self.poke.swap(false, Ordering::SeqCst);
+            if poked || last.is_none_or(|t| t.elapsed() >= MCP_POLL) {
+                let _ = self.poll_mcp();
+                last = Some(Instant::now());
+            }
+            let expired = self.state.lock().unwrap().auths.sweep(now_ms());
+            if !expired.is_empty() {
+                self.emit(
+                    expired
+                        .iter()
+                        .map(|a| result(&a.command_id, "expired", None, None))
+                        .collect(),
+                );
+                self.push_mcp();
+            }
+            {
+                let mut st = self.state.lock().unwrap();
+                let hub = &self.hub;
+                st.watched.retain(|s| hub.is_subscribed(s));
+                if st.watched.is_empty() || self.stop.load(Ordering::SeqCst) {
+                    st.poller = false;
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// `GET /mcp` (`{name: MCPStatus}`) → §3.2 servers, sorted by name. Only
+/// `needs_auth` offers sign-in; `needs_client_registration` needs the
+/// desktop (ADR §3.6 status values).
+fn mcp_servers(v: &Json) -> Vec<McpServer> {
+    let Json::Obj(fields) = v else {
+        return Vec::new();
+    };
+    let mut out: Vec<McpServer> = fields
+        .iter()
+        .map(|(name, s)| {
+            let (status, error, flows) = match json::get_str(s, "status") {
+                Some("connected") => ("connected", None, vec![]),
+                Some("disabled") => ("disabled", None, vec![]),
+                Some("needs_auth") => ("needs-auth", None, vec!["desktop", "phone-callback"]),
+                Some("needs_client_registration") => (
+                    "failed",
+                    Some("configure the client on the desktop".to_string()),
+                    vec![],
+                ),
+                Some("failed") => ("failed", json::get_str(s, "error").map(redact), vec![]),
+                _ => ("pending", None, vec![]),
+            };
+            McpServer {
+                name: name.clone(),
+                status,
+                error,
+                auth_flows: flows,
+                auth: None,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// An `MCPStatus` answer (authenticate, callback) → the command outcome.
+fn mcp_outcome(resp: &HttpResponse) -> Result<(), String> {
+    let v = validate_json(resp).map_err(|e| clip(e.to_string()))?;
+    match json::get_str(&v, "status") {
+        Some("connected") => Ok(()),
+        _ => Err(clip(
+            json::get_str(&v, "error")
+                .or_else(|| json::get_str(&v, "message"))
+                .map_or_else(|| format!("sign-in answered HTTP {}", resp.status), redact),
+        )),
+    }
+}
+
+/// The `redirect_uri` of OpenCode's sign-in URL when it is a loopback
+/// `http://127.0.0.1:<port>/<path>` (or localhost): (prefix, port, path).
+fn loopback_redirect(url: &str) -> Option<(String, u16, String)> {
+    let query = url.split_once('?')?.1;
+    let raw = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("redirect_uri="))?;
+    let uri = form_decode(raw).ok()?;
+    let rest = uri
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| uri.strip_prefix("http://localhost:"))?;
+    let (port, path) = rest.split_at(rest.find('/')?);
+    if path.contains(['?', '#']) {
+        return None;
+    }
+    Some((uri.clone(), port.parse().ok()?, path.to_string()))
+}
+
+fn result(
+    command_id: &str,
+    status: &str,
+    error: Option<String>,
+    session_id: Option<String>,
+) -> EventKind {
+    EventKind::CommandResult {
+        command_id: command_id.to_string(),
+        status: status.to_string(),
+        error,
+        session_id,
+        permission_id: None,
+    }
+}
+
+fn done(command_id: &str, outcome: Result<(), String>, session_id: &str) -> EventKind {
+    let sid = Some(session_id.to_string());
+    match outcome {
+        Ok(()) => result(command_id, "completed", None, sid),
+        Err(e) => result(command_id, "failed", Some(e), sid),
     }
 }
 
@@ -1055,11 +1735,16 @@ impl Inner {
     }
 
     /// One connection: connect → resync state → pump until EOF/error.
-    fn sse_session(&self) -> Result<(), AdapterError> {
+    fn sse_session(self: &Arc<Self>) -> Result<(), AdapterError> {
         let mut body = self.sse_connect()?;
         // Every (re)connect re-lists state: events lost in the gap are
-        // replaced by the fresh snapshot (restart/recovery criterion).
+        // replaced by the fresh snapshot (restart/recovery criterion), and
+        // watched transcripts are rebuilt (deltas are not replayed).
         self.refresh()?;
+        let watched: Vec<String> = self.state.lock().unwrap().watched.iter().cloned().collect();
+        for sid in watched {
+            self.spawn_hydrate(sid);
+        }
         let mut data = String::new();
         let mut event_oversize = false;
         loop {
@@ -1239,87 +1924,90 @@ impl Inner {
         };
         let props = json::get(payload, "properties");
         let event_id = json::get_str(payload, "id").unwrap_or("");
-        let Some(kind) = self.normalize(event_id, etype, props) else {
+        let mut out = Vec::new();
+        if let Some(props) = props {
+            self.normalize(event_id, etype, props, &mut out);
+        }
+        self.emit(out);
+    }
+
+    /// Hands normalized events to the subscribers (the companion: engine
+    /// ingest/publish). Never called with the state lock held.
+    fn emit(&self, kinds: Vec<EventKind>) {
+        if kinds.is_empty() {
             return;
-        };
+        }
         // Snapshot the subscriber list so callbacks can (un)subscribe
         // without deadlocking against the notification.
         let subs = self.subs.lock().unwrap().clone();
-        for (_, cb) in subs {
-            cb(kind.clone());
+        for kind in kinds {
+            for (_, cb) in &subs {
+                cb(kind.clone());
+            }
         }
     }
 
-    /// Native SSE event → protocol `EventKind`. Side effects (cache,
-    /// pending, asked) happen under the state lock; `None` means the event
-    /// has no protocol representation (`sync`, catalogs, comments…).
-    fn normalize(&self, event_id: &str, etype: &str, props: Option<&Json>) -> Option<EventKind> {
+    /// A transcript op for a session somebody watches: OpenCode reports
+    /// every session of its server, the hub keeps only watched ones.
+    fn push(&self, session_id: &str, op: Op) {
+        if self.hub.streams(session_id) {
+            self.hub.push(session_id, op);
+        }
+    }
+
+    /// Native SSE event → protocol events (`out`) and transcript ops (§3.6
+    /// OpenCode table). Cache side effects happen under the state lock;
+    /// events with no representation (`sync` twins, heartbeats, catalogs)
+    /// produce nothing.
+    fn normalize(&self, event_id: &str, etype: &str, props: &Json, out: &mut Vec<EventKind>) {
+        let sid = json::get_str(props, "sessionID").unwrap_or("").to_string();
         match etype {
             "session.created" | "session.updated" => {
-                let props = props?;
-                let info = json::get(props, "info")?;
-                let created = etype == "session.created";
-                let mut st = self.state.lock().unwrap();
-                let session = Self::map_session(info, &self.id, &st.statuses)?;
-                Self::upsert_session(&mut st.sessions, session.clone());
-                drop(st);
-                Some(if created {
-                    EventKind::SessionCreated(session)
-                } else {
-                    EventKind::SessionUpdated(session)
-                })
-            }
-            "session.status" | "session.idle" => {
-                let props = props?;
-                let sid = json::get_str(props, "sessionID")?.to_string();
-                let proto = if etype == "session.idle" {
-                    "completed".to_string()
-                } else {
-                    let t = json::get(props, "status")
-                        .and_then(|s| json::get_str(s, "type"))
-                        .unwrap_or("");
-                    match t {
-                        "idle" => "completed".to_string(),
-                        "error" | "failed" => "interrupted".to_string(),
-                        _ => "running".to_string(),
-                    }
+                let Some(info) = json::get(props, "info") else {
+                    return;
                 };
                 let mut st = self.state.lock().unwrap();
-                st.statuses.insert(sid.clone(), proto.clone());
-                let session = st.sessions.iter_mut().find(|s| s.id == sid)?;
-                if session.status == proto {
-                    return None;
-                }
-                session.status = proto;
-                session.last_activity_at = now_ms();
-                Some(EventKind::SessionUpdated(session.clone()))
+                let Some(session) = Self::map_session(info, &self.id, &st.statuses) else {
+                    return;
+                };
+                Self::upsert_session(&mut st.sessions, session.clone());
+                let session = st.sessions.iter().find(|s| s.id == session.id).cloned();
+                out.extend(session.map(if etype == "session.created" {
+                    EventKind::SessionCreated
+                } else {
+                    EventKind::SessionUpdated
+                }));
             }
-            "session.error" => {
-                let props = props?;
-                let sid = json::get_str(props, "sessionID")?.to_string();
-                let msg = clip(
-                    json::get(props, "error")
-                        .map(err_text)
-                        .unwrap_or_else(|| "unknown native error".to_string()),
-                );
-                let mut st = self.state.lock().unwrap();
-                let cmd = st
-                    .pending
-                    .iter()
-                    .position(|(s, _)| *s == sid)
-                    .map(|i| st.pending.remove(i).1);
-                match cmd {
-                    // G4.1: the failure channel reaches the ORIGINAL command
-                    Some(command_id) => Some(EventKind::CommandResult {
-                        command_id,
-                        status: "failed".to_string(),
-                        error: Some(msg),
-                        session_id: Some(sid),
-                        permission_id: None,
-                    }),
+            "session.status" => {
+                let status = json::get(props, "status");
+                match status.and_then(|s| json::get_str(s, "type")).unwrap_or("") {
+                    "idle" => self.end_turn(&sid, "completed", None, out),
+                    "error" | "failed" => self.session_status(&sid, "interrupted", out),
+                    t => {
+                        self.session_status(&sid, "running", out);
+                        self.busy(&sid, out);
+                        if let (Some(status), "retry") = (status, t) {
+                            self.retry_notice(&sid, status);
+                        }
+                    }
+                }
+            }
+            // idempotent: it arrives twice per turn after an abort
+            "session.idle" => self.end_turn(&sid, "completed", None, out),
+            "session.error" if !sid.is_empty() => {
+                let err = json::get(props, "error");
+                let name = err.and_then(|e| json::get_str(e, "name"));
+                if name == Some("MessageAbortedError") {
+                    self.end_turn(&sid, "interrupted", None, out);
+                    return;
+                }
+                let msg = clip(err.map_or_else(|| "unknown native error".to_string(), err_text));
+                let before = out.len();
+                self.end_turn(&sid, "failed", Some(msg.clone()), out);
+                if out.len() == before {
                     // No correlated command (native-side turn): honest
                     // activity entry — never a fabricated commandId.
-                    None => Some(EventKind::Activity(ActivityEvent {
+                    out.push(EventKind::Activity(ActivityEvent {
                         id: if event_id.is_empty() {
                             next_id("act")
                         } else {
@@ -1329,129 +2017,973 @@ impl Inner {
                         kind: "session".to_string(),
                         text: clip(format!("opencode: {msg}")),
                         ref_id: Some(sid),
-                    })),
+                    }));
                 }
             }
-            "permission.asked" => {
-                let props = props?;
-                let native_id = json::get_str(props, "id")?.to_string();
-                let sid = json::get_str(props, "sessionID").unwrap_or("").to_string();
-                let permission = json::get_str(props, "permission").unwrap_or("permission");
-                let patterns: Vec<String> = json::get(props, "patterns")
-                    .and_then(json::as_arr)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|p| json::as_str(p).map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let context = match json::get(props, "tool") {
-                    Some(t) => format!(
-                        "native {permission} (message {})",
-                        json::get_str(t, "messageID").unwrap_or("?")
-                    ),
-                    None => format!("native {permission}"),
+            "message.updated" => self.message(props, out),
+            "message.part.updated" => self.part(props),
+            "message.part.delta" => {
+                let (Some(part), Some(delta)) = (
+                    json::get_str(props, "partID"),
+                    json::get_str(props, "delta"),
+                ) else {
+                    return;
                 };
-                let now = now_ms();
-                let pr = PermissionRequest {
-                    // Native id doubles as the protocol id: per_* is already
-                    // globally unique and keeps the mapping reversible.
-                    id: native_id.clone(),
-                    native_request_id: native_id.clone(),
-                    session_id: sid,
-                    agent_id: "build".to_string(),
-                    host_id: self.id.clone(),
-                    action: native_action(permission).to_string(),
-                    title: format!("OpenCode permission: {permission}"),
-                    command: if patterns.is_empty() {
-                        permission.to_string()
-                    } else {
-                        format!("{permission} {}", patterns.join(" "))
-                    },
-                    args: patterns,
-                    directory: None,
-                    risk: "medium".to_string(),
-                    status: "pending".to_string(),
-                    supported_decisions: vec![
-                        "approve-once".into(),
-                        "approve-session".into(),
-                        "reject".into(),
-                    ],
-                    revision: 1,
-                    fingerprint: None,
-                    requested_at: now,
-                    // Engine TTL policy (120 s, same as mock permissions).
-                    // Native has no TTL — divergence noted for wiring review.
-                    expires_at: now + 120_000,
-                    context,
-                    decided_at: None,
-                    decision: None,
-                    tool_item_id: None,
-                    options: vec![],
-                    detail: None,
-                };
-                self.state
-                    .lock()
-                    .unwrap()
-                    .asked
-                    .insert(native_id, pr.clone());
-                Some(EventKind::PermissionRequested(pr))
+                // text and reasoning only; a user part has no item of its id
+                let known = self.state.lock().unwrap().parts.contains_key(part);
+                if known && json::get_str(props, "field") == Some("text") && self.hub.streams(&sid)
+                {
+                    self.hub.append(&sid, part, Field::Text, delta);
+                }
             }
-            "permission.replied" => {
-                let props = props?;
-                let native_id = json::get_str(props, "id")
+            "permission.asked" | "question.asked" => {
+                let question = etype == "question.asked";
+                let Some(pr) = permission_request(&self.id, props, question) else {
+                    return;
+                };
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.asked.insert(pr.id.clone(), pr.clone());
+                    if let Some(call) = &pr.tool_item_id {
+                        st.perms.insert(call.clone(), pr.id.clone());
+                        trim(&mut st.perms);
+                    }
+                }
+                if let Some(call) = &pr.tool_item_id {
+                    self.hub.update(&pr.session_id, call, |item| {
+                        if let Some(tool) = &mut item.tool {
+                            tool.status = ToolStatus::AwaitingApproval;
+                            tool.permission_id = Some(pr.id.clone());
+                        }
+                    });
+                }
+                out.push(EventKind::PermissionRequested(pr));
+            }
+            "permission.replied" | "question.replied" | "question.rejected" => {
+                let Some(native_id) = json::get_str(props, "id")
                     .or_else(|| json::get_str(props, "requestID"))
-                    .or_else(|| json::get_str(props, "requestId"))?
-                    .to_string();
+                    .or_else(|| json::get_str(props, "requestId"))
+                else {
+                    return;
+                };
                 let mut st = self.state.lock().unwrap();
                 // Unknown/untracked request → honest skip, no fabrication.
-                let mut pr = st.asked.remove(&native_id)?;
-                let reply = json::get_str(props, "reply");
-                let (status, decision) = match reply {
-                    Some("once") => ("approved", Some("approve-once")),
-                    Some("always") => ("approved", Some("approve-session")),
-                    Some("reject") => ("rejected", Some("reject")),
+                let Some(mut pr) = st.asked.remove(native_id) else {
+                    return;
+                };
+                let (status, decision) = match (etype, json::get_str(props, "reply")) {
+                    ("question.replied", _) => ("approved", Some("approve-once")),
+                    ("question.rejected", _) | (_, Some("reject")) => ("rejected", Some("reject")),
+                    (_, Some("once")) => ("approved", Some("approve-once")),
+                    (_, Some("always")) => ("approved", Some("approve-session")),
                     // Answered but the payload didn't say how: stale (still
                     // honest — no outcome is claimed).
                     _ => ("stale", None),
                 };
+                if let (Some(call), "rejected") = (&pr.tool_item_id, status) {
+                    st.rejected.insert(call.clone());
+                    if st.rejected.len() > MAP_MAX {
+                        st.rejected.clear();
+                    }
+                }
                 pr.status = status.to_string();
                 pr.decision = decision.map(str::to_string);
                 pr.decided_at = Some(now_ms());
-                Some(EventKind::PermissionResolved(pr))
+                out.push(EventKind::PermissionResolved(pr));
             }
-            "message.part.updated" => {
-                let props = props?;
-                let part = json::get(props, "part")?;
-                if json::get_str(part, "type") != Some("text") {
-                    // tool-call parts: no protocol representation yet
-                    // (capability `session.output` says so)
-                    return None;
-                }
-                let text = json::get_str(part, "text")?;
-                let sid = json::get_str(part, "sessionID")
-                    .or_else(|| json::get_str(props, "sessionID"))?
-                    .to_string();
-                Some(EventKind::Activity(ActivityEvent {
-                    id: if event_id.is_empty() {
-                        next_id("act")
+            "todo.updated" => {
+                let steps = json::get(props, "todos")
+                    .and_then(json::as_arr)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|t| PlanStep {
+                        text: json::get_str(t, "content").unwrap_or("").to_string(),
+                        status: match json::get_str(t, "status") {
+                            Some("in_progress") => "in_progress",
+                            Some("completed") => "completed",
+                            Some("cancelled") => "cancelled",
+                            _ => "pending",
+                        },
+                    })
+                    .collect();
+                let item = Item {
+                    id: "plan".into(),
+                    kind: ItemKind::Plan,
+                    ts: now_ms(),
+                    turn_id: self.latest_turn(&sid),
+                    steps,
+                    ..Default::default()
+                };
+                self.push(&sid, Op::Item(item));
+            }
+            "session.compacted" => {
+                let id = format!(
+                    "compacted:{}",
+                    if event_id.is_empty() {
+                        next_id("c")
                     } else {
                         event_id.to_string()
-                    },
-                    ts: now_ms(),
-                    kind: "session".to_string(),
-                    text: text.to_string(),
-                    ref_id: Some(sid),
-                }))
+                    }
+                );
+                self.notice(&sid, id, "info", "Context compacted".into());
+            }
+            "tui.toast.show" => {
+                if json::get_str(props, "title").is_some_and(|t| t.starts_with("MCP")) {
+                    self.poke.store(true, Ordering::SeqCst);
+                }
+            }
+            "mcp.tools.changed" => self.poke.store(true, Ordering::SeqCst),
+            "mcp.browser.open.failed" => {
+                let (Some(name), Some(url)) =
+                    (json::get_str(props, "mcpName"), json::get_str(props, "url"))
+                else {
+                    return;
+                };
+                self.state
+                    .lock()
+                    .unwrap()
+                    .open_failed
+                    .insert(name.to_string(), url.to_string());
+                self.push_mcp();
             }
             // server.connected/heartbeat: handled by the connect+refresh
             // cycle; sync (aggregate replay wrapper) has no cursor — state
-            // re-list replaces it (capability `event.replay` = unavailable).
-            _ => None,
+            // re-list and hydration replace it.
+            _ => {}
+        }
+    }
+
+    /// Session status cache + `session_updated` on change.
+    fn session_status(&self, sid: &str, proto: &str, out: &mut Vec<EventKind>) {
+        let mut st = self.state.lock().unwrap();
+        st.statuses.insert(sid.to_string(), proto.to_string());
+        if let Some(session) = st.sessions.iter_mut().find(|s| s.id == sid)
+            && session.status != proto
+        {
+            session.status = proto.to_string();
+            session.last_activity_at = now_ms();
+            out.push(EventKind::SessionUpdated(session.clone()));
+        }
+    }
+
+    /// `session.status busy`: the session's prompts are `running` (once
+    /// each), live state `running`.
+    fn busy(&self, sid: &str, out: &mut Vec<EventKind>) {
+        let op = {
+            let mut st = self.state.lock().unwrap();
+            for (_, command_id, started) in st.pending.iter_mut().filter(|p| p.0 == sid && !p.2) {
+                *started = true;
+                out.push(EventKind::CommandProgress {
+                    command_id: command_id.clone(),
+                    state: "running".into(),
+                    session_id: Some(sid.to_string()),
+                });
+            }
+            let live = st.live.entry(sid.to_string()).or_default();
+            (live.state != "running").then(|| {
+                live.state = "running";
+                Op::State(LiveState {
+                    status: "running",
+                    ..Default::default()
+                })
+            })
+        };
+        if let Some(op) = op {
+            self.push(sid, op);
+        }
+    }
+
+    /// Turn end (§4.6): idle → completed, abort → interrupted, other errors →
+    /// failed. Closes the running turns, the session's prompt commands
+    /// (completed / cancelled / failed) and a waiting interrupt (completed).
+    /// Idempotent: a second idle finds nothing open.
+    fn end_turn(
+        &self,
+        sid: &str,
+        status: &'static str,
+        error: Option<String>,
+        out: &mut Vec<EventKind>,
+    ) {
+        if status == "completed" {
+            self.session_status(sid, "completed", out);
+        }
+        let now = now_ms();
+        let mut ops = Vec::new();
+        let mut st = self.state.lock().unwrap();
+        let (prompt, prompt_error) = match status {
+            "completed" => ("completed", None),
+            "interrupted" => ("cancelled", None),
+            _ => ("failed", error.clone()),
+        };
+        let mut i = 0;
+        while i < st.pending.len() {
+            if st.pending[i].0 == sid {
+                let (_, command_id, _) = st.pending.remove(i);
+                out.push(result(
+                    &command_id,
+                    prompt,
+                    prompt_error.clone(),
+                    Some(sid.to_string()),
+                ));
+            } else {
+                i += 1;
+            }
+        }
+        let live = st.live.entry(sid.to_string()).or_default();
+        for turn in live.turns.iter_mut().filter(|t| t.status == "running") {
+            turn.status = status;
+            turn.ended_at = Some(now);
+            turn.error = error.clone();
+            ops.push(Op::Turn(turn.clone()));
+        }
+        if let Some(command_id) = live.interrupt.take() {
+            out.push(result(
+                &command_id,
+                "completed",
+                None,
+                Some(sid.to_string()),
+            ));
+        }
+        if live.state != "idle" {
+            live.state = "idle";
+            ops.push(Op::State(LiveState::default()));
+        }
+        drop(st);
+        for op in ops {
+            self.push(sid, op);
+        }
+    }
+
+    fn latest_turn(&self, sid: &str) -> Option<String> {
+        let st = self.state.lock().unwrap();
+        st.live.get(sid)?.turns.last().map(|t| t.id.clone())
+    }
+
+    fn notice(&self, sid: &str, id: String, level: &'static str, text: String) {
+        let item = Item {
+            id,
+            kind: ItemKind::Notice,
+            ts: now_ms(),
+            turn_id: self.latest_turn(sid),
+            level: Some(level),
+            text,
+            ..Default::default()
+        };
+        self.push(sid, Op::Item(item));
+    }
+
+    /// `session.status retry` → "Retrying: <message>" (+ the action's label
+    /// and link), one notice per turn updated in place: a quota retry loops.
+    fn retry_notice(&self, sid: &str, status: &Json) {
+        let mut text = format!(
+            "Retrying: {}",
+            json::get_str(status, "message").unwrap_or("the provider failed")
+        );
+        if let Some(action) = json::get(status, "action") {
+            let label = json::get_str(action, "label").unwrap_or("details");
+            if let Some(link) = json::get_str(action, "link") {
+                text.push_str(&format!(" ({label}: {link})"));
+            }
+        }
+        let anchor = self.latest_turn(sid).unwrap_or_else(|| sid.to_string());
+        self.notice(sid, format!("retry:{anchor}"), "warning", text);
+    }
+
+    /// `message.updated`: records the role and turn of every message. An
+    /// assistant message starts its turn (id = the user messageID, so a
+    /// queued prompt's turn starts when it actually runs); a user message's
+    /// `summary.diffs` become the turn's diffs and `Session.files`.
+    fn message(&self, props: &Json, out: &mut Vec<EventKind>) {
+        let Some(info) = json::get(props, "info") else {
+            return;
+        };
+        let (Some(id), Some(sid)) = (json::get_str(info, "id"), json::get_str(info, "sessionID"))
+        else {
+            return;
+        };
+        let user = json::get_str(info, "role") == Some("user");
+        let turn_id = match user {
+            true => id,
+            false => json::get_str(info, "parentID").unwrap_or(id),
+        };
+        let mut st = self.state.lock().unwrap();
+        st.roles.insert(id.to_string(), (user, turn_id.to_string()));
+        trim(&mut st.roles);
+        if st.live.len() > SESSIONS_KEPT {
+            let watched = st.watched.clone();
+            st.live.retain(|s, _| watched.contains(s));
+        }
+        let op = if user {
+            let diffs = summary_diffs(info);
+            if diffs.is_empty() {
+                return;
+            }
+            if let Some(session) = st.sessions.iter_mut().find(|s| s.id == sid) {
+                for d in &diffs {
+                    let change = FileChange {
+                        path: d.path.clone(),
+                        additions: d.additions,
+                        deletions: d.deletions,
+                        status: if d.status == "deleted" {
+                            "removed"
+                        } else {
+                            d.status
+                        }
+                        .into(),
+                    };
+                    match session.files.iter_mut().find(|f| f.path == d.path) {
+                        Some(f) => *f = change,
+                        None => session.files.push(change),
+                    }
+                }
+                out.push(EventKind::SessionUpdated(session.clone()));
+            }
+            let live = st.live.entry(sid.to_string()).or_default();
+            let Some(turn) = live.turns.iter_mut().find(|t| t.id == turn_id) else {
+                return;
+            };
+            turn.diffs = diffs;
+            Op::Turn(turn.clone())
+        } else {
+            let running = st.statuses.get(sid).is_some_and(|s| s == "running");
+            let time = json::get(info, "time");
+            let live = st.live.entry(sid.to_string()).or_default();
+            if live.turns.iter().any(|t| t.id == turn_id) {
+                return;
+            }
+            let completed = time.and_then(|t| json::get_i64(t, "completed"));
+            let turn = TurnState {
+                id: turn_id.to_string(),
+                status: if running || completed.is_none() {
+                    "running"
+                } else {
+                    "completed"
+                },
+                started_at: time
+                    .and_then(|t| json::get_i64(t, "created"))
+                    .unwrap_or_else(now_ms),
+                ended_at: completed.filter(|_| !running),
+                ..Default::default()
+            };
+            live.turns.push(turn.clone());
+            if live.turns.len() > TURNS_KEPT {
+                live.turns.remove(0);
+            }
+            Op::Turn(turn)
+        };
+        drop(st);
+        self.push(sid, op);
+    }
+
+    /// `message.part.updated` → user / text / thinking / tool items and the
+    /// step-finish usage. A part of a message whose role is unknown waits
+    /// for hydration (never guess: a user's text must not show as the
+    /// agent's).
+    fn part(&self, props: &Json) {
+        let Some(part) = json::get(props, "part") else {
+            return;
+        };
+        let (Some(id), Some(msg), Some(sid)) = (
+            json::get_str(part, "id"),
+            json::get_str(part, "messageID"),
+            json::get_str(part, "sessionID").or_else(|| json::get_str(props, "sessionID")),
+        ) else {
+            return;
+        };
+        let mut st = self.state.lock().unwrap();
+        let Some((user, turn)) = st.roles.get(msg).cloned() else {
+            return;
+        };
+        let op = match json::get_str(part, "type") {
+            Some("step-finish") => {
+                let Some(turn) = st
+                    .live
+                    .get_mut(sid)
+                    .and_then(|l| l.turns.iter_mut().find(|t| t.id == turn))
+                else {
+                    return;
+                };
+                add_usage(turn, part);
+                Op::Turn(turn.clone())
+            }
+            _ => match part_item(part, id, msg, user, &turn, &st) {
+                Some(item) => {
+                    if matches!(item.kind, ItemKind::Text | ItemKind::Thinking) {
+                        st.parts.insert(id.to_string(), item.kind);
+                        trim(&mut st.parts);
+                    }
+                    Op::Item(item)
+                }
+                None => return,
+            },
+        };
+        drop(st);
+        self.push(sid, op);
+    }
+
+    fn spawn_hydrate(self: &Arc<Self>, sid: String) {
+        let inner = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("opencode-hydrate".into())
+            .spawn(move || inner.hydrate(&sid));
+    }
+
+    /// Rebuilds a watched session's transcript from `GET
+    /// /session/{id}/message` (§4.4): roles, items in message order, and the
+    /// turns with their usage and outcome. Items replace by id, so running
+    /// it again (every SSE reconnect) only refreshes what changed.
+    fn hydrate(&self, sid: &str) {
+        let Ok(resp) = self.req(
+            "GET",
+            &format!("{}/session/{sid}/message", self.endpoint),
+            None,
+        ) else {
+            return;
+        };
+        let Some(msgs) = validate_json(&resp).ok().filter(|_| resp.status == 200) else {
+            return;
+        };
+        let mut ops = Vec::new();
+        let mut turns: Vec<(TurnState, bool)> = Vec::new();
+        let mut st = self.state.lock().unwrap();
+        let busy = st.statuses.get(sid).is_some_and(|s| s == "running");
+        for m in json::as_arr(&msgs).unwrap_or(&[]) {
+            let (Some(info), Some(parts)) = (
+                json::get(m, "info"),
+                json::get(m, "parts").and_then(json::as_arr),
+            ) else {
+                continue;
+            };
+            let Some(id) = json::get_str(info, "id") else {
+                continue;
+            };
+            let user = json::get_str(info, "role") == Some("user");
+            let turn_id = match user {
+                true => id,
+                false => json::get_str(info, "parentID").unwrap_or(id),
+            };
+            st.roles.insert(id.to_string(), (user, turn_id.to_string()));
+            let time = json::get(info, "time");
+            let at = |k| time.and_then(|t| json::get_i64(t, k));
+            if user {
+                turns.push((
+                    TurnState {
+                        id: id.to_string(),
+                        status: "completed",
+                        started_at: at("created").unwrap_or_else(now_ms),
+                        diffs: summary_diffs(info),
+                        ..Default::default()
+                    },
+                    false,
+                ));
+            }
+            let Some((turn, seen)) = turns.iter_mut().find(|(t, _)| t.id == turn_id) else {
+                continue;
+            };
+            if !user {
+                *seen = true;
+                turn.ended_at = at("completed").max(turn.ended_at);
+                match json::get(info, "error") {
+                    Some(e) if json::get_str(e, "name") == Some("MessageAbortedError") => {
+                        turn.status = "interrupted"
+                    }
+                    Some(e) => {
+                        turn.status = "failed";
+                        turn.error = Some(clip(err_text(e)));
+                    }
+                    None => {}
+                }
+            }
+            for part in parts {
+                let Some(pid) = json::get_str(part, "id") else {
+                    continue;
+                };
+                if json::get_str(part, "type") == Some("step-finish") {
+                    add_usage(turn, part);
+                } else if let Some(mut item) = part_item(part, pid, id, user, turn_id, &st) {
+                    if matches!(item.kind, ItemKind::Text | ItemKind::Thinking) {
+                        // a finished message's parts are done even when cut
+                        item.done |= at("completed").is_some();
+                        st.parts.insert(pid.to_string(), item.kind);
+                    }
+                    ops.push(Op::Item(item));
+                }
+            }
+        }
+        trim(&mut st.roles);
+        trim(&mut st.parts);
+        // the newest turn still runs while the session is busy
+        if let Some((last, _)) = turns.iter_mut().rev().find(|(_, seen)| *seen)
+            && busy
+            && last.status == "completed"
+        {
+            last.status = "running";
+            last.ended_at = None;
+        }
+        let live = st.live.entry(sid.to_string()).or_default();
+        for (turn, _) in turns.into_iter().filter(|(_, seen)| *seen) {
+            match live.turns.iter_mut().find(|t| t.id == turn.id) {
+                Some(t) => *t = turn.clone(),
+                None => live.turns.push(turn.clone()),
+            }
+            ops.push(Op::Turn(turn));
+        }
+        let keep = live.turns.len().saturating_sub(TURNS_KEPT);
+        live.turns.drain(..keep);
+        drop(st);
+        for op in ops {
+            self.hub.push(sid, op);
         }
     }
 }
 
+/// Drops the older half of an id map past `MAP_MAX` (OpenCode's `msg_` and
+/// `prt_` ids sort by creation time).
+fn trim<V>(map: &mut HashMap<String, V>) {
+    if map.len() <= MAP_MAX {
+        return;
+    }
+    let mut keys: Vec<String> = map.keys().cloned().collect();
+    keys.sort();
+    for k in &keys[..keys.len() / 2] {
+        map.remove(k);
+    }
+}
+
+/// One part as a transcript item: a user's typed text (synthetic and
+/// ignored parts are context OpenCode added, not what the user wrote),
+/// assistant text or reasoning (`done` once `time.end` is set), or a tool
+/// call keyed by `callID`.
+fn part_item(
+    part: &Json,
+    id: &str,
+    msg: &str,
+    user: bool,
+    turn: &str,
+    st: &OcState,
+) -> Option<Item> {
+    let time = json::get(part, "time");
+    let ts = time
+        .and_then(|t| json::get_i64(t, "start"))
+        .unwrap_or_else(now_ms);
+    let text = || json::get_str(part, "text").unwrap_or("").to_string();
+    let base = Item {
+        ts,
+        turn_id: Some(turn.to_string()),
+        ..Default::default()
+    };
+    match json::get_str(part, "type")? {
+        "text" if user => {
+            let extra = |k| json::get_bool(part, k) == Some(true);
+            (!extra("synthetic") && !extra("ignored")).then(|| Item {
+                id: msg.to_string(),
+                kind: ItemKind::User,
+                text: text(),
+                ..base
+            })
+        }
+        kind @ ("text" | "reasoning") => Some(Item {
+            id: id.to_string(),
+            kind: if kind == "text" {
+                ItemKind::Text
+            } else {
+                ItemKind::Thinking
+            },
+            text: text(),
+            done: time.and_then(|t| json::get_i64(t, "end")).is_some(),
+            ..base
+        }),
+        "tool" => {
+            let call = json::get_str(part, "callID")?;
+            let state = json::get(part, "state");
+            let tool = tool_call(part, state, st.perms.get(call), st, call);
+            let ts = state
+                .and_then(|s| json::get(s, "time"))
+                .and_then(|t| json::get_i64(t, "start"))
+                .unwrap_or(ts);
+            Some(Item {
+                id: call.to_string(),
+                kind: ItemKind::Tool,
+                ts,
+                tool: Some(tool),
+                ..base
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A tool part's `state` → `ToolCall` (§3.6): pending → running (repeated
+/// `metadata.output` is the output so far) → completed / error, which is a
+/// denial after a rejected request. While a request for the call is pending
+/// the card awaits approval.
+fn tool_call(
+    part: &Json,
+    state: Option<&Json>,
+    perm: Option<&String>,
+    st: &OcState,
+    call: &str,
+) -> ToolCall {
+    let get = |k| state.and_then(|s| json::get(s, k));
+    let input = get("input");
+    let input_str = |k| input.and_then(|i| json::get_str(i, k));
+    let meta = get("metadata");
+    let error = get("error").and_then(json::as_str).map(str::to_string);
+    let status = match get("status").and_then(json::as_str) {
+        Some("pending" | "running") if perm.is_some_and(|p| st.asked.contains_key(p)) => {
+            ToolStatus::AwaitingApproval
+        }
+        Some("running") => ToolStatus::Running,
+        Some("completed") => ToolStatus::Completed,
+        Some("error")
+            if st.rejected.contains(call)
+                || error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("The user rejected permission")) =>
+        {
+            ToolStatus::Denied
+        }
+        Some("error") => ToolStatus::Failed,
+        _ => ToolStatus::Pending,
+    };
+    let output = match status {
+        ToolStatus::Completed => get("output"),
+        _ => meta.and_then(|m| json::get(m, "output")),
+    };
+    let path = meta
+        .and_then(|m| json::get_str(m, "filepath"))
+        .or_else(|| input_str("filePath"))
+        .unwrap_or("");
+    let diffs = meta
+        .and_then(|m| json::get_str(m, "diff"))
+        .map(|patch| vec![file_diff(path, "modified", patch)])
+        .unwrap_or_default();
+    let title = get("title")
+        .and_then(json::as_str)
+        .filter(|t| !t.is_empty())
+        .or_else(|| input_str("command"))
+        .or_else(|| input_str("filePath"))
+        .or_else(|| input_str("url"))
+        .or_else(|| input_str("pattern"))
+        .map(str::to_string);
+    let time = get("time");
+    let at = |k| time.and_then(|t| json::get_i64(t, k));
+    ToolCall {
+        name: json::get_str(part, "tool").unwrap_or("tool").to_string(),
+        title,
+        status,
+        // the raw command for a shell, else the input as JSON
+        input: match (input_str("command"), input) {
+            (Some(c), _) => c.to_string(),
+            (None, Some(v @ Json::Obj(f))) if !f.is_empty() => json::stringify(v),
+            _ => String::new(),
+        },
+        output: output.and_then(json::as_str).unwrap_or("").to_string(),
+        error,
+        diffs,
+        permission_id: perm.cloned(),
+        duration_ms: at("end").zip(at("start")).map(|(e, s)| e - s),
+        ..Default::default()
+    }
+}
+
+/// A unified diff for one file, its +/- lines counted (headers excluded).
+fn file_diff(path: &str, status: &'static str, patch: &str) -> FileDiff {
+    let count = |sign: char, head: &str| {
+        patch
+            .lines()
+            .filter(|l| l.starts_with(sign) && !l.starts_with(head))
+            .count() as i64
+    };
+    FileDiff {
+        path: path.to_string(),
+        status,
+        additions: count('+', "+++"),
+        deletions: count('-', "---"),
+        patch: patch.to_string(),
+        truncated: false,
+    }
+}
+
+/// A user message's `summary.diffs` (`[{file, patch, additions, deletions,
+/// status}]`): the turn's file changes.
+fn summary_diffs(info: &Json) -> Vec<FileDiff> {
+    let list = json::get(info, "summary")
+        .and_then(|s| json::get(s, "diffs"))
+        .and_then(json::as_arr)
+        .unwrap_or(&[]);
+    list.iter()
+        .filter_map(|d| {
+            let path = json::get_str(d, "file")?;
+            let status = match json::get_str(d, "status") {
+                Some("added") => "added",
+                Some("deleted" | "removed") => "deleted",
+                _ => "modified",
+            };
+            Some(FileDiff {
+                additions: json::get_i64(d, "additions").unwrap_or(0),
+                deletions: json::get_i64(d, "deletions").unwrap_or(0),
+                ..file_diff(path, status, json::get_str(d, "patch").unwrap_or(""))
+            })
+        })
+        .collect()
+}
+
+/// A `step-finish` part's tokens and cost, added to its turn.
+fn add_usage(turn: &mut TurnState, part: &Json) {
+    let Some(tokens) = json::get(part, "tokens") else {
+        return;
+    };
+    let n = |k| json::get_i64(tokens, k).unwrap_or(0);
+    let cache = json::get(tokens, "cache").and_then(|c| json::get_i64(c, "read"));
+    let usage = turn.usage.get_or_insert_with(Usage::default);
+    usage.input += n("input");
+    usage.output += n("output");
+    if let Some(read) = cache {
+        *usage.cache_read.get_or_insert(0) += read;
+    }
+    if n("reasoning") > 0 {
+        *usage.reasoning.get_or_insert(0) += n("reasoning");
+    }
+    if let Some(cost) = json::get(part, "cost")
+        .and_then(json::as_f64)
+        .filter(|c| *c > 0.0)
+    {
+        *turn.cost_usd.get_or_insert(0.0) += cost;
+    }
+}
+
+/// `permission.asked` / `question.asked` → the engine's record (§4.5):
+/// `toolItemId` = the tool's `callID`, the native choices as options, the
+/// detail the phone renders inside the card. Legacy fields stay filled for
+/// v2 phones. Everything here is journaled: redacted and capped.
+fn permission_request(host: &str, props: &Json, question: bool) -> Option<PermissionRequest> {
+    let native_id = json::get_str(props, "id")?.to_string();
+    let call = json::get(props, "tool")
+        .and_then(|t| json::get_str(t, "callID"))
+        .map(str::to_string);
+    let message = json::get(props, "tool").and_then(|t| json::get_str(t, "messageID"));
+    let strings = |k: &str| -> Vec<String> {
+        json::get(props, k)
+            .and_then(json::as_arr)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|p| json::as_str(p).map(redact))
+            .collect()
+    };
+    let option = |id: &str, decision: &str, label: &str, scope: &'static str| PermissionOption {
+        id: id.into(),
+        decision: decision.into(),
+        label: label.into(),
+        rule: None,
+        scope,
+        destination: None,
+        takes_message: false,
+        stops_turn: false,
+    };
+    let now = now_ms();
+    let (permission, patterns, detail, options) = if question {
+        let questions = json::get(props, "questions")
+            .and_then(json::as_arr)
+            .unwrap_or(&[]);
+        let first = questions
+            .first()
+            .and_then(|q| json::get_str(q, "question"))
+            .unwrap_or("question");
+        (
+            "question".to_string(),
+            vec![redact(first)],
+            detail_question(questions),
+            vec![
+                option("answer", "approve-once", "Submit answers", "once"),
+                option("skip", "reject", "Skip", "once"),
+            ],
+        )
+    } else {
+        let permission = json::get_str(props, "permission").unwrap_or("permission");
+        let patterns = strings("patterns");
+        let always = strings("always");
+        let rule = always.join(" ");
+        let label = if rule.is_empty() {
+            "Always allow until OpenCode restarts".to_string()
+        } else {
+            format!("Always allow `{rule}` until OpenCode restarts")
+        };
+        let options = vec![
+            option("once", "approve-once", "Allow once", "once"),
+            PermissionOption {
+                rule: (!rule.is_empty()).then_some(rule),
+                ..option("always", "approve-session", &label, "session")
+            },
+            // rejecting with a message keeps the turn going (§3.3)
+            PermissionOption {
+                takes_message: true,
+                ..option("reject", "reject", "Deny", "once")
+            },
+        ];
+        let detail = permission_detail(permission, json::get(props, "metadata"), &patterns);
+        (permission.to_string(), patterns, detail, options)
+    };
+    let action = if question {
+        "agent-control"
+    } else {
+        native_action(&permission)
+    };
+    Some(PermissionRequest {
+        // Native id doubles as the protocol id: per_*/que_* is already
+        // globally unique and keeps the mapping reversible.
+        id: native_id.clone(),
+        native_request_id: native_id,
+        session_id: json::get_str(props, "sessionID").unwrap_or("").to_string(),
+        agent_id: "build".to_string(),
+        host_id: host.to_string(),
+        action: action.to_string(),
+        title: if question {
+            "OpenCode asks a question".to_string()
+        } else {
+            format!("OpenCode permission: {permission}")
+        },
+        command: cap(
+            if patterns.is_empty() || question {
+                patterns.join(" ")
+            } else {
+                format!("{permission} {}", patterns.join(" "))
+            }
+            .trim()
+            .to_string(),
+            COMMAND_CAP,
+        ),
+        args: patterns,
+        directory: None,
+        risk: match action {
+            "shell" => "high",
+            "file-write" | "network" => "medium",
+            _ => "low",
+        }
+        .to_string(),
+        status: "pending".to_string(),
+        supported_decisions: vec![
+            "approve-once".into(),
+            "approve-session".into(),
+            "reject".into(),
+        ],
+        revision: 1,
+        fingerprint: None,
+        requested_at: now,
+        // none of OpenCode's requests expire (the engine applies the same)
+        expires_at: now + LIVE_PERMISSION_TTL_MS,
+        context: match message {
+            Some(m) => format!("native {permission} (message {m})"),
+            None => format!("native {permission}"),
+        },
+        decided_at: None,
+        decision: None,
+        tool_item_id: call,
+        options,
+        detail: Some(detail),
+    })
+}
+
+/// What the phone shows inside the card: the bash command, the edit's diff
+/// (`metadata.diff`), the URL, or the patterns.
+fn permission_detail(permission: &str, meta: Option<&Json>, patterns: &[String]) -> Json {
+    let meta_str = |k| meta.and_then(|m| json::get_str(m, k)).map(redact);
+    let first = patterns.first().cloned().unwrap_or_default();
+    let kind = |k: &str, fields: Vec<(&str, String)>| {
+        let mut all = vec![("kind", json::s(k))];
+        all.extend(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k, json::s(&cap(v, DETAIL_CAP)))),
+        );
+        json::obj(all)
+    };
+    match permission {
+        "bash" => kind(
+            "shell",
+            vec![(
+                "command",
+                meta_str("command").unwrap_or_else(|| patterns.join(" ")),
+            )],
+        ),
+        "edit" => {
+            let mut fields = vec![("path", meta_str("filepath").unwrap_or(first))];
+            fields.extend(meta_str("diff").map(|d| ("patch", d)));
+            kind("edit", fields)
+        }
+        "webfetch" => kind("fetch", vec![("url", meta_str("url").unwrap_or(first))]),
+        "read" => kind(
+            "read",
+            vec![("path", meta_str("filePath").unwrap_or(first))],
+        ),
+        _ => kind(
+            "generic",
+            vec![
+                ("tool", permission.to_string()),
+                ("input", patterns.join("\n")),
+            ],
+        ),
+    }
+}
+
+/// `question.asked` questions → `detail.question` (ids are indexes: the
+/// reply is one label array per question, in order). `custom` (free text)
+/// defaults to allowed.
+fn detail_question(questions: &[Json]) -> Json {
+    let list = questions
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let choices = json::get(q, "options")
+                .and_then(json::as_arr)
+                .unwrap_or(&[])
+                .iter()
+                .map(|o| {
+                    json::obj(vec![
+                        ("label", json::s(json::get_str(o, "label").unwrap_or(""))),
+                        (
+                            "description",
+                            json::s(json::get_str(o, "description").unwrap_or("")),
+                        ),
+                    ])
+                })
+                .collect();
+            json::obj(vec![
+                ("id", json::s(&i.to_string())),
+                (
+                    "text",
+                    json::s(&redact(json::get_str(q, "question").unwrap_or(""))),
+                ),
+                ("header", json::s(json::get_str(q, "header").unwrap_or(""))),
+                ("options", Json::Arr(choices)),
+                (
+                    "multiSelect",
+                    Json::Bool(json::get_bool(q, "multiple") == Some(true)),
+                ),
+                (
+                    "allowFreeText",
+                    Json::Bool(json::get_bool(q, "custom") != Some(false)),
+                ),
+            ])
+        })
+        .collect();
+    json::obj(vec![
+        ("kind", json::s("question")),
+        ("questions", Json::Arr(list)),
+    ])
+}
+
+/// Cuts `s` to `max` bytes at a char boundary.
+fn cap(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut at = max;
+        while !s.is_char_boundary(at) {
+            at -= 1;
+        }
+        s.truncate(at);
+    }
+    s
+}
 /// Native error payload → message. Observed shape (probe §8):
 /// `{name, data:{message}}`; string and bare-name fallbacks kept.
 fn err_text(e: &Json) -> String {
@@ -1511,6 +3043,10 @@ pub(crate) mod tests {
         pub sse_hold: bool,
         /// Serve an oversize (> 4 MiB) response body on /session.
         pub oversize_http: bool,
+        /// Extra JSON answers by exact "METHOD /path" (checked first).
+        pub routes: Vec<(String, String)>,
+        /// Wait this long before writing the SSE script.
+        pub sse_delay_ms: u64,
     }
 
     impl Default for Opts {
@@ -1521,6 +3057,8 @@ pub(crate) mod tests {
                 chunked_sse: false,
                 sse_hold: true,
                 oversize_http: false,
+                routes: Vec::new(),
+                sse_delay_ms: 0,
             }
         }
     }
@@ -1627,6 +3165,11 @@ pub(crate) mod tests {
                     let path = parts.next().unwrap_or("/").to_string();
                     let (path, _query) = path.split_once('?').unwrap_or((path.as_str(), ""));
                     r.lock().unwrap().push(format!("{method} {path} {body}"));
+                    let key = format!("{method} {path}");
+                    if let Some((_, answer)) = o.routes.iter().find(|(k, _)| *k == key) {
+                        respond(&mut stream, "200 OK", "application/json", answer);
+                        return;
+                    }
 
                     match (method.as_str(), path) {
                         ("GET", "/global/health") => respond(
@@ -1671,6 +3214,7 @@ pub(crate) mod tests {
                             if stream.write_all(head.as_bytes()).is_err() {
                                 return;
                             }
+                            std::thread::sleep(Duration::from_millis(o.sse_delay_ms));
                             if let Some(script) = &o.sse {
                                 if o.chunked_sse {
                                     // split into two chunks so the reader's
@@ -1720,6 +3264,9 @@ pub(crate) mod tests {
                             }
                         }
                         ("POST", p) if p.ends_with("/abort") => {
+                            respond(&mut stream, "200 OK", "application/json", "true")
+                        }
+                        ("POST", p) if p.starts_with("/question/") => {
                             respond(&mut stream, "200 OK", "application/json", "true")
                         }
                         ("POST", p) if p.contains("/permission/") && p.ends_with("/reply") => {
@@ -2445,5 +3992,736 @@ pub(crate) mod tests {
         assert!(!err.to_string().contains("user:"));
         assert!(!ad.detail().unwrap().contains("supersecretpass"));
         assert!(!ad.detail().unwrap().contains("user:"));
+    }
+
+    /* ---------------- ADR-015 step 5: rich parts ---------------- */
+    // Scripts: sanitized `/global/event` captures from an isolated
+    // `opencode serve` 1.19.4 on local Ollama (`tests/fixtures/opencode/`),
+    // fed to the normalizer in order. `retry.sse` carries the live retry
+    // shape recorded in `opencode-live-events.md` §2.6.
+
+    use crate::transcript::Hub;
+
+    /// The captured session.
+    pub const SID: &str = "ses_e590d63d1ffeINRRRmnvST2KP5";
+    pub const APPROVE: &str = include_str!("../tests/fixtures/opencode/bash-approve.sse");
+    const REJECT: &str = include_str!("../tests/fixtures/opencode/bash-reject.sse");
+    const TODO: &str = include_str!("../tests/fixtures/opencode/todo.sse");
+    const ABORT: &str = include_str!("../tests/fixtures/opencode/abort.sse");
+    const RETRY: &str = include_str!("../tests/fixtures/opencode/retry.sse");
+    /// A second capture: an edit approved inline, then the question tool.
+    const EDIT_SID: &str = "ses_e58fe4c49ffeLOPOlJuistwhl7";
+    const EDIT: &str = include_str!("../tests/fixtures/opencode/edit.sse");
+    const QUESTION_SID: &str = EDIT_SID;
+    const QUESTION: &str = include_str!("../tests/fixtures/opencode/question.sse");
+    const MESSAGES: &str = include_str!("../tests/fixtures/opencode/messages.json");
+    const MCP: &str = include_str!("../tests/fixtures/opencode/mcp.json");
+
+    /// An adapter on a fake server, streaming into a hub where one
+    /// connection watches `sid` (what the companion's subscribe sets up).
+    struct Rig {
+        f: Fake,
+        ad: OpenCodeAdapter,
+        hub: HubHandle,
+        rx: mpsc::Receiver<EventKind>,
+        _out: mpsc::Receiver<(crate::server::MsgClass, Vec<u8>)>,
+    }
+
+    fn rig(opts: Opts, sid: &str) -> Rig {
+        let f = start(opts);
+        let shared = Arc::new(Mutex::new(Hub::default()));
+        let (out, rx_out) =
+            crate::server::Outbound::new(Arc::new(crate::companion::Saturation::default()), false);
+        {
+            let mut hub = shared.lock().unwrap();
+            hub.ensure(sid, now_ms());
+            hub.subscribe(1, out, sid, None).unwrap();
+        }
+        let hub = HubHandle::new(shared);
+        let ad = OpenCodeAdapter::with_hub("oc-1", &f.addr, None, hub.clone());
+        let (tx, rx) = mpsc::channel();
+        ad.subscribe(move |k| {
+            let _ = tx.send(k);
+        });
+        Rig {
+            f,
+            ad,
+            hub,
+            rx,
+            _out: rx_out,
+        }
+    }
+
+    impl Rig {
+        fn feed(&self, script: &str) {
+            for line in script.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    self.ad.inner.on_sse_data(data);
+                }
+            }
+        }
+        /// The transcript ops so far (deltas flushed), parsed.
+        fn ops(&self, sid: &str) -> Vec<Json> {
+            self.hub
+                .ops(sid)
+                .iter()
+                .map(|o| json::parse(o).unwrap())
+                .collect()
+        }
+        fn events(&self) -> Vec<EventKind> {
+            self.rx.try_iter().collect()
+        }
+        fn requests(&self, needle: &str) -> Vec<String> {
+            let reqs = self.f.requests.lock().unwrap();
+            reqs.iter()
+                .filter(|r| r.contains(needle))
+                .cloned()
+                .collect()
+        }
+        fn decide(
+            &self,
+            permission: &str,
+            option: &str,
+            message: Option<&str>,
+            answers: Vec<(String, Vec<String>)>,
+        ) -> ServerMsg {
+            self.ad
+                .send(&ClientMsg::PermissionDecision {
+                    command_id: format!("cmd-{option}"),
+                    permission_id: permission.into(),
+                    decision: if option == "reject" || option == "skip" {
+                        "reject"
+                    } else {
+                        "approve-once"
+                    }
+                    .into(),
+                    revision: 1.0,
+                    option_id: Some(option.into()),
+                    message: message.map(str::to_string),
+                    answers,
+                })
+                .unwrap()
+        }
+    }
+
+    /// `script` up to (and from) the event line containing `marker`.
+    fn split<'a>(script: &'a str, marker: &str) -> (&'a str, &'a str) {
+        let at = script.find(marker).expect("marker in script");
+        script.split_at(script[..at].rfind("data: ").unwrap())
+    }
+
+    /// The item ops for `id`, oldest first.
+    fn items<'a>(ops: &'a [Json], id: &str) -> Vec<&'a Json> {
+        ops.iter()
+            .filter(|o| json::get_str(o, "op") == Some("item"))
+            .filter_map(|o| json::get(o, "item"))
+            .filter(|i| json::get_str(i, "id") == Some(id))
+            .collect()
+    }
+
+    fn tool_statuses(ops: &[Json], call: &str) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for item in items(ops, call) {
+            let s = json::get(item, "tool")
+                .and_then(|t| json::get_str(t, "status"))
+                .unwrap()
+                .to_string();
+            if seen.last() != Some(&s) {
+                seen.push(s);
+            }
+        }
+        seen
+    }
+
+    fn turn<'a>(ops: &'a [Json], id: &str) -> Option<&'a Json> {
+        ops.iter()
+            .rev()
+            .filter(|o| json::get_str(o, "op") == Some("turn"))
+            .filter_map(|o| json::get(o, "turn"))
+            .find(|t| json::get_str(t, "id") == Some(id))
+    }
+
+    fn results(events: &[EventKind]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::CommandResult {
+                    command_id, status, ..
+                } => Some((command_id.clone(), status.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn submit_to(ad: &OpenCodeAdapter, sid: &str, cmd: &str) {
+        let ack = ad
+            .send(&ClientMsg::SubmitPrompt {
+                command_id: cmd.into(),
+                session_id: sid.into(),
+                text: "hello".into(),
+            })
+            .unwrap();
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }));
+    }
+
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !f() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn text_and_reasoning_deltas_become_appends() {
+        let r = rig(Opts::default(), SID);
+        r.feed(APPROVE);
+        let ops = r.ops(SID);
+        // reasoning: created empty, grown by appends, replaced whole at its end
+        let think = "prt_1a6f3caca001Duu7ANPZATPIYE";
+        let versions = items(&ops, think);
+        assert_eq!(json::get_str(versions[0], "kind"), Some("thinking"));
+        assert_eq!(json::get_str(versions[0], "text"), Some(""));
+        assert_eq!(json::get_bool(versions[0], "done"), Some(false));
+        let last = versions.last().unwrap();
+        assert_eq!(json::get_bool(last, "done"), Some(true));
+        let full = json::get_str(last, "text").unwrap();
+        assert!(full.starts_with("The user wants me to run"), "{full}");
+        let appended: String = ops
+            .iter()
+            .filter(|o| {
+                json::get_str(o, "op") == Some("append") && json::get_str(o, "id") == Some(think)
+            })
+            .map(|o| {
+                assert_eq!(json::get_str(o, "field"), Some("text"));
+                json::get_str(o, "text").unwrap()
+            })
+            .collect();
+        assert_eq!(appended, full, "the deltas rebuild the final text");
+        // the answer streams the same way, as a text item of its turn
+        let done: Vec<&Json> = ops
+            .iter()
+            .filter_map(|o| json::get(o, "item"))
+            .filter(|i| json::get_str(i, "kind") == Some("text"))
+            .collect();
+        let answer = done.last().unwrap();
+        assert_eq!(json::get_str(answer, "text"), Some("DONE"));
+        assert_eq!(
+            json::get_str(answer, "turnId"),
+            Some("msg_1a6f29c8f001OaOj6wOaB61V5O")
+        );
+        assert!(ops.iter().any(|o| json::get_str(o, "op") == Some("append")
+            && json::get_str(o, "text") == Some("DONE")));
+    }
+
+    #[test]
+    fn tool_part_lifecycle_maps_to_tool_item() {
+        let r = rig(Opts::default(), SID);
+        r.feed(APPROVE);
+        r.feed(REJECT);
+        let ops = r.ops(SID);
+        // approved: the card waits inside its own lifecycle, then completes
+        assert_eq!(
+            tool_statuses(&ops, "call_22tnronp"),
+            [
+                "pending",
+                "running",
+                "awaiting-approval",
+                "running",
+                "completed"
+            ]
+        );
+        let done = items(&ops, "call_22tnronp").pop().unwrap();
+        let tool = json::get(done, "tool").unwrap();
+        assert_eq!(json::get_str(tool, "name"), Some("bash"));
+        assert_eq!(json::get_str(tool, "title"), Some("echo hi > note.txt"));
+        assert_eq!(json::get_str(tool, "input"), Some("echo hi > note.txt"));
+        assert_eq!(json::get_str(tool, "output"), Some("(no output)"));
+        assert_eq!(
+            json::get_str(tool, "permissionId"),
+            Some("per_1a6f3f4040012zUvvUmJzvZF6K")
+        );
+        assert!(json::get_i64(tool, "durationMs").is_some());
+        // rejected (asked while still pending): the error is a denial
+        assert_eq!(
+            tool_statuses(&ops, "call_mncm01jw"),
+            ["pending", "awaiting-approval", "denied"]
+        );
+        let denied = items(&ops, "call_mncm01jw").pop().unwrap();
+        let error = json::get(denied, "tool")
+            .and_then(|t| json::get_str(t, "error"))
+            .unwrap();
+        assert!(error.contains("rejected permission"), "{error}");
+    }
+
+    #[test]
+    fn permission_links_to_tool_by_call_id_with_diff() {
+        let r = rig(Opts::default(), EDIT_SID);
+        r.feed(EDIT);
+        let asked = r
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                EventKind::PermissionRequested(p) => Some(p),
+                _ => None,
+            })
+            .expect("permission_requested");
+        let call = asked.tool_item_id.clone().expect("toolItemId");
+        assert_eq!(asked.action, "file-write");
+        let detail = asked.detail.as_ref().unwrap();
+        assert_eq!(json::get_str(detail, "kind"), Some("edit"));
+        assert!(
+            json::get_str(detail, "path")
+                .unwrap()
+                .ends_with("hello.txt")
+        );
+        assert!(
+            json::get_str(detail, "patch")
+                .unwrap()
+                .contains("+hello world")
+        );
+        let options: Vec<(&str, &str, &str)> = asked
+            .options
+            .iter()
+            .map(|o| (o.id.as_str(), o.decision.as_str(), o.scope))
+            .collect();
+        assert_eq!(
+            options,
+            [
+                ("once", "approve-once", "once"),
+                ("always", "approve-session", "session"),
+                ("reject", "reject", "once")
+            ]
+        );
+        assert!(asked.options[1].label.ends_with("until OpenCode restarts"));
+        assert!(asked.options[2].takes_message);
+        // the card with that callID waited for this very request, and the
+        // completed edit carries the diff
+        let ops = r.ops(EDIT_SID);
+        let waiting = items(&ops, &call)
+            .into_iter()
+            .map(|i| json::get(i, "tool").unwrap())
+            .find(|t| json::get_str(t, "status") == Some("awaiting-approval"))
+            .expect("awaiting-approval");
+        assert_eq!(
+            json::get_str(waiting, "permissionId"),
+            Some(asked.id.as_str())
+        );
+        let done = items(&ops, &call).pop().unwrap();
+        let tool = json::get(done, "tool").unwrap();
+        assert_eq!(json::get_str(tool, "status"), Some("completed"));
+        let diffs = json::get(tool, "diffs")
+            .and_then(json::as_arr)
+            .expect("diffs");
+        assert!(
+            json::get_str(&diffs[0], "patch")
+                .unwrap()
+                .contains("+hello world")
+        );
+        assert_eq!(json::get_i64(&diffs[0], "additions"), Some(1));
+    }
+
+    #[test]
+    fn reject_with_message_reaches_reply_route() {
+        let r = rig(Opts::default(), SID);
+        let (asked, rest) = split(REJECT, "permission.replied");
+        r.feed(asked);
+        let pid = "per_1a6f433780014gQkcE3qRjTXtd";
+        assert!(r.ad.knows_permission(pid));
+        let ack = r.decide(
+            pid,
+            "reject",
+            Some("Not now - phone user declined."),
+            vec![],
+        );
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        let sent = r.requests(&format!("/permission/{pid}/reply"));
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].ends_with(r#"{"reply":"reject","message":"Not now - phone user declined."}"#),
+            "{}",
+            sent[0]
+        );
+        assert!(!r.ad.knows_permission(pid));
+        // our own reply: the echo resolves nothing twice, the card is denied
+        r.events();
+        r.feed(rest);
+        assert!(
+            !r.events()
+                .iter()
+                .any(|e| matches!(e, EventKind::PermissionResolved(_)))
+        );
+        assert_eq!(
+            tool_statuses(&r.ops(SID), "call_mncm01jw").last().unwrap(),
+            "denied"
+        );
+    }
+
+    #[test]
+    fn question_round_trip() {
+        let r = rig(Opts::default(), QUESTION_SID);
+        let (asked, rest) = split(QUESTION, "question.replied");
+        r.feed(asked);
+        let q = r
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                EventKind::PermissionRequested(p) => Some(p),
+                _ => None,
+            })
+            .expect("question asked");
+        assert!(q.id.starts_with("que_"));
+        let detail = q.detail.as_ref().unwrap();
+        assert_eq!(json::get_str(detail, "kind"), Some("question"));
+        let first = &json::get(detail, "questions")
+            .and_then(json::as_arr)
+            .unwrap()[0];
+        assert_eq!(json::get_str(first, "id"), Some("0"));
+        let labels: Vec<&str> = json::get(first, "options")
+            .and_then(json::as_arr)
+            .unwrap()
+            .iter()
+            .filter_map(|o| json::get_str(o, "label"))
+            .collect();
+        assert!(
+            labels.contains(&"tabs") && labels.contains(&"spaces"),
+            "{labels:?}"
+        );
+        assert_eq!(
+            q.options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+            ["answer", "skip"]
+        );
+        let call = q.tool_item_id.clone().expect("question tool call");
+        assert_eq!(
+            tool_statuses(&r.ops(QUESTION_SID), &call).last().unwrap(),
+            "awaiting-approval"
+        );
+        // answered from the phone: one label array per question, in order
+        let ack = r.decide(
+            &q.id,
+            "answer",
+            None,
+            vec![("0".into(), vec!["tabs".into()])],
+        );
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        let sent = r.requests(&format!("/question/{}/reply", q.id));
+        assert!(
+            sent[0].ends_with(r#"{"answers":[["tabs"]]}"#),
+            "{}",
+            sent[0]
+        );
+        r.feed(rest);
+        assert_eq!(
+            tool_statuses(&r.ops(QUESTION_SID), &call).last().unwrap(),
+            "completed"
+        );
+
+        // asked again and answered in the TUI → resolved natively; skipping
+        // from the phone uses the reject route
+        let (asked, _) = split(QUESTION, "question.replied");
+        r.feed(asked);
+        r.feed(&r#"data: {"payload":{"type":"question.replied","properties":{"sessionID":"S","requestID":"Q","answers":[["spaces"]]}}}"#.replace("S", QUESTION_SID).replace("Q", &q.id));
+        let resolved = r.events().into_iter().find_map(|e| match e {
+            EventKind::PermissionResolved(p) => Some(p),
+            _ => None,
+        });
+        assert_eq!(
+            resolved.map(|p| (p.status, p.decision)),
+            Some(("approved".into(), Some("approve-once".into())))
+        );
+        r.feed(asked);
+        let ack = r.decide(&q.id, "skip", None, vec![]);
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        assert_eq!(r.requests(&format!("/question/{}/reject", q.id)).len(), 1);
+    }
+
+    #[test]
+    fn todo_updated_becomes_plan() {
+        let r = rig(Opts::default(), SID);
+        r.feed(TODO);
+        let ops = r.ops(SID);
+        let plan = items(&ops, "plan").pop().expect("plan item");
+        assert_eq!(json::get_str(plan, "kind"), Some("plan"));
+        let steps: Vec<(&str, &str)> = json::get(plan, "steps")
+            .and_then(json::as_arr)
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    json::get_str(s, "text").unwrap(),
+                    json::get_str(s, "status").unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(steps, [("write tests", "pending"), ("ship it", "pending")]);
+    }
+
+    #[test]
+    fn abort_is_interrupted_not_failed() {
+        let r = rig(Opts::default(), SID);
+        submit_to(&r.ad, SID, "cmd-p");
+        let (streaming, rest) = split(ABORT, "session.error");
+        r.feed(streaming);
+        let ack =
+            r.ad.send(&ClientMsg::Interrupt {
+                command_id: "cmd-i".into(),
+                session_id: SID.into(),
+            })
+            .unwrap();
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }));
+        // accepted on the native confirmation; the turn has not ended yet
+        let before = r.events();
+        assert!(before.iter().any(|e| matches!(e, EventKind::CommandProgress { command_id, state, .. } if command_id == "cmd-i" && state == "accepted")));
+        assert!(results(&before).is_empty(), "{before:?}");
+        r.feed(rest);
+        let after = r.events();
+        assert_eq!(
+            results(&after),
+            [
+                ("cmd-p".to_string(), "cancelled".to_string()),
+                ("cmd-i".to_string(), "completed".to_string())
+            ]
+        );
+        let ops = r.ops(SID);
+        let turn = turn(&ops, "msg_1a6f4d6d2001gIe4k034JayBNS").expect("turn");
+        assert_eq!(json::get_str(turn, "status"), Some("interrupted"));
+        assert!(json::get_str(turn, "error").is_none());
+    }
+
+    #[test]
+    fn idle_completes_the_prompt_command() {
+        let r = rig(Opts::default(), SID);
+        submit_to(&r.ad, SID, "cmd-1");
+        r.feed(APPROVE);
+        let events = r.events();
+        let running = events
+            .iter()
+            .filter(|e| matches!(e, EventKind::CommandProgress { command_id, state, .. } if command_id == "cmd-1" && state == "running"))
+            .count();
+        assert_eq!(running, 1, "running once, however often busy repeats");
+        assert_eq!(
+            results(&events),
+            [("cmd-1".to_string(), "completed".to_string())]
+        );
+        let ops = r.ops(SID);
+        let turn = turn(&ops, "msg_1a6f29c8f001OaOj6wOaB61V5O").unwrap();
+        assert_eq!(json::get_str(turn, "status"), Some("completed"));
+        let usage = json::get(turn, "usage").unwrap();
+        assert_eq!(json::get_i64(usage, "inputTokens"), Some(7815 + 54));
+        assert_eq!(json::get_i64(usage, "outputTokens"), Some(62 + 23));
+        assert_eq!(json::get_i64(usage, "cacheReadTokens"), Some(7811));
+        assert!(
+            json::get(turn, "costUsd").is_none(),
+            "a local model costs nothing"
+        );
+    }
+
+    #[test]
+    fn double_idle_is_idempotent() {
+        let r = rig(Opts::default(), SID);
+        r.feed(APPROVE);
+        let idle: String = APPROVE
+            .lines()
+            .filter(|l| {
+                l.contains(r#""type":"session.idle""#) || l.contains(r#""status":{"type":"idle"}"#)
+            })
+            .map(|l| format!("{l}\n\n"))
+            .collect();
+        assert!(!idle.is_empty());
+        let (events, ops) = (r.events().len(), r.ops(SID).len());
+        assert!(events > 0);
+        r.feed(&idle);
+        r.feed(&idle);
+        assert!(r.events().is_empty());
+        assert_eq!(r.ops(SID).len(), ops);
+    }
+
+    #[test]
+    fn retry_status_becomes_notice() {
+        let r = rig(Opts::default(), SID);
+        r.feed(RETRY);
+        let ops = r.ops(SID);
+        let notices: Vec<&Json> = ops
+            .iter()
+            .filter_map(|o| json::get(o, "item"))
+            .filter(|i| json::get_str(i, "kind") == Some("notice"))
+            .collect();
+        let ids: std::collections::BTreeSet<&str> = notices
+            .iter()
+            .filter_map(|n| json::get_str(n, "id"))
+            .collect();
+        assert_eq!(ids.len(), 1, "one notice per turn, updated in place");
+        let last = notices.last().unwrap();
+        assert_eq!(json::get_str(last, "level"), Some("warning"));
+        assert_eq!(
+            json::get_str(last, "text"),
+            Some(
+                "Retrying: Free usage exceeded, subscribe to Go (subscribe: https://opencode.ai/go)"
+            )
+        );
+        // still a running turn, never a failure
+        assert!(
+            !r.events()
+                .iter()
+                .any(|e| matches!(e, EventKind::CommandResult { .. }))
+        );
+    }
+
+    #[test]
+    fn mcp_needs_auth_is_polled_and_auth_start_returns_url() {
+        let auth = r#"{"authorizationUrl":"https://mcp.sentry.dev/oauth/authorize?response_type=code&client_id=<redacted>&code_challenge=<redacted>&code_challenge_method=S256&redirect_uri=http%3A%2F%2F127.0.0.1%3A19876%2Fmcp%2Foauth%2Fcallback&state=st-1&scope=org%3Aread","oauthState":"st-1"}"#;
+        let r = rig(
+            Opts {
+                routes: vec![
+                    ("GET /mcp".into(), MCP.into()),
+                    ("POST /mcp/sentry/auth".into(), auth.into()),
+                    (
+                        "POST /mcp/sentry/auth/callback".into(),
+                        r#"{"status":"connected"}"#.into(),
+                    ),
+                    (
+                        "POST /mcp/sentry/auth/authenticate".into(),
+                        r#"{"status":"connected"}"#.into(),
+                    ),
+                ],
+                ..Default::default()
+            },
+            SID,
+        );
+        let mcp = |r: &Rig| -> Option<Json> {
+            r.ops(SID)
+                .into_iter()
+                .rev()
+                .find(|o| json::get_str(o, "op") == Some("mcp"))
+                .and_then(|o| {
+                    json::get(&o, "servers")
+                        .and_then(json::as_arr)
+                        .map(|a| a[0].clone())
+                })
+        };
+        // polled when the first phone subscribes
+        r.ad.on_subscribe(SID);
+        wait_for("mcp op", || mcp(&r).is_some());
+        let sentry = mcp(&r).unwrap();
+        assert_eq!(json::get_str(&sentry, "name"), Some("sentry"));
+        assert_eq!(json::get_str(&sentry, "status"), Some("needs-auth"));
+        assert_eq!(
+            json::stringify(json::get(&sentry, "authFlows").unwrap()),
+            r#"["desktop","phone-callback"]"#
+        );
+        // phone flow: the URL to open and the dead page's prefix
+        let ack =
+            r.ad.send(&ClientMsg::McpAuth {
+                command_id: "cmd-auth".into(),
+                session_id: SID.into(),
+                server: "sentry".into(),
+                flow: "phone-callback".into(),
+            })
+            .unwrap();
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        let sentry = mcp(&r).unwrap();
+        let state = json::get(&sentry, "auth").expect("auth state");
+        assert_eq!(json::get_str(state, "state"), Some("awaiting-callback"));
+        assert!(
+            json::get_str(state, "url")
+                .unwrap()
+                .starts_with("https://mcp.sentry.dev/oauth/authorize?")
+        );
+        assert_eq!(
+            json::get_str(state, "callbackPrefix"),
+            Some("http://127.0.0.1:19876/mcp/oauth/callback")
+        );
+        // the pasted dead page completes it (code forwarded), once
+        let callback = |cmd: &str| {
+            r.ad.send(&ClientMsg::McpAuthCallback {
+                command_id: cmd.into(),
+                session_id: SID.into(),
+                server: "sentry".into(),
+                callback_url: "http://127.0.0.1:19876/mcp/oauth/callback?code=c0de&state=st-1"
+                    .into(),
+            })
+            .unwrap()
+        };
+        assert!(matches!(
+            callback("cmd-cb"),
+            ServerMsg::Ack { ok: true, .. }
+        ));
+        let mut done = Vec::new();
+        wait_for("callback results", || {
+            done.extend(results(&r.events()));
+            done.len() >= 2
+        });
+        assert!(
+            done.contains(&("cmd-auth".into(), "completed".into())),
+            "{done:?}"
+        );
+        assert!(
+            done.contains(&("cmd-cb".into(), "completed".into())),
+            "{done:?}"
+        );
+        assert!(r.requests("/auth/callback")[0].ends_with(r#"{"code":"c0de"}"#));
+        assert!(matches!(
+            callback("cmd-cb2"),
+            ServerMsg::Ack { ok: false, .. }
+        ));
+        // desktop flow: OpenCode signs in through the desktop browser
+        let ack =
+            r.ad.send(&ClientMsg::McpAuth {
+                command_id: "cmd-desk".into(),
+                session_id: SID.into(),
+                server: "sentry".into(),
+                flow: "desktop".into(),
+            })
+            .unwrap();
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }));
+        let mut done = Vec::new();
+        wait_for("desktop result", || {
+            done.extend(results(&r.events()));
+            !done.is_empty()
+        });
+        assert_eq!(done, [("cmd-desk".to_string(), "completed".to_string())]);
+        r.ad.dispose();
+    }
+
+    #[test]
+    fn hydrates_items_from_messages_on_subscribe_and_reconnect() {
+        let r = rig(
+            Opts {
+                routes: vec![(format!("GET /session/{SID}/message"), MESSAGES.into())],
+                sse_hold: false,
+                ..Default::default()
+            },
+            SID,
+        );
+        r.ad.on_subscribe(SID);
+        let has = |r: &Rig, id: &str| !items(&r.ops(SID), id).is_empty();
+        wait_for("hydrated", || has(&r, "call_mncm01jw"));
+        let ops = r.ops(SID);
+        let user = items(&ops, "msg_1a6f29c8f001OaOj6wOaB61V5O")[0];
+        assert_eq!(json::get_str(user, "kind"), Some("user"));
+        assert!(
+            json::get_str(user, "text")
+                .unwrap()
+                .contains("echo hi > note.txt")
+        );
+        assert_eq!(tool_statuses(&ops, "call_22tnronp"), ["completed"]);
+        assert_eq!(tool_statuses(&ops, "call_mncm01jw"), ["denied"]);
+        let answer = items(&ops, "prt_1a6f4061b001rO2jCZOA6vpqqz");
+        assert_eq!(
+            answer.first().and_then(|i| json::get_str(i, "text")),
+            Some("DONE")
+        );
+        let first = turn(&ops, "msg_1a6f29c8f001OaOj6wOaB61V5O").unwrap();
+        assert_eq!(json::get_str(first, "status"), Some("completed"));
+        assert!(json::get(first, "usage").is_some());
+        let aborted = turn(&ops, "msg_1a6f4d6d2001gIe4k034JayBNS").unwrap();
+        assert_eq!(json::get_str(aborted, "status"), Some("interrupted"));
+        // every SSE (re)connect rebuilds the watched transcript
+        let path = format!("/session/{SID}/message");
+        r.ad.start_events().unwrap();
+        wait_for("re-hydrated after reconnect", || {
+            r.requests(&path).len() >= 3
+        });
+        r.ad.dispose();
     }
 }

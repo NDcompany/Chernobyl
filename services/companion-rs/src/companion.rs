@@ -273,8 +273,7 @@ impl Companion {
         }
 
         // Live runtimes are pushed to `companion.runtimes` here, each built
-        // with `companion.hub()` to stream its transcripts (ADR-015 §3.3);
-        // OpenCode streams once its rich parts land (step 5).
+        // with `companion.hub()` to stream its transcripts (ADR-015 §3.3).
 
         // ADR-015 §4.3: Codex app-server runtimes. The child is spawned on
         // the first session; the boot probe only resolves the binary.
@@ -310,7 +309,12 @@ impl Companion {
             // programmatic configs fall back to OpenCode's documented
             // serve default.
             let endpoint = endpoint.unwrap_or_else(|| "http://127.0.0.1:4096".to_string());
-            let oc = Arc::new(OpenCodeAdapter::new(&id, &endpoint, auth.as_deref()));
+            let oc = Arc::new(OpenCodeAdapter::with_hub(
+                &id,
+                &endpoint,
+                auth.as_deref(),
+                companion.hub(),
+            ));
             let probe = oc.refresh();
             {
                 let mut mgr = companion.shared.adapters.lock().unwrap();
@@ -2516,6 +2520,50 @@ mod tests {
         let snap = comp.snapshot();
         assert_eq!(snap.hosts.len(), demo.hosts.len());
         assert_eq!(snap.permissions.len(), demo.permissions.len());
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    // ---- ADR-015 step 5: OpenCode conversation text stays in memory ----
+
+    #[test]
+    fn user_text_is_not_echoed_or_journaled() {
+        use crate::opencode::tests::{APPROVE, SID};
+        let sessions =
+            format!(r#"[{{"id":"{SID}","title":"capture","time":{{"created":1,"updated":2}}}}]"#);
+        let f = start_fake(FakeOpts {
+            sse: Some(APPROVE.into()),
+            // the phone subscribes before the turn streams
+            sse_delay_ms: 300,
+            routes: vec![("GET /session".into(), sessions)],
+            ..Default::default()
+        });
+        let c = with_opencode(temp_config("oc-echo"), &f.addr);
+        let comp = Companion::boot(c.clone()).unwrap();
+        let (out, _rx) = crate::server::Outbound::new(Arc::new(Saturation::default()), false);
+        let ack = comp.subscribe(7, &out, "sub-1", SID, None);
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        // the turn ran: its permission was journaled, it went idle
+        let journal = |needle: &str| {
+            let store = comp.shared.storage.lock().unwrap();
+            store.events.iter().any(|e| e.payload.contains(needle))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(journal("per_1a6f3f4040012zUvvUmJzvZF6K") && journal(r#""status":"completed""#)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the captured turn never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // the prompt and the answer are transcript items, never activity
+        assert!(!journal("single word DONE"), "user text journaled");
+        assert!(!journal(r#""text":"DONE""#), "assistant text journaled");
+        let ops = comp.hub().ops(SID).join("\n");
+        assert!(
+            ops.contains(r#""kind":"user""#) && ops.contains("single word DONE"),
+            "{ops}"
+        );
         comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }

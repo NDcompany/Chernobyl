@@ -31,7 +31,14 @@ Everything lives in one folder: `%APPDATA%\CHERNOBYL` by default, or `CHERNOBYL_
 | Backups you create (`--backup`) | the folder you choose: keep it one only you can write, because the `.sha256` sidecar catches corruption, not deliberate edits | restore | until you delete them |
 
 What it does **not** store: the transport token (environment variable only), your agents'
-conversation history, or file contents. Two credentials are stored in plaintext: the OpenCode
+conversation history, or file contents. Live transcripts (prompts, replies, reasoning, tool
+input and output, diffs) that a subscribed phone watches are held **in memory only**: redacted
+for known secret shapes, size-capped, and dropped an hour after a session ends. They are never
+journaled. OpenCode conversation text used to be republished as journaled activity events;
+since ADR-015 step 5 it is not. Permission requests are journaled as before, with their
+command or patterns and, for an edit, the diff OpenCode shows, redacted and capped. An
+`mcp_auth_callback` command is journaled with its callback URL replaced by `<redacted>`, because
+it carries a one-time authorization code. Two credentials are stored in plaintext: the OpenCode
 `basicAuth` in `companion.json` and the control key. Only the folder's permissions protect
 them. The default `%APPDATA%\CHERNOBYL` is readable by your Windows account and administrators
 only, but the files go wherever a copy of the folder goes: a roaming profile, a support bundle,
@@ -53,7 +60,7 @@ or secrets. They are served on loopback; beyond loopback `/health` requires the 
 | Pairing payload (host id, endpoints, device id, per-device key) and the optional token | OS keystore (`expo-secure-store`, unlocked-device only) | until you unpair the host |
 | App settings, onboarding flag, display name | app SQLite database | until the app is uninstalled or data cleared |
 | Your approval decisions (permission id, agent, command text, decision, risk, time) | app SQLite database | newest **1 000** |
-| Live state (sessions, approvals) | memory, refreshed from the companion | not persisted |
+| Live state (sessions, approvals, live transcripts) | memory, refreshed from the companion | not persisted |
 
 The phone shows local notifications for approval requests and finished sessions. There is no
 push service (no FCM/APNs), so notification content never leaves the device.

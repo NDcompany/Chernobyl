@@ -1317,6 +1317,14 @@ impl HubHandle {
         self.hub().is_subscribed(session)
     }
 
+    /// True while the session has a transcript or a subscriber. A runtime
+    /// that streams on demand (OpenCode sees every session of its server)
+    /// pushes only then, so unwatched sessions cost no hub memory.
+    pub fn streams(&self, session: &str) -> bool {
+        let hub = self.hub();
+        hub.has(session) || hub.is_subscribed(session)
+    }
+
     /// Counts a malformed runtime frame on `/health` (`runtimeMalformed`).
     pub fn malformed(&self) {
         self.hub().malformed();

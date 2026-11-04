@@ -782,7 +782,7 @@ pub fn check_callback_url(
 
 /// `application/x-www-form-urlencoded` decoding: `+` is a space, `%XX` a
 /// byte. Bad escapes, invalid UTF-8 and control characters are refused.
-fn form_decode(s: &str) -> Result<String, &'static str> {
+pub(crate) fn form_decode(s: &str) -> Result<String, &'static str> {
     let b = s.as_bytes();
     let hex = |k: usize| b.get(k).and_then(|&c| (c as char).to_digit(16));
     let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
@@ -830,6 +830,12 @@ impl<T> PendingAuth<T> {
         self.map
             .insert(key, (now_ms + AUTH_TTL_MS, value))
             .map(|(_, v)| v)
+    }
+
+    /// The pair's entry while it has not expired (what the phone is shown).
+    pub fn get(&self, session: &str, server: &str, now_ms: i64) -> Option<&T> {
+        let (deadline, value) = self.map.get(&(session.to_string(), server.to_string()))?;
+        (now_ms < *deadline).then_some(value)
     }
 
     /// Removes the pair's entry and returns it if it has not expired. Taking
