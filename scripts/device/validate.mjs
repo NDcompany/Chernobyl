@@ -9,7 +9,8 @@
 //
 // Emulator networking: the companion stays bound to loopback and the phone
 // dials ws://10.0.2.2:<port> (the emulator's alias for the host loopback).
-import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, existsSync, openSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import * as a from './adb.mjs';
 import * as c from './companion.mjs';
@@ -29,10 +30,11 @@ let comp = null;
 let deviceId = null;
 
 const shot = (row, name) => a.screenshot(join(OUT, `${row}-${name}.png`));
+/** `pass: null` records NOT RUN (the observation says why). */
 const record = (row, pass, observed) => {
   results[row] = { pass, observed, at: new Date().toISOString() };
   writeFileSync(resultsPath, JSON.stringify(results, null, 2));
-  console.log(`${pass ? 'PASS' : 'FAIL'} ${row} — ${observed}`);
+  console.log(`${pass === null ? 'NOT RUN' : pass ? 'PASS' : 'FAIL'} ${row} — ${observed}`);
 };
 const logTail = (n = 12) => c.logText(comp).split('\n').filter(Boolean).slice(-n).join('\n');
 const saveLog = (row) => writeFileSync(join(OUT, `${row}-companion.txt`), logTail(30));
@@ -322,7 +324,7 @@ const ROWS = {
     for (let i = 0; i < 10 && !gone; i++) {
       await a.sleep(1000);
       const nodes = a.dump();
-      const cut = nodes.findIndex((n) => n.text === 'Decided');
+      const cut = nodes.findIndex((n) => /^decided$/i.test(n.text));
       gone = !(cut >= 0 ? nodes.slice(0, cut) : nodes).some((n) => n.text === perm.command);
     }
     shot('4.3', 'after-other-client');
@@ -511,8 +513,8 @@ function openPairingLink(payload) {
   a.shell(`am start -a android.intent.action.VIEW -d 'chernobyl://connect-host?payload=${encodeURIComponent(payload)}' ${PKG}`);
 }
 async function ensurePaired(row) {
-  // rows 1.3/7.3 leave a token-requiring companion behind
-  if (!comp || comp.token) {
+  // rows 1.3/7.3 leave a token-requiring companion behind; section 9 a live one
+  if (!comp || comp.token || comp.live) {
     await start();
     deviceId = null;
   }
@@ -551,20 +553,677 @@ async function scrollTo(match, swipes = 6) {
   }
   throw new Error(`not found after scrolling: ${match}`);
 }
-async function newTask(title, message, { doubleTap = false, expectNavigate = true, afterTap } = {}) {
+async function newTask(title, message, { doubleTap = false, expectNavigate = true, afterTap, verified = false, agent } = {}) {
   await a.tap(await scrollTo('Start a new task'));
   await a.waitFor('Start session', 15_000);
+  if (agent) await a.tap(agent);
   await a.tap('Fix flaky API tests');
   a.type(title);
   a.key('KEYCODE_BACK');
   await a.tap('Describe what the agent should do');
-  a.type(message);
+  if (verified) await a.typeVerified(message);
+  else a.type(message);
   a.key('KEYCODE_BACK');
   const btn = await a.waitFor('Start a new agent session', 10_000);
   a.shell(`input tap ${btn.x} ${btn.y}`);
   if (doubleTap) a.shell(`input tap ${btn.x} ${btn.y}`);
   if (afterTap) afterTap();
   if (expectNavigate) await a.sleep(2500);
+}
+
+/* ---- section 9 (ADR-015 §7 step 11): live sessions on the real Claude Code CLI ---- */
+
+// Its own CHERNOBYL_HOME: only the claude adapter (no demo agents), one
+// allow-listed workspace that must not contain the data dir (§4.2.3).
+const LIVE_HOME = join(process.env.TEMP ?? '.', 'chernobyl-device-run-live');
+const LIVE_WS = process.env.LIVE_WS ?? join(process.env.TEMP ?? '.', 'chernobyl-live-ws');
+// every child claude.exe runs this model: tiny prompts on Haiku cost cents per run
+const LIVE_MODEL = process.env.LIVE_MODEL ?? 'haiku';
+const FAKE_KEY = 'sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKEFAKE';
+const live = { sid: null, sids: [], obs: null, costs: new Map(), model: null, echoTurns: null, queued: new Set() };
+
+async function startLive(extraAdapters = []) {
+  mkdirSync(LIVE_WS, { recursive: true });
+  mkdirSync(LIVE_HOME, { recursive: true });
+  const cfg = {
+    version: 1,
+    name: 'CHERNOBYL host',
+    dataDir: LIVE_HOME,
+    adapters: [{ id: 'claude-1', type: 'claude', enabled: true, workspaces: [LIVE_WS], maxSessions: 3 }, ...extraAdapters],
+    retention: { events: 5000, commands: 5000, eventsMaxAgeMs: 604800000 },
+    diagnostics: { port: 9487 },
+    probeIntervalMs: 15000,
+    server: { port: 8787, bind: '127.0.0.1', requireE2e: false },
+  };
+  writeFileSync(join(LIVE_HOME, 'companion.json'), JSON.stringify(cfg, null, 2));
+  // the runner may itself run inside Claude Code: none of its session
+  // variables may reach the child CLI, only the model choice
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(CLAUDE|ANTHROPIC_)/i.test(k)));
+  env.ANTHROPIC_MODEL = LIVE_MODEL;
+  if (comp) c.stopCompanion(comp);
+  live.obs?.close();
+  live.obs = null;
+  await a.sleep(800);
+  comp = c.startCompanion({ home: LIVE_HOME, log: join(OUT, '9-companion-full.txt'), env });
+  comp.live = true;
+  await c.waitListening(comp);
+}
+
+/** A loopback client subscribed to the live sessions: the companion's own
+ *  view of each transcript, to compare the phone against, plus turn costs. */
+async function observer() {
+  if (live.obs && live.obs.closed == null) return live.obs;
+  const o = await hc.connect(`ws://127.0.0.1:${comp.port}`);
+  o.send({ type: 'hello', clientId: 'device-run-observer', protocol: 2 });
+  o.views = new Map();
+  o.ws.on('message', (d) => {
+    let m;
+    try {
+      m = JSON.parse(d.toString());
+    } catch {
+      return;
+    }
+    if (m.type !== 'transcript' && m.type !== 'transcript_snapshot') return;
+    let v = o.views.get(m.sessionId);
+    if (!v || m.type === 'transcript_snapshot') {
+      v = { items: new Map(), turns: new Map(), state: v?.state ?? null, mcp: v?.mcp ?? [] };
+      o.views.set(m.sessionId, v);
+    }
+    const turn = (t) => {
+      v.turns.set(t.id, t);
+      if (t.costUsd != null) live.costs.set(t.id, t.costUsd);
+    };
+    const state = (s) => {
+      v.state = s;
+      if (s?.model) live.model = s.model;
+    };
+    if (m.type === 'transcript_snapshot') {
+      for (const it of m.items) v.items.set(it.id, it);
+      m.turns.forEach(turn);
+      state(m.state);
+      v.mcp = m.mcp;
+      return;
+    }
+    for (const op of m.ops) {
+      if (op.op === 'item') {
+        v.items.set(op.item.id, op.item);
+        if (op.item.kind === 'user' && op.item.queued) live.queued.add(op.item.text);
+      }
+      else if (op.op === 'append') {
+        const it = v.items.get(op.id);
+        if (it && op.field === 'text') it.text += op.text;
+        else if (it?.tool) it.tool[op.field] = (it.tool[op.field] ?? '') + op.text;
+      } else if (op.op === 'turn') turn(op.turn);
+      else if (op.op === 'state') state(op.state);
+      else if (op.op === 'mcp') v.mcp = op.servers;
+    }
+  });
+  for (const sid of live.sids) o.send({ type: 'session_subscribe', commandId: `obs-${Date.now()}-${sid}`, sessionId: sid });
+  live.obs = o;
+  return o;
+}
+const view = () => live.obs?.views.get(live.sid) ?? { items: new Map(), turns: new Map(), state: null, mcp: [] };
+const endedTurns = () => [...view().turns.values()].filter((t) => t.status !== 'running');
+const totalCost = () => [...live.costs.values()].reduce((x, y) => x + y, 0);
+/** The companion snapshot (`state` replies carry no commandId: take the next one). */
+async function snapshotNow() {
+  const o = await observer();
+  o.send({ type: 'list_state', commandId: `ls-${Date.now()}` });
+  const st = await o.next((t) => t.includes('"type":"state"'), 5000, true);
+  return st ? JSON.parse(st).snapshot : null;
+}
+async function until(f, ms, step = 500) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const v = await f();
+    if (v) return v;
+    if (Date.now() > deadline) return null;
+    await a.sleep(step);
+  }
+}
+
+/** One of the app's own views (never a system dialog: the inline "Allow" is the app's). */
+const appNode = (re, nodes = a.dump()) => nodes.find((n) => n.pkg === PKG && (re.test(n.text) || re.test(n.desc))) ?? null;
+const waitApp = (re, ms = 15_000) => until(() => appNode(re), ms);
+async function tapApp(re, ms = 15_000) {
+  const n = (await waitApp(re, ms)) ?? (await reveal(re));
+  if (!n) throw new Error(`not on screen: ${re}\nscreen: ${a.screenText().slice(0, 600)}`);
+  return a.tap(n);
+}
+
+async function ensureLive(row) {
+  if (!comp?.live) {
+    await startLive();
+    deviceId = null;
+  }
+  if (!deviceId) await freshPair(row);
+  await goHome();
+  if (!(await waitText(/hosts? online/, 45_000))) throw new Error('phone not connected');
+  await observer();
+}
+async function openSession(sid) {
+  a.shell(`am start -a android.intent.action.VIEW -d 'chernobyl:///session/${sid}' ${PKG}`);
+  await waitApp(/^Message Claude Code/, 20_000);
+}
+/** Starts a Claude session from the phone's new-task screen; resolves its id from the companion. */
+async function newLiveSession(title, prompt) {
+  await newTask(title, prompt, { verified: true });
+  const sid = await until(async () => (await snapshotNow())?.sessions?.find((s) => s.title === title)?.id, 30_000, 1000);
+  if (!sid) throw new Error(`no session titled ${title}`);
+  live.sid = sid;
+  live.sids.push(sid);
+  live.obs.send({ type: 'session_subscribe', commandId: `obs-${Date.now()}`, sessionId: sid });
+  return sid;
+}
+/** The shared conversation for rows 9.2-9.11 (one CLI process keeps the cost down). */
+async function ensureLiveSession(row) {
+  await ensureLive(row);
+  if (!live.sid) {
+    await newLiveSession('Live session', 'Reply with the word OK.');
+    await waitTurnEnd(0, 120_000);
+  } else await openSession(live.sid);
+}
+/** Taps "Jump to latest" until it goes: one tap often lands short of the end
+ *  after a long text item (app issue); the extra taps are counted for the report. */
+async function jumpLatest() {
+  for (let i = 0; i < 5; i++) {
+    const j = appNode(/^Jump to latest$/);
+    if (!j) return;
+    if (i > 0) live.extraJumps = (live.extraJumps ?? 0) + 1;
+    await a.tap(j);
+    await a.sleep(800);
+  }
+}
+/** Scrolls the conversation down until `re` shows: an expanded card can run
+ *  past the composer, and the list does not always follow new items (app
+ *  issue: no "Jump to latest" pill either, 9.10-approval.png). */
+async function reveal(re) {
+  for (let i = 0; i < 4; i++) {
+    const n = await waitApp(re, 2000);
+    if (n) return n;
+    a.shell('input swipe 360 1000 360 650 300');
+    await a.sleep(700);
+  }
+  return null;
+}
+/** Types a prompt into the conversation composer; `sendTyped()` taps Send. */
+async function typePrompt(text) {
+  const field = await tapApp(/^Message .+…$/);
+  await a.typeVerified(text);
+  if (!live.kbShot) {
+    // the conversation view does not move the composer above the keyboard
+    live.kbShot = true;
+    shot('9', 'keyboard-over-composer');
+  }
+  return field;
+}
+/** The soft keyboard covers the composer (the Send node stays in the tree
+ *  under it, so a tap would hit a key): hide it first. */
+async function hideKeyboard() {
+  if (/mInputShown=true/.test(a.shell('dumpsys input_method'))) {
+    a.key('KEYCODE_BACK');
+    await a.sleep(600);
+  }
+}
+async function sendTyped() {
+  await hideKeyboard();
+  return tapApp(/^Send prompt to agent$/, 5000);
+}
+async function sendPrompt(text) {
+  await typePrompt(text);
+  await sendTyped();
+}
+/** Waits until more turns have ended than `n0` and none runs. */
+const waitTurnEnd = (n0, ms = 120_000) =>
+  until(() => endedTurns().length > n0 && ![...view().turns.values()].some((t) => t.status === 'running'), ms, 1000);
+/** The session's pending request (snapshot record), once Claude asked. */
+const waitPerm = (ms = 120_000) =>
+  until(async () => (await snapshotNow())?.permissions?.find((p) => p.sessionId === live.sid && p.status === 'pending'), ms, 1500);
+/** Requests the runner may allow: inside the workspace (a bare name or a path under it). */
+const inWorkspace = (p) => {
+  const cmd = p.command ?? '';
+  const norm = (s) => s.replace(/\\/g, '/').toLowerCase();
+  return !cmd.includes('..') && (norm(cmd).includes(norm(LIVE_WS)) || !/[\\/]|[a-z]:/i.test(cmd));
+};
+/** The phone's text item that starts with `prefix` (number runs keep rows apart). */
+const phoneText = (prefix, nodes = a.dump()) => nodes.find((n) => n.pkg === PKG && n.text.startsWith(prefix))?.text ?? null;
+const obsText = (prefix) => [...view().items.values()].find((i) => i.kind === 'text' && i.text.trimStart().startsWith(prefix)) ?? null;
+const contiguous = (s, from, to) => {
+  const ns = s.trim().split(/\s+/).map(Number);
+  return ns.length === to - from + 1 && ns.every((n, i) => n === from + i);
+};
+
+Object.assign(ROWS, {
+  // 9.1: "Starting Claude Code…", then the text item grows in place
+  async '9.1'() {
+    await ensureLive('9.1');
+    const title = 'Live 9.1';
+    await newTask(title, 'Print the numbers 1 to 1500 separated by spaces.', { verified: true, expectNavigate: false });
+    const sid = await until(async () => (await snapshotNow())?.sessions?.find((s) => s.title === title)?.id, 30_000, 300);
+    if (!sid) throw new Error('no session');
+    live.sid = sid;
+    live.sids.push(sid);
+    live.obs.send({ type: 'session_subscribe', commandId: `obs-${Date.now()}`, sessionId: sid });
+    // the hint shows while the CLI initializes; a dump works then (nothing streams yet)
+    const hint = await until(() => (obsText('1 2 3') ? 'late' : a.find(/Starting Claude Code/)), 30_000, 0);
+    const starting = !!hint && hint !== 'late';
+    if (starting) shot('9.1', 'starting');
+    // while text streams, uiautomator never gets an idle UI (a dump blocks ~11 s and
+    // returns the stale tree), so the phone is sampled by screencap, paired with
+    // the companion's text length at that moment
+    const frames = [];
+    await until(() => {
+      const len = obsText('1 2 3')?.text.length ?? 0;
+      if (len && len !== frames.at(-1)?.len) frames.push({ len, png: a.adb(['exec-out', 'screencap', '-p'], { binary: true }) });
+      return endedTurns().length > 0;
+    }, 120_000, 0);
+    const mid = frames.filter((f) => f.len < 6000);
+    mid.slice(0, 2).forEach((f, i) => writeFileSync(join(OUT, `9.1-stream-${i + 1}.png`), f.png));
+    const differ = mid.length >= 2 && !mid[0].png.equals(mid[1].png);
+    const jumpShown = !!appNode(/^Jump to latest$/);
+    await jumpLatest();
+    const done = await waitApp(/^Done · /, 10_000);
+    shot('9.1', 'done');
+    const finalOk = contiguous(phoneText('1 2 3 4 5') ?? '', 1, 1500);
+    record('9.1', starting && differ && finalOk && !!done && /haiku/i.test(live.model ?? ''), `"Starting Claude Code…" shown=${starting}; phone frames while streaming at companion text lengths ${mid.map((f) => f.len).join(' -> ')} (stream-1/stream-2 differ=${differ}); final phone text is 1..1500=${finalOk}; "Jump to latest" shown at turn end=${jumpShown}; footer "${done?.desc || done?.text || 'none'}"; model=${live.model}; cost so far $${totalCost().toFixed(4)}`);
+  },
+  // 9.3: inline Allow inside the card; the Approvals tab entry clears; the file exists
+  async '9.3'() {
+    await ensureLiveSession('9.3');
+    const n0 = endedTurns().length;
+    await sendPrompt('Create a.txt containing hi.');
+    const perm = await waitPerm();
+    if (!perm) return record('9.3', false, 'no permission request within 120 s');
+    if (!inWorkspace(perm)) return record('9.3', false, `request outside the workspace: ${perm.title}`);
+    await jumpLatest();
+    const card = await waitApp(/^Tool Write: awaiting approval$/, 20_000);
+    shot('9.3', 'inline-approval');
+    await goHome();
+    await a.tap('Approvals');
+    await a.sleep(1500);
+    const pendingRow = (nodes) => {
+      const cut = nodes.findIndex((n) => /^decided$/i.test(n.text));
+      return (cut >= 0 ? nodes.slice(0, cut) : nodes).find((n) => n.pkg === PKG && (n.desc.includes(perm.command) || n.text.includes(perm.command))) ?? null;
+    };
+    const row = pendingRow(a.dump());
+    shot('9.3', 'approvals-pending');
+    // the inbox row opens the conversation at the card
+    if (row) await a.tap(row);
+    else await openSession(live.sid);
+    const atCard = await waitApp(/^Tool Write: awaiting approval$/, 20_000);
+    await tapApp(/^Allow$/);
+    const doneCard = await waitApp(/^Tool Write: completed$/, 60_000);
+    shot('9.3', 'allowed');
+    await waitTurnEnd(n0);
+    await goHome();
+    await a.tap('Approvals');
+    await a.sleep(1500);
+    const cleared = !pendingRow(a.dump());
+    shot('9.3', 'approvals-after');
+    const file = existsSync(join(LIVE_WS, 'a.txt')) ? readFileSync(join(LIVE_WS, 'a.txt'), 'utf8').trim() : null;
+    record('9.3', !!card && !!row && !!atCard && !!doneCard && cleared && file !== null, `inline card "Tool Write: awaiting approval"=${!!card}; listed on the Approvals tab=${!!row}; the row opened the conversation at the card=${!!atCard}; after Allow "Tool Write: completed"=${!!doneCard}; gone from the pending list=${cleared}; a.txt in the workspace=${JSON.stringify(file)}`);
+    await openSession(live.sid);
+  },
+  // 9.2: tool card input then output; the Edit card shows its diff
+  async '9.2'() {
+    await ensureLiveSession('9.2');
+    const n0 = endedTurns().length;
+    await sendPrompt('Create e.txt containing hi, then edit it to say hello.');
+    const allowed = [];
+    for (let i = 0; i < 4; i++) {
+      const perm = await waitPerm(i === 0 ? 120_000 : 30_000);
+      if (!perm) break;
+      await jumpLatest();
+      const n = await waitApp(/^Tool \w+: awaiting approval$/, 20_000);
+      if (i === 0) shot('9.2', 'write-approval');
+      if (/Edit/.test(n?.desc ?? '')) shot('9.2', 'edit-approval');
+      if (!inWorkspace(perm)) {
+        await tapApp(/^Deny$/);
+        continue;
+      }
+      await tapApp(/^Allow$/);
+      allowed.push(/Tool (\w+)/.exec(n?.desc ?? '')?.[1] ?? '?');
+      await a.sleep(2000);
+    }
+    await waitTurnEnd(n0);
+    await jumpLatest();
+    // expand this turn's cards (the lowest match; earlier rows left Write cards
+    // above): Write shows its input and output, then Edit its diff
+    const last = (re) => a.dump().filter((n) => n.pkg === PKG && re.test(n.desc)).sort((p, q) => q.y - p.y)[0] ?? null;
+    const write = last(/^Tool Write: completed$/);
+    if (write) await a.tap(write);
+    await a.sleep(800);
+    const writeScreen = a.screenText();
+    shot('9.2', 'write-expanded');
+    const writeShown = /Input/.test(writeScreen) && /e\.txt/.test(writeScreen) && /File created successfully/.test(writeScreen);
+    if (write) await a.tap(write); // collapse again; the header stays put
+    await a.sleep(800);
+    const edit = last(/^Tool Edit: completed$/);
+    if (edit) await a.tap(edit);
+    await a.sleep(800);
+    // the diff follows the Input block, below the fold
+    const diff = await reveal(/^Diff .*e\.txt/);
+    shot('9.2', 'edit-diff');
+    const obsWrite = [...view().items.values()].find((i) => i.tool?.name === 'Write' && /e\.txt/.test(i.tool.title ?? i.tool.input ?? ''));
+    const content = existsSync(join(LIVE_WS, 'e.txt')) ? readFileSync(join(LIVE_WS, 'e.txt'), 'utf8').trim() : null;
+    record('9.2', writeShown && !!diff, `allowed ${allowed.join(', ')}; Write card expanded shows its Input and the output "File created successfully…"=${writeShown} (companion output ${JSON.stringify(obsWrite?.tool.output?.slice(0, 30) ?? null)}); Edit card diff label: ${diff ? `"${diff.desc}"` : 'none'}; companion Write diff patch ${JSON.stringify(obsWrite?.tool.diffs?.[0]?.patch ?? null)}; e.txt=${JSON.stringify(content)}`);
+  },
+  // 9.4: "Deny and tell Claude why": the tool shows denied, Claude continues, the turn ends
+  async '9.4'() {
+    await ensureLiveSession('9.4');
+    const n0 = endedTurns().length;
+    await sendPrompt('Create b.txt containing hi.');
+    const perm = await waitPerm();
+    if (!perm) return record('9.4', false, 'no permission request within 120 s');
+    await jumpLatest();
+    await waitApp(/^Tool \w+: awaiting approval$/, 20_000);
+    await tapApp(/^More options$/);
+    const why = await reveal(/and tell Claude why$/);
+    if (!why) {
+      shot('9.4', 'more-options');
+      await tapApp(/^Deny$/);
+      return record('9.4', false, `no "… and tell Claude why" choice under More (9.4-more-options.png); the request's options: ${JSON.stringify((perm.options ?? []).map((o) => ({ label: o.label, decision: o.decision, scope: o.scope, takesMessage: o.takesMessage })))}`);
+    }
+    await a.tap(why);
+    await tapApp(/^Reason for Claude$/);
+    await a.typeVerified('Not now. Reply OK.');
+    await hideKeyboard();
+    shot('9.4', 'reason');
+    await tapApp(/^Send reason$/);
+    const denied = await waitApp(/^Tool \w+: denied$/, 30_000);
+    // a retry by another route is refused too: the row is about the turn ending
+    let extra = 0;
+    const ended = await until(async () => {
+      if (await waitTurnEnd(n0, 1)) return true;
+      const again = (await snapshotNow())?.permissions?.some((x) => x.sessionId === live.sid && x.status === 'pending');
+      const deny = again && (await reveal(/^Deny$/));
+      if (deny && extra < 3) {
+        extra++;
+        await a.tap(deny);
+      }
+      return false;
+    }, 120_000, 1500);
+    shot('9.4', 'after');
+    const toolItem = [...view().items.values()].find((i) => i.tool?.permissionId === perm.id);
+    const after = toolItem ? [...view().items.values()].filter((i) => i.kind === 'text' && i.ts >= toolItem.ts && i.turnId === toolItem.turnId) : [];
+    record('9.4', !!denied && !!ended && after.length > 0, `card "${denied?.desc ?? 'no denied mark'}"; turn ended=${!!ended}; Claude's text after the denial: ${JSON.stringify(after.map((i) => i.text).join(' ').slice(0, 120))}; extra requests denied plainly: ${extra}`);
+  },
+  // 9.5: a follow-up mid-turn joins the running turn and is answered in it.
+  // Two cases: sent while text streams (no tool in the turn), and sent while
+  // the turn is about to run a tool (Bash seq)
+  async '9.5'() {
+    await ensureLiveSession('9.5');
+    const cases = [
+      { tag: '9.5a', first: 'Without tools, print 2001 to 2800 separated by spaces.', word: 'PINEAPPLE', streamFirst: true },
+      { tag: '9.5b', first: 'Use bash seq to print 5001 to 5800.', word: 'MANGO', streamFirst: false },
+    ];
+    const notes = [];
+    let pass = true;
+    for (const k of cases) {
+      const n0 = endedTurns().length;
+      const t0 = view().turns.size;
+      const follow = `Then say ${k.word}.`;
+      // no dumps once the turn runs (see 9.1): the follow-up goes in by the
+      // field and button positions found while typing the first prompt
+      const field = await typePrompt(k.first);
+      const send = await sendTyped();
+      await a.tap(field);
+      a.type(follow);
+      await hideKeyboard();
+      await until(() => (k.streamFirst ? [...view().items.values()].some((i) => i.kind === 'text' && i.text.length > 300 && !i.done) : [...view().turns.values()].some((t) => t.status === 'running')), 60_000, 200);
+      const runningAtSend = [...view().turns.values()].some((t) => t.status === 'running');
+      await a.tap(send);
+      await a.sleep(1500);
+      shot(k.tag, 'joins');
+      await waitTurnEnd(n0);
+      await jumpLatest();
+      shot(k.tag, 'answered');
+      const newTurns = [...view().turns.values()].slice(t0);
+      const said = [...view().items.values()].find((i) => i.kind === 'text' && i.text.includes(k.word));
+      const merged = newTurns.length === 1 && said?.turnId === newTurns[0].id;
+      pass &&= runningAtSend && live.queued.has(follow) && merged;
+      notes.push(`${k.tag} (${k.streamFirst ? 'sent while text streamed, no tool' : 'sent before a Bash call'}): sent while the turn ran=${runningAtSend}; companion marked it queued=${live.queued.has(follow)}; turns: ${newTurns.length} (${newTurns.map((t) => t.status).join(', ')}); ${k.word} answered in the first prompt's turn=${merged}`);
+    }
+    record('9.5', pass, `${notes.join('. ')}. While sending, the phone composer says "Joins the current turn" (${cases.map((k) => `${k.tag}-joins.png`).join(', ')}); ${cases.map((k) => `${k.tag}-answered.png`).join(', ')} show the word under its own turn footer`);
+  },
+  // 9.6: Stop mid-stream -> "Stopped"; the next prompt works in the same session
+  async '9.6'() {
+    await ensureLiveSession('9.6');
+    const sid = live.sid;
+    const n0 = endedTurns().length;
+    // long and tool-free (Claude answers a short run with `seq` in a second)
+    await typePrompt('Without tools, print 3001 to 6000 separated by spaces.');
+    const send = await sendTyped();
+    // dumps stall once text streams (see 9.1), so Stop is tapped at its place
+    // left of Send in the composer row (measured on the 720 px emulator)
+    const streaming = await until(() => (obsText('3001 3002')?.text.length ?? 0) > 400, 90_000, 200);
+    shot('9.6', 'streaming');
+    a.shell(`input tap ${send.x - 178} ${send.y}`);
+    await waitTurnEnd(n0, 30_000);
+    await jumpLatest();
+    // the turn footer: an accessible view labelled "Stopped" (a tool card says "Tool …: cancelled")
+    const stopped = (await reveal(/^Stopped$/)) && a.dump().find((n) => n.pkg === PKG && n.desc === 'Stopped');
+    shot('9.6', 'stopped');
+    const interrupted = endedTurns().at(-1)?.status === 'interrupted';
+    const cut = obsText('3001 3002')?.text.trim().split(/\s+/).length ?? 0;
+    const n1 = endedTurns().length;
+    await sendPrompt('Reply with the word OK.');
+    const ok = await waitTurnEnd(n1);
+    await jumpLatest();
+    const done = await waitApp(/^Done · /, 15_000);
+    shot('9.6', 'next-prompt');
+    const last = endedTurns().at(-1);
+    record('9.6', !!streaming && !!stopped && interrupted && !!ok && last?.status === 'completed' && live.sid === sid, `stopped after ${cut} of 3000 numbers; footer "Stopped"=${!!stopped}; companion turn status=${interrupted ? 'interrupted' : endedTurns().at(-2)?.status}; next prompt in the same session -> ${last?.status} ("${done?.desc || 'no footer'}")`);
+  },
+  // 9.7: backgrounded; the approval arrives as a notification; the tap opens the card
+  async '9.7'() {
+    await ensureLiveSession('9.7');
+    const n0 = endedTurns().length;
+    await sendPrompt('Create d.txt containing hi.');
+    a.key('KEYCODE_HOME');
+    let notif = null;
+    for (let i = 0; i < 40 && !notif; i++) {
+      await a.sleep(2000);
+      a.shell('cmd statusbar expand-notifications');
+      await a.sleep(800);
+      notif = a.dump().find((n) => /Approval needed/.test(n.text));
+      if (!notif) a.shell('cmd statusbar collapse');
+    }
+    shot('9.7', 'notification');
+    if (!notif) {
+      launch();
+      return record('9.7', false, 'no approval notification within 90 s');
+    }
+    await a.tap(notif);
+    const card = await waitApp(/^Tool \w+: awaiting approval$/, 20_000);
+    const allow = appNode(/^Allow$/);
+    shot('9.7', 'opened-at-card');
+    await tapApp(/^Deny$/);
+    await waitTurnEnd(n0);
+    record('9.7', !!card && !!allow, `notification "${notif.text}"; the tap opened the conversation with "${card?.desc ?? 'no card'}" and its Allow button on screen=${!!allow}; denied afterwards`);
+  },
+  // 9.8: network off/on mid-stream: the transcript resumes with no gap or duplicate
+  async '9.8'() {
+    await ensureLiveSession('9.8');
+    const n0 = endedTurns().length;
+    await sendPrompt('Print the numbers 4001 to 4800 separated by spaces.');
+    const before = await until(() => obsText('4001 4002')?.text.length, 60_000, 200);
+    shot('9.8', 'streaming');
+    a.shell('svc wifi disable');
+    a.shell('svc data disable');
+    const offline = await waitText(/Not connected|Reconnecting/, 30_000);
+    shot('9.8', 'offline');
+    await waitTurnEnd(n0, 120_000);
+    await a.sleep(5000);
+    netOn();
+    await until(() => !/Not connected/.test(a.screenText()), 90_000, 1000);
+    await jumpLatest();
+    const final = await until(() => {
+      const t = phoneText('4001 4002');
+      return t && /4800\s*$/.test(t) ? t : null;
+    }, 60_000, 1000);
+    shot('9.8', 'resumed');
+    const copies = a.dump().filter((n) => n.pkg === PKG && n.text.startsWith('4001 4002')).length;
+    const ref = obsText('4001 4002')?.text ?? '';
+    const norm = (s) => (s ?? '').trim().replace(/\s+/g, ' ');
+    const same = !!final && norm(final) === norm(ref);
+    record('9.8', !!before && before < ref.length && !!offline && same && contiguous(final ?? '', 4001, 4800) && copies === 1, `network cut at ${before} of ${ref.length} chars of the companion's text item (9.8-streaming.png); offline banner=${!!offline}; after reconnect the phone text equals the companion's item=${same}, is 4001..4800 contiguous (no gap, no repeat)=${contiguous(final ?? '', 4001, 4800)}; copies on screen=${copies}`);
+  },
+  // 9.9: the MCP chip and sheet render the user's real servers (no sign-in)
+  async '9.9'() {
+    await ensureLiveSession('9.9');
+    const chip = await waitApp(/^MCP servers: \d+ of \d+ connected/, 20_000);
+    const mode = appNode(/^Permission mode: /);
+    shot('9.9', 'chips');
+    if (!chip) return record('9.9', false, 'no MCP chip in the header');
+    await a.tap(chip);
+    const sheet = await waitApp(/^MCP servers$/, 10_000);
+    await a.sleep(800);
+    shot('9.9', 'sheet');
+    const statuses = view().mcp.reduce((m, s) => ({ ...m, [s.status]: (m[s.status] ?? 0) + 1 }), {});
+    await tapApp(/^Close$/);
+    record('9.9', !!sheet, `chip "${chip.desc}"; mode chip "${mode?.desc ?? 'none'}"; sheet "MCP servers" opened=${!!sheet}; companion statuses ${JSON.stringify(statuses)}. Sign-in part NOT RUN: it would start an OAuth flow on the user's real MCP servers and open the desktop browser`);
+  },
+  // 9.10: a persistent "always allow" suggestion confirms the rule and the file (cancelled here)
+  async '9.10'() {
+    await ensureLiveSession('9.10');
+    writeFileSync(join(LIVE_WS, 'fake.txt'), `${FAKE_KEY}\n`);
+    live.echoTurns = endedTurns().length;
+    await sendPrompt('Run in bash: cp fake.txt k.txt; cat k.txt');
+    const perm = await waitPerm();
+    if (!perm) return record('9.10', null, 'NOT RUN: no permission request (the command ran without asking)');
+    await jumpLatest();
+    await waitApp(/^Tool \w+: awaiting approval$/, 20_000);
+    shot('9.10', 'approval');
+    const persistent = (perm.options ?? []).find((o) => o.scope === 'persistent' && o.decision !== 'reject');
+    let res;
+    if (!persistent) res = [null, `NOT RUN: no persistent suggestion offered (options: ${(perm.options ?? []).map((o) => o.label).join(' / ')})`];
+    else {
+      await tapApp(/^More options$/);
+      await a.tap(await reveal(new RegExp(`^${persistent.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)));
+      const modal = await waitApp(/^Rule: /, 5000);
+      shot('9.10', 'confirm');
+      await tapApp(/^Cancel$/);
+      await a.sleep(1000);
+      const written = existsSync(join(LIVE_WS, '.claude', 'settings.local.json'));
+      const stillPending = (await snapshotNow())?.permissions?.some((p) => p.id === perm.id && p.status === 'pending');
+      res = [!!modal && /settings\.local\.json/.test(modal.text) && !written && stillPending, `option "${persistent.label}"; confirm shows ${JSON.stringify(modal?.text ?? null)}; cancelled: settings.local.json written=${written}, request still pending=${stillPending}`];
+    }
+    record('9.10', ...res);
+    // 9.11 continues with this request: allow it once
+    await tapApp(inWorkspace(perm) ? /^Allow$/ : /^Deny$/);
+  },
+  // 9.11: a key in tool output shows as «redacted:…», never the key
+  async '9.11'() {
+    await ensureLiveSession('9.11');
+    if (live.echoTurns == null) {
+      writeFileSync(join(LIVE_WS, 'fake.txt'), `${FAKE_KEY}\n`);
+      live.echoTurns = endedTurns().length;
+      await sendPrompt('Run in bash: cp fake.txt k.txt; cat k.txt');
+    }
+    // allow whatever else the command needs (workspace only)
+    const ended = await until(async () => {
+      if (await waitTurnEnd(live.echoTurns, 1)) return true;
+      const p = (await snapshotNow())?.permissions?.find((x) => x.sessionId === live.sid && x.status === 'pending');
+      const btn = p && (await reveal(inWorkspace(p) ? /^Allow$/ : /^Deny$/));
+      if (btn) await a.tap(btn);
+      return false;
+    }, 150_000, 1500);
+    await jumpLatest();
+    for (const n of a.dump().filter((x) => x.pkg === PKG && /^Tool Bash: completed$/.test(x.desc))) await a.tap(n);
+    await a.sleep(800);
+    const screen = a.screenText();
+    shot('9.11', 'redacted');
+    const all = JSON.stringify([...view().items.values()]);
+    const masked = /«redacted:[^»]*»/.exec(screen)?.[0] ?? null;
+    record('9.11', !!ended && !!masked && !screen.includes('FAKEFAKE') && !all.includes('FAKEFAKEFAKE'), `phone shows ${masked ?? 'no redaction marker'}; key text on screen=${screen.includes('FAKEFAKE')}; key anywhere in the companion's transcript=${all.includes('FAKEFAKEFAKE')}; turn ended=${!!ended}`);
+  },
+  // 9.12: OpenCode on local Ollama, attached to an ISOLATED `opencode serve`
+  // (HOME, USERPROFILE and XDG_* under a temp dir, as tests/opencode_e2e.rs
+  // spawn_server does): streaming, an inline bash approval, an abort as Stopped
+  async '9.12'() {
+    const exe = process.env.OPENCODE_BIN ?? join(process.env.APPDATA ?? '', 'npm/node_modules/opencode-ai/bin/opencode.exe');
+    if (!existsSync(exe)) return record('9.12', null, `NOT RUN: no opencode CLI at ${exe}`);
+    const ALIAS = 'chernobyl-qwen35-24k';
+    const OLLAMA = 'http://127.0.0.1:11434';
+    const made = await fetch(`${OLLAMA}/api/create`, { method: 'POST', body: JSON.stringify({ model: ALIAS, from: 'qwen3.5:4b', parameters: { num_ctx: 24576 }, stream: false }) }).then((r) => r.text()).catch((e) => String(e));
+    if (!/success/.test(made)) return record('9.12', null, `NOT RUN: no local Ollama qwen3.5:4b (${made.slice(0, 120)})`);
+    const base = join(process.env.TEMP ?? '.', `chernobyl-oc-device-${Date.now()}`);
+    const dir = (n) => {
+      mkdirSync(join(base, 'iso', n), { recursive: true });
+      return join(base, 'iso', n);
+    };
+    const work = join(base, 'work');
+    mkdirSync(join(base, 'iso', 'config', 'opencode'), { recursive: true });
+    mkdirSync(work, { recursive: true });
+    // a git root stops OpenCode's walk up from the cwd into the user's profile
+    spawnSync('git', ['init', '-q'], { cwd: work });
+    writeFileSync(join(base, 'iso', 'config', 'opencode', 'opencode.json'), JSON.stringify({
+      $schema: 'https://opencode.ai/config.json', autoupdate: false, share: 'disabled', model: `ollama/${ALIAS}`,
+      provider: { ollama: { npm: '@ai-sdk/openai-compatible', name: 'Ollama', options: { baseURL: `${OLLAMA}/v1` }, models: { [ALIAS]: { name: 'qwen3.5 4b 24k', limit: { context: 24576, output: 4096 } } } } },
+      permission: { bash: 'ask', edit: 'ask' },
+    }));
+    const port = 14096;
+    const log = openSync(join(base, 'serve.log'), 'a');
+    const env = { ...process.env, HOME: dir('home'), USERPROFILE: dir('home'), XDG_DATA_HOME: dir('data'), XDG_CONFIG_HOME: join(base, 'iso', 'config'), XDG_CACHE_HOME: dir('cache'), XDG_STATE_HOME: dir('state') };
+    const serve = spawn(exe, ['serve', '--port', String(port), '--hostname', '127.0.0.1'], { cwd: work, env, stdio: ['ignore', log, log] });
+    try {
+      const up = await until(() => fetch(`http://127.0.0.1:${port}/session`).then((r) => r.ok).catch(() => false), 60_000, 1000);
+      if (!up) return record('9.12', false, 'isolated opencode serve never answered');
+      await startLive([{ id: 'oc-1', type: 'opencode', enabled: true, endpoint: `http://127.0.0.1:${port}` }]);
+      await ensureLive('9.12');
+      const title = 'Live 9.12';
+      // the wording of tests/opencode_e2e.rs: the 4B model otherwise just prints the command
+      await newTask(title, 'Use the bash tool to run exactly this command: echo hi > note.txt', { verified: true, agent: / · OpenCode$/ });
+      const sid = await until(async () => (await snapshotNow())?.sessions?.find((x) => x.title === title)?.id, 30_000, 1000);
+      if (!sid) return record('9.12', false, 'no OpenCode session created');
+      live.sid = sid;
+      live.obs.send({ type: 'session_subscribe', commandId: `obs-${Date.now()}`, sessionId: sid });
+      // a CPU-bound 4B model reads OpenCode's prompt slowly: minutes
+      const perm = await waitPerm(600_000);
+      if (!perm) return record('9.12', false, 'no bash approval within 10 min');
+      await jumpLatest();
+      const card = await waitApp(/^Tool bash: awaiting approval$/, 30_000);
+      shot('9.12', 'approval');
+      await tapApp(/^Allow once$/);
+      const ran = await until(() => [...view().items.values()].find((i) => i.tool?.name === 'bash' && i.tool.status === 'completed'), 300_000, 2000);
+      await waitTurnEnd(0, 600_000);
+      await jumpLatest();
+      shot('9.12', 'ran');
+      // abort mid-turn
+      const n1 = endedTurns().length;
+      await typePrompt('Write a long poem about the sea.');
+      const send = await sendTyped();
+      const stop = await waitApp(/^Stop$/, 10_000);
+      // abort once the poem streams
+      const poem = await until(() => [...view().items.values()].find((i) => i.kind === 'text' && !i.done && i.text.length > 40), 300_000, 500);
+      const atStop = poem?.text.length ?? 0;
+      if (stop) await a.tap(stop);
+      else a.shell(`input tap ${send.x - 178} ${send.y}`);
+      await waitTurnEnd(n1, 120_000);
+      const streamed = !!poem;
+      const stopped = await waitApp(/^Stopped$/, 30_000);
+      shot('9.12', 'stopped');
+      record('9.12', !!card && !!ran && streamed && !!stopped && endedTurns().at(-1)?.status === 'interrupted', `isolated opencode serve 1.19 on Ollama qwen3.5:4b; inline card "${card?.desc ?? 'none'}" -> Allow once -> bash ${ran ? `completed, output ${JSON.stringify((ran.tool.output ?? '').trim().slice(0, 40))}` : 'not completed'}; the poem streamed (${atStop} chars when Stop was tapped, ${(poem && view().items.get(poem.id)?.text.length) ?? 0} at the end)=${streamed}; Stop -> footer "Stopped"=${!!stopped}, companion turn ${endedTurns().at(-1)?.status}`);
+    } finally {
+      spawnSync('taskkill', ['/F', '/T', '/PID', String(serve.pid)]);
+      await fetch(`${OLLAMA}/api/delete`, { method: 'DELETE', body: JSON.stringify({ model: ALIAS }) }).catch(() => {});
+      rmSync(base, { recursive: true, force: true, maxRetries: 3 });
+    }
+  },
+  async '9.13'() {
+    record('9.13', null, 'NOT RUN: no pre-ADR-015 APK artifact kept');
+  },
+});
+
+/** Ends every live session (the CLI exits on stdin EOF) and reports the spend. */
+async function endLive() {
+  if (!live.obs) return;
+  for (const sid of live.sids) live.obs.send({ type: 'session_end', commandId: `end-${Date.now()}-${sid}`, sessionId: sid });
+  await a.sleep(8000);
+  console.log(`live model ${live.model}; Claude cost this run $${totalCost().toFixed(4)} over ${live.costs.size} turns; extra "Jump to latest" taps needed: ${live.extraJumps ?? 0}`);
+  appendFileSync(join(OUT, '9-cost.txt'), `${new Date().toISOString()} rows ${pick.join(' ')}: model ${live.model}, ${live.costs.size} turns, total_cost_usd ${totalCost().toFixed(4)}\n`);
+  live.obs.close();
 }
 
 // rows 5.1/5.3 switch the phone's network off; a row that fails midway must
@@ -575,7 +1234,8 @@ const netOn = () => {
 };
 
 const pick = process.argv.slice(2);
-const order = pick.length ? pick : Object.keys(ROWS);
+// section 9 drives the real Claude CLI (it costs money): named rows or LIVE=1 only
+const order = pick.length ? pick : Object.keys(ROWS).filter((r) => !r.startsWith('9.') || process.env.LIVE === '1');
 try {
   netOn();
   await dismissSystemDialogs();
@@ -590,5 +1250,6 @@ try {
     }
   }
 } finally {
+  await endLive();
   if (comp) stop();
 }

@@ -13,12 +13,12 @@ export const BIN = process.env.COMPANION_BIN ?? join(process.cwd(), 'services/co
  * companion's eprintln! panics on a closed pipe, and a file outlives this
  * script so later steps can keep reading it).
  */
-export function startCompanion({ home, port = 18787, diag = 19487, token, requireE2e = false, bind = '127.0.0.1', log }) {
+export function startCompanion({ home, port = 18787, diag = 19487, token, requireE2e = false, bind = '127.0.0.1', log, env: baseEnv = process.env }) {
   mkdirSync(home, { recursive: true });
   const args = ['--bind', bind, '--port', String(port), '--diagnostics-port', String(diag)];
   if (token) args.push('--token', token);
   if (requireE2e) args.push('--require-e2e');
-  const env = { ...process.env, CHERNOBYL_HOME: home };
+  const env = { ...baseEnv, CHERNOBYL_HOME: home };
   delete env.HOST_TOKEN;
   appendFileSync(log, `\n--- start ${new Date().toISOString()} ${args.join(' ')}\n`);
   const fd = openSync(log, 'a');

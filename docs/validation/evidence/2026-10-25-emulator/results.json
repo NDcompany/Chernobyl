@@ -119,5 +119,70 @@
     "pass": true,
     "observed": "hello with protocol 1 -> protocol mismatch refusal; close 4002",
     "at": "2026-10-25T22:15:20.647Z"
+  },
+  "9.1": {
+    "pass": true,
+    "observed": "\"Starting Claude Code…\" shown=true; phone frames while streaming at companion text lengths 375 -> 695 -> 1015 -> 1415 -> 1735 -> 2055 -> 2279 -> 2599 -> 2839 -> 3159 -> 3479 -> 3799 -> 4013 -> 4267 -> 4467 -> 4733 -> 4933 -> 5199 -> 5399 -> 5653 -> 5867 (stream-1/stream-2 differ=true); final phone text is 1..1500=true; \"Jump to latest\" shown at turn end=true; footer \"Done · 12.3 s · 45.3k tokens · <$0.01\"; model=claude-haiku-5-5; cost so far $0.0024",
+    "at": "2026-11-04T17:58:42.181Z"
+  },
+  "9.3": {
+    "pass": true,
+    "observed": "inline card \"Tool Write: awaiting approval\"=true; listed on the Approvals tab=true; the row opened the conversation at the card=true; after Allow \"Tool Write: completed\"=true; gone from the pending list=true; a.txt in the workspace=\"hi\"",
+    "at": "2026-11-04T18:19:21.558Z"
+  },
+  "9.2": {
+    "pass": true,
+    "observed": "allowed Write, Edit; Write card expanded shows its Input and the output \"File created successfully…\"=true (companion output \"File created successfully at: \"); Edit card diff label: \"Diff e.txt, Modified: 1 added, 1 removed\"; companion Write diff patch \"@@ -0,0 +1 @@\\n+hi\"; e.txt=\"hello\"",
+    "at": "2026-11-04T18:30:19.137Z"
+  },
+  "9.4": {
+    "pass": true,
+    "observed": "card \"Tool Write: denied\"; turn ended=true; Claude's text after the denial: \"The Write call returned an error saying \\\"Not now. Reply OK.\\\" instead of writing the file, so I'll check whether the file\"; extra requests denied plainly: 1",
+    "at": "2026-11-04T18:36:44.529Z"
+  },
+  "9.5": {
+    "pass": false,
+    "observed": "9.5a (sent while text streamed, no tool): sent while the turn ran=true; companion marked it queued=true; turns: 2 (completed, completed); PINEAPPLE answered in the first prompt's turn=false. 9.5b (sent before a Bash call): sent while the turn ran=true; companion marked it queued=true; turns: 2 (completed, completed); MANGO answered in the first prompt's turn=false. While sending, the phone composer says \"Joins the current turn\" (9.5a-joins.png, 9.5b-joins.png); 9.5a-answered.png, 9.5b-answered.png show the word under its own turn footer",
+    "at": "2026-11-04T18:54:30.494Z"
+  },
+  "9.6": {
+    "pass": true,
+    "observed": "stopped after 171 of 3000 numbers; footer \"Stopped\"=true; companion turn status=interrupted; next prompt in the same session -> completed (\"Done · 1.2 s · 63.9k tokens · <$0.01\")",
+    "at": "2026-11-04T18:45:52.414Z"
+  },
+  "9.7": {
+    "pass": true,
+    "observed": "notification \"Approval needed\"; the tap opened the conversation with \"Tool Write: awaiting approval\" and its Allow button on screen=true; denied afterwards",
+    "at": "2026-11-04T18:11:47.944Z"
+  },
+  "9.8": {
+    "pass": true,
+    "observed": "network cut at 456 of 3999 chars of the companion's text item (9.8-streaming.png); offline banner=true; after reconnect the phone text equals the companion's item=true, is 4001..4800 contiguous (no gap, no repeat)=true; copies on screen=1",
+    "at": "2026-11-04T18:12:34.841Z"
+  },
+  "9.9": {
+    "pass": true,
+    "observed": "chip \"MCP servers: 15 of 32 connected, needs attention\"; mode chip \"Permission mode: Ask before edits\"; sheet \"MCP servers\" opened=true; companion statuses {\"needs-auth\":15,\"failed\":2,\"connected\":15}. Sign-in part NOT RUN: it would start an OAuth flow on the user's real MCP servers and open the desktop browser",
+    "at": "2026-11-04T18:12:54.894Z"
+  },
+  "9.10": {
+    "pass": true,
+    "observed": "option \"Allow `cp fake.txt k.txt; cat k.txt` for this project (just you)\"; confirm shows \"Rule: Bash(cp fake.txt k.txt; cat k.txt)\\nFile: .claude/settings.local.json\"; cancelled: settings.local.json written=false, request still pending=true",
+    "at": "2026-11-04T18:39:56.587Z"
+  },
+  "9.11": {
+    "pass": true,
+    "observed": "phone shows «redacted:anthropic-key»; key text on screen=false; key anywhere in the companion's transcript=false; turn ended=true",
+    "at": "2026-11-04T18:40:23.106Z"
+  },
+  "9.13": {
+    "pass": null,
+    "observed": "NOT RUN: no pre-ADR-015 APK artifact kept",
+    "at": "2026-11-04T18:16:46.876Z"
+  },
+  "9.12": {
+    "pass": true,
+    "observed": "isolated opencode serve 1.19 on Ollama qwen3.5:4b; inline card \"Tool bash: awaiting approval\" -> Allow once -> bash completed, output \"(no output)\"; the poem streamed (47 chars when Stop was tapped, 51 at the end)=true; Stop -> footer \"Stopped\"=true, companion turn interrupted",
+    "at": "2026-11-04T19:13:06.589Z"
   }
 }
