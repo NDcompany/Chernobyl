@@ -1,8 +1,8 @@
 {
   "1.1": {
     "pass": true,
-    "observed": "home: 2 hosts online; companion clients=1; device b3f9439268d6fd85 registered=true",
-    "at": "2026-11-04T17:37:04.198Z"
+    "observed": "home: 2 hosts online; companion clients=1; device 5976f4635664f87d registered=true",
+    "at": "2026-11-04T20:44:19.503Z"
   },
   "6.2": {
     "pass": true,
@@ -53,7 +53,7 @@
   "4.1": {
     "pass": true,
     "observed": "sessions 5 -> 6; live output on the session screen=true",
-    "at": "2026-11-04T17:37:45.026Z"
+    "at": "2026-11-04T20:44:53.368Z"
   },
   "8.5n": {
     "pass": true,
