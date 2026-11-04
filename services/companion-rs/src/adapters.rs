@@ -297,6 +297,14 @@ impl AdapterManager {
         }
     }
 
+    /// Records why an adapter runs reduced (a Claude entry whose workspaces
+    /// failed stays a hook ingress) without changing its health.
+    pub fn note_error(&mut self, id: &str, error: String) {
+        if let Some(s) = self.statuses.get_mut(id) {
+            s.last_error = Some(error);
+        }
+    }
+
     /// Phase 3: fold a probe result (boot probe or probe loop) into the
     /// status. `None` = healthy.
     pub fn probe_result(&mut self, id: &str, error: Option<String>) {
@@ -346,7 +354,7 @@ mod tests {
             enabled: true,
             endpoint: None,
             basic_auth: None,
-            codex: None,
+            ..Default::default()
         }
     }
 
@@ -361,7 +369,7 @@ mod tests {
                 enabled: false,
                 endpoint: None,
                 basic_auth: None,
-                codex: None,
+                ..Default::default()
             },
         ]);
         let list = m.list();

@@ -31,151 +31,12 @@ use crate::crypto::sha256;
 use crate::json::{self, Json};
 use crate::protocol::{DecisionError, LiveWorkspace, PermissionOption, PermissionRequest};
 use crate::runtime_io::{child_env, redact};
+use crate::transcript::{
+    Field, FileDiff, Item, ItemKind, LiveState, McpAuthState, McpServer, Op, PlanStep, ToolCall,
+    ToolStatus, TurnState, Usage,
+};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-
-/* ------------------------------------------------------------------ */
-/* Normalized output: mirror of ADR-015 §3.3 `transcript.rs`           */
-/* ------------------------------------------------------------------ */
-
-/// Stand-in for `crate::transcript`, which is being written in parallel:
-/// the same names and fields as ADR-015 §3.3. Part 2 deletes this module and
-/// points the `use` below at `crate::transcript`.
-pub mod shapes {
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub enum ItemKind {
-        User,
-        Text,
-        Thinking,
-        Tool,
-        Plan,
-        Notice,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub enum ToolStatus {
-        Pending,
-        Running,
-        AwaitingApproval,
-        Completed,
-        Failed,
-        Denied,
-        Cancelled,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct FileDiff {
-        pub path: String,
-        pub status: &'static str,
-        pub additions: i64,
-        pub deletions: i64,
-        pub patch: String,
-        pub truncated: bool,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct PlanStep {
-        pub text: String,
-        pub status: &'static str,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct ToolCall {
-        pub name: String,
-        pub title: Option<String>,
-        pub status: ToolStatus,
-        pub input: String,
-        pub output: String,
-        pub output_truncated: bool,
-        pub error: Option<String>,
-        pub diffs: Vec<FileDiff>,
-        pub permission_id: Option<String>,
-        pub auto_approved: Option<String>,
-        pub duration_ms: Option<i64>,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct Item {
-        pub id: String,
-        pub kind: ItemKind,
-        pub ts: i64,
-        pub turn_id: Option<String>,
-        pub parent_id: Option<String>,
-        pub text: String,
-        pub done: bool,
-        pub truncated: bool,
-        pub queued: bool,
-        pub level: Option<&'static str>,
-        pub tool: Option<ToolCall>,
-        pub steps: Vec<PlanStep>,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub enum Field {
-        Text,
-        Input,
-        Output,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct TurnState {
-        pub id: String,
-        pub status: &'static str,
-        pub started_at: i64,
-        pub ended_at: Option<i64>,
-        pub usage: Option<Usage>,
-        pub cost_usd: Option<f64>,
-        pub error: Option<String>,
-        pub diffs: Vec<FileDiff>,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct Usage {
-        pub input: i64,
-        pub output: i64,
-        pub cache_read: Option<i64>,
-        pub reasoning: Option<i64>,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct LiveState {
-        pub status: &'static str,
-        pub permission_mode: Option<String>,
-        pub model: Option<String>,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct McpServer {
-        pub name: String,
-        pub status: &'static str,
-        pub error: Option<String>,
-        pub auth_flows: Vec<&'static str>,
-        pub auth: Option<McpAuthState>,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct McpAuthState {
-        pub state: &'static str,
-        pub url: Option<String>,
-        pub callback_prefix: Option<String>,
-        pub error: Option<String>,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum Op {
-        Item(Item),
-        Append {
-            id: String,
-            field: Field,
-            text: String,
-        },
-        Turn(TurnState),
-        State(LiveState),
-        Mcp(Vec<McpServer>),
-    }
-}
-
-use shapes::*;
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -492,6 +353,7 @@ pub struct Asked {
 struct Sent {
     subtype: &'static str,
     command_id: Option<String>,
+    /// The MCP server name, or the mode of a `set_permission_mode`.
     server: Option<String>,
 }
 
@@ -511,7 +373,7 @@ struct Turn {
 }
 
 /// Protocol state of one driven Claude session. Not thread-safe by itself:
-/// part 2 holds it under one mutex, which is what linearizes `decide` against
+/// `claude_runtime` holds it under one mutex, which is what linearizes `decide` against
 /// `control_cancel_request` (§4.2.4).
 pub struct Driver {
     adapter_id: String,
@@ -597,6 +459,17 @@ impl Driver {
         self.turn.is_some()
     }
 
+    /// The CLI's current permission mode (kept for a `--resume` respawn).
+    pub fn permission_mode(&self) -> Option<&str> {
+        self.permission_mode.as_deref()
+    }
+
+    /// No turn running, no prompt in flight and no request waiting: what the
+    /// reaper needs before it closes stdin.
+    pub fn is_quiet(&self) -> bool {
+        self.turn.is_none() && self.prompts.is_empty() && self.asks.is_empty()
+    }
+
     /// Whether `permission_id` is a request this process still waits on.
     pub fn knows_permission(&self, permission_id: &str) -> bool {
         self.request_id_of(permission_id)
@@ -669,7 +542,13 @@ impl Driver {
             return Err("permission mode must be default, acceptEdits or plan");
         }
         let body = format!(r#"{{"subtype":"set_permission_mode","mode":{}}}"#, q(mode));
-        self.request(body, "set_permission_mode", Some(command_id), None, send)
+        self.request(
+            body,
+            "set_permission_mode",
+            Some(command_id),
+            Some(mode),
+            send,
+        )
     }
 
     /// `mcp_status` (verified live; the reply becomes an `Op::Mcp`).
@@ -1058,11 +937,22 @@ impl Driver {
                     result: Ok(()),
                 });
             }
-            (subtype, result) => out.push(Event::Reply {
-                command_id: sent.command_id,
-                subtype,
-                result,
-            }),
+            (subtype, result) => {
+                // the CLI sends no `system/status` for a mode it was told
+                if subtype == "set_permission_mode"
+                    && result.is_ok()
+                    && let Some(mode) = sent.server
+                    && self.permission_mode.as_deref() != Some(&mode)
+                {
+                    self.permission_mode = Some(mode);
+                    out.push(Event::Op(Op::State(self.live_state())));
+                }
+                out.push(Event::Reply {
+                    command_id: sent.command_id,
+                    subtype,
+                    result,
+                })
+            }
         }
     }
 
@@ -2812,7 +2702,7 @@ fn pretty(v: &Json) -> String {
 
 /// The exact source text of `key`'s value in the JSON object `obj`, which
 /// `json::parse` already accepted: echoes go back byte for byte (§4.5).
-fn raw_member<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn raw_member<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
     let b = obj.as_bytes();
     let mut i = skip_ws(b, 0);
     if b.get(i) != Some(&b'{') {

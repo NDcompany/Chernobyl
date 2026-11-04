@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub const CONFIG_VERSION: i64 = 1;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AdapterEntryConfig {
     pub id: String,
     pub kind: String,
@@ -22,6 +22,18 @@ pub struct AdapterEntryConfig {
     /// `codex` entries (ADR-015 §4.3): `workspaces`, `binary`, `args`,
     /// validated at load (workspace policy §4.2.3).
     pub codex: Option<crate::codex::LaunchConfig>,
+    /// `claude` entries (ADR-015 §4.2.3): folders the phone may start Claude
+    /// Code in. Empty = hook ingress only. Adding a folder is trusting it:
+    /// print mode skips Claude's folder-trust dialog. Checked at boot
+    /// (`claude_live::validate_workspace`).
+    pub workspaces: Vec<String>,
+    /// `claude` entries: an explicit `claude.exe` (never a `.cmd` shim).
+    pub binary: Option<String>,
+    /// `claude` entries: live Claude Code processes at once (default 3).
+    pub max_sessions: Option<u32>,
+    /// `claude` entries: the starting permission mode (default, acceptEdits
+    /// or plan; never a bypass mode).
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,9 +77,7 @@ pub fn default_config() -> CompanionConfig {
             id: "mock-1".into(),
             kind: "mock".into(),
             enabled: true,
-            endpoint: None,
-            basic_auth: None,
-            codex: None,
+            ..Default::default()
         }],
         events_cap: 5_000,
         commands_cap: 5_000,
@@ -165,6 +175,46 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
         } else {
             None
         };
+        let workspaces = match json::get(entry, "workspaces").filter(|_| kind == "claude") {
+            None | Some(Json::Null) => Vec::new(),
+            Some(Json::Arr(list)) => list
+                .iter()
+                .map(|w| {
+                    json::as_str(w)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| format!("adapters[{i}].workspaces must be non-empty strings"))?,
+            Some(_) => return Err(format!("adapters[{i}].workspaces must be an array")),
+        };
+        let binary = match json::get(entry, "binary").filter(|_| kind == "claude") {
+            None | Some(Json::Null) => None,
+            Some(v) => Some(
+                json::as_str(v)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| format!("adapters[{i}].binary must be a non-empty string"))?
+                    .to_string(),
+            ),
+        };
+        let max_sessions = json::get(entry, "maxSessions")
+            .filter(|_| kind == "claude")
+            .filter(|v| **v != Json::Null)
+            .map(|v| as_i64(Some(v), &format!("adapters[{i}].maxSessions"), 1, 16))
+            .transpose()?
+            .map(|n| n as u32);
+        let permission_mode = match json::get(entry, "permissionMode").filter(|_| kind == "claude")
+        {
+            None | Some(Json::Null) => None,
+            Some(v) => Some(
+                json::as_str(v)
+                    .filter(|m| crate::claude_live::PERMISSION_MODES.contains(m))
+                    .ok_or_else(|| {
+                        format!("adapters[{i}].permissionMode must be default, acceptEdits or plan")
+                    })?
+                    .to_string(),
+            ),
+        };
         adapters.push(AdapterEntryConfig {
             id,
             kind,
@@ -172,6 +222,10 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
             endpoint,
             basic_auth,
             codex,
+            workspaces,
+            binary,
+            max_sessions,
+            permission_mode,
         });
     }
     let ids: Vec<&str> = adapters
@@ -276,6 +330,19 @@ pub fn config_to_json(c: &CompanionConfig) -> Json {
                             fields.push(("binary", json::s(&cx.binary.to_string_lossy())));
                             let args = cx.args.iter().map(|a| json::s(a));
                             fields.push(("args", Json::Arr(args.collect())));
+                        }
+                        if !a.workspaces.is_empty() {
+                            let list = a.workspaces.iter().map(|w| json::s(w)).collect();
+                            fields.push(("workspaces", Json::Arr(list)));
+                        }
+                        if let Some(b) = &a.binary {
+                            fields.push(("binary", json::s(b)));
+                        }
+                        if let Some(n) = a.max_sessions {
+                            fields.push(("maxSessions", Json::Int(n.into())));
+                        }
+                        if let Some(m) = &a.permission_mode {
+                            fields.push(("permissionMode", json::s(m)));
                         }
                         json::obj(fields)
                     })
@@ -408,6 +475,45 @@ mod tests {
         let again = validate_config(&config_to_json(&parsed)).unwrap();
         assert_eq!(again.adapters[0].codex, Some(cx));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_live_keys_parse_round_trip_and_fail_closed() {
+        let base = r#"{"version":1,"name":"x","dataDir":"x","retention":{"events":5000,"eventsMaxAgeMs":600000},"diagnostics":{"port":9487},"probeIntervalMs":15000,"adapters":["#;
+        let parse =
+            |entry: &str| validate_config(&json::parse(&format!("{base}{entry}]}}")).unwrap());
+        let c = parse(r#"{"id":"claude-1","type":"claude","workspaces":["C:/w"],"binary":"C:/c.exe","maxSessions":2,"permissionMode":"plan"}"#).unwrap();
+        let a = &c.adapters[0];
+        assert_eq!(a.workspaces, ["C:/w"]);
+        assert_eq!(a.binary.as_deref(), Some("C:/c.exe"));
+        assert_eq!(a.max_sessions, Some(2));
+        assert_eq!(a.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(validate_config(&config_to_json(&c)).unwrap(), c);
+        // without the keys: an ingress-only entry, as before
+        let c = parse(r#"{"id":"claude-1","type":"claude","workspaces":null}"#).unwrap();
+        assert!(c.adapters[0].workspaces.is_empty());
+        for (entry, field) in [
+            (
+                r#"{"id":"c","type":"claude","workspaces":"C:/w"}"#,
+                "workspaces",
+            ),
+            (
+                r#"{"id":"c","type":"claude","workspaces":[""]}"#,
+                "workspaces",
+            ),
+            (
+                r#"{"id":"c","type":"claude","maxSessions":0}"#,
+                "maxSessions",
+            ),
+            (
+                r#"{"id":"c","type":"claude","permissionMode":"bypassPermissions"}"#,
+                "permissionMode",
+            ),
+            (r#"{"id":"c","type":"claude","binary":7}"#, "binary"),
+        ] {
+            let err = parse(entry).unwrap_err();
+            assert!(err.contains(field), "{entry}: {err}");
+        }
     }
 
     #[test]

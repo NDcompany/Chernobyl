@@ -15,13 +15,15 @@
 //! notification decoder, approvals); codex_runtime: its LiveRuntime (one
 //! app-server child per adapter, sessions as threads).
 //! claude_live: ADR-015 Claude Code driver core (frame decoder, permission
-//! options, stdin encoders, launch and workspace policy).
+//! options, stdin encoders, launch and workspace policy). claude_runtime:
+//! ADR-015 Claude Code live runtime (driven processes behind LiveRuntime).
 
 pub mod adapters;
 pub mod backup;
 pub mod base64;
 pub mod claude;
 pub mod claude_live;
+pub mod claude_runtime;
 pub mod client;
 pub mod codex;
 pub mod codex_runtime;

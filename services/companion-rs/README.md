@@ -142,6 +142,43 @@ items or 2 MiB per session; text is redacted and capped as ADR-015 §3.5 lists (
 100 ms, at most 8 KiB per append). `/health` reports `transcriptSessions`, `transcriptSubs`
 and `runtimeMalformed`.
 
+### Claude Code adapter (ADR-015 §4.2)
+
+The `"type": "claude"` entry is always the hook ingress (Claude Code hooks POST to the
+diagnostics listener). With `workspaces` it also drives Claude Code sessions from the phone:
+
+```json
+{ "id": "claude-1", "type": "claude", "enabled": true,
+  "workspaces": ["G:\\Chernobyl"], "binary": null, "maxSessions": 3, "permissionMode": "default" }
+```
+
+- `workspaces` (optional): absolute, existing folders, checked at boot. A drive root, the
+  user-profile folder and any folder containing the CHERNOBYL data directory are refused; a bad
+  entry is logged by name, shows as `lastError` on `/adapters`, and the entry stays an ingress
+  only. Without `workspaces` nothing is spawned (today's behaviour). The phone sees them as
+  `Agent.live.workspaces` and `create_session.project` must be one of those ids.
+  **Adding a folder to `workspaces` is trusting it:** the CLI runs in print mode, which skips
+  Claude's folder-trust dialog, so that folder's project hooks, settings and MCP servers
+  load on spawn.
+- `binary`: `null` = `%USERPROFILE%\.local\bin\claude.exe`, else `claude.exe` on `PATH`
+  (never the npm `.cmd` shim: no shell is ever used). Health is `claude --version` at boot
+  and in the probe loop.
+- `maxSessions` (1-16, default 3): live `claude.exe` processes at once. `create_session`
+  is also limited to one per 5 s.
+- `permissionMode` (`default` | `acceptEdits` | `plan`, default the CLI's): the starting
+  mode; the phone can switch among the same three. Bypass modes are never reachable.
+
+Each session is one `claude -p --input-format stream-json …` child with `--session-id
+<uuid>` (the session id) in its workspace; prompts travel on stdin only and the environment
+drops `HOST_TOKEN`, `CHERNOBYL_*` and `NODE_OPTIONS`. Prompts sent mid-turn join the
+running turn (`promptWhileBusy: merge`); approvals are answered inline with Claude's own
+options; `interrupt`, `set_permission_mode`, `session_end` (interrupt, close stdin, kill
+after 5 s) and MCP status, sign-in (desktop or phone-callback) and reconnect are supported. A
+process idle for 30 min with no subscriber and nothing pending has its stdin closed; the next
+command respawns it with `--resume`. If a process dies, open approvals turn `stale`, its
+prompts fail ("Claude Code exited with code N") and the session ends. Hooks fired by a driven
+session are ignored, so it never shows twice.
+
 ### Codex adapter (ADR-015 §4.3)
 
 An adapter entry in `companion.json` with `"type": "codex"` drives `codex app-server`:
@@ -272,6 +309,7 @@ matrix covers those).
 | `config` / `adapters` / `companion` | Node-parity config, adapter discovery, boot/reconcile/idempotency; the `LiveRuntime` trait and router (ADR-015 §4.1): `create_session` by the agent's `hostId`, session commands to the owning runtime, `permission_decision` to the runtime that surfaced it, the rest to the engine; demo data hidden while any runtime is healthy |
 | `server` | accept loops, auth (4001/429), origin refusal (403), posture gates (D1/D2/D6), version gate (4002), live session revocation (4003, D4), heartbeat, diagnostics HTTP, E2E handshake + sealed-frame dispatch, `session_subscribe`/`session_unsubscribe` per connection |
 | `transcript` | ADR-015 transcript hub: per-session op ring + compacted items, coalesced deltas, subscriptions, half-bulk backpressure, snapshots, redaction and caps; `HubHandle` is what live runtimes push through |
+| `claude_live` / `claude_runtime` | ADR-015 Claude Code: stream-json driver core (decoder, permission options, encoders, workspace policy) and its `LiveRuntime` (a process per session, reaper and `--resume`, G1 lifecycles, MCP sign-in) |
 | `codex` / `codex_runtime` | ADR-015 Codex app-server: JSON-RPC core (decoder, approvals, MCP) and its `LiveRuntime` (spawn, sessions as threads, hub/engine wiring) |
 | `runtime_io` | ADR-015 child process IO, env scrub, secret redaction, desktop URL opener, OAuth callback check |
 | `client` | test WS client + loopback `http_get` (used by `--self-test`) |

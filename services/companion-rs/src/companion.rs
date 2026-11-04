@@ -6,6 +6,7 @@
 
 use crate::adapters::{AdapterManager, LiveRuntime};
 use crate::claude::ClaudeAdapter;
+use crate::claude_runtime::{ClaudeRuntime, LiveConfig};
 use crate::codex_runtime::{CodexRuntime, Sink};
 use crate::config::CompanionConfig;
 use crate::engine::Engine;
@@ -156,11 +157,13 @@ impl Companion {
 
         // Phase 7: the Claude Code hook ingress — no endpoint (it is a
         // route the companion exposes), just the enabled adapter id.
+        // ADR-015 §4.2.3: with `workspaces` the same entry also drives
+        // Claude Code sessions; a bad workspace keeps it an ingress only.
         let claude_cfg = config
             .adapters
             .iter()
             .find(|e| e.enabled && e.kind == "claude")
-            .map(|e| e.id.clone());
+            .map(|e| (e.id.clone(), LiveConfig::from_entry(e, &config.data_dir)));
 
         // ADR-009: the demo seed exists only while a mock adapter is enabled
         // (`"enabled": false` in companion.json turns the demo data off).
@@ -354,16 +357,47 @@ impl Companion {
         // Phase 7: mount the Claude Code hook ingress (PRD §7.5). No probe
         // and no endpoint — the companion exposes a loopback route and the
         // user-installed bridge posts to it; health is the route being ready.
-        if let Some(id) = claude_cfg {
+        if let Some((id, live)) = claude_cfg {
             let cl = Arc::new(ClaudeAdapter::new(&id));
             {
                 let mut mgr = companion.shared.adapters.lock().unwrap();
                 mgr.attach_claude(&id, cl.capabilities());
             }
             *companion.shared.claude.lock().unwrap() = Some(cl);
+            match live {
+                Ok(Some(cfg)) => {
+                    let rt = ClaudeRuntime::new(&id, cfg, companion.hub());
+                    companion.attach_claude_live(Arc::new(rt));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("[companion] {e}");
+                    let mut mgr = companion.shared.adapters.lock().unwrap();
+                    mgr.note_error(&id, e);
+                }
+            }
         }
 
         Ok(companion)
+    }
+
+    /// ADR-015 step 6: routes Claude Code live sessions to `rt`. Its engine
+    /// events go through `engine_sink` (permissions ingested, so the engine
+    /// stays the G2 authority), its health comes from the probe
+    /// loop, and its capabilities replace the ingress's where they overlap.
+    pub fn attach_claude_live(&mut self, rt: Arc<ClaudeRuntime>) {
+        rt.set_sink(self.engine_sink());
+        let probe = rt.refresh();
+        let live = rt.capabilities();
+        let mut caps = ClaudeAdapter::new(rt.id()).capabilities();
+        caps.retain(|c| !live.iter().any(|l| l.id == c.id));
+        caps.extend(live);
+        {
+            let mut mgr = self.shared.adapters.lock().unwrap();
+            mgr.attach_claude(rt.id(), caps);
+            mgr.probe_result(rt.id(), probe.err().map(|e| e.to_string()));
+        }
+        self.runtimes.push(rt);
     }
 
     /* ---------------------------------------------------------------- */
@@ -371,6 +405,14 @@ impl Companion {
     /* ---------------------------------------------------------------- */
 
     pub fn handle_client_msg(&self, msg: ClientMsg) -> Option<ServerMsg> {
+        // the same merged view as `hello_ack` (runtime sessions, transcript
+        // flags), never the engine's own snapshot
+        if let ClientMsg::ListState { .. } = msg {
+            return Some(ServerMsg::State {
+                snapshot: self.snapshot(),
+                last_seq: self.last_seq(),
+            });
+        }
         let msg_cmd_id = msg.command_id().map(str::to_string);
         let msg_mutating = msg.is_mutating();
         // Mutating commands are persisted BEFORE execution, idempotent by
@@ -1070,6 +1112,15 @@ impl Companion {
         let Some(cl) = self.shared.claude.lock().unwrap().clone() else {
             return 404;
         };
+        // ADR-015 §4.2.1: a session the companion drives streams its own
+        // transcript; its hooks (user settings load in print mode too) would
+        // show it twice
+        if let Ok(v) = crate::json::parse(payload)
+            && let Some(sid) = crate::json::get_str(&v, "session_id")
+            && self.runtimes.iter().any(|r| r.owns_session(sid))
+        {
+            return 200;
+        }
         match cl.ingest(payload) {
             Ok(Some(kind)) => {
                 let mut engine = self.engine.lock().unwrap();
@@ -1299,11 +1350,13 @@ fn json_text(msg: &ClientMsg) -> String {
             if let Some(m) = message {
                 fields.push(("message", json::s(m)));
             }
+            // answers can carry anything the user typed: each value is
+            // journaled as `<redacted>` (execution uses the in-memory message)
             if !answers.is_empty() {
                 let answers = answers
                     .iter()
                     .map(|(id, list)| {
-                        let list = list.iter().map(|a| json::s(a)).collect();
+                        let list = list.iter().map(|_| json::s("<redacted>")).collect();
                         (id.clone(), Json::Arr(list))
                     })
                     .collect();
@@ -1680,7 +1733,7 @@ mod tests {
             enabled: true,
             endpoint: Some(endpoint.into()),
             basic_auth: None,
-            codex: None,
+            ..Default::default()
         });
         c
     }
@@ -2620,6 +2673,7 @@ mod tests {
             endpoint: None,
             basic_auth: None,
             codex: Some(launch),
+            ..Default::default()
         });
         let comp = Companion::boot(c.clone()).unwrap();
         let status = crate::json::stringify(&comp.adapters_json());
@@ -2735,5 +2789,161 @@ mod tests {
         let _ = std::fs::remove_dir_all(&c.data_dir);
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_file(&log);
+    }
+
+    // ---- ADR-015 step 6: the Claude Code runtime behind the router ----
+
+    use crate::claude_runtime::tests as cl;
+
+    /// A companion with the Claude hook ingress mounted and a piped Claude
+    /// runtime attached under the same adapter id.
+    fn with_claude(tag: &str, peers: Vec<cl::React>) -> (Companion, cl::Rig, CompanionConfig) {
+        let mut c = temp_config(tag);
+        c.adapters.push(AdapterEntryConfig {
+            id: "claude-1".into(),
+            kind: "claude".into(),
+            enabled: true,
+            ..Default::default()
+        });
+        let mut comp = Companion::boot(c.clone()).unwrap();
+        let rig = cl::rig_with_hub(comp.hub(), cl::fast(), 3, peers);
+        comp.attach_claude_live(rig.rt.clone());
+        (comp, rig, c)
+    }
+
+    #[test]
+    fn claude_permission_decision_reaches_the_driver_as_control_response() {
+        let (comp, rig, c) = with_claude(
+            "claude-route",
+            vec![cl::replay(include_str!(
+                "../tests/fixtures/claude/capture-3.ndjson"
+            ))],
+        );
+        // create_session routes by the agent's host
+        let sid = match comp.handle_client_msg(cl::create_msg("c1", "run node")) {
+            Some(ServerMsg::Ack {
+                ok: true,
+                session_id: Some(s),
+                ..
+            }) => s,
+            other => panic!("{other:?}"),
+        };
+        let pid = "claude-1:65dbfe00-575c-4ac5-b8e9-0c989a34fedc";
+        cx::wait_until("the engine record", || permission(&comp, pid).is_some());
+        let p = permission(&comp, pid).unwrap();
+        assert_eq!(p.session_id, sid);
+        assert_eq!(p.supported_decisions, ["approve-once", "reject"]);
+        // a stale revision never reaches the CLI
+        refusal(comp.handle_client_msg(decision("d0", pid, "approve-once", None, 0.0)));
+        // a legacy tap: the engine picks "allow", the driver writes it
+        assert!(ok(comp.handle_client_msg(decision(
+            "d1",
+            pid,
+            "approve-once",
+            None,
+            1.0
+        ))));
+        let want = r#"{"type":"control_response","response":{"subtype":"success","request_id":"65dbfe00-575c-4ac5-b8e9-0c989a34fedc","response":{"behavior":"allow","updatedInput":{"command":"node -e \"console.log(42)\"","description":"Run node to print 42"}}}}"#;
+        rig.wait("the answer", |r| {
+            r.stdin.lock().unwrap().iter().any(|f| f == want)
+        });
+        let p = permission(&comp, pid).unwrap();
+        assert_eq!((p.status.as_str(), p.revision), ("approved", 2));
+        cx::wait_until("the turn", || command_status(&comp, "c1") == "completed");
+        // a late second decision fails closed
+        refusal(comp.handle_client_msg(decision("d2", pid, "reject", None, 2.0)));
+        // hooks from the driven session are not shown twice
+        let hook =
+            format!(r#"{{"session_id":"{sid}","hook_event_name":"SessionStart","cwd":"x"}}"#);
+        assert_eq!(comp.ingest_claude_hook(&hook), 200);
+        assert!(
+            !comp
+                .snapshot()
+                .activity
+                .iter()
+                .any(|a| a.text.contains("session started")),
+            "a driven session's hook is ignored"
+        );
+        let other = r#"{"session_id":"desktop-1","hook_event_name":"SessionStart","cwd":"x"}"#;
+        assert_eq!(comp.ingest_claude_hook(other), 200);
+        assert!(
+            comp.snapshot()
+                .activity
+                .iter()
+                .any(|a| a.text.contains("session started"))
+        );
+        // the adapter list shows the runtime's capabilities over the ingress's
+        let adapters = crate::json::stringify(&comp.adapters_json());
+        assert!(
+            adapters.contains(r#"{"id":"session.create","status":"available"}"#),
+            "{adapters}"
+        );
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    /// `list_state` answers the same merged view as `hello_ack`: runtime
+    /// sessions with their transcript flag, no demo sessions behind them.
+    #[test]
+    fn list_state_returns_the_merged_snapshot() {
+        let (comp, rig, c) = with_claude("claude-list", vec![cl::idle()]);
+        let sid = rig.create("c1", "hi");
+        let reply = comp.handle_client_msg(ClientMsg::ListState {
+            command_id: "ls".into(),
+        });
+        let Some(ServerMsg::State { snapshot, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        let ids: Vec<(&str, bool)> = snapshot
+            .sessions
+            .iter()
+            .map(|s| (s.id.as_str(), s.transcript))
+            .collect();
+        assert_eq!(ids, [(sid.as_str(), true)]);
+        assert_eq!(
+            snapshot
+                .agents
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            ["claude-1"]
+        );
+        comp.shutdown(true);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    /// Question answers can carry anything the user typed: the journal keeps
+    /// `<redacted>` per value; only the in-memory message is executed.
+    #[test]
+    fn permission_decision_answers_are_journaled_redacted() {
+        let c = temp_config("answers-redact");
+        let journal = c.data_dir.join("companion.journal");
+        let comp = Companion::boot(c.clone()).unwrap();
+        let secret = "my-home-address-42";
+        let msg = ClientMsg::PermissionDecision {
+            command_id: "cmd-answers".into(),
+            permission_id: "claude-1:q1".into(),
+            decision: "approve-once".into(),
+            revision: 1.0,
+            option_id: Some("allow".into()),
+            message: None,
+            answers: vec![("q1".into(), vec![secret.into(), "two".into()])],
+        };
+        refusal(comp.handle_client_msg(msg));
+        {
+            let store = comp.shared.storage.lock().unwrap();
+            let rec = store.commands.get("cmd-answers").expect("persisted");
+            assert!(
+                rec.payload
+                    .contains(r#""answers":{"q1":["<redacted>","<redacted>"]}"#),
+                "{}",
+                rec.payload
+            );
+        }
+        assert!(!std::fs::read_to_string(&journal).unwrap().contains(secret));
+        comp.shutdown(true);
+        let on_disk = std::fs::read_to_string(&journal).unwrap();
+        assert!(!on_disk.contains(secret) && !on_disk.contains("\"two\""));
+        let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 }

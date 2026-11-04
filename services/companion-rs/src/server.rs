@@ -2642,7 +2642,7 @@ mod e2e_tests {
             enabled: true,
             endpoint: None,
             basic_auth: None,
-            codex: None,
+            ..Default::default()
         });
         let companion = Arc::new(Companion::boot(c).unwrap());
         let handle = start("127.0.0.1", 0, 0, None, companion.clone()).unwrap();

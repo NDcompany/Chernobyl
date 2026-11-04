@@ -9,7 +9,7 @@ page records **which versions were verified** and the limits that matter in prac
 |---|---|---|---|---|
 | OpenCode | agent runtime | `opencode` **1.19.4** (live e2e PASS 2026-10-24), 1.17.7 (Phase 3) | `services/companion-rs/src/opencode.rs` | attach-only HTTP + SSE to a running `opencode serve`; never spawns a second server |
 | Ollama | model runtime | Ollama **0.40.9** | `services/companion-rs/src/ollama.rs` | attach-only HTTP (`/api/version`, `/api/tags`, `/api/ps`) |
-| Claude Code | hook ingress | Claude Code **2.1.309** (`SessionStart` captured live) | `services/companion-rs/src/claude.rs` | Claude Code hooks POST to the loopback diagnostics listener; install the snippet from `chernobyl-companion --claude-hooks` yourself (never auto-written) |
+| Claude Code | hook ingress + driven sessions | Claude Code **2.1.309** (`SessionStart` captured live); driven sessions **2.1.310** (live Haiku run through the companion server) | `services/companion-rs/src/claude.rs`, `claude_live.rs`, `claude_runtime.rs` | hooks POST to the loopback diagnostics listener (install the snippet from `chernobyl-companion --claude-hooks` yourself, never auto-written); with `workspaces`, the phone also starts `claude.exe` sessions (stream-json on stdio) in allow-listed folders |
 | Codex | agent runtime (live sessions) | **no live run**: openai/codex `970111f` schema, fake app-server processes only | `services/companion-rs/src/codex.rs`, `codex_runtime.rs` | spawns one `codex app-server` (stdio JSON-RPC) per adapter on the first session, in an allow-listed workspace; each phone session is a thread |
 | Hermes | — | not installed, deferred | ADR-008 | not offered; unsupported adapters stay invisible rather than half-working |
 | Mock | simulation | — | `services/companion-rs/src/seed.rs` | offline demo data; the phone labels it **Simulation** (ADR-009) |
@@ -23,10 +23,18 @@ page records **which versions were verified** and the limits that matter in prac
   reconnect, state is re-listed.
 - **Ollama.** It is a model provider, not an agent. Session operations report
   `unavailable` (PRD §7.7).
-- **Claude Code.** It is ingress only. Listing, creating, prompting and interrupting
-  sessions and reviewing permissions are all `unavailable`; the companion only observes
-  hook events. Only `SessionStart` was captured live. Other hook shapes are parsed
-  defensively and reported `limited`.
+- **Claude Code.** Without `workspaces` it is ingress only: the companion observes hook
+  events from sessions started in VS Code or a terminal (only `SessionStart` was captured
+  live; other hook shapes are parsed defensively and reported `limited`). With
+  `workspaces` the phone drives its own sessions: create, prompt (follow-ups join the
+  running turn), interrupt, inline approvals with Claude's options, permission mode
+  (default, accept edits, plan), end, a streaming transcript, and MCP status, sign-in and
+  reconnect. History of sessions it did not start is `unavailable`; desktop MCP sign-in
+  is `limited` (whether the CLI's own listener reconnects by itself is unverified, so the
+  companion polls and reconnects). **Adding a folder to `workspaces` is trusting it:** the
+  CLI runs in print mode, which skips Claude's folder-trust dialog, so the folder's
+  project hooks and MCP servers load on spawn. Hooks of a driven session are ignored, so it
+  is not shown twice. Set `binary` only to a real `claude.exe` (no `.cmd` shim).
 - **Codex.** Every capability is `limited`: "implemented from openai/codex@970111f schema;
   verified against fake app-server processes only; no live run". Sessions stream a live
   transcript; approvals carry Codex's own options (allow, allow for this session, the
