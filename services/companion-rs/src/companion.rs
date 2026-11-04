@@ -2654,7 +2654,11 @@ mod tests {
         let snap = comp.snapshot();
         let hosts: Vec<&str> = snap.hosts.iter().map(|h| h.id.as_str()).collect();
         assert_eq!(hosts, ["rt-a", "rt-b"]);
-        assert!(snap.hosts.iter().all(|h| !h.simulated && h.status == "connected"));
+        assert!(
+            snap.hosts
+                .iter()
+                .all(|h| !h.simulated && h.status == "connected")
+        );
         assert_eq!(snap.permissions.len(), demo.permissions.len());
         comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
