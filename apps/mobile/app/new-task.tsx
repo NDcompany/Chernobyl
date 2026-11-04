@@ -181,7 +181,8 @@ export default function NewTaskScreen() {
                 {selectedAgent?.name ?? 'The agent'} starts only in folders allow-listed on your PC.
               </Text>
             </View>
-          ) : (
+          ) : selectedAgent?.simulated ? (
+            // a real agent never takes a folder typed on the phone (ADR-015 §4.2.3)
             <TextField
               form={form}
               name="project"
@@ -190,7 +191,7 @@ export default function NewTaskScreen() {
               hint="Working directory label for the session"
               autoCapitalize="none"
             />
-          )}
+          ) : null}
 
           {isUnknown ? (
             <Card style={{ borderColor: colors.warning, gap: spacing.xs }}>

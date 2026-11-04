@@ -188,7 +188,7 @@ pub fn validate_workspace(
     }
     if profile
         .and_then(|h| std::fs::canonicalize(h).ok())
-        .is_some_and(|h| plain(&h) == path)
+        .is_some_and(|h| PathBuf::from(plain(&h)).starts_with(&dir))
     {
         return Err(format!(
             "the user profile folder cannot be a workspace: {path}"
@@ -1925,8 +1925,10 @@ fn suggestion_option(i: usize, s: &Json, plan: bool) -> Option<PermissionOption>
     let (label, rule) = match json::get_str(s, "type")? {
         "setMode" => {
             let mode = json::get_str(s, "mode")?;
-            if mode == "bypassPermissions" {
-                return None; // never reachable from the phone (T4)
+            // the same whitelist as set_permission_mode: bypassPermissions,
+            // dontAsk and auto are never reachable from the phone (T4)
+            if !matches!(mode, "default" | "acceptEdits" | "plan") {
+                return None;
             }
             let label = match (mode, dest) {
                 ("acceptEdits", _) if plan => "Approve and auto-accept edits".to_string(),
@@ -2021,7 +2023,8 @@ fn describe(tool: &str, input: &Json, req: &Json, workspace: &str) -> Described 
     let mut questions = Vec::new();
     let (detail, action, risk, command) = match tool {
         "Bash" => {
-            let command = get("command");
+            // capped like every other input; the full text stays in `input_raw`
+            let command = cap_marked(&get("command"), INPUT_MAX);
             let mut f = vec![("kind", json::s("shell")), ("command", json::s(&command))];
             if !workspace.is_empty() {
                 f.push(("cwd", json::s(workspace)));
@@ -3629,7 +3632,7 @@ mod tests {
 
     #[test]
     fn suggestion_filter_drops_bypass_and_unoffered_rules() {
-        let offered = r#","permission_suggestions":[{"type":"setMode","mode":"bypassPermissions","destination":"session"},{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"npm test:*"}],"behavior":"allow","destination":"projectSettings"},{"type":"replaceRules","rules":[{"toolName":"Bash"}],"behavior":"allow","destination":"userSettings"},{"type":"addRules","rules":[{"toolName":"Read"}],"behavior":"deny","destination":"session"},{ "type" : "setMode", "mode":"acceptEdits", "destination":"userSettings" }]"#;
+        let offered = r#","permission_suggestions":[{"type":"setMode","mode":"dontAsk","destination":"session"},{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"npm test:*"}],"behavior":"allow","destination":"projectSettings"},{"type":"replaceRules","rules":[{"toolName":"Bash"}],"behavior":"allow","destination":"userSettings"},{"type":"addRules","rules":[{"toolName":"Read"}],"behavior":"deny","destination":"session"},{ "type" : "setMode", "mode":"acceptEdits", "destination":"userSettings" }]"#;
         let frame = can_use_tool("f1", "Bash", r#"{"command":"npm test"}"#, offered);
         let mut d = Driver::new("claude-1", "ses-1", RUN1);
         let p = ask(&mut d, &frame);
@@ -3687,7 +3690,7 @@ mod tests {
                 "{option}"
             );
         };
-        refuse("suggestion-0", "approve-session"); // bypassPermissions: never offered
+        refuse("suggestion-0", "approve-session"); // dontAsk (like bypassPermissions/auto): never offered
         refuse("suggestion-2", "approve-session"); // not a type the phone may grant
         refuse("suggestion-9", "approve-session"); // never offered at all
         refuse("suggestion-1", "approve-once"); // the option's bucket is fixed
@@ -4211,8 +4214,16 @@ mod tests {
         };
         refused(&ws, "contains the CHERNOBYL data directory");
         refused(&data, "contains the CHERNOBYL data directory");
-        refused(&root, "contains the CHERNOBYL data directory");
+        // root holds both the data dir and the profile; either refusal will do
+        assert!(check(&root).is_err());
         refused(&profile, "user profile folder");
+        // a folder that contains the profile (the Users folder) is refused too
+        let users = root.join("users");
+        let me = users.join("me");
+        std::fs::create_dir_all(&me).unwrap();
+        let err = validate_workspace(&users.to_string_lossy(), &data, Some(&me)).unwrap_err();
+        assert!(err.contains("user profile folder"), "{err}");
+        assert!(validate_workspace(&me.to_string_lossy(), &data, Some(&users)).is_ok());
         let canon = std::fs::canonicalize(&root).unwrap();
         let drive = PathBuf::from(plain(&canon));
         refused(drive.ancestors().last().unwrap(), "drive root");

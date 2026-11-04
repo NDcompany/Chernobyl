@@ -131,7 +131,18 @@ ADR-015 lets the phone start Claude Code and Codex processes, stream their trans
 | T10 | Two writers on one Claude session | New sessions get a fresh `--session-id`; `--resume` is used only to respawn a session this companion created after its idle reap; nothing else is resumed, so `--fork-session` is never needed. Codex has no resume at all | `idle_process_is_reaped_and_resumed` |
 | T11 | Print mode skips Claude's folder-trust dialog | Only allow-listed workspaces can be spawned in (T1). `INTEGRATIONS.md`, `README.md` and the `config.rs` doc comment state that adding a folder to `workspaces` is trusting it | docs |
 
-**Residuals.** A secret split across two streaming text deltas can show until its block completes and is re-redacted. Redaction recognises known shapes only. The runtimes' own transcript files on the desktop keep everything. Prompts and deny messages sent from the phone are journaled as part of their command records (the 5 000-record command retention), unredacted. Codex has no live run. None of T1-T11 has emulator or physical-device evidence yet: checklist rows 9.1-9.13 are NOT RUN.
+**Residuals.** A secret split across two streaming text deltas can show until its block completes and is re-redacted. Redaction recognises known shapes only. The runtimes' own transcript files on the desktop keep everything. Prompts and deny messages sent from the phone are journaled as part of their command records (the 5 000-record command retention), unredacted. Codex has no live run. Emulator evidence: checklist rows 9.1-9.13 ran 2026-11-04 (11 of 13 pass; 9.10 and 9.11 cover T4 and T2); there is no physical-device evidence yet.
+
+**Review 2026-11-05 (three read-only reviewers on the live-session code, findings verified and fixed).**
+- *T11:* OpenCode took a phone-typed folder as `?directory=` and skipped the allow-list. A non-empty `project` is now refused, and the phone shows no free-text folder field for real agents.
+- *T11:* the profile guard only refused the profile folder itself. A folder that contains it, such as the Users folder, is now refused too.
+- *T4:* a CLI `setMode` suggestion could offer `auto` or `dontAsk` as a persistent option. Suggestions now take the same `default | acceptEdits | plan` whitelist as `set_permission_mode`.
+- *T1:* OpenCode desktop sign-ins are capped at 4 open threads. The Bash command in a permission request is capped at 16 KiB, like every other tool input.
+- *T2:* redaction now covers `ghu_`, `ghr_`, `glpat-`, `npm_`, `sk_live_`, `rk_live_` and `sk_test_`.
+- *T5:* a link whose target holds a bidi or zero-width character is not tappable on the phone.
+- **Accepted:**
+  - The OpenCode Basic credential goes to whatever listens on the configured loopback port. A local process that binds the port first while OpenCode is down receives it; adversary (c) on loopback is accepted, as in §3.
+  - A desktop sign-in opens whatever http(s) URL the MCP server supplies. Only the server name is shown to the phone.
 
 ## 4. Unverified assumptions (explicitly not proven)
 

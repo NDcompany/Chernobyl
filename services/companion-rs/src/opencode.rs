@@ -48,7 +48,7 @@ use crate::transcript::{
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -128,6 +128,9 @@ struct Auth {
 
 /// Bounds for the id maps (ids are creation-ordered; the older half goes).
 const MAP_MAX: usize = 4096;
+/// Desktop sign-in threads open at once (each waits up to `AUTH_TTL_MS`).
+const MAX_DESKTOP_AUTHS: usize = 4;
+static DESKTOP_AUTHS: AtomicUsize = AtomicUsize::new(0);
 const TURNS_KEPT: usize = 8;
 const SESSIONS_KEPT: usize = 64;
 const MCP_POLL: Duration = Duration::from_secs(30);
@@ -798,12 +801,19 @@ impl Inner {
         prompt: &str,
         project: Option<&str>,
     ) -> Result<ServerMsg, AdapterError> {
-        let mut url = format!("{}/session", self.endpoint);
-        if let Some(p) = project
-            && !p.is_empty()
-        {
-            url.push_str(&format!("?directory={}", urlencode(p)));
+        // ADR-015 §4.2.3: a phone never picks a folder. OpenCode has no
+        // workspace allow-list, so its sessions start where `opencode serve`
+        // runs, and a `project` (once passed as `?directory=`) is refused.
+        if project.is_some_and(|p| !p.is_empty()) {
+            return Ok(ack(
+                command_id,
+                false,
+                Some("OpenCode sessions start in the folder opencode serve runs in".into()),
+                None,
+                None,
+            ));
         }
+        let url = format!("{}/session", self.endpoint);
         let body = json::stringify(&json::obj(vec![("title", json::s(title))]));
         let resp = self.req("POST", &url, Some(&body))?;
         if !(200..300).contains(&resp.status) {
@@ -1112,6 +1122,17 @@ impl Inner {
         flow: &str,
     ) -> Result<ServerMsg, AdapterError> {
         let name = urlencode(server);
+        // each desktop sign-in holds a thread for up to AUTH_TTL_MS, and a
+        // newer one replaces (not ends) the older request: bound them
+        if flow == "desktop" && DESKTOP_AUTHS.load(Ordering::SeqCst) >= MAX_DESKTOP_AUTHS {
+            return Ok(ack(
+                command_id,
+                false,
+                Some("too many sign-ins are open on the PC: finish or close one first".into()),
+                Some(session_id),
+                None,
+            ));
+        }
         let auth = if flow == "desktop" {
             Auth {
                 command_id: command_id.to_string(),
@@ -1180,6 +1201,7 @@ impl Inner {
                 session_id.to_string(),
                 server.to_string(),
             );
+            DESKTOP_AUTHS.fetch_add(1, Ordering::SeqCst);
             std::thread::spawn(move || {
                 let url = format!(
                     "{}/mcp/{}/auth/authenticate",
@@ -1190,6 +1212,7 @@ impl Inner {
                 let outcome = http_request_waiting("POST", &url, inner.auth.as_deref(), None, wait)
                     .map_err(clip)
                     .and_then(|r| mcp_outcome(&r));
+                DESKTOP_AUTHS.fetch_sub(1, Ordering::SeqCst);
                 if inner.end_auth(&ses, &srv, &cmd) {
                     inner.emit(vec![done(&cmd, outcome, &ses)]);
                 }
@@ -3564,16 +3587,36 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn create_session_maps_directory_and_rides_the_first_prompt() {
+    fn create_session_refuses_a_phone_chosen_directory_and_rides_the_first_prompt() {
         let f = start(Opts::default());
         let ad = adapter(&f);
+        let refused = ad
+            .send(&ClientMsg::CreateSession {
+                command_id: "cmd-d".into(),
+                agent_id: "build".into(),
+                title: "Fresh".into(),
+                prompt: "first turn".into(),
+                project: Some(r"C:\Users".into()),
+            })
+            .unwrap();
+        assert!(
+            matches!(refused, ServerMsg::Ack { ok: false, .. }),
+            "{refused:?}"
+        );
+        assert!(
+            f.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| !r.starts_with("POST /session"))
+        );
         let msg = ad
             .send(&ClientMsg::CreateSession {
                 command_id: "cmd-c".into(),
                 agent_id: "build".into(),
                 title: "Fresh".into(),
                 prompt: "first turn".into(),
-                project: Some(r"C:\proj\demo".into()),
+                project: None,
             })
             .unwrap();
         match msg {
@@ -3584,10 +3627,7 @@ pub(crate) mod tests {
             other => panic!("expected ack, got {other:?}"),
         }
         let reqs = f.requests.lock().unwrap();
-        assert!(
-            reqs.iter().any(|r| r.starts_with("POST /session ?directory=")
-                || r.starts_with("POST /session ") /* path recorded without query */),
-        );
+        assert!(reqs.iter().any(|r| r.starts_with("POST /session ")),);
         assert!(
             reqs.iter()
                 .any(|r| r.contains("prompt_async") && r.contains("first turn"))

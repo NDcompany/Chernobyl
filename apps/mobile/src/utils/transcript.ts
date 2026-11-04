@@ -177,7 +177,9 @@ export function parseMarkdown(src: string, streaming = false): MdBlock[] {
 const ESCAPABLE = '\\`*_{}[]()#+-.!|~<>"\'';
 const SPACE_RE = /\s/;
 const ALNUM_RE = /[A-Za-z0-9]/;
-const URL_RE = /^https?:\/\/[^\s<>`"'()[\]{}]+/;
+// invisible and bidi controls end a URL: a link carrying one is never tappable,
+// so what the confirm shows is what opens
+const URL_RE = /^https?:\/\/[^\s<>`"'()[\]{}​-‏‪-‮⁠-⁩﻿]+/;
 
 function canOpen(s: string, from: number, to: number, ch: string): boolean {
   if (to >= s.length || SPACE_RE.test(s[to])) return false;

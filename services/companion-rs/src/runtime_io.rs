@@ -146,17 +146,24 @@ fn secret_at(s: &str, i: usize, j: usize) -> Option<(usize, usize, &'static str)
 /// Whole-word token shapes. 20+ chars after a prefix keeps prose out; a bare
 /// `sk-` must also carry a digit (`sk-this-is-a-long-hyphenated-name`).
 fn token_kind(w: &[u8]) -> Option<&'static str> {
-    const PREFIXED: [(&[u8], &str); 7] = [
+    const PREFIXED: [(&[u8], &str); 14] = [
         (b"sk-ant-", "anthropic-key"),
         (b"sk-proj-", "openai-key"),
         (b"github_pat_", "github-token"),
         (b"ghp_", "github-token"),
         (b"gho_", "github-token"),
         (b"ghs_", "github-token"),
+        (b"ghu_", "github-token"),
+        (b"ghr_", "github-token"),
+        (b"glpat-", "gitlab-token"),
+        (b"npm_", "npm-token"),
+        (b"sk_live_", "stripe-key"),
+        (b"rk_live_", "stripe-key"),
+        (b"sk_test_", "stripe-key"),
         (b"sk-", "openai-key"),
     ];
     // every shape starts with one of these bytes; most words stop here
-    if !matches!(w[0], b's' | b'g' | b'x' | b'A') {
+    if !matches!(w[0], b's' | b'g' | b'x' | b'A' | b'n' | b'r') {
         return None;
     }
     for (prefix, kind) in PREFIXED {
@@ -891,6 +898,11 @@ mod tests {
                 format!("key {} end", m("anthropic-key")),
             ),
             (fake("sk-proj-", 30), m("openai-key")),
+            (fake("ghu_", 36), m("github-token")),
+            (fake("glpat-", 20), m("gitlab-token")),
+            (fake("npm_", 36), m("npm-token")),
+            (fake("sk_live_", 24), m("stripe-key")),
+            (fake("rk_live_", 24), m("stripe-key")),
             (fake("sk-", 48), m("openai-key")),
             (
                 format!("é{}é", fake("sk-ant-", 30)),

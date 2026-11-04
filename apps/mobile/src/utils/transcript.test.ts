@@ -144,6 +144,11 @@ test('markdown: links show the full URL; only http(s) is tappable; no HTML', () 
   // an image is never an image: its URL shows as text
   assert.match(parseInline('![i](https://t.co/p.png)').map((s) => s.text).join(''), /i \(https:\/\/t\.co\/p\.png\)/);
   assert.equal(parseInline('<b>x</b>')[0].text, '<b>x</b>');
+  // a bidi override or zero-width char inside the target: not tappable
+  for (const ch of ['‮', '​', '⁦']) {
+    const spans = parseInline(`[bank](https://bank.example${ch}moc.live/x)`);
+    assert.ok(spans.every((s) => !s.url), JSON.stringify(spans));
+  }
 });
 
 test('markdown: hostile input parses in linear time', () => {
