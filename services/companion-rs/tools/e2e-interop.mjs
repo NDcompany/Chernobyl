@@ -229,12 +229,14 @@ async function main() {
     JSON.stringify(pairC.endpoints) === JSON.stringify([deadUrl, url]),
     pairC.endpoints.join(', '),
   );
-  // Documented capacity edge: two full 5-digit-port endpoints = 215 bytes >
-  // 213 (v10-M) — the payload must still print for paste, QR failure reported.
-  const pairOver = runPair(home, {
-    endpoints: [url, `ws://127.0.0.1:${await freePort()}`],
-    expectQrOverflow: true,
-  });
+  // Two full endpoints (LAN + tunnel, ~250 bytes) fit since the QR grew to
+  // v15-M (412 bytes)
+  const pairTwo = runPair(home, { endpoints: [url, `ws://127.0.0.1:${await freePort()}`] });
+  check('S10: two endpoints still render a QR', pairTwo.endpoints.length === 2, pairTwo.endpoints.join(', '));
+  // Capacity edge: past 412 bytes the payload must still print for paste, QR
+  // failure reported
+  const longHost = `wss://${['a', 'b', 'c', 'd'].map((x) => x.repeat(60)).join('.')}.example.com`;
+  const pairOver = runPair(home, { endpoints: [url, longHost], expectQrOverflow: true });
   check(
     'S10: QR overflow keeps a pasteable payload with endpoint order intact',
     pairOver.endpoints.length === 2 && pairOver.endpoints[0] === url,
