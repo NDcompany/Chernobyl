@@ -251,7 +251,9 @@ export function StatusPill({ status, inverse = false }: { status: SessionStatus;
       accessible
       accessibilityLabel={`Status: ${p.label}`}
     >
-      <RNText style={[typography.xs, { color: p.fg, fontWeight: '700' }]}>{p.label}</RNText>
+      <RNText style={[typography.xs, { color: p.fg, fontWeight: '700' }]} numberOfLines={1}>
+        {p.label}
+      </RNText>
     </View>
   );
 }

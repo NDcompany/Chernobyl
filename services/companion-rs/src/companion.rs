@@ -654,7 +654,11 @@ impl Companion {
                 if !snap.hosts.iter().any(|h| h.id == a.host_id) {
                     snap.hosts.push(crate::protocol::Host {
                         id: a.host_id.clone(),
-                        name: a.name.clone(),
+                        // the PC, not the agent: the phone shows "agent · host"
+                        name: std::env::var("COMPUTERNAME")
+                            .ok()
+                            .filter(|n| !n.is_empty())
+                            .unwrap_or_else(|| "This PC".into()),
                         kind: "local".into(),
                         platform: std::env::consts::OS.into(),
                         address: "127.0.0.1".into(),

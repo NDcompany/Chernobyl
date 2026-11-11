@@ -36,7 +36,7 @@ label/colors), `RiskPill` (low|medium|high), `SimulatedTag` (grey "Simulated" pr
 `safeTop=false` when the screen draws its own dark header + `bottomInset` for tab clearance +
 `scrollRef` for live-output autoscroll; a `KeyboardAvoidingView` with `padding` on both platforms
 keeps the footer above the keyboard, since edge-to-edge Android no longer resizes the window), `PageHeader` (`onBack`: undefined→`router.back()`, null→no
-button; `dark` variant for black headers), `Card` (`strong` = black outline), `EmptyState` (default
+button; `dark` variant for black headers; a `right` element such as a status pill sizes itself, the 44 px slot is only a minimum), `Card` (`strong` = black outline), `EmptyState` (default
 `contour="bottom"`), `ToastHost` (global, reads `appStore.toasts`, tab-bar aware — mounted once in
 root layout), `ConfirmModal` (destructive confirmations; `note` = scope/safety line).
 

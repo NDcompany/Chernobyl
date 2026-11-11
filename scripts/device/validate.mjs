@@ -948,7 +948,8 @@ Object.assign(ROWS, {
     const after = toolItem ? [...view().items.values()].filter((i) => i.kind === 'text' && i.ts >= toolItem.ts && i.turnId === toolItem.turnId) : [];
     record('9.4', !!denied && !!ended && after.length > 0, `card "${denied?.desc ?? 'no denied mark'}"; turn ended=${!!ended}; Claude's text after the denial: ${JSON.stringify(after.map((i) => i.text).join(' ').slice(0, 120))}; extra requests denied plainly: ${extra}`);
   },
-  // 9.5: a follow-up mid-turn joins the running turn and is answered in it.
+  // 9.5: a follow-up mid-turn shows "Queued" and is answered, in that turn or
+  // the next (Claude merges only sometimes; the companion advertises `queue`).
   // Two cases: sent while text streams (no tool in the turn), and sent while
   // the turn is about to run a tool (Bash seq)
   async '9.5'() {
@@ -981,10 +982,11 @@ Object.assign(ROWS, {
       const newTurns = [...view().turns.values()].slice(t0);
       const said = [...view().items.values()].find((i) => i.kind === 'text' && i.text.includes(k.word));
       const merged = newTurns.length === 1 && said?.turnId === newTurns[0].id;
-      pass &&= runningAtSend && live.queued.has(follow) && merged;
-      notes.push(`${k.tag} (${k.streamFirst ? 'sent while text streamed, no tool' : 'sent before a Bash call'}): sent while the turn ran=${runningAtSend}; companion marked it queued=${live.queued.has(follow)}; turns: ${newTurns.length} (${newTurns.map((t) => t.status).join(', ')}); ${k.word} answered in the first prompt's turn=${merged}`);
+      const settled = newTurns.length > 0 && newTurns.every((t) => t.status !== 'running');
+      pass &&= runningAtSend && live.queued.has(follow) && !!said && settled;
+      notes.push(`${k.tag} (${k.streamFirst ? 'sent while text streamed, no tool' : 'sent before a Bash call'}): sent while the turn ran=${runningAtSend}; companion marked it queued=${live.queued.has(follow)}; turns: ${newTurns.length} (${newTurns.map((t) => t.status).join(', ')}); ${k.word} answered=${!!said} (merged into the first turn=${merged}); all turns settled=${settled}`);
     }
-    record('9.5', pass, `${notes.join('. ')}. While sending, the phone composer says "Joins the current turn" (${cases.map((k) => `${k.tag}-joins.png`).join(', ')}); ${cases.map((k) => `${k.tag}-answered.png`).join(', ')} show the word under its own turn footer`);
+    record('9.5', pass, `${notes.join('. ')}. While sending, the phone shows "Queued" (${cases.map((k) => `${k.tag}-joins.png`).join(', ')}); ${cases.map((k) => `${k.tag}-answered.png`).join(', ')} show the word under its own turn footer`);
   },
   // 9.6: Stop mid-stream -> "Stopped"; the next prompt works in the same session
   async '9.6'() {

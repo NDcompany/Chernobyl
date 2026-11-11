@@ -166,7 +166,8 @@ export function PageHeader({ title, subtitle, onBack, right, dark = false, borde
           </Text>
         ) : null}
       </View>
-      <View style={styles.headerBtn}>{right}</View>
+      {/* a status pill is wider than the 44 px button slot: let it size itself */}
+      <View style={right ? styles.headerRight : styles.headerBtn}>{right}</View>
     </View>
   );
 }
@@ -424,6 +425,12 @@ const styles = StyleSheet.create({
     height: 44,
     borderRadius: 22,
     alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerRight: {
+    minWidth: 44,
+    height: 44,
+    alignItems: 'flex-end',
     justifyContent: 'center',
   },
 
