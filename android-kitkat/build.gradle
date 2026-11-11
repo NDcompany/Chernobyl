@@ -1,0 +1,34 @@
+// CHERNOBYL for Android 4.4 (API 19): plain framework + Java, see docs/decisions/ADR-019-kitkat-client.md
+plugins { id 'com.android.application' version '9.2.1' }
+
+android {
+    namespace 'com.chernobyl.kitkat'
+    compileSdk 36
+    defaultConfig {
+        applicationId 'com.chernobyl.kitkat'
+        minSdk 19
+        targetSdk 36
+        versionCode 1
+        versionName '0.1.0'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            // re-signed with the owner's key by sign-release.ps1 (v1 + v2: KitKat checks v1 only)
+            signingConfig signingConfigs.debug
+        }
+    }
+    lint { abortOnError false; checkReleaseBuilds false }
+    testOptions { unitTests.returnDefaultValues = true }
+}
+
+dependencies {
+    implementation 'com.google.zxing:core:3.3.3'
+    testImplementation 'junit:junit:4.13.2'
+    // android.jar's org.json is stubbed on the JVM; the real one for tests
+    testImplementation 'org.json:json:20231013'
+}
