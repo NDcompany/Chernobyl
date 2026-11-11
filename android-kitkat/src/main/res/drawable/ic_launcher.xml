@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- black tile with an original 8x8 pixel mark (the main app's look: black, white, one accent) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="48dp" android:height="48dp" android:viewportWidth="48" android:viewportHeight="48">
+    <path android:fillColor="#FF050505" android:pathData="M8,2h32a6,6 0 0 1 6,6v32a6,6 0 0 1 -6,6h-32a6,6 0 0 1 -6,-6v-32a6,6 0 0 1 6,-6z"/>
+    <path android:fillColor="#FFFFFFFF" android:pathData="M21,12h6v3h-6zM18,15h12v3h-12zM15,18h18v3h-18zM12,21h6v3h-6zM21,21h6v3h-6zM30,21h6v3h-6zM12,24h24v3h-24zM15,27h18v3h-18zM18,30h12v3h-12zM21,33h6v3h-6z"/>
+</vector>

@@ -64,6 +64,10 @@ holds it in the device keystore. Beyond loopback a token alone is not enough to 
 commands (decision D2): the E2E session handshake must complete first (see
 `services/companion-rs/README.md`, "E2E wire format").
 
+**Android 4.4 tablet?** The main app needs Android 7.0. `android-kitkat/` is a separate native
+client for KitKat (API 19) with the same pairing and E2E encryption: sessions, live conversations,
+approvals, alerts, files and git (ADR-019; install steps in `docs/INSTALL.md`).
+
 ## Screens
 
 | Screen | Route | Notes |

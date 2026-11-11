@@ -48,6 +48,48 @@ To test on an emulator, `scripts/device/validate.mjs` runs the phone checklist a
 APK and a real companion. It pairs, connects, restarts things, revokes the device and saves
 evidence. The emulator reaches the PC's loopback as `10.0.2.2`.
 
+### Android 4.4 tablets (KitKat client)
+
+The main app needs Android 7.0. For an Android 4.4 tablet there is a separate native client,
+`android-kitkat/` (ADR-019): same pairing, same E2E encryption, about 300 KB, no Google Play
+services needed.
+
+Build and sign it (JDK 17 + Android SDK; uses the cached Gradle 9.4.1 / AGP 9.2.1; runs the unit
+tests first):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File android-kitkat\build-release.ps1
+# -> release\chernobyl-kitkat-0.1.0.apk, signed v1 + v2 with CHB_KEYSTORE (default G:\Secrets\Android\chernobyl-release.jks)
+```
+
+Install on the tablet:
+
+1. Settings → Security → turn on **Unknown sources**.
+2. Copy the APK over USB and open it in a file manager, or `adb install release\chernobyl-kitkat-0.1.0.apk`.
+3. Open **CHERNOBYL**. It starts on **Pair**.
+
+Pair:
+
+1. On the PC, with the companion running, create an offer for an address the tablet can reach:
+   `chernobyl-companion --pair --endpoint ws://<pc-lan-ip>:8787` (a LAN bind needs `--token`), or
+   your tunnel's `wss://…ngrok-free.app` URL. Offers expire after 5 minutes and work once.
+2. Paste the `payload: {...}` line into the first field (or tap **Scan QR** and point the camera at
+   the terminal QR), type the access token, tap **Pair and connect**.
+3. The rail shows **Online** and Home fills in. "Keys stored in" on the Pair screen says whether the
+   Android Keystore protects the stored key (the normal case) or only app-private storage.
+
+Good to know on a real 4.4 tablet:
+
+- `wss://` works: the app turns on TLS 1.2 itself and carries the Let's Encrypt (ISRG) roots that
+  Android 4.4 lacks, so ngrok URLs validate. A certificate error in "Status" means some other CA.
+- A foreground notification keeps the connection while the app is in the background. When the
+  screen is off, KitKat may sleep the CPU and Wi-Fi; alerts then arrive when it wakes. Tick
+  **Keep the connection awake** on the Pair screen for instant alerts (costs battery).
+- "Refused: unauthorized" = wrong or missing token: type the right one and leave the payload field
+  empty to keep the pairing. "Refused: unknown device" / "offer expired" = make a new offer.
+  "device revoked" = pair again.
+- Removing or changing the lock screen can wipe KitKat's keystore; the app then asks to pair again.
+
 ## Publish checksums (maintainer)
 
 ```powershell
