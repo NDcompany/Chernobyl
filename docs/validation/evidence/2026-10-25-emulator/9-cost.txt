@@ -11,3 +11,4 @@ Per-run Claude cost from the turns' costUsd (result frames), as printed by the r
 Total about $0.16. 9.12 (OpenCode on local Ollama) costs nothing.
 2026-11-04T19:09:51.617Z rows 9.12: model null, 0 turns, total_cost_usd 0.0000
 2026-11-04T19:13:15.774Z rows 9.12: model null, 0 turns, total_cost_usd 0.0000
+2026-11-11T19:26:20.451Z rows 9.1 9.5: model claude-haiku-5-5, 5 turns, total_cost_usd 0.0194

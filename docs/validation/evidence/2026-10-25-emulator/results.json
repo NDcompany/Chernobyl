@@ -122,8 +122,8 @@
   },
   "9.1": {
     "pass": true,
-    "observed": "\"Starting Claude Code…\" shown=true; phone frames while streaming at companion text lengths 375 -> 695 -> 1015 -> 1415 -> 1735 -> 2055 -> 2279 -> 2599 -> 2839 -> 3159 -> 3479 -> 3799 -> 4013 -> 4267 -> 4467 -> 4733 -> 4933 -> 5199 -> 5399 -> 5653 -> 5867 (stream-1/stream-2 differ=true); final phone text is 1..1500=true; \"Jump to latest\" shown at turn end=true; footer \"Done · 12.3 s · 45.3k tokens · <$0.01\"; model=claude-haiku-5-5; cost so far $0.0024",
-    "at": "2026-11-04T17:58:42.181Z"
+    "observed": "\"Starting Claude Code…\" shown=true; phone frames while streaming at companion text lengths 459 -> 859 -> 1259 -> 1659 -> 2059 -> 2459 -> 2763 -> 3163 -> 3403 -> 3803 -> 4083 -> 4283 -> 4549 -> 4803 -> 5003 -> 5269 -> 5537 (stream-1/stream-2 differ=true); final phone text is 1..1500=true; \"Jump to latest\" shown at turn end=false; footer \"Done · 12.9 s · 46.2k tokens · <$0.01\"; model=claude-haiku-5-5; cost so far $0.0069",
+    "at": "2026-11-11T19:25:14.605Z"
   },
   "9.3": {
     "pass": true,
@@ -141,9 +141,9 @@
     "at": "2026-11-04T18:36:44.529Z"
   },
   "9.5": {
-    "pass": false,
-    "observed": "9.5a (sent while text streamed, no tool): sent while the turn ran=true; companion marked it queued=true; turns: 2 (completed, completed); PINEAPPLE answered in the first prompt's turn=false. 9.5b (sent before a Bash call): sent while the turn ran=true; companion marked it queued=true; turns: 2 (completed, completed); MANGO answered in the first prompt's turn=false. While sending, the phone composer says \"Joins the current turn\" (9.5a-joins.png, 9.5b-joins.png); 9.5a-answered.png, 9.5b-answered.png show the word under its own turn footer",
-    "at": "2026-11-04T18:54:30.494Z"
+    "pass": true,
+    "observed": "9.5a (sent while text streamed, no tool): sent while the turn ran=true; companion marked it queued=true; turns: 2 (completed, completed); PINEAPPLE answered=true (merged into the first turn=false); all turns settled=true. 9.5b (sent before a Bash call): sent while the turn ran=true; companion marked it queued=true; turns: 2 (completed, completed); MANGO answered=true (merged into the first turn=false); all turns settled=true. While sending, the phone shows \"Queued\" (9.5a-joins.png, 9.5b-joins.png); 9.5a-answered.png, 9.5b-answered.png show the word under its own turn footer",
+    "at": "2026-11-11T19:26:12.341Z"
   },
   "9.6": {
     "pass": true,

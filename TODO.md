@@ -331,9 +331,8 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
 
 ### Open items (2026-11-04)
 
-- [ ] Emulator: re-run row 9.5 (now "Queued"), 9.9 sign-in on a throwaway MCP server, and 9.13
-      (needs a pre-ADR-015 APK build). Also eyeball the keyboard and list-follow fixes (`9bf315d`) in a live session;
-      only the diff fix was seen on the emulator.
+- [ ] Emulator: 9.9 sign-in on a throwaway MCP server, and 9.13 (needs a pre-ADR-015 APK build).
+      Row 9.5 re-passed 2026-11-12; the keyboard and list-follow fixes were seen working on screen.
 - [ ] Codex: `thread/resume` after the app-server exits, the 30 s interrupt-unknown timer and
       the 10-min `mcp_auth` expiry (none built; ADR-015 §10).
 - [ ] A live Codex run, when someone has Codex installed and signed in; capabilities stay
