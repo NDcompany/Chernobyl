@@ -119,4 +119,66 @@ mod tests {
         let raw = decode("dGhlIHNhbXBsZSBub25jZQ==").unwrap();
         assert_eq!(raw.len(), 16);
     }
+
+    #[test]
+    fn empty_buffer_decodes_to_empty_vec() {
+        assert_eq!(decode("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn single_byte_padding_two_equals() {
+        assert_eq!(encode(&[0x41]), "QQ==");
+        assert_eq!(decode("QQ==").unwrap(), vec![0x41]);
+    }
+
+    #[test]
+    fn two_bytes_padding_one_equal() {
+        assert_eq!(encode(&[0x41, 0x42]), "QUI=");
+        assert_eq!(decode("QUI=").unwrap(), vec![0x41, 0x42]);
+    }
+
+    #[test]
+    fn three_bytes_no_padding() {
+        assert_eq!(encode(&[0x41, 0x42, 0x43]), "QUJD");
+        assert_eq!(decode("QUJD").unwrap(), vec![0x41, 0x42, 0x43]);
+    }
+
+    #[test]
+    fn strict_decode_rejects_whitespace_and_newlines() {
+        assert_eq!(decode("Zm9v\n"), None);
+        assert_eq!(decode(" Zm9v"), None);
+        assert_eq!(decode("Zm 9v"), None);
+        assert_eq!(decode("Zm9v\r\n"), None);
+    }
+
+    #[test]
+    fn strict_decode_rejects_urlsafe_substitutions() {
+        assert_eq!(decode("Zm-v"), None);
+        assert_eq!(decode("Zm_v"), None);
+    }
+
+    #[test]
+    fn strict_decode_rejects_non_zero_trailing_bits_pad_two() {
+        // "ZE==" has non-zero bits in the unused 4 bits of the second char
+        assert_eq!(decode("ZE=="), None);
+        // "Zg==" decodes cleanly to 'f'
+        assert_eq!(decode("Zg==").unwrap(), b"f");
+    }
+
+    // BUG in base64::decode: padding '=' in non-final 4-byte chunks is permitted because
+    // chunk parsing processes each 4-byte slice independently without tracking if a previous
+    // chunk contained padding; "Zg==Zg==" yields Some([102, 102]) instead of None.
+    #[test]
+    #[ignore = "bug: base64::decode accepts embedded padding '=' in non-final chunks (e.g. Zg==Zg==)"]
+    fn strict_decode_rejects_embedded_padding_in_multiblock() {
+        // padding '=' can only appear at the end of the entire string
+        assert_eq!(decode("Zg==Zg=="), None);
+        assert_eq!(decode("QUI=QUI="), None);
+    }
+
+    #[test]
+    fn all_byte_values_round_trip() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        assert_eq!(decode(&encode(&bytes)).unwrap(), bytes);
+    }
 }

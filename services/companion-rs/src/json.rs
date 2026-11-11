@@ -728,4 +728,96 @@ mod tests {
             assert_eq!(a, b, "stateless parse must be deterministic for {s:?}");
         }
     }
+
+    #[test]
+    fn as_helpers_return_none_on_type_mismatch() {
+        let n = Json::Int(42);
+        let s = Json::Str("hello".into());
+        let b = Json::Bool(true);
+        let null = Json::Null;
+        let arr = Json::Arr(vec![]);
+
+        assert_eq!(as_str(&n), None);
+        assert_eq!(as_i64(&s), None);
+        assert_eq!(as_f64(&null), None);
+        assert_eq!(as_bool(&n), None);
+        assert_eq!(as_arr(&b), None);
+
+        // but matching types extract Some
+        assert_eq!(as_str(&s), Some("hello"));
+        assert_eq!(as_i64(&n), Some(42));
+        assert_eq!(as_f64(&n), Some(42.0));
+        assert_eq!(as_bool(&b), Some(true));
+        assert!(as_arr(&arr).is_some());
+    }
+
+    #[test]
+    fn get_helpers_return_none_on_missing_key_or_non_object() {
+        let test_obj = obj(vec![("k", s("v"))]);
+        let arr = Json::Arr(vec![]);
+
+        assert_eq!(get(&arr, "k"), None);
+        assert_eq!(get(&test_obj, "missing"), None);
+        assert_eq!(get_str(&test_obj, "k"), Some("v"));
+        assert_eq!(get_str(&test_obj, "missing"), None);
+    }
+
+    #[test]
+    fn json_error_display_strings_are_non_empty() {
+        let errors = [
+            JsonError::Eof,
+            JsonError::TrailingGarbage,
+            JsonError::InvalidNumber,
+            JsonError::InvalidString,
+            JsonError::ControlCharInString,
+            JsonError::LoneSurrogate,
+            JsonError::InvalidEscape,
+            JsonError::InvalidLiteral,
+            JsonError::UnexpectedChar,
+            JsonError::DepthExceeded,
+            JsonError::DuplicateKey,
+        ];
+        for e in errors {
+            let msg = e.to_string();
+            assert!(!msg.is_empty(), "error {e:?} display must not be empty");
+        }
+    }
+
+    #[test]
+    fn rejects_single_quoted_strings() {
+        assert!(parse("'single'").is_err());
+        assert!(parse(r#"{"key": 'value'}"#).is_err());
+    }
+
+    #[test]
+    fn rejects_trailing_commas_in_arrays_and_objects() {
+        assert!(parse("[1, 2,]").is_err());
+        assert!(parse(r#"{"a": 1,}"#).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_colons_and_commas() {
+        assert!(parse(r#"{"a" 1}"#).is_err());
+        assert!(parse("[1 2]").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_and_truncated_escape_sequences() {
+        assert_eq!(parse(r#""\q""#), Err(JsonError::InvalidEscape));
+        assert_eq!(parse(r#""\x""#), Err(JsonError::InvalidEscape));
+        assert_eq!(parse(r#""\u12""#), Err(JsonError::Eof));
+        assert_eq!(parse(r#""\u123z""#), Err(JsonError::InvalidString));
+    }
+
+    #[test]
+    fn rejects_plus_signed_number() {
+        assert!(parse("+1").is_err());
+        assert!(parse("+0.5").is_err());
+    }
+
+    #[test]
+    fn escape_special_characters_round_trip() {
+        let escaped = parse(r#""\b\f\r\t\/\"\\""#).unwrap();
+        assert_eq!(escaped, Json::Str("\u{0008}\u{000c}\r\t/\"\\".into()));
+    }
 }

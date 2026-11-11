@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ts:
+    name: TypeScript Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  rust:
+    name: Rust Runtime Gates
+    # services/companion-rs is Windows-first and links system DLLs directly via ffi.rs
+    # (kernel32, psapi, ws2_32, crypt32 / DPAPI, bcrypt) with raw Windows socket handles
+    # and Windows process extensions without POSIX fallbacks. Linux cannot compile companion-rs,
+    # so this job is kept on windows-latest.
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            services/companion-rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('services/companion-rs/Cargo.lock', 'services/companion-rs/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cargo Test
+        run: cargo test --manifest-path services/companion-rs/Cargo.toml
+
+      - name: Cargo Clippy
+        run: cargo clippy --manifest-path services/companion-rs/Cargo.toml --all-targets -- -D warnings
+
+      - name: Cargo Format Check
+        run: cargo fmt --manifest-path services/companion-rs/Cargo.toml --check
+
+      - name: Cargo Self-Test
+        run: cargo run --manifest-path services/companion-rs/Cargo.toml -- --self-test
+
+  interop:
+    name: Interop Gate
+    needs: [ts, rust]
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            services/companion-rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('services/companion-rs/Cargo.lock', 'services/companion-rs/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run E2E Interop
+        run: npm run verify:e2e

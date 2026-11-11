@@ -94,4 +94,53 @@ mod tests {
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
     }
+
+    #[test]
+    fn single_block_boundary_55_bytes() {
+        // 55 bytes + 0x80 (1 byte) + 8 bytes length = 64 bytes (exact 1 block)
+        let msg = [b'x'; 55];
+        let digest = sha1(&msg);
+        assert_ne!(digest, [0u8; 20]);
+    }
+
+    #[test]
+    fn two_block_boundary_56_bytes() {
+        // 56 bytes + 0x80 = 57 bytes > 56, so length cannot fit in block 1; spills to block 2
+        let msg = [b'x'; 56];
+        let digest = sha1(&msg);
+        assert_ne!(digest, [0u8; 20]);
+    }
+
+    #[test]
+    fn two_block_exact_64_bytes() {
+        // exactly one 64-byte chunk of data: padding and length must form a full second block
+        let msg = [b'y'; 64];
+        let digest = sha1(&msg);
+        assert_ne!(digest, [0u8; 20]);
+    }
+
+    #[test]
+    fn two_block_boundary_119_bytes() {
+        // 119 bytes + 1 byte padding + 8 bytes length = 128 bytes (exact 2 blocks)
+        let msg = [b'z'; 119];
+        let digest = sha1(&msg);
+        assert_ne!(digest, [0u8; 20]);
+    }
+
+    #[test]
+    fn three_block_boundary_120_bytes() {
+        // 120 bytes + 1 byte padding = 121 bytes > 120 (56 mod 64); spills to block 3
+        let msg = [b'w'; 120];
+        let digest = sha1(&msg);
+        assert_ne!(digest, [0u8; 20]);
+    }
+
+    #[test]
+    fn sha1_deterministic_across_repeated_runs() {
+        let input = b"The quick brown fox jumps over the lazy dog";
+        let d1 = sha1(input);
+        let d2 = sha1(input);
+        assert_eq!(d1, d2);
+        assert_eq!(hex(&d1), "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12");
+    }
 }

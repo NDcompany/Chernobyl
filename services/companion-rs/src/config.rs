@@ -579,4 +579,107 @@ mod tests {
         assert!(load_config(Some(&path)).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn validate_config_rejects_empty_data_dir() {
+        let v = json::parse(r#"{"version":1,"name":"h","dataDir":"","adapters":[],"retention":{"events":5000,"eventsMaxAgeMs":600000},"diagnostics":{"port":9487},"probeIntervalMs":15000}"#).unwrap();
+        let err = validate_config(&v).unwrap_err();
+        assert!(err.contains("dataDir"), "got {err}");
+    }
+
+    #[test]
+    fn validate_config_rejects_out_of_range_probe_interval() {
+        let v_low = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[],"retention":{"events":5000,"eventsMaxAgeMs":600000},"diagnostics":{"port":9487},"probeIntervalMs":500}"#).unwrap();
+        assert!(
+            validate_config(&v_low)
+                .unwrap_err()
+                .contains("probeIntervalMs")
+        );
+
+        let v_high = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[],"retention":{"events":5000,"eventsMaxAgeMs":600000},"diagnostics":{"port":9487},"probeIntervalMs":700000}"#).unwrap();
+        assert!(
+            validate_config(&v_high)
+                .unwrap_err()
+                .contains("probeIntervalMs")
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_out_of_range_diagnostics_port() {
+        let v = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[],"retention":{"events":5000,"eventsMaxAgeMs":600000},"diagnostics":{"port":70000},"probeIntervalMs":15000}"#).unwrap();
+        let err = validate_config(&v).unwrap_err();
+        assert!(err.contains("diagnostics.port"), "got {err}");
+    }
+
+    #[test]
+    fn validate_config_rejects_out_of_range_events_max_age() {
+        let v = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[],"retention":{"events":5000,"eventsMaxAgeMs":1000},"diagnostics":{"port":9487},"probeIntervalMs":15000}"#).unwrap();
+        let err = validate_config(&v).unwrap_err();
+        assert!(err.contains("retention.eventsMaxAgeMs"), "got {err}");
+    }
+
+    #[test]
+    fn validate_config_rejects_invalid_server_options() {
+        let v_bind = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[],"retention":{"events":5000,"eventsMaxAgeMs":600000},"diagnostics":{"port":9487},"probeIntervalMs":15000,"server":{"bind":""}}"#).unwrap();
+        assert!(
+            validate_config(&v_bind)
+                .unwrap_err()
+                .contains("server.bind")
+        );
+
+        let v_port = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[],"retention":{"events":5000,"eventsMaxAgeMs":600000},"diagnostics":{"port":9487},"probeIntervalMs":15000,"server":{"port":80000}}"#).unwrap();
+        assert!(
+            validate_config(&v_port)
+                .unwrap_err()
+                .contains("server.port")
+        );
+
+        let v_e2e = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[],"retention":{"events":5000,"eventsMaxAgeMs":600000},"diagnostics":{"port":9487},"probeIntervalMs":15000,"server":{"requireE2e":"yes"}}"#).unwrap();
+        assert!(
+            validate_config(&v_e2e)
+                .unwrap_err()
+                .contains("server.requireE2e")
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_missing_required_sections() {
+        let no_ret = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[],"diagnostics":{"port":9487},"probeIntervalMs":15000}"#).unwrap();
+        assert!(
+            validate_config(&no_ret)
+                .unwrap_err()
+                .contains("'retention' is required")
+        );
+
+        let no_diag = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[],"retention":{"events":5000,"eventsMaxAgeMs":600000},"probeIntervalMs":15000}"#).unwrap();
+        assert!(
+            validate_config(&no_diag)
+                .unwrap_err()
+                .contains("'diagnostics' is required")
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_ollama_without_endpoint() {
+        let v = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[{"id":"ol-1","type":"ollama","enabled":true}],"retention":{"events":5000,"eventsMaxAgeMs":600000},"diagnostics":{"port":9487},"probeIntervalMs":15000}"#).unwrap();
+        let err = validate_config(&v).unwrap_err();
+        assert!(err.contains("endpoint is required"), "got {err}");
+    }
+
+    #[test]
+    fn validate_config_rejects_adapter_with_missing_or_empty_id() {
+        let v_empty = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[{"id":"","type":"mock"}],"retention":{"events":5000,"eventsMaxAgeMs":600000},"diagnostics":{"port":9487},"probeIntervalMs":15000}"#).unwrap();
+        assert!(
+            validate_config(&v_empty)
+                .unwrap_err()
+                .contains("id must be a non-empty string")
+        );
+
+        let v_missing = json::parse(r#"{"version":1,"name":"h","dataDir":"x","adapters":[{"type":"mock"}],"retention":{"events":5000,"eventsMaxAgeMs":600000},"diagnostics":{"port":9487},"probeIntervalMs":15000}"#).unwrap();
+        assert!(
+            validate_config(&v_missing)
+                .unwrap_err()
+                .contains("id must be a non-empty string")
+        );
+    }
 }

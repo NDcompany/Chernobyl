@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Companion and Draft Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            services/companion-rs/target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('services/companion-rs/Cargo.lock', 'services/companion-rs/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Companion (Release)
+        run: cargo build --release --manifest-path services/companion-rs/Cargo.toml
+
+      - name: Package Release
+        run: node scripts/package-release.mjs
+
+      # Note: Android APK builds separately on Ubuntu runners via android.yml.
+      # Because GitHub Actions runs workflow runs concurrently on the same tag,
+      # the release draft is initialized here with the companion binary and
+      # SHA256SUMS.txt, and the signed APK artifact can be attached to the draft
+      # release manually before publication.
+      - name: Create Draft Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            services/companion-rs/target/release/chernobyl-companion.exe
+            release/SHA256SUMS.txt
