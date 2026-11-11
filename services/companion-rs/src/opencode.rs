@@ -3921,7 +3921,8 @@ pub(crate) mod tests {
         });
         let ad = adapter(&f);
         let err = ad.refresh().unwrap_err();
-        assert_eq!(err.code(), "invalid-response");
+        // flaked once under a loaded full run as "unknown": print the cause
+        assert_eq!(err.code(), "invalid-response", "{err}");
         assert!(!ad.is_healthy());
         assert!(ad.detail().unwrap().contains("byte limit"));
     }

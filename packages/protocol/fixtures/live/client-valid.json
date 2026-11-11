@@ -73,5 +73,8 @@
   { "type": "git_stage", "commandId": "c-ws-8", "workspaceId": "3f2a9c1d0e4b", "paths": ["README.md", "src/new file.ts"] },
   { "type": "git_unstage", "commandId": "c-ws-9", "workspaceId": "3f2a9c1d0e4b", "paths": ["README.md"] },
   { "type": "git_commit", "commandId": "c-ws-10", "workspaceId": "3f2a9c1d0e4b", "message": "Fix the login redirect\n\nCloses #12" },
-  { "type": "git_push", "commandId": "c-ws-11", "workspaceId": "3f2a9c1d0e4b" }
+  { "type": "git_push", "commandId": "c-ws-11", "workspaceId": "3f2a9c1d0e4b" },
+  { "type": "git_pull", "commandId": "c-ws-12", "workspaceId": "3f2a9c1d0e4b" },
+  { "type": "terminal_run", "commandId": "c-term-1", "workspaceId": "3f2a9c1d0e4b", "command": "npm test -- --watch=false" },
+  { "type": "terminal_stop", "commandId": "c-term-2", "workspaceId": "3f2a9c1d0e4b" }
 ]

@@ -2,9 +2,10 @@
  * Changes (ADR-016): review and ship an agent's work from the phone. Git
  * status of one allow-listed workspace grouped Conflicts / Staged / Changes /
  * Untracked; tap a file for its diff (DiffView), Stage / Unstage toggles, a
- * commit message box, and Push (current branch to its upstream, never forced,
- * after a confirm naming branch → upstream). Every change is a command with
- * its own result; git's own error text is shown when it fails.
+ * commit message box, Pull (a fast-forward from the upstream only, after a
+ * confirm naming upstream → branch) and Push (current branch to its upstream,
+ * never forced, after a confirm naming branch → upstream). Every change is a
+ * command with its own result; git's own error text is shown when it fails.
  */
 import { useCallback, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
@@ -23,7 +24,14 @@ import {
   type WorkspaceChange,
 } from '@/data/workspace';
 import { zodHandler } from '@/forms/zodBridge';
-import { aheadBehind, changeSections, findWorkspace, pushTarget, type ChangeSection } from '@/utils/workspace';
+import {
+  aheadBehind,
+  changeSections,
+  findWorkspace,
+  pullSource,
+  pushTarget,
+  type ChangeSection,
+} from '@/utils/workspace';
 import { Button, Text, TextField } from '@/ui/primitives';
 import { Card, ConfirmModal, EmptyState, PageHeader, Screen } from '@/ui/surface';
 import { DiffView } from '@/ui/transcript';
@@ -65,6 +73,7 @@ export default function ChangesScreen() {
   const [busy, setBusy] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [confirmPush, setConfirmPush] = useState(false);
+  const [confirmPull, setConfirmPull] = useState(false);
   const form = useForm<CommitForm>({ defaultValues: { message: '' } });
 
   /** One git change at a time; the status is re-read after it, whatever happened. */
@@ -129,6 +138,7 @@ export default function ChangesScreen() {
 
   const sections = status ? changeSections(status) : [];
   const target = status ? pushTarget(status) : undefined;
+  const source = status ? pullSource(status) : undefined;
   const sync = status ? aheadBehind(status) : '';
 
   const toggleDiff = (section: ChangeSection, path: string) => {
@@ -326,8 +336,17 @@ export default function ChangesScreen() {
             />
           </Card>
 
-          {target ? (
+          {target && source ? (
             <View style={{ gap: spacing.xs }}>
+              <Button
+                label={status.behind > 0 ? `Pull ${status.behind} commit(s)` : 'Pull'}
+                icon="arrow-left"
+                variant="secondary"
+                loading={busy === 'Pull'}
+                disabled={busy !== null || !source.canPull}
+                onPress={() => setConfirmPull(true)}
+                accessibilityLabel={`Pull ${source.label}`}
+              />
               <Button
                 label={status.ahead > 0 ? `Push ${status.ahead} commit(s)` : 'Push'}
                 icon="arrow-right"
@@ -344,6 +363,19 @@ export default function ChangesScreen() {
           ) : null}
         </>
       )}
+
+      <ConfirmModal
+        visible={confirmPull}
+        title={`Pull into ${status?.branch ?? ''}?`}
+        message={source?.label ?? ''}
+        note="Fast-forward only: no merge commit, no rebase. If the branches have diverged or a local change would be overwritten, git refuses and nothing changes."
+        confirmLabel="Pull"
+        onConfirm={() => {
+          setConfirmPull(false);
+          void run('Pull', { type: 'git_pull', workspaceId: ws.id }, `Pulled ${source?.label ?? ''}`);
+        }}
+        onCancel={() => setConfirmPull(false)}
+      />
 
       <ConfirmModal
         visible={confirmPush}

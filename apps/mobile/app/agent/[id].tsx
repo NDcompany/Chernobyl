@@ -10,6 +10,7 @@ import { colors, spacing } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { useSnapshot } from '@/data/state';
 import { useWorkspaceEnabled } from '@/data/workspace';
+import { useTerminalEnabled } from '@/data/terminal';
 import {
   activityFor,
   agentById,
@@ -32,6 +33,7 @@ export default function AgentDetailScreen() {
   const insets = useSafeAreaInsets();
   const now = useNow(30_000);
   const workspaceOn = useWorkspaceEnabled();
+  const terminalOn = useTerminalEnabled();
 
   if (!authed) return <Redirect href="/sign-in" />;
 
@@ -172,6 +174,17 @@ export default function AgentDetailScreen() {
                   onPress={() => router.push({ pathname: '/changes/[workspace]', params: { workspace: w.id } })}
                   accessibilityLabel={`Review the git changes of ${w.label}`}
                 />
+                {terminalOn ? (
+                  <Button
+                    label="Terminal"
+                    icon="terminal"
+                    variant="secondary"
+                    size="sm"
+                    fullWidth={false}
+                    onPress={() => router.push({ pathname: '/terminal/[workspace]', params: { workspace: w.id } })}
+                    accessibilityLabel={`Run a command in ${w.label}`}
+                  />
+                ) : null}
               </View>
             </Card>
           ))}

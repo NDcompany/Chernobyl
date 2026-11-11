@@ -74,7 +74,8 @@ commands (decision D2): the E2E session handshake must complete first (see
 | Agents | `/agents` | search + full list |
 | Agent details | `/agent/[id]` | capabilities, workspaces (Files, Changes), sessions, activity, start session |
 | Files | `/files/[workspace]`, `/file/[workspace]` | read-only folder browser and text viewer of an allow-listed workspace |
-| Changes | `/changes/[workspace]` | git status, diffs, stage/unstage, commit, push (confirmed) |
+| Changes | `/changes/[workspace]` | git status, diffs, stage/unstage, commit, pull (fast-forward only) and push (both confirmed) |
+| Terminal | `/terminal/[workspace]` | opt-in (ADR-020): one command line at a time in a workspace, streamed output, exit code, Stop; only when the PC sets `terminal.enabled` |
 | Sessions | `/sessions` | All / Running / Waiting / Completed filters + search |
 | Session workspace | `/session/[id]` | live conversation for transcript sessions (see below); otherwise Output / Files / Activity, send, interrupt |
 | Approvals | `/approvals` | pending (live countdowns) + decided history |
@@ -150,8 +151,15 @@ usual.
 **Files and Changes (ADR-016).** From an agent's workspace (agent screen, or the Files and
 Changes chips on a live conversation) the phone browses the allow-listed folder read-only
 (secrets masked, `.env*` values hidden) and reviews git: status, diffs, stage and unstage,
-commit, and push the current branch to its upstream (never forced). No pull, no file editing,
-no terminal.
+commit, pull (fast-forward only from the upstream; never a merge commit or rebase) and push
+the current branch to its upstream (never forced). No file editing.
+
+**Terminal (ADR-020, opt-in, off by default).** With `"terminal": {"enabled": true}` in
+`companion.json` (`scripts\setup-windows.ps1 -EnableTerminal`) the paired phone gets a Terminal
+per workspace: one command line through the PC's shell (`cmd.exe` on Windows), cwd = the
+workspace, **without the agents' approval prompts**. 120 s at most (Stop kills the process tree),
+output ANSI-stripped, redacted and capped at 1 MiB, every run journaled and audited. Setup
+options (`-OpenCode`, `-StartOpenCode`, `-EnableTerminal`, `-ConfigOnly`): `docs/INSTALL.md`.
 
 ## Backend runtime
 

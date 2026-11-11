@@ -94,6 +94,36 @@ Start-on-login (user-level, no elevation):
 .\chernobyl-companion.exe --uninstall-autostart  # idempotent removal
 ```
 
+### One-shot Windows setup (`scripts/setup-windows.ps1`)
+
+From a checkout with a release build, one script installs the exe, writes `companion.json`
+(Claude Code on, your folders allow-listed, LAN bind), creates the access token, adds the
+firewall rule (elevated prompt), registers start-on-login and prints the pairing QR:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 -Workspaces 'G:\Projects\app'
+```
+
+| Flag | Effect |
+|---|---|
+| `-TunnelUrl wss://host` / `-NgrokDomain <name>.ngrok-free.dev` | second endpoint for away from home; turns on `requireE2e` |
+| `-OpenCode [-OpenCodeUrl http://127.0.0.1:4096]` | adds `{"id":"opencode-1","type":"opencode","endpoint":…,"basicAuthEnv":"OPENCODE_SERVER_PASSWORD"}` (attach-only) |
+| `-StartOpenCode` | also runs `opencode serve --port <port> --hostname 127.0.0.1` hidden in the first workspace folder, now and at login (HKCU Run `CHERNOBYL OpenCode`); implies `-OpenCode`, loopback URLs only |
+| `-EnableTerminal` | writes `"terminal": {"enabled": true}`: the paired phone can run shell commands in the workspaces **without approval prompts** (ADR-020). Off otherwise |
+| `-ConfigOnly` | writes `companion.json` (and the OpenCode launcher) and stops: no install, token, firewall, autostart or process changes |
+| `-NoAutostart`, `-Port`, `-Exe` | as named |
+
+**OpenCode password.** No password is ever written to `companion.json`. If you start `opencode
+serve` with `OPENCODE_SERVER_PASSWORD`, set it as a *user* environment variable (System
+Properties > Environment Variables, or `[Environment]::SetEnvironmentVariable('OPENCODE_SERVER_PASSWORD', '<pw>', 'User')`
+in a PowerShell you then close), plus `OPENCODE_SERVER_USERNAME` if it is not `opencode`. Open
+a new PowerShell before running setup: the companion and the OpenCode launcher both read it at
+start, from `basicAuthEnv`. Unset means no auth (the server's loopback default).
+
+`scripts\test-setup-windows.ps1` checks the script without touching your real config, Run key
+or variables (AST parse, then `-ConfigOnly` runs in a temp `APPDATA`, each file loaded by a debug
+build of the companion).
+
 ## Backup / restore (same machine)
 
 ```powershell

@@ -30,7 +30,9 @@
  *      a reconnect with the cursor replays with no gap or duplicate; a stale
  *      cursor gets a snapshot; an inline decision by optionId + revision is
  *      accepted and a stale revision refused; a client that never subscribes
- *      receives zero transcript frames; the fake logs no protocol violation
+ *      receives zero transcript frames; the fake logs no protocol violation;
+ *      with `terminal.enabled` a sealed terminal_run streams its output to
+ *      the starting client only, then terminal_exit (ADR-020)
  *
  * No device claim: this is Node-vs-real-companion evidence only.
  */
@@ -497,6 +499,7 @@ async function main() {
         retention: { events: 5000, eventsMaxAgeMs: 604800000 },
         diagnostics: { port: 0 },
         probeIntervalMs: 15000,
+        terminal: { enabled: true },
       }),
     );
     const port2 = await freePort();
@@ -567,6 +570,28 @@ async function main() {
     check(
       'workspace: an observer connection never sees another client\'s results',
       !observed.some((m) => m.type === 'workspace_result'),
+    );
+
+    // ADR-020: the opt-in terminal, sealed like everything else
+    const termAck = await a.send({ type: 'terminal_run', commandId: 'term-1', workspaceId: wsId, command: 'echo interop-term' });
+    await waitFor(() => msgs.some((m) => m.type === 'command_result' && m.commandId === 'term-1'), 10000);
+    const termOut = msgs
+      .filter((m) => m.type === 'terminal_output' && m.commandId === 'term-1')
+      .map((m) => m.data)
+      .join('');
+    const termExit = msgs.findIndex((m) => m.type === 'terminal_exit' && m.commandId === 'term-1');
+    const termResult = msgs.findIndex((m) => m.type === 'command_result' && m.commandId === 'term-1');
+    check(
+      'terminal: advertised when enabled; a sealed run streams its output, exit code 0, then its command_result; observers see no output',
+      (helloAck?.features ?? []).includes('terminal.v1') &&
+        termAck.ok &&
+        termOut.includes('interop-term') &&
+        termExit >= 0 &&
+        msgs[termExit].exitCode === 0 &&
+        termExit < termResult &&
+        msgs[termResult].status === 'completed' &&
+        !observed.some((m) => m.type === 'terminal_output' || m.type === 'terminal_exit'),
+      `${termAck.error ?? ''} | ${JSON.stringify(termOut)} | ${termExit} < ${termResult}`,
     );
 
     const created = await a.send({

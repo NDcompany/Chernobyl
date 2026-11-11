@@ -19,10 +19,15 @@ use crate::protocol::{
 };
 use crate::server::Outbound;
 use crate::storage::{CommandRecord, Storage};
+use crate::terminal::Terminals;
 use crate::transcript::{Hub, HubHandle};
 use crate::workspace::Workspace;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+
+/// ADR-020: where a terminal run's output goes (the starting connection,
+/// sealed); false once that connection can take no more.
+pub type TermSink = Arc<dyn Fn(ServerMsg) -> bool + Send + Sync>;
 
 /// Refusal for an id two healthy runtimes claim (never guessed).
 const AMBIGUOUS: &str = "claimed by more than one runtime — refused";
@@ -139,6 +144,8 @@ pub struct Companion {
     workspace_busy: Arc<Mutex<HashSet<String>>>,
     /// ADR-018: the Claude Code runtime, for `PermissionRequest` hooks.
     claude_live: Option<Arc<ClaudeRuntime>>,
+    /// ADR-020: running terminal commands and the start rate limit.
+    terminals: Arc<Terminals>,
 }
 
 impl Companion {
@@ -155,7 +162,7 @@ impl Companion {
             .adapters
             .iter()
             .find(|e| e.enabled && e.kind == "opencode")
-            .map(|e| (e.id.clone(), e.endpoint.clone(), e.basic_auth.clone()));
+            .map(|e| (e.id.clone(), e.endpoint.clone(), e.opencode_auth()));
 
         // Phase 7: locate the Ollama attach target the same way — first
         // enabled entry wins (attach-only; no second server, G4.3).
@@ -266,6 +273,7 @@ impl Companion {
             control_key,
             workspace_busy: Arc::default(),
             claude_live: None,
+            terminals: Arc::default(),
         };
 
         // Boot reconciliation: unresolved commands → unknown (never re-run),
@@ -422,6 +430,17 @@ impl Companion {
     /* ---------------------------------------------------------------- */
 
     pub fn handle_client_msg(&self, msg: ClientMsg) -> Option<ServerMsg> {
+        self.handle_client_msg_with(msg, None)
+    }
+
+    /// [`Self::handle_client_msg`] with the connection's output sink, which
+    /// only `terminal_run` uses (ADR-020); the server passes it for a
+    /// connection with a live E2E session, so without one a run is refused.
+    pub fn handle_client_msg_with(
+        &self,
+        msg: ClientMsg,
+        out: Option<TermSink>,
+    ) -> Option<ServerMsg> {
         // the same merged view as `hello_ack` (runtime sessions, transcript
         // flags), never the engine's own snapshot
         if let ClientMsg::ListState { .. } = msg {
@@ -618,7 +637,7 @@ impl Companion {
                     command_id,
                     workspace_id,
                     op,
-                } => Some(self.workspace_command(command_id, workspace_id, op)),
+                } => Some(self.workspace_command(command_id, workspace_id, op, out)),
                 _ => None,
             },
             Route::Engine => {
@@ -829,7 +848,15 @@ impl Companion {
         command_id: &str,
         workspace_id: &str,
         op: &WorkspaceOp,
+        out: Option<TermSink>,
     ) -> ServerMsg {
+        match op {
+            WorkspaceOp::TerminalRun { command } => {
+                return self.terminal_run(command_id, workspace_id, command, out);
+            }
+            WorkspaceOp::TerminalStop => return self.terminal_stop(command_id, workspace_id),
+            _ => {}
+        }
         if !op.is_mutating() {
             return self.workspace_query(command_id, workspace_id, op).1;
         }
@@ -861,6 +888,7 @@ impl Companion {
                     WorkspaceOp::GitStage { paths } => ws.stage(paths),
                     WorkspaceOp::GitUnstage { paths } => ws.unstage(paths),
                     WorkspaceOp::GitCommit { message } => ws.commit(message),
+                    WorkspaceOp::GitPull => ws.pull(),
                     _ => ws.push(),
                 };
                 busy.lock().unwrap().remove(&wid);
@@ -876,6 +904,7 @@ impl Companion {
                             .collect(),
                     )),
                     WorkspaceOp::GitPush => Some(("git-push", String::from("push"))),
+                    WorkspaceOp::GitPull => Some(("git-pull", String::from("pull --ff-only"))),
                     _ => None,
                 };
                 if let Some((kind, what)) = audit {
@@ -904,6 +933,120 @@ impl Companion {
                 self.workspace_busy.lock().unwrap().remove(workspace_id);
                 ServerMsg::ack_err(command_id, &format!("could not start the git action: {e}"))
             }
+        }
+    }
+
+    /// ADR-020 `terminal_run`, after `handle_client_msg` journaled it (the
+    /// command line redacted): refused unless `terminal.enabled` and a live
+    /// E2E connection (`out`). One run per workspace, one start per 2 s;
+    /// audited before it starts; acked once the shell is running; its
+    /// output goes to `out` only (never journaled), then `terminal_exit`
+    /// and exactly one `command_result` (G1).
+    fn terminal_run(
+        &self,
+        command_id: &str,
+        workspace_id: &str,
+        command: &str,
+        out: Option<TermSink>,
+    ) -> ServerMsg {
+        if !self.shared.config.terminal_enabled {
+            return ServerMsg::ack_err(command_id, crate::terminal::OFF);
+        }
+        let Some(out) = out else {
+            return ServerMsg::ack_err(command_id, crate::terminal::NEEDS_E2E);
+        };
+        let ws = match self.workspace(workspace_id) {
+            Ok(ws) => ws,
+            Err(e) => return ServerMsg::ack_err(command_id, &e),
+        };
+        let stop = match self.terminals.begin(workspace_id) {
+            Ok(stop) => stop,
+            Err(e) => return ServerMsg::ack_err(command_id, &e),
+        };
+        let line = crate::runtime_io::redact(command);
+        let _ = self
+            .shared
+            .storage
+            .lock()
+            .unwrap()
+            .append_audit("terminal-run", &format!("{workspace_id}: {line}"));
+        let child = match crate::terminal::spawn(ws.root(), command) {
+            Ok(child) => child,
+            Err(e) => {
+                self.terminals.end(workspace_id);
+                return ServerMsg::ack_err(command_id, &e);
+            }
+        };
+        let pid = child.id();
+        let (terminals, sink) = (self.terminals.clone(), self.engine_sink());
+        let (cmd, wid) = (command_id.to_string(), workspace_id.to_string());
+        let started = std::thread::Builder::new()
+            .name("terminal-run".into())
+            .spawn(move || {
+                let timeout = crate::terminal::TIMEOUT;
+                let mut live = true;
+                let (end, truncated) = crate::terminal::run(
+                    child,
+                    &stop,
+                    timeout,
+                    crate::terminal::OUTPUT_MAX,
+                    &mut |data| {
+                        live = live
+                            && out(ServerMsg::TerminalOutput {
+                                command_id: cmd.clone(),
+                                workspace_id: wid.clone(),
+                                data,
+                            });
+                    },
+                );
+                terminals.end(&wid);
+                let exit_code = match end {
+                    crate::terminal::End::Exit(code) => code,
+                    _ => None,
+                };
+                out(ServerMsg::TerminalExit {
+                    command_id: cmd.clone(),
+                    workspace_id: wid,
+                    exit_code,
+                    reason: end.reason(),
+                    truncated,
+                });
+                let error = end.error(timeout);
+                sink(EventKind::CommandResult {
+                    command_id: cmd,
+                    status: if error.is_some() {
+                        "failed"
+                    } else {
+                        "completed"
+                    }
+                    .into(),
+                    error,
+                    session_id: None,
+                    permission_id: None,
+                });
+            });
+        match started {
+            Ok(_) => ServerMsg::ack_ok(command_id, None),
+            Err(e) => {
+                // fail closed: the shell never runs unwatched
+                crate::terminal::kill_pid(pid);
+                self.terminals.end(workspace_id);
+                ServerMsg::ack_err(command_id, &format!("could not start the terminal: {e}"))
+            }
+        }
+    }
+
+    /// ADR-020 `terminal_stop`: kills the workspace's running command and
+    /// its process tree. Not journaled; the run's `command_result` says
+    /// "stopped from the phone".
+    pub fn terminal_stop(&self, command_id: &str, workspace_id: &str) -> ServerMsg {
+        if !self.shared.config.terminal_enabled {
+            return ServerMsg::ack_err(command_id, crate::terminal::OFF);
+        }
+        if self.terminals.stop(workspace_id) {
+            ServerMsg::ack_ok(command_id, None)
+        } else {
+            ServerMsg::ack_err(command_id, "nothing is running in this workspace")
         }
     }
 
@@ -3517,7 +3660,15 @@ mod tests {
 
     /// A companion whose fake runtime allow-lists a fresh git repository.
     fn with_workspace(tag: &str) -> (Companion, CompanionConfig, std::path::PathBuf, String) {
-        let c = temp_config(tag);
+        with_workspace_cfg(tag, |_| {})
+    }
+
+    fn with_workspace_cfg(
+        tag: &str,
+        tweak: impl FnOnce(&mut CompanionConfig),
+    ) -> (Companion, CompanionConfig, std::path::PathBuf, String) {
+        let mut c = temp_config(tag);
+        tweak(&mut c);
         let mut comp = Companion::boot(c.clone()).unwrap();
         let root = crate::workspace::tests::repo(tag);
         let path = crate::claude_live::plain(&std::fs::canonicalize(&root).unwrap());
@@ -3671,6 +3822,21 @@ mod tests {
         assert!(audit("git-commit", crate::workspace::NOTHING_TO_COMMIT));
         assert!(audit("git-push", "no upstream"));
         drop(store);
+        // a pull without an upstream: the same lifecycle, its own audit kind
+        assert!(ok(comp.handle_client_msg(ws_msg(
+            "pl1",
+            &id,
+            WorkspaceOp::GitPull
+        ))));
+        assert_eq!(outcome(&comp, "pl1"), "failed");
+        let store = comp.shared.storage.lock().unwrap();
+        assert!(
+            store
+                .audit
+                .iter()
+                .any(|a| a.kind == "git-pull" && a.text.contains("no upstream"))
+        );
+        drop(store);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 
@@ -3683,6 +3849,134 @@ mod tests {
         comp.workspace_busy.lock().unwrap().clear();
         let e = refusal(comp.handle_client_msg(ws_msg("b2", "000000000000", WorkspaceOp::GitPush)));
         assert_eq!(e, "unknown workspace");
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    // ---- ADR-020: the opt-in terminal ----
+
+    type Seen = Arc<Mutex<Vec<ServerMsg>>>;
+
+    fn capture() -> (Seen, TermSink) {
+        let seen: Seen = Arc::default();
+        let sink = seen.clone();
+        (
+            seen,
+            Arc::new(move |m: ServerMsg| {
+                sink.lock().unwrap().push(m);
+                true
+            }),
+        )
+    }
+
+    fn run_msg(command_id: &str, id: &str, command: &str) -> ClientMsg {
+        ws_msg(
+            command_id,
+            id,
+            WorkspaceOp::TerminalRun {
+                command: command.into(),
+            },
+        )
+    }
+
+    #[test]
+    fn terminal_is_refused_unless_enabled_and_sealed() {
+        let (comp, c, _root, id) = with_workspace("term-off");
+        let (_, sink) = capture();
+        let e = refusal(comp.handle_client_msg_with(run_msg("t1", &id, "echo hi"), Some(sink)));
+        assert!(e.contains("terminal is off"), "{e}");
+        let e = refusal(Some(comp.terminal_stop("t2", &id)));
+        assert!(e.contains("terminal is off"), "{e}");
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+
+        let (comp, c, _root, id) = with_workspace_cfg("term-nosink", |c| c.terminal_enabled = true);
+        let e = refusal(comp.handle_client_msg(run_msg("t3", &id, "echo hi")));
+        assert_eq!(e, crate::terminal::NEEDS_E2E);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    #[test]
+    fn terminal_runs_streams_audits_and_stops() {
+        let (comp, c, root, id) = with_workspace_cfg("term-run", |c| c.terminal_enabled = true);
+        std::fs::write(root.join("marker.txt"), "").unwrap();
+        let (seen, sink) = capture();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let list = if cfg!(windows) { "dir /b" } else { "ls" };
+        let line = format!("{list} && echo token={secret}");
+        assert!(ok(comp.handle_client_msg_with(
+            run_msg("r1", &id, &line),
+            Some(sink.clone())
+        )));
+        // one at a time, one start per 2 s
+        let e =
+            refusal(comp.handle_client_msg_with(run_msg("r2", &id, "echo x"), Some(sink.clone())));
+        assert!(
+            e.contains("still running") || e.contains("wait a moment"),
+            "{e}"
+        );
+        assert_eq!(outcome(&comp, "r1"), "completed");
+        {
+            let seen = seen.lock().unwrap();
+            let text: String = seen
+                .iter()
+                .filter_map(|m| match m {
+                    ServerMsg::TerminalOutput { data, .. } => Some(data.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(text.contains("marker.txt"), "cwd is the workspace: {text}");
+            assert!(!text.contains(secret), "{text}");
+            match seen.last() {
+                Some(ServerMsg::TerminalExit {
+                    exit_code: Some(0),
+                    reason: "exit",
+                    truncated: false,
+                    ..
+                }) => {}
+                other => panic!("expected a clean exit last, got {other:?}"),
+            }
+        }
+        {
+            let store = comp.shared.storage.lock().unwrap();
+            let rec = store.commands.get("r1").unwrap();
+            assert!(rec.payload.contains("terminal_run"), "{}", rec.payload);
+            assert!(!rec.payload.contains(secret), "{}", rec.payload);
+            let audit: Vec<_> = store
+                .audit
+                .iter()
+                .filter(|a| a.kind == "terminal-run")
+                .collect();
+            assert_eq!(audit.len(), 1);
+            assert!(audit[0].text.starts_with(&id) && audit[0].text.contains(list));
+            assert!(!audit[0].text.contains(secret), "{}", audit[0].text);
+        }
+
+        // a long run stopped from the phone
+        std::thread::sleep(crate::terminal::START_INTERVAL);
+        let sleeper = if cfg!(windows) {
+            "ping -n 30 127.0.0.1"
+        } else {
+            "sleep 30"
+        };
+        assert!(ok(comp.handle_client_msg_with(
+            run_msg("r3", &id, sleeper),
+            Some(sink)
+        )));
+        assert!(ok(Some(comp.terminal_stop("s1", &id))));
+        assert_eq!(outcome(&comp, "r3"), "failed");
+        assert!(matches!(
+            seen.lock().unwrap().last(),
+            Some(ServerMsg::TerminalExit {
+                reason: "stopped",
+                exit_code: None,
+                ..
+            })
+        ));
+        let store = comp.shared.storage.lock().unwrap();
+        assert!(
+            !store.commands.contains_key("s1"),
+            "a stop is not journaled"
+        );
+        drop(store);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 }

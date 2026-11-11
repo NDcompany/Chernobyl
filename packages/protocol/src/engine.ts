@@ -292,7 +292,13 @@ export class MockEngine {
       case 'git_unstage':
       case 'git_commit':
       case 'git_push':
+      case 'git_pull':
         reply = ackErr(msg.commandId, 'connect a PC to browse files and git');
+        break;
+      // ADR-020: no terminal in the simulation either
+      case 'terminal_run':
+      case 'terminal_stop':
+        reply = ackErr(msg.commandId, 'connect a PC with the terminal turned on');
         break;
       default:
         reply = undefined;

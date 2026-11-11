@@ -19,6 +19,11 @@ pub struct AdapterEntryConfig {
     /// `opencode` entries: `user:pass` for a server started with
     /// `OPENCODE_SERVER_PASSWORD` (sent as HTTP Basic on loopback).
     pub basic_auth: Option<String>,
+    /// `opencode` entries: the NAME of an environment variable holding the
+    /// server password, read at boot so no secret sits in the file. The user
+    /// is `OPENCODE_SERVER_USERNAME` or `opencode`, as the server decides.
+    /// Unset or empty: no auth. Exclusive with `basic_auth`.
+    pub basic_auth_env: Option<String>,
     /// `codex` entries (ADR-015 §4.3): `workspaces`, `binary`, `args`,
     /// validated at load (workspace policy §4.2.3).
     pub codex: Option<crate::codex::LaunchConfig>,
@@ -53,6 +58,27 @@ pub struct CompanionConfig {
     pub server_port: u16,
     pub server_bind: String,
     pub server_require_e2e: bool,
+    /// ADR-020: the opt-in one-shot terminal (`terminal.enabled`, default
+    /// off). Only when true is `terminal.v1` advertised and run.
+    pub terminal_enabled: bool,
+}
+
+impl AdapterEntryConfig {
+    /// HTTP Basic `user:pass` for an `opencode` entry: `basicAuth`, or the
+    /// password from the `basicAuthEnv` variable at call time.
+    pub fn opencode_auth(&self) -> Option<String> {
+        if let Some(b) = &self.basic_auth {
+            return Some(b.clone());
+        }
+        let pass = std::env::var(self.basic_auth_env.as_deref()?)
+            .ok()
+            .filter(|p| !p.is_empty())?;
+        let user = std::env::var("OPENCODE_SERVER_USERNAME")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "opencode".into());
+        Some(format!("{user}:{pass}"))
+    }
 }
 
 pub fn config_dir() -> PathBuf {
@@ -87,6 +113,7 @@ pub fn default_config() -> CompanionConfig {
         server_port: 8787,
         server_bind: "127.0.0.1".into(),
         server_require_e2e: false,
+        terminal_enabled: false,
     }
 }
 
@@ -151,6 +178,26 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
             .unwrap_or(true);
         let endpoint = json::get_str(entry, "endpoint").map(str::to_string);
         let basic_auth = json::get_str(entry, "basicAuth").map(str::to_string);
+        let basic_auth_env = match json::get(entry, "basicAuthEnv") {
+            None | Some(Json::Null) => None,
+            Some(v) => Some(
+                json::as_str(v)
+                    .filter(|n| {
+                        !n.is_empty()
+                            && n.len() <= 128
+                            && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    })
+                    .ok_or_else(|| {
+                        format!("adapters[{i}].basicAuthEnv must be an environment variable name")
+                    })?
+                    .to_string(),
+            ),
+        };
+        if basic_auth.is_some() && basic_auth_env.is_some() {
+            return Err(format!(
+                "adapters[{i}]: set basicAuth or basicAuthEnv, not both"
+            ));
+        }
         // Attach-only adapter: where the server is must be stated — no
         // implicit default port that could probe the wrong process (G4.3).
         if enabled && kind == "opencode" && endpoint.is_none() {
@@ -221,6 +268,7 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
             enabled,
             endpoint,
             basic_auth,
+            basic_auth_env,
             codex,
             workspaces,
             binary,
@@ -286,6 +334,12 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
         })
         .transpose()?
         .unwrap_or(false);
+    // ADR-020: off unless the file says exactly `true`
+    let terminal_enabled = json::get(raw, "terminal")
+        .and_then(|t| json::get(t, "enabled"))
+        .map(|v| json::as_bool(v).ok_or_else(|| "'terminal.enabled' must be a boolean".to_string()))
+        .transpose()?
+        .unwrap_or(false);
 
     Ok(CompanionConfig {
         name,
@@ -299,6 +353,7 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
         server_port,
         server_bind,
         server_require_e2e,
+        terminal_enabled,
     })
 }
 
@@ -323,6 +378,9 @@ pub fn config_to_json(c: &CompanionConfig) -> Json {
                         }
                         if let Some(b) = &a.basic_auth {
                             fields.push(("basicAuth", json::s(b)));
+                        }
+                        if let Some(n) = &a.basic_auth_env {
+                            fields.push(("basicAuthEnv", json::s(n)));
                         }
                         if let Some(cx) = &a.codex {
                             let paths = cx.workspaces.iter().map(|w| json::s(&w.path));
@@ -369,6 +427,10 @@ pub fn config_to_json(c: &CompanionConfig) -> Json {
                 ("bind", json::s(&c.server_bind)),
                 ("requireE2e", Json::Bool(c.server_require_e2e)),
             ]),
+        ),
+        (
+            "terminal",
+            json::obj(vec![("enabled", Json::Bool(c.terminal_enabled))]),
         ),
     ])
 }
@@ -458,6 +520,58 @@ mod tests {
         let out = crate::json::stringify(&config_to_json(&parsed));
         assert!(out.contains("http://127.0.0.1:4096"), "{out}");
         assert!(out.contains("\"basicAuth\""), "{out}");
+    }
+
+    #[test]
+    fn opencode_basic_auth_env_and_terminal_flag_parse_and_round_trip() {
+        let cfg = |adapter: &str, extra: &str| {
+            validate_config(&json::parse(&format!(
+                r#"{{"version":1,"name":"x","dataDir":"x","adapters":[{adapter}],"retention":{{"events":5000,"eventsMaxAgeMs":600000}},"diagnostics":{{"port":9487}},"probeIntervalMs":15000{extra}}}"#
+            )).unwrap())
+        };
+        let oc = |more: &str| {
+            format!(
+                r#"{{"id":"opencode-1","type":"opencode","endpoint":"http://127.0.0.1:4096"{more}}}"#
+            )
+        };
+        let c = cfg(&oc(r#","basicAuthEnv":"OPENCODE_SERVER_PASSWORD""#), "").unwrap();
+        let a = &c.adapters[0];
+        assert_eq!(
+            a.basic_auth_env.as_deref(),
+            Some("OPENCODE_SERVER_PASSWORD")
+        );
+        assert_eq!(a.basic_auth, None);
+        assert!(!c.terminal_enabled, "the terminal is off by default");
+        assert_eq!(validate_config(&config_to_json(&c)).unwrap(), c);
+        // the password is read from the variable at call time, never stored
+        let named = |var: &str| AdapterEntryConfig {
+            basic_auth_env: Some(var.into()),
+            ..a.clone()
+        };
+        assert_eq!(named("CHB_SURELY_UNSET_7F3A").opencode_auth(), None);
+        let path = std::env::var("PATH").unwrap();
+        let auth = named("PATH").opencode_auth().unwrap();
+        assert!(auth.ends_with(&format!(":{path}")), "{auth}");
+        let inline = cfg(&oc(r#","basicAuth":"u:p""#), "").unwrap();
+        assert_eq!(inline.adapters[0].opencode_auth().as_deref(), Some("u:p"));
+        for (more, field) in [
+            (r#","basicAuthEnv":"""#, "basicAuthEnv"),
+            (r#","basicAuthEnv":"A B""#, "basicAuthEnv"),
+            (r#","basicAuthEnv":7"#, "basicAuthEnv"),
+            (r#","basicAuth":"u:p","basicAuthEnv":"P""#, "not both"),
+        ] {
+            let err = cfg(&oc(more), "").unwrap_err();
+            assert!(err.contains(field), "{more}: {err}");
+        }
+
+        let on = cfg(&oc(""), r#","terminal":{"enabled":true}"#).unwrap();
+        assert!(on.terminal_enabled);
+        let text = json::stringify(&config_to_json(&on));
+        assert!(text.contains(r#""terminal":{"enabled":true}"#), "{text}");
+        assert_eq!(validate_config(&config_to_json(&on)).unwrap(), on);
+        assert!(!cfg(&oc(""), r#","terminal":{}"#).unwrap().terminal_enabled);
+        let err = cfg(&oc(""), r#","terminal":{"enabled":"yes"}"#).unwrap_err();
+        assert!(err.contains("terminal.enabled"), "{err}");
     }
 
     #[test]

@@ -71,10 +71,16 @@ Workspace files and git (ADR-016): folder listings, file content,
 git status and diffs the phone opens are read on demand, sent only to the asking phone and
 never journaled; file content and diffs are redacted for known secret shapes, and `.env*`
 files reach the phone with every value masked. The git commands themselves (`git_stage`,
-`git_unstage`, `git_commit` with its message, `git_push`) are journaled like any command, and
-a commit or push adds an audit record with the workspace id, the message's first line and the
-outcome. Two credentials are stored in plaintext: the OpenCode
-`basicAuth` in `companion.json` and the control key. Only the folder's permissions protect
+`git_unstage`, `git_commit` with its message, `git_push`, `git_pull`) are journaled like any
+command, and a commit, push or pull adds an audit record with the workspace id, the message's
+first line and the outcome. The opt-in terminal (ADR-020, off unless `terminal.enabled`): the
+command line you run is journaled with its command and kept in a `terminal-run` audit record,
+both redacted for known secret shapes; its output is never journaled or stored, it goes only to
+the phone that started it (redacted, at most 1 MiB) and lives in that screen until you leave
+it. The phone keeps your last 20 command lines per workspace in its local app storage. Two
+credentials are stored in plaintext: the OpenCode `basicAuth` in `companion.json` (setup
+writes `basicAuthEnv` instead, which names a user environment variable read at start, so the
+password never enters the file) and the control key. Only the folder's permissions protect
 them. The default `%APPDATA%\CHERNOBYL` is readable by your Windows account and administrators
 only, but the files go wherever a copy of the folder goes: a roaming profile, a support bundle,
 or a `CHERNOBYL_HOME` on a drive without permissions. Adapter endpoint credentials

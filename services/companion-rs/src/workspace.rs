@@ -12,7 +12,8 @@
 //!   `runtime_io::redact`; `.env*` files have every value masked.
 //! - Git: an absolute-path `git` binary with an argument vector (no shell),
 //!   cwd = the workspace, the scrubbed child env plus no prompts, timeouts
-//!   and output caps. No force, no amend, no hook bypass, no pull.
+//!   and output caps. No force, no amend, no hook bypass; pull is a
+//!   fast-forward only (ADR-016 addendum).
 
 use crate::claude_live::plain;
 use crate::json::{self, Json};
@@ -44,6 +45,7 @@ pub const STAGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Commit hooks (lint, tests) run exactly as on the desktop.
 pub const COMMIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+pub const PULL_TIMEOUT: Duration = Duration::from_secs(60);
 /// A grandchild (ssh, a credential helper) may keep git's pipes open.
 const PIPE_GRACE: Duration = Duration::from_secs(2);
 
@@ -420,6 +422,39 @@ impl Workspace {
             "{head} -> {remote}/{}",
             merge.trim_start_matches("refs/heads/")
         ))
+    }
+
+    /// `git_pull`: a fast-forward of the current branch from its configured
+    /// upstream, nothing else: `--ff-only` (never a merge commit),
+    /// `--no-rebase` and `--no-autostash` over whatever the repository's
+    /// config says. Diverged history, or local changes the incoming commits
+    /// would overwrite, are refused by git and change nothing.
+    pub fn pull(&self) -> Result<String, String> {
+        self.repo()?;
+        let (head, remote, merge) = self.upstream()?;
+        let out = self.git_change(
+            &[
+                "pull",
+                "--ff-only",
+                "--no-rebase",
+                "--no-autostash",
+                "--no-edit",
+                &remote,
+                &merge,
+            ],
+            PULL_TIMEOUT,
+        )?;
+        let from = format!("{remote}/{}", merge.trim_start_matches("refs/heads/"));
+        Ok(if out.contains("Already up to date") {
+            format!("{head} is up to date with {from}")
+        } else {
+            format!("{from} -> {head}")
+        })
+    }
+
+    /// The canonical workspace folder (ADR-020: the terminal's cwd).
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// (branch, remote, remote ref) of the checked-out branch.
@@ -1178,5 +1213,96 @@ pub(crate) mod tests {
             git(&root, &["rev-parse", "HEAD"]),
             "the remote keeps the other commit"
         );
+    }
+
+    /// A clone of `remote` with its own identity, tracking main.
+    fn clone_of(remote: &Path, tag: &str) -> PathBuf {
+        let dir = temp(tag);
+        git(&dir, &["clone", "-q", &remote.to_string_lossy(), "."]);
+        for (k, v) in [
+            ("user.name", "O"),
+            ("user.email", "o@example.invalid"),
+            ("commit.gpgsign", "false"),
+            ("core.autocrlf", "false"),
+        ] {
+            git(&dir, &["config", k, v]);
+        }
+        dir
+    }
+
+    fn commit_file(dir: &Path, name: &str, text: &str) {
+        std::fs::write(dir.join(name), text).unwrap();
+        git(dir, &["add", name]);
+        git(dir, &["commit", "-q", "-m", name]);
+    }
+
+    #[test]
+    fn pull_fast_forwards_only() {
+        let remote = temp("pull-remote");
+        git(
+            &remote,
+            &["-c", "init.defaultBranch=main", "init", "-q", "--bare"],
+        );
+        let root = repo("pull");
+        let (ws, _) = open(&root);
+        // no upstream: refused before git runs
+        let err = ws.pull().unwrap_err();
+        assert!(err.contains("no upstream"), "{err}");
+        git(
+            &root,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        git(&root, &["push", "-q", "-u", "origin", "main"]);
+        // pull.rebase / merge.autostash in the repo's config change nothing
+        git(&root, &["config", "pull.rebase", "true"]);
+        assert_eq!(ws.pull().unwrap(), "main is up to date with origin/main");
+
+        // someone else pushed: a fast-forward
+        let other = clone_of(&remote, "pull-other");
+        commit_file(&other, "b.txt", "b\n");
+        git(&other, &["push", "-q"]);
+        // an unrelated local edit stays where it is
+        std::fs::write(root.join("README.md"), "hello\nlocal\n").unwrap();
+        assert_eq!(ws.pull().unwrap(), "origin/main -> main");
+        assert_eq!(
+            git(&remote, &["rev-parse", "main"]),
+            git(&root, &["rev-parse", "HEAD"])
+        );
+        assert!(root.join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "hello\nlocal\n"
+        );
+
+        // a local edit the incoming commit would overwrite: git refuses
+        commit_file(&other, "README.md", "hello\nremote\n");
+        git(&other, &["push", "-q"]);
+        let before = git(&root, &["rev-parse", "HEAD"]);
+        let err = ws.pull().unwrap_err();
+        assert!(err.contains("overwritten"), "{err}");
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), before);
+        git(&root, &["checkout", "--", "README.md"]);
+        ws.pull().unwrap();
+
+        // diverged: refused, never merged or rebased
+        commit_file(&other, "c.txt", "c\n");
+        git(&other, &["push", "-q"]);
+        commit_file(&root, "d.txt", "d\n");
+        let before = git(&root, &["rev-parse", "HEAD"]);
+        let err = ws.pull().unwrap_err();
+        assert!(
+            err.contains("fast-forward") || err.contains("Not possible"),
+            "{err}"
+        );
+        assert_eq!(
+            git(&root, &["rev-parse", "HEAD"]),
+            before,
+            "no merge commit"
+        );
+        assert_eq!(
+            git(&root, &["rev-list", "--count", "--merges", "HEAD"]).trim(),
+            "0"
+        );
+        assert!(!root.join("c.txt").exists());
     }
 }

@@ -21,6 +21,7 @@ Additive protocol, still v2, advertised as `hello_ack.features` `workspace.v1`. 
 | `git_unstage {workspaceId, paths[]}` | command | same |
 | `git_commit {workspaceId, message}` | command | same; audit record `git-commit` |
 | `git_push {workspaceId}` | command | same; audit record `git-push` |
+| `git_pull {workspaceId}` | command | same; audit record `git-pull` (addendum, §7) |
 
 - **Reads** run on the connection's read loop and are answered to that connection only: the `workspace_result` goes out right before the ack (`server.rs`), so the phone's transport resolves the ack after the result arrived. They are never journaled.
 - **Commands** take the existing path in `Companion::handle_client_msg`: persisted before execution, deduplicated by `commandId` (a replay returns the original ack and runs nothing), acked on acceptance, run on a worker thread, closed by exactly one `command_result` whose `error` is git's own summary (G1).
@@ -64,4 +65,8 @@ Entry points: the agent screen's Workspaces section (Files, Changes per workspac
 
 ## 6. Deliberately not included
 
-No terminal or arbitrary command execution; no file editing, creation, rename or delete; no `git pull`, fetch, checkout, branch switching, reset, revert, stash, rebase or merge; no force-push, no amend, no hook bypass; no image or binary preview; no search across files. Each would widen T1 beyond "review and ship"; they need their own decision.
+No terminal or arbitrary command execution (since added as the opt-in ADR-020, off by default); no file editing, creation, rename or delete; no fetch, checkout, branch switching, reset, revert, stash, rebase or merge (a fast-forward-only pull was added, §7); no force-push, no amend, no hook bypass; no image or binary preview; no search across files. Each would widen T1 beyond "review and ship"; they need their own decision.
+
+## 7. Addendum 2026-11-12: `git_pull` (fast-forward only)
+
+So the owner can bring a branch up to date before reviewing or pushing, `git_pull {workspaceId}` runs `git pull --ff-only --no-rebase --no-autostash --no-edit <remote> <merge ref>` for the checked-out branch's configured upstream (the same `upstream()` lookup as push: a detached HEAD, no upstream, a `.` or `-`-leading remote are refused before git runs). It can never create a merge commit, rebase or stash, whatever `pull.rebase` or `merge.autostash` say. Diverged history, or a local change the incoming commits would overwrite, is refused by git with its own summary and changes nothing; unrelated local changes stay. Same lifecycle as push: journaled, deduplicated, one git command at a time per workspace, 60 s timeout, `command_result` with git's summary, audit record `git-pull`. W6 now reads "stage, unstage, commit, push, and a fast-forward pull". Phone: a Pull button on Changes (label "Pull N commit(s)" when the last status knew it was behind) with a confirm naming `upstream → branch`; the status is re-read after it. Tests: `pull_fast_forwards_only` (up to date with `pull.rebase=true` set, a fast-forward keeping an unrelated local edit, an overwriting local edit refused, diverged refused with no merge commit, no upstream refused), `git_commit_runs_once_per_command_id_and_is_audited` (the `git-pull` audit), fixtures `git_pull` in `client-valid.json` / `client-invalid.json`.

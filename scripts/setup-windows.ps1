@@ -25,17 +25,48 @@
 # %USERPROFILE%\.claude\settings.json (`--install-hooks`, backup in settings.json.chernobyl-backup),
 # so Claude Code sessions in a terminal or VS Code ask the phone too; the PC still asks if the
 # phone does not answer in 120 s. Undo: & "$env:LOCALAPPDATA\Programs\CHERNOBYL\chernobyl-companion.exe" --uninstall-hooks
+#
+# OpenCode: -OpenCode adds an attach-only OpenCode adapter for an `opencode serve` at -OpenCodeUrl
+# (default http://127.0.0.1:4096). No password is ever written to the file: if the server needs
+# one, set the user variable OPENCODE_SERVER_PASSWORD (and OPENCODE_SERVER_USERNAME if it is not
+# `opencode`); the companion reads it at start (`basicAuthEnv`). -StartOpenCode also runs
+# `opencode serve --port <port> --hostname 127.0.0.1` hidden in the first workspace folder, now and
+# at every login (HKCU Run).
+#
+# Terminal (ADR-020): -EnableTerminal lets the paired phone run any command line in an allow-listed
+# workspace WITHOUT the agents' approval prompts. Off unless you pass it.
+#
+# -ConfigOnly writes companion.json (and the OpenCode launcher) and stops: no exe copy, token,
+# firewall, autostart or process changes. For checking what setup would write.
 param(
   [Parameter(Mandatory = $true)][string[]]$Workspaces,
   [int]$Port = 8787,
-  [string]$Exe = (Join-Path $PSScriptRoot '..\services\companion-rs\target\release\chernobyl-companion.exe'),
+  [string]$Exe,
   [switch]$NoAutostart,
   [switch]$PhoneApprovals,
   [string]$TunnelUrl,
   [string]$NgrokDomain,
-  [string]$Ngrok = 'C:\ngrok\ngrok.exe'
+  [string]$Ngrok = 'C:\ngrok\ngrok.exe',
+  [switch]$OpenCode,
+  [string]$OpenCodeUrl = 'http://127.0.0.1:4096',
+  [switch]$StartOpenCode,
+  [switch]$EnableTerminal,
+  [switch]$ConfigOnly
 )
 $ErrorActionPreference = 'Stop'
+# not a param default: Windows PowerShell 5.1 leaves $PSScriptRoot empty there under -File
+if (-not $Exe) { $Exe = Join-Path $PSScriptRoot '..\services\companion-rs\target\release\chernobyl-companion.exe' }
+if ($StartOpenCode) { $OpenCode = [switch]$true }
+if ($OpenCode) {
+  $ocUri = $null
+  if (-not [Uri]::TryCreate($OpenCodeUrl, [UriKind]::Absolute, [ref]$ocUri) -or $ocUri.Scheme -ne 'http' -or $ocUri.PathAndQuery -ne '/') {
+    throw "-OpenCodeUrl must look like http://127.0.0.1:4096 (got $OpenCodeUrl)"
+  }
+  $OpenCodeUrl = "http://$($ocUri.Authority)"
+}
+if ($StartOpenCode -and $ocUri.Host -notin @('127.0.0.1', 'localhost')) {
+  throw "-StartOpenCode serves on this PC only: -OpenCodeUrl must be http://127.0.0.1:<port> (got $OpenCodeUrl)"
+}
 if ($NgrokDomain) {
   if ($NgrokDomain -notmatch '^[a-z0-9-]+(\.[a-z0-9-]+)+$') { throw "-NgrokDomain must be a bare host name (got $NgrokDomain)" }
   if (-not (Test-Path $Ngrok)) { throw "ngrok not found at $Ngrok (pass -Ngrok <path>)" }
@@ -43,39 +74,72 @@ if ($NgrokDomain) {
 }
 if ($TunnelUrl -and $TunnelUrl -notmatch '^wss://[^/\s]+/?$') { throw "-TunnelUrl must look like wss://host (got $TunnelUrl)" }
 
-if (-not (Test-Path $Exe)) { throw "No companion exe at $Exe. Build it first: cargo build --release --manifest-path services\companion-rs\Cargo.toml" }
+if (-not $ConfigOnly -and -not (Test-Path $Exe)) { throw "No companion exe at $Exe. Build it first: cargo build --release --manifest-path services\companion-rs\Cargo.toml" }
 if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { Write-Warning 'claude is not on PATH: install Claude Code and sign in (run "claude" once) before starting sessions.' }
 foreach ($w in $Workspaces) { if (-not (Test-Path $w -PathType Container)) { throw "Workspace folder does not exist: $w" } }
 
 # 1. install the exe
 $bin = Join-Path $env:LOCALAPPDATA 'Programs\CHERNOBYL'
 New-Item -ItemType Directory -Force $bin | Out-Null
-Get-Process chernobyl-companion -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 500
 $target = Join-Path $bin 'chernobyl-companion.exe'
-Copy-Item $Exe $target -Force
-Write-Host "Installed $target"
+if (-not $ConfigOnly) {
+  Get-Process chernobyl-companion -ErrorAction SilentlyContinue | Stop-Process -Force
+  Start-Sleep -Milliseconds 500
+  Copy-Item $Exe $target -Force
+  Write-Host "Installed $target"
+}
 
 # 2. config
 $dir = Join-Path $env:APPDATA 'CHERNOBYL'
 New-Item -ItemType Directory -Force $dir | Out-Null
 $cfgPath = Join-Path $dir 'companion.json'
 if (Test-Path $cfgPath) { Copy-Item $cfgPath "$cfgPath.bak" -Force }
+$adapters = @(
+  [ordered]@{ id = 'mock-1'; type = 'mock'; enabled = $false },
+  [ordered]@{ id = 'claude-1'; type = 'claude'; enabled = $true; workspaces = @($Workspaces | ForEach-Object { (Resolve-Path $_).Path }) }
+)
+if ($OpenCode) {
+  # attach-only; the password (if any) stays in the user variable, never in this file
+  $adapters += , ([ordered]@{ id = 'opencode-1'; type = 'opencode'; enabled = $true; endpoint = $OpenCodeUrl; basicAuthEnv = 'OPENCODE_SERVER_PASSWORD' })
+}
 $cfg = [ordered]@{
   version = 1
   name = "$env:COMPUTERNAME"
   dataDir = $dir
-  adapters = @(
-    [ordered]@{ id = 'mock-1'; type = 'mock'; enabled = $false },
-    [ordered]@{ id = 'claude-1'; type = 'claude'; enabled = $true; workspaces = @($Workspaces | ForEach-Object { (Resolve-Path $_).Path }) }
-  )
+  adapters = $adapters
   retention = [ordered]@{ events = 5000; eventsMaxAgeMs = 604800000 }
   diagnostics = [ordered]@{ port = 9487 }
   probeIntervalMs = 15000
   server = [ordered]@{ port = $Port; bind = '0.0.0.0'; requireE2e = [bool]$TunnelUrl }
+  # ADR-020: the paired phone may run shell commands without approval prompts only if this is true
+  terminal = [ordered]@{ enabled = [bool]$EnableTerminal }
 }
 [IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding $false))
 Write-Host "Wrote $cfgPath"
+if ($EnableTerminal) { Write-Warning 'Terminal ON: the paired phone can run any command in your workspaces without approval prompts (ADR-020).' }
+
+# 2b. OpenCode serve: a hidden launcher in the first workspace folder, now and at login
+if ($StartOpenCode) {
+  $oc = Get-Command opencode -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  $ocExe = if ($oc) { $oc.Source } else { Write-Warning 'opencode is not on PATH: install OpenCode; the launcher looks for it again at login.'; 'opencode' }
+  $ocDir = (Resolve-Path $Workspaces[0]).Path
+  $ocVbs = Join-Path $bin 'opencode-serve.vbs'
+  $ocLine = '""' + $ocExe + '"" serve --port ' + $ocUri.Port + ' --hostname 127.0.0.1'
+  [IO.File]::WriteAllText($ocVbs, "Set sh = CreateObject(""WScript.Shell"")`r`nsh.CurrentDirectory = ""$ocDir""`r`nsh.Run ""$ocLine"", 0, False`r`n", (New-Object Text.UTF8Encoding $false))
+  Write-Host "Wrote $ocVbs"
+}
+if ($ConfigOnly) { Write-Host 'Config only: nothing installed, started or registered.'; return }
+if ($StartOpenCode) {
+  if (-not $NoAutostart) {
+    Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'CHERNOBYL OpenCode' -Value "wscript.exe `"$ocVbs`""
+  }
+  if (Get-NetTCPConnection -LocalPort $ocUri.Port -State Listen -ErrorAction SilentlyContinue) {
+    Write-Host "Port $($ocUri.Port) is already listening; not starting a second OpenCode server."
+  } else {
+    Start-Process wscript.exe -ArgumentList "`"$ocVbs`""
+    Write-Host "OpenCode started: $OpenCodeUrl (in $ocDir)"
+  }
+}
 
 # 3. token (created once; the companion and the login autostart read HOST_TOKEN)
 $token = [Environment]::GetEnvironmentVariable('HOST_TOKEN', 'User')

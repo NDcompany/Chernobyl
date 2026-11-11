@@ -21,6 +21,8 @@
  *    `hello_ack.features` (FEATURE_TRANSCRIPT); the reducer is ./transcript.
  *  - ADR-016 (additive, still v2): workspace files and git, advertised by
  *    FEATURE_WORKSPACE.
+ *  - ADR-020 (additive, still v2): the opt-in one-shot terminal, advertised by
+ *    FEATURE_TERMINAL only when the PC turned it on.
  *
  * All timestamps are epoch milliseconds (UTC). All ids are opaque strings.
  */
@@ -464,13 +466,15 @@ export const WORKSPACE_PATH_MAX = 1024;
 export const WORKSPACE_PATHS_MAX = 256;
 export const WORKSPACE_MESSAGE_MAX = 4096;
 export const WORKSPACE_ID_MAX = 64;
+/** ADR-020: one terminal command line, in UTF-16 units. */
+export const TERMINAL_COMMAND_MAX = 4096;
 
 /**
  * `workspaceId` is an `Agent.live.workspaces[].id`; paths are relative to that
  * workspace (`/`-separated; '' = its root). Reads (fs_list, fs_read,
  * git_status, git_diff) are answered with a `workspace_result` followed by an
  * ack; never journaled. Mutations (git_stage, git_unstage, git_commit,
- * git_push) get the full command lifecycle: ack on acceptance, then one
+ * git_push, git_pull, terminal_run) get the full command lifecycle: ack on acceptance, then one
  * `command_result` (its `error` carries git's own summary).
  */
 export type WorkspaceClientMessage =
@@ -481,7 +485,18 @@ export type WorkspaceClientMessage =
   | { type: 'git_stage'; commandId: string; workspaceId: string; paths: string[] }
   | { type: 'git_unstage'; commandId: string; workspaceId: string; paths: string[] }
   | { type: 'git_commit'; commandId: string; workspaceId: string; message: string }
-  | { type: 'git_push'; commandId: string; workspaceId: string };
+  | { type: 'git_push'; commandId: string; workspaceId: string }
+  /** ADR-016 addendum: fast-forward the current branch from its upstream (`--ff-only`). */
+  | { type: 'git_pull'; commandId: string; workspaceId: string }
+  /**
+   * ADR-020 (only when `hello_ack.features` has FEATURE_TERMINAL): one
+   * command line through the PC's shell, cwd = the workspace. Acked once it
+   * runs; output arrives as `terminal_output` to this connection, then one
+   * `terminal_exit`, then its `command_result`.
+   */
+  | { type: 'terminal_run'; commandId: string; workspaceId: string; command: string }
+  /** ADR-020: kill the workspace's running command; ack only, never journaled. */
+  | { type: 'terminal_stop'; commandId: string; workspaceId: string };
 
 export interface FsEntry {
   name: string;
@@ -528,12 +543,25 @@ export type WorkspaceResult =
     }
   | { kind: 'git_diff'; path?: string; staged: boolean; truncated: boolean; patch: string };
 
-export type WorkspaceServerMessage = {
-  type: 'workspace_result';
-  commandId: string;
-  workspaceId: string;
-  result: WorkspaceResult;
-};
+export type WorkspaceServerMessage =
+  | {
+      type: 'workspace_result';
+      commandId: string;
+      workspaceId: string;
+      result: WorkspaceResult;
+    }
+  /** ADR-020: output (stdout+stderr, ANSI stripped, redacted); never journaled. */
+  | { type: 'terminal_output'; commandId: string; workspaceId: string; data: string }
+  | {
+      type: 'terminal_exit';
+      commandId: string;
+      workspaceId: string;
+      /** Set when `reason` is `exit` (null if the process had none). */
+      exitCode: number | null;
+      reason: 'exit' | 'timeout' | 'stopped';
+      /** Output passed the 1 MiB cap; the rest was dropped. */
+      truncated: boolean;
+    };
 
 /* ------------------------------------------------------------------ */
 /* Client → server messages                                            */
@@ -796,6 +824,9 @@ const CLIENT_TYPES: ReadonlySet<string> = new Set([
   'git_unstage',
   'git_commit',
   'git_push',
+  'git_pull',
+  'terminal_run',
+  'terminal_stop',
 ]);
 
 const SERVER_TYPES: ReadonlySet<string> = new Set([
@@ -816,6 +847,8 @@ const SERVER_TYPES: ReadonlySet<string> = new Set([
   'transcript',
   'transcript_snapshot',
   'workspace_result',
+  'terminal_output',
+  'terminal_exit',
 ]);
 
 function hasCommandId(v: Record<string, unknown>): boolean {
@@ -840,7 +873,7 @@ function isPaths(v: unknown): boolean {
 /** Validates an untrusted payload as a ClientMessage. */
 export function isClientMessage(v: unknown): v is ClientMessage {
   if (!isRecord(v) || !isStr(v.type) || !CLIENT_TYPES.has(v.type)) return false;
-  if (v.type.startsWith('fs_') || v.type.startsWith('git_')) {
+  if (v.type.startsWith('fs_') || v.type.startsWith('git_') || v.type.startsWith('terminal_')) {
     // ADR-016: shape only; containment is the companion's job
     if (!hasCommandId(v) || !isStr(v.workspaceId) || !fits(v.workspaceId, WORKSPACE_ID_MAX)) return false;
   }
@@ -931,7 +964,12 @@ export function isClientMessage(v: unknown): v is ClientMessage {
       return isPath(v.path);
     case 'git_status':
     case 'git_push':
+    case 'git_pull':
+    case 'terminal_stop':
       return true;
+    case 'terminal_run':
+      // shape only; blank lines and line breaks are refused by the companion
+      return isStr(v.command) && fits(v.command, TERMINAL_COMMAND_MAX);
     case 'git_diff':
       return (
         (v.path === undefined || fits(v.path, WORKSPACE_PATH_MAX)) &&
@@ -1037,6 +1075,16 @@ export function isServerMessage(v: unknown): v is ServerMessage {
     case 'workspace_result':
       // result kinds stay open (a newer companion may add some)
       return hasCommandId(v) && isStr(v.workspaceId) && isRecord(v.result) && isStr(v.result.kind);
+    case 'terminal_output':
+      return hasCommandId(v) && isStr(v.workspaceId) && typeof v.data === 'string';
+    case 'terminal_exit':
+      return (
+        hasCommandId(v) &&
+        isStr(v.workspaceId) &&
+        (v.exitCode === null || isNum(v.exitCode)) &&
+        (v.reason === 'exit' || v.reason === 'timeout' || v.reason === 'stopped') &&
+        typeof v.truncated === 'boolean'
+      );
     default:
       return false;
   }
