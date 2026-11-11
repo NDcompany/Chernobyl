@@ -63,32 +63,30 @@ test('countdown: minute countdowns pad seconds', () => {
   assert.equal(countdown(now + 599_000, now), 'expires in 9:59');
 });
 
-test('hostTone and hostStatusLabel: all states and fallbacks', () => {
+test('hostTone and hostStatusLabel: every state', () => {
   assert.equal(hostTone('connected'), 'success');
   assert.equal(hostTone('connecting'), 'warning');
-  assert.equal(hostTone('disconnected'), 'neutral');
-  assert.equal(hostTone('error'), 'neutral');
+  assert.equal(hostTone('offline'), 'neutral');
 
   assert.equal(hostStatusLabel('connected'), 'Connected');
   assert.equal(hostStatusLabel('connecting'), 'Connecting…');
-  assert.equal(hostStatusLabel('disconnected'), 'Offline');
-  assert.equal(hostStatusLabel('error'), 'Offline');
+  assert.equal(hostStatusLabel('offline'), 'Offline');
 });
 
-test('transportTone and transportStatusLabel: all states and fallbacks', () => {
+test('transportTone and transportStatusLabel: every state', () => {
   assert.equal(transportTone('connected'), 'success');
   assert.equal(transportTone('connecting'), 'warning');
   assert.equal(transportTone('handshaking'), 'warning');
   assert.equal(transportTone('reconnecting'), 'warning');
   assert.equal(transportTone('denied'), 'error');
-  assert.equal(transportTone('disconnected'), 'neutral');
+  assert.equal(transportTone('offline'), 'neutral');
 
   assert.equal(transportStatusLabel('connected'), 'Connected');
   assert.equal(transportStatusLabel('connecting'), 'Connecting…');
   assert.equal(transportStatusLabel('handshaking'), 'Authorizing…');
   assert.equal(transportStatusLabel('reconnecting'), 'Reconnecting…');
   assert.equal(transportStatusLabel('denied'), 'Denied');
-  assert.equal(transportStatusLabel('disconnected'), 'Offline');
+  assert.equal(transportStatusLabel('offline'), 'Offline');
 });
 
 test('agentTone and agentStatusLabel: online, busy, idle, offline', () => {

@@ -25,12 +25,10 @@ const makeHost = (id: string, name = 'Host'): Host => ({
   id,
   name,
   status: 'connected',
+  kind: 'local',
   platform: 'win32',
-  version: '1.0.0',
   address: '127.0.0.1',
-  daemonStartedAt: 1000,
-  lastHeartbeatAt: 2000,
-  capabilities: ['claude-code'],
+  lastSeenAt: 2000,
 });
 
 const makeAgent = (id: string, name = 'Agent'): Agent => ({
@@ -40,7 +38,7 @@ const makeAgent = (id: string, name = 'Agent'): Agent => ({
   kind: 'claude-code',
   state: 'online',
   capabilities: ['shell'],
-  activeSessions: 0,
+  acceptsNewSession: true,
 });
 
 const makeSession = (id: string, title = 'Session'): Session => ({
@@ -79,15 +77,14 @@ const makePermission = (id: string): PermissionRequest => ({
 
 const makeActivity = (id: string, ts = 1000): ActivityEvent => ({
   id,
-  type: 'session_started',
-  source: 'agent',
-  actorId: 'a1',
-  refId: 's1',
-  title: 'Started session',
-  description: 'Running task',
-  level: 'info',
   ts,
+  kind: 'session',
+  text: 'Started session',
+  refId: 's1',
 });
+
+/** Every event message carries an envelope; the reducer ignores it. */
+const env = (seq: number) => ({ seq, eventId: `e${seq}`, occurredAt: 1000 + seq });
 
 test('applyServerMessage: hello_ack and state replace the entire snapshot', () => {
   const customSnapshot: Snapshot = {
@@ -110,7 +107,7 @@ test('applyServerMessage: hello_ack and state replace the entire snapshot', () =
   const fromState = applyServerMessage(EMPTY_SNAPSHOT, {
     type: 'state',
     snapshot: customSnapshot,
-    seq: 43,
+    lastSeq: 43,
   });
   assert.deepEqual(fromState, customSnapshot);
 });
@@ -120,42 +117,42 @@ test('applyServerMessage: host_updated upserts cleanly (prepend new, replace exi
   const h2 = makeHost('h2', 'Second');
   const s0 = EMPTY_SNAPSHOT;
 
-  const s1 = applyServerMessage(s0, { type: 'host_updated', host: h1 });
+  const s1 = applyServerMessage(s0, { type: 'host_updated', host: h1, ...env(1) });
   assert.deepEqual(s1.hosts, [h1]);
 
-  const s2 = applyServerMessage(s1, { type: 'host_updated', host: h2 });
+  const s2 = applyServerMessage(s1, { type: 'host_updated', host: h2, ...env(1) });
   assert.deepEqual(s2.hosts, [h2, h1]);
 
   const h1Updated = { ...h1, name: 'Updated' };
-  const s3 = applyServerMessage(s2, { type: 'host_updated', host: h1Updated });
+  const s3 = applyServerMessage(s2, { type: 'host_updated', host: h1Updated, ...env(1) });
   assert.deepEqual(s3.hosts, [h2, h1Updated]);
 });
 
 test('applyServerMessage: agent_updated upserts agents', () => {
   const a1 = makeAgent('a1', 'Agent 1');
   const a2 = makeAgent('a2', 'Agent 2');
-  const s1 = applyServerMessage(EMPTY_SNAPSHOT, { type: 'agent_updated', agent: a1 });
+  const s1 = applyServerMessage(EMPTY_SNAPSHOT, { type: 'agent_updated', agent: a1, ...env(1) });
   assert.deepEqual(s1.agents, [a1]);
 
-  const s2 = applyServerMessage(s1, { type: 'agent_updated', agent: a2 });
+  const s2 = applyServerMessage(s1, { type: 'agent_updated', agent: a2, ...env(1) });
   assert.deepEqual(s2.agents, [a2, a1]);
 
   const a1Busy = { ...a1, state: 'busy' as const };
-  const s3 = applyServerMessage(s2, { type: 'agent_updated', agent: a1Busy });
+  const s3 = applyServerMessage(s2, { type: 'agent_updated', agent: a1Busy, ...env(1) });
   assert.deepEqual(s3.agents, [a2, a1Busy]);
 });
 
 test('applyServerMessage: session_created and session_updated upsert sessions', () => {
   const sess1 = makeSession('s1', 'Session 1');
   const sess2 = makeSession('s2', 'Session 2');
-  const s1 = applyServerMessage(EMPTY_SNAPSHOT, { type: 'session_created', session: sess1 });
+  const s1 = applyServerMessage(EMPTY_SNAPSHOT, { type: 'session_created', session: sess1, ...env(1) });
   assert.deepEqual(s1.sessions, [sess1]);
 
-  const s2 = applyServerMessage(s1, { type: 'session_updated', session: sess2 });
+  const s2 = applyServerMessage(s1, { type: 'session_updated', session: sess2, ...env(1) });
   assert.deepEqual(s2.sessions, [sess2, sess1]);
 
   const sess1Done = { ...sess1, status: 'completed' as const, progress: 100 };
-  const s3 = applyServerMessage(s2, { type: 'session_updated', session: sess1Done });
+  const s3 = applyServerMessage(s2, { type: 'session_updated', session: sess1Done, ...env(1) });
   assert.deepEqual(s3.sessions, [sess2, sess1Done]);
 });
 
@@ -164,7 +161,7 @@ test('applyServerMessage: session_output appends lines, updates progress/status 
     id: `l-${i}`,
     stream: 'stdout' as const,
     text: `Line ${i}`,
-    timestamp: 1000 + i,
+    ts: 1000 + i,
   }));
   const baseSession = { ...makeSession('s1'), output: initialLines };
   const state: Snapshot = { ...EMPTY_SNAPSHOT, sessions: [baseSession, makeSession('s2')] };
@@ -173,7 +170,7 @@ test('applyServerMessage: session_output appends lines, updates progress/status 
     id: `new-${i}`,
     stream: 'stdout' as const,
     text: `New ${i}`,
-    timestamp: 2000 + i,
+    ts: 2000 + i,
   }));
 
   const nextState = applyServerMessage(state, {
@@ -182,6 +179,7 @@ test('applyServerMessage: session_output appends lines, updates progress/status 
     lines: newLines,
     progress: 85,
     status: 'running',
+    ...env(1),
   });
 
   const updatedS1 = nextState.sessions.find((s) => s.id === 's1')!;
@@ -197,11 +195,11 @@ test('applyServerMessage: session_output appends lines, updates progress/status 
 
 test('applyServerMessage: permission_requested and permission_resolved upsert requests', () => {
   const p1 = makePermission('p1');
-  const s1 = applyServerMessage(EMPTY_SNAPSHOT, { type: 'permission_requested', permission: p1 });
+  const s1 = applyServerMessage(EMPTY_SNAPSHOT, { type: 'permission_requested', permission: p1, ...env(1) });
   assert.deepEqual(s1.permissions, [p1]);
 
   const p1Resolved = { ...p1, status: 'approved' as const, decision: 'approve-once' as const, decidedAt: 1500 };
-  const s2 = applyServerMessage(s1, { type: 'permission_resolved', permission: p1Resolved });
+  const s2 = applyServerMessage(s1, { type: 'permission_resolved', permission: p1Resolved, ...env(1) });
   assert.deepEqual(s2.permissions, [p1Resolved]);
 });
 
@@ -211,6 +209,7 @@ test('applyServerMessage: activity prepends and caps at 80 items', () => {
     state = applyServerMessage(state, {
       type: 'activity',
       event: makeActivity(`act-${i}`, i),
+      ...env(i),
     });
   }
   assert.equal(state.activity.length, 80);
@@ -220,6 +219,6 @@ test('applyServerMessage: activity prepends and caps at 80 items', () => {
 
 test('applyServerMessage: ignores non-state messages such as ack and pong', () => {
   const s0: Snapshot = { ...EMPTY_SNAPSHOT, hosts: [makeHost('h1')] };
-  const s1 = applyServerMessage(s0, { type: 'pong', pingId: 'p1' } as any);
+  const s1 = applyServerMessage(s0, { type: 'pong', commandId: 'c1' });
   assert.equal(s1, s0);
 });

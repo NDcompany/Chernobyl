@@ -19,12 +19,10 @@ const makeHost = (id: string, name = 'Host', simulated = false): Host => ({
   id,
   name,
   status: 'connected',
+  kind: 'local',
   platform: 'win32',
-  version: '1.0.0',
   address: '127.0.0.1',
-  daemonStartedAt: 1000,
-  lastHeartbeatAt: 2000,
-  capabilities: ['claude-code'],
+  lastSeenAt: 2000,
   simulated,
 });
 
@@ -35,7 +33,7 @@ const makeAgent = (id: string, name = 'Agent', hostId = 'h1', simulated = false)
   kind: 'claude-code',
   state: 'online',
   capabilities: ['shell', 'file-write'],
-  activeSessions: 0,
+  acceptsNewSession: true,
   simulated,
 });
 
@@ -52,7 +50,7 @@ const makeSession = (id: string, agentId = 'a1', status: Session['status'] = 'ru
   timeline: [],
   output: [],
   files: [],
-  transcript,
+  ...(transcript ? { transcript: true as const } : {}),
 });
 
 const makePermission = (
@@ -220,7 +218,7 @@ test('counts: computes connected hosts, online/busy agents, active sessions and 
   const snapshot: Snapshot = {
     hosts: [
       makeHost('h1'),
-      { ...makeHost('h2'), status: 'disconnected' },
+      { ...makeHost('h2'), status: 'offline' },
     ],
     agents: [
       makeAgent('a1'),
@@ -253,9 +251,9 @@ test('recentActivity and activityFor: sorts and slices', {
 }, () => {
   const { recentActivity, activityFor } = selectorsMod!;
   const events: ActivityEvent[] = [
-    { id: 'e1', type: 'session_started', source: 'agent', actorId: 'a1', refId: 's1', title: 'E1', description: '', level: 'info', ts: 10 },
-    { id: 'e2', type: 'session_started', source: 'agent', actorId: 'a1', refId: 's2', title: 'E2', description: '', level: 'info', ts: 20 },
-    { id: 'e3', type: 'session_started', source: 'agent', actorId: 'a1', refId: 's1', title: 'E3', description: '', level: 'info', ts: 30 },
+    { id: 'e1', ts: 10, kind: 'session', text: 'E1', refId: 's1' },
+    { id: 'e2', ts: 20, kind: 'session', text: 'E2', refId: 's2' },
+    { id: 'e3', ts: 30, kind: 'session', text: 'E3', refId: 's1' },
   ];
   const snapshot: Snapshot = { hosts: [], agents: [], sessions: [], permissions: [], activity: events };
 
@@ -271,8 +269,8 @@ test('searchAgents: matches against name, kind, capabilities and host name', {
   const { searchAgents } = selectorsMod!;
   const h1 = makeHost('h1', 'Primary Desktop');
   const h2 = makeHost('h2', 'Remote Server');
-  const a1 = { ...makeAgent('a1', 'Haiku Assistant', 'h1'), kind: 'claude-code', capabilities: ['shell'] };
-  const a2 = { ...makeAgent('a2', 'Ollama Qwen', 'h2'), kind: 'opencode', capabilities: ['chat', 'vision'] };
+  const a1 = { ...makeAgent('a1', 'Haiku Assistant', 'h1'), kind: 'claude-code' as const, capabilities: ['shell'] };
+  const a2 = { ...makeAgent('a2', 'Ollama Qwen', 'h2'), kind: 'opencode' as const, capabilities: ['chat', 'vision'] };
   const snapshot: Snapshot = { hosts: [h1, h2], agents: [a1, a2], sessions: [], permissions: [], activity: [] };
 
   assert.equal(searchAgents(snapshot, '').length, 2);
