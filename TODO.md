@@ -338,6 +338,11 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
 - [x] Claude session history: every session in an allow-listed workspace (phone, terminal or
       VS Code) is listed, replayed and continued with `--resume` (`bd999f6`; live Haiku run
       $0.0076, ADR-015 §10).
+- [x] Claude composer (ADR-017): model chip and `set_model`, a model for new tasks, camera
+      photos in prompts (4 at most, 180,000 base64 chars together: one WebSocket frame), the
+      slash-command menu, the context meter and rename; live Haiku run $0.0061.
+- [ ] Composer: gallery attachments need `expo-image-picker` (not shipped); one camera run on a
+      device; chunked uploads if bigger photos are wanted.
 - [ ] A live Codex run, when someone has Codex installed and signed in; capabilities stay
       `limited` until then.
 - [ ] Rare server-test flake `control_routes_refuse_a_missing_or_wrong_control_key`

@@ -1,7 +1,7 @@
 # CHERNOBYL — privacy and data retention
 
 **Applies to:** the desktop companion (`chernobyl-companion.exe`) and the CHERNOBYL phone app.
-**Last reviewed:** 2026-11-12 against `bd999f6` (Claude Code session history on the phone).
+**Last reviewed:** 2026-11-12 against ADR-017 (Claude composer: photos, model, rename on the phone).
 
 ## The short version
 
@@ -48,7 +48,14 @@ requests are journaled as before, with their command or patterns and, for an edi
 the runtime shows, redacted and capped. An `mcp_auth_callback` command is journaled with its
 callback URL replaced by `<redacted>`, because it carries a one-time authorization code. The
 answers to an agent's question (`permission_decision.answers`) are journaled with each value
-replaced by `<redacted>`. Two credentials are stored in plaintext: the OpenCode
+replaced by `<redacted>`. Photos you attach to a Claude Code prompt (ADR-017; at most 4, about
+130 KiB together) travel inside that prompt through the encrypted channel to Claude Code on your
+PC, which sends them to Anthropic like any image you paste into Claude Code. The companion does
+not store them: the journal keeps only each photo's type with the data replaced by `<redacted>`,
+and the live transcript and history show only how many images a prompt had. The phone keeps the
+preview only until the prompt is sent. Claude Code itself saves the prompt, images included, in
+its own session file under `%USERPROFILE%\.claude\projects`, as it does for terminal sessions.
+A model choice and a session name you set on the phone are journaled as sent. Two credentials are stored in plaintext: the OpenCode
 `basicAuth` in `companion.json` and the control key. Only the folder's permissions protect
 them. The default `%APPDATA%\CHERNOBYL` is readable by your Windows account and administrators
 only, but the files go wherever a copy of the folder goes: a roaming profile, a support bundle,
