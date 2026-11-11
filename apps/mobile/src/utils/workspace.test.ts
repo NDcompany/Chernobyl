@@ -13,6 +13,7 @@ import {
   formatBytes,
   gitStatusLabel,
   lineChunks,
+  pullSource,
   pushTarget,
   workspaceForProject,
 } from './workspace.ts';
@@ -82,6 +83,9 @@ test('push target is honest about detached heads and missing upstreams', () => {
   assert.deepEqual(pushTarget(status()), { label: 'main → origin/main', canPush: true });
   assert.equal(pushTarget(status({ upstream: undefined })).canPush, false);
   assert.equal(pushTarget(status({ branch: null })).canPush, false);
+  assert.deepEqual(pullSource(status()), { label: 'origin/main → main', canPull: true });
+  assert.equal(pullSource(status({ upstream: undefined })).canPull, false);
+  assert.equal(pullSource(status({ branch: null })).canPull, false);
   assert.equal(aheadBehind(status()), 'up to date');
   assert.equal(aheadBehind(status({ ahead: 2, behind: 1 })), '↑2 ↓1');
   assert.equal(aheadBehind(status({ upstream: undefined })), '');

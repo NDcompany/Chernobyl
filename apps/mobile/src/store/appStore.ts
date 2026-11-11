@@ -9,6 +9,7 @@ import { applyCommandLifecycle, type CommandEntry } from '@chernobyl/domain';
 import { nextId, type AgentKind, type ServerMessage } from '@chernobyl/protocol';
 import type { TransportStatus } from '@/data/transport';
 import { sqliteStorage } from '@/platform/storage';
+import { remember } from '@/utils/terminal';
 
 export interface CommandRecord extends CommandEntry {
   permissionId?: string;
@@ -88,6 +89,8 @@ export interface AppState {
    * through the domain FSM — NOT through the ack.
    */
   commandStates: CommandRecordTracker;
+  /** ADR-018: the last command lines per workspace id, newest first; on this phone only. */
+  terminalHistory: Record<string, string[]>;
 
   completeOnboarding: () => void;
   signIn: () => void;
@@ -111,6 +114,7 @@ export interface AppState {
   trackCommand: (msg: ServerMessage) => void;
   updateSettings: (patch: Partial<Settings>) => void;
   toggleIntegration: (kind: AgentKind) => void;
+  rememberCommand: (workspaceId: string, line: string) => void;
 }
 
 const TOAST_MS = 3400;
@@ -132,6 +136,7 @@ export const useAppStore = create<AppState>()(
       sessionFilter: 'all',
       inFlight: {},
       commandStates: {},
+      terminalHistory: {},
 
       completeOnboarding: () => set({ onboarded: true }),
       signIn: () => set({ authed: true }),
@@ -268,6 +273,13 @@ export const useAppStore = create<AppState>()(
             integrations: { ...s.settings.integrations, [kind]: !s.settings.integrations[kind] },
           },
         })),
+      rememberCommand: (workspaceId, line) =>
+        set((s) => ({
+          terminalHistory: {
+            ...s.terminalHistory,
+            [workspaceId]: remember(s.terminalHistory[workspaceId] ?? [], line),
+          },
+        })),
     }),
     {
       name: 'chernobyl-app',
@@ -277,6 +289,7 @@ export const useAppStore = create<AppState>()(
         authed: s.authed,
         user: s.user,
         settings: s.settings,
+        terminalHistory: s.terminalHistory,
       }),
     },
   ),

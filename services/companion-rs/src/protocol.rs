@@ -11,8 +11,14 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const FEATURE_TRANSCRIPT: &str = "transcript.v1";
 /// ADR-016: workspace files (read-only) and git (additive, protocol stays 2).
 pub const FEATURE_WORKSPACE: &str = "workspace.v1";
+/// ADR-018: the opt-in one-shot terminal, advertised only while
+/// `terminal.enabled` is true in companion.json.
+pub const FEATURE_TERMINAL: &str = "terminal.v1";
 /// What `hello_ack.features` advertises.
 pub const FEATURES: &[&str] = &[FEATURE_TRANSCRIPT, FEATURE_WORKSPACE];
+/// [`FEATURES`] plus the terminal, for a companion that turned it on.
+pub const FEATURES_WITH_TERMINAL: &[&str] =
+    &[FEATURE_TRANSCRIPT, FEATURE_WORKSPACE, FEATURE_TERMINAL];
 pub const PERMISSION_TTL_MS: i64 = 120_000;
 /// ADR-015: presentation expiry of runtime-sourced requests. None of the
 /// runtimes expires a request itself (PRD §13.4); mock and demo keep 120 s.
@@ -748,6 +754,15 @@ pub enum WorkspaceOp {
         message: String,
     },
     GitPush,
+    /// ADR-016 addendum: fast-forward the current branch from its upstream.
+    GitPull,
+    /// ADR-018: one command line through the shell, cwd = the workspace.
+    TerminalRun {
+        command: String,
+    },
+    /// ADR-018: kill the workspace's running command (its process tree).
+    /// Not journaled: the run's own `command_result` records the stop.
+    TerminalStop,
 }
 
 /// ADR-016 bounds shared with the TS validator.
@@ -755,6 +770,8 @@ pub const WS_PATH_MAX: usize = 1024;
 pub const WS_PATHS_MAX: usize = 256;
 pub const WS_MESSAGE_MAX: usize = 4096;
 pub const WS_ID_MAX: usize = 64;
+/// ADR-018: one terminal command line, in UTF-16 units.
+pub const TERMINAL_COMMAND_MAX: usize = 4096;
 
 impl WorkspaceOp {
     /// The wire `type` (also the journal's command kind).
@@ -768,6 +785,9 @@ impl WorkspaceOp {
             WorkspaceOp::GitUnstage { .. } => "git_unstage",
             WorkspaceOp::GitCommit { .. } => "git_commit",
             WorkspaceOp::GitPush => "git_push",
+            WorkspaceOp::GitPull => "git_pull",
+            WorkspaceOp::TerminalRun { .. } => "terminal_run",
+            WorkspaceOp::TerminalStop => "terminal_stop",
         }
     }
 
@@ -778,10 +798,14 @@ impl WorkspaceOp {
                 | WorkspaceOp::GitUnstage { .. }
                 | WorkspaceOp::GitCommit { .. }
                 | WorkspaceOp::GitPush
+                | WorkspaceOp::GitPull
+                | WorkspaceOp::TerminalRun { .. }
         )
     }
 
-    /// The message as the phone sent it (journal payload).
+    /// The message as the phone sent it (journal payload). A terminal
+    /// command line is redacted: the journal keeps what ran, not a secret
+    /// typed into it.
     pub fn to_json(&self, command_id: &str, workspace_id: &str) -> Json {
         let mut fields = vec![
             ("type", json::s(self.kind())),
@@ -803,7 +827,13 @@ impl WorkspaceOp {
                 fields.push(("paths", list(paths)))
             }
             WorkspaceOp::GitCommit { message } => fields.push(("message", json::s(message))),
-            WorkspaceOp::GitStatus | WorkspaceOp::GitPush => {}
+            WorkspaceOp::TerminalRun { command } => {
+                fields.push(("command", json::s(&crate::runtime_io::redact(command))))
+            }
+            WorkspaceOp::GitStatus
+            | WorkspaceOp::GitPush
+            | WorkspaceOp::GitPull
+            | WorkspaceOp::TerminalStop => {}
         }
         json::obj(fields)
     }
@@ -858,6 +888,15 @@ impl WorkspaceOp {
                     message: m.to_string(),
                 }),
             "git_push" => Some(WorkspaceOp::GitPush),
+            "git_pull" => Some(WorkspaceOp::GitPull),
+            // shape only; blank, NUL and line breaks are refused by terminal.rs
+            "terminal_run" => json::get(obj, "command")
+                .and_then(json::as_str)
+                .filter(|c| !c.is_empty() && fits(c, TERMINAL_COMMAND_MAX))
+                .map(|c| WorkspaceOp::TerminalRun {
+                    command: c.to_string(),
+                }),
+            "terminal_stop" => Some(WorkspaceOp::TerminalStop),
             _ => return None,
         })
     }
@@ -1166,6 +1205,23 @@ pub enum ServerMsg {
         workspace_id: String,
         result: Json,
     },
+    /// ADR-018: a chunk of a terminal run's output (stdout and stderr
+    /// merged, ANSI stripped, redacted), to the starting connection only.
+    /// Never journaled.
+    TerminalOutput {
+        command_id: String,
+        workspace_id: String,
+        data: String,
+    },
+    /// ADR-018: the run ended, right before its `command_result`. `reason`
+    /// is `exit`, `timeout` or `stopped`; `exit_code` is set for `exit`.
+    TerminalExit {
+        command_id: String,
+        workspace_id: String,
+        exit_code: Option<i64>,
+        reason: &'static str,
+        truncated: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1419,6 +1475,30 @@ impl ServerMsg {
                 ("commandId", json::s(command_id)),
                 ("workspaceId", json::s(workspace_id)),
                 ("result", result.clone()),
+            ]),
+            ServerMsg::TerminalOutput {
+                command_id,
+                workspace_id,
+                data,
+            } => json::obj(vec![
+                ("type", json::s("terminal_output")),
+                ("commandId", json::s(command_id)),
+                ("workspaceId", json::s(workspace_id)),
+                ("data", json::s(data)),
+            ]),
+            ServerMsg::TerminalExit {
+                command_id,
+                workspace_id,
+                exit_code,
+                reason,
+                truncated,
+            } => json::obj(vec![
+                ("type", json::s("terminal_exit")),
+                ("commandId", json::s(command_id)),
+                ("workspaceId", json::s(workspace_id)),
+                ("exitCode", exit_code.map_or(Json::Null, Json::Int)),
+                ("reason", json::s(reason)),
+                ("truncated", Json::Bool(*truncated)),
             ]),
         }
     }
@@ -2385,8 +2465,78 @@ mod tests {
     }
 
     #[test]
+    fn git_pull_and_terminal_messages_parse_within_bounds() {
+        for (typ, mutating) in [
+            (r#""git_pull""#, true),
+            (r#""terminal_stop""#, false),
+            (r#""terminal_run","command":"npm test""#, true),
+        ] {
+            let raw = format!(r#"{{"type":{typ},"commandId":"c","workspaceId":"w"}}"#);
+            let msg = parse_client_message(&raw).unwrap();
+            assert_eq!(msg.is_mutating(), mutating, "{raw}");
+            let ClientMsg::Workspace { op, .. } = &msg else {
+                panic!("{raw}")
+            };
+            let back = json::stringify(&op.to_json("c", "w"));
+            assert_eq!(parse_client_message(&back), Some(msg.clone()), "{back}");
+        }
+        let run = |cmd: &str| {
+            format!(
+                r#"{{"type":"terminal_run","commandId":"c","workspaceId":"w","command":{}}}"#,
+                json::stringify(&json::s(cmd))
+            )
+        };
+        assert!(parse_client_message(&run(&"x".repeat(TERMINAL_COMMAND_MAX))).is_some());
+        assert!(parse_client_message(&run(&"x".repeat(TERMINAL_COMMAND_MAX + 1))).is_none());
+        assert!(parse_client_message(&run("")).is_none());
+        // the journal payload carries the command line redacted
+        let secret = parse_client_message(&run(
+            "curl -H \"Authorization: Bearer abcdefghijklmnopqrstuvwxyz\" x",
+        ))
+        .unwrap();
+        let ClientMsg::Workspace { op, .. } = &secret else {
+            panic!()
+        };
+        let journal = json::stringify(&op.to_json("c", "w"));
+        assert!(!journal.contains("abcdefghijklmnop"), "{journal}");
+    }
+
+    #[test]
+    fn terminal_messages_match_golden_fixtures() {
+        let golden = fixture!("terminal.json");
+        let golden = json::as_arr(&golden).unwrap();
+        let output = ServerMsg::TerminalOutput {
+            command_id: "c-term-1".into(),
+            workspace_id: "3f2a9c1d0e4b".into(),
+            data: crate::terminal::clean("\u{1b}[32mok\u{1b}[0m 12 passing\r\n"),
+        };
+        assert_eq!(canon(&output.to_json()), canon(&golden[0]));
+        for (i, (code, reason, truncated)) in [
+            (Some(0), "exit", false),
+            (None, "timeout", true),
+            (None, "stopped", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let exit = ServerMsg::TerminalExit {
+                command_id: "c-term-1".into(),
+                workspace_id: "3f2a9c1d0e4b".into(),
+                exit_code: code,
+                reason,
+                truncated,
+            };
+            assert_eq!(canon(&exit.to_json()), canon(&golden[i + 1]), "{i}");
+        }
+    }
+
+    #[test]
     fn hello_ack_advertises_transcript_feature() {
         assert_eq!(FEATURES, ["transcript.v1", "workspace.v1"]);
+        assert_eq!(
+            FEATURES_WITH_TERMINAL,
+            ["transcript.v1", "workspace.v1", "terminal.v1"]
+        );
         let msg = ServerMsg::HelloAck {
             protocol: PROTOCOL_VERSION,
             server_time: 1_761_436_800_000,

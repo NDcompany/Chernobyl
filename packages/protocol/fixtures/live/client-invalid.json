@@ -181,5 +181,10 @@
   { "why": "git_unstage with an empty path", "msg": { "type": "git_unstage", "commandId": "c", "workspaceId": "w", "paths": [""] } },
   { "why": "git_unstage paths not strings", "msg": { "type": "git_unstage", "commandId": "c", "workspaceId": "w", "paths": [1] } },
   { "why": "git_commit with empty message", "msg": { "type": "git_commit", "commandId": "c", "workspaceId": "w", "message": "" } },
-  { "why": "git_commit without message", "msg": { "type": "git_commit", "commandId": "c", "workspaceId": "w" } }
+  { "why": "git_commit without message", "msg": { "type": "git_commit", "commandId": "c", "workspaceId": "w" } },
+  { "why": "git_pull without workspaceId", "msg": { "type": "git_pull", "commandId": "c" } },
+  { "why": "terminal_run without command", "msg": { "type": "terminal_run", "commandId": "c", "workspaceId": "w" } },
+  { "why": "terminal_run with empty command", "msg": { "type": "terminal_run", "commandId": "c", "workspaceId": "w", "command": "" } },
+  { "why": "terminal_run command not a string", "msg": { "type": "terminal_run", "commandId": "c", "workspaceId": "w", "command": ["ls"] } },
+  { "why": "terminal_stop without commandId", "msg": { "type": "terminal_stop", "workspaceId": "w" } }
 ]

@@ -11,6 +11,9 @@ export const FEATURE_TRANSCRIPT = 'transcript.v1';
 /** ADR-016: `hello_ack.features` entry for workspace files and git (still v2). */
 export const FEATURE_WORKSPACE = 'workspace.v1';
 
+/** ADR-018: `hello_ack.features` entry for the opt-in one-shot terminal (still v2). */
+export const FEATURE_TERMINAL = 'terminal.v1';
+
 /** Permission requests older than this are stale and must not be decided on. */
 export const PERMISSION_TTL_MS = 2 * 60_000;
 

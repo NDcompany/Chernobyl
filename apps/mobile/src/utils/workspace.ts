@@ -85,6 +85,13 @@ export function pushTarget(s: GitStatus): { label: string; canPush: boolean } {
   return { label: `${s.branch} → ${s.upstream}`, canPush: true };
 }
 
+/** "origin/main → main" (a fast-forward from the upstream), or why there is nothing to pull from. */
+export function pullSource(s: GitStatus): { label: string; canPull: boolean } {
+  if (s.branch === null) return { label: 'Detached HEAD: check out a branch on the PC', canPull: false };
+  if (!s.upstream) return { label: `${s.branch} has no upstream: set one on the PC`, canPull: false };
+  return { label: `${s.upstream} → ${s.branch}`, canPull: true };
+}
+
 /** "↑2 ↓1", "up to date", or '' without an upstream. */
 export function aheadBehind(s: GitStatus): string {
   if (!s.upstream) return '';

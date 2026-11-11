@@ -19,6 +19,7 @@
 //! ADR-015 Claude Code live runtime (driven processes behind LiveRuntime).
 //! claude_history: Claude Code sessions on disk (discovery and replay).
 //! workspace: ADR-016 read-only files and git for allow-listed workspaces.
+//! terminal: ADR-018 opt-in one-shot command runner (off by default).
 
 pub mod adapters;
 pub mod backup;
@@ -47,6 +48,7 @@ pub mod seed;
 pub mod server;
 pub mod sha1;
 pub mod storage;
+pub mod terminal;
 pub mod transcript;
 pub mod tui;
 pub mod workspace;

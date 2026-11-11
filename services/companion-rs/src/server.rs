@@ -10,7 +10,7 @@ use crate::base64;
 use crate::companion::Companion;
 use crate::e2e;
 use crate::json;
-use crate::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg, parse_client_message};
+use crate::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg, WorkspaceOp, parse_client_message};
 use crate::storage::{DeviceRecord, PairingRecord, Storage};
 use crate::ws::{self, Frame, Handshake};
 use std::io::{self, Read, Write};
@@ -1883,7 +1883,11 @@ fn serve_ws(
                         server_time: crate::protocol::now_ms(),
                         snapshot: companion.snapshot(),
                         last_seq: companion.last_seq(),
-                        features: crate::protocol::FEATURES,
+                        features: if companion.shared.config.terminal_enabled {
+                            crate::protocol::FEATURES_WITH_TERMINAL
+                        } else {
+                            crate::protocol::FEATURES
+                        },
                     }),
                     // ADR-015: a subscription belongs to this connection (its
                     // id and Outbound); the D2 gate above already demanded a
@@ -1904,6 +1908,28 @@ fn serve_ws(
                         command_id,
                         session_id,
                     } => Some(companion.unsubscribe(conn_id, command_id, session_id)),
+                    // ADR-018: the terminal's output goes to this connection
+                    // only, and only one with a live E2E session gets a sink
+                    // (a paired device, whatever the posture); without it the
+                    // companion refuses the run.
+                    ClientMsg::Workspace {
+                        op: WorkspaceOp::TerminalRun { .. },
+                        ..
+                    } => {
+                        let sink = outbound.has_session().then(|| {
+                            let out = outbound.clone();
+                            Arc::new(move |m: ServerMsg| {
+                                out.enqueue_sealed(m.to_text().into_bytes(), MsgClass::Bulk)
+                                    .is_ok()
+                            }) as crate::companion::TermSink
+                        });
+                        companion.handle_client_msg_with(msg, sink)
+                    }
+                    ClientMsg::Workspace {
+                        command_id,
+                        workspace_id,
+                        op: WorkspaceOp::TerminalStop,
+                    } => Some(companion.terminal_stop(command_id, workspace_id)),
                     // ADR-016 reads: the result goes to this connection only,
                     // right before its ack (the D2 gate above applies). Never
                     // journaled; mutations take the command path below.
@@ -2053,9 +2079,18 @@ mod e2e_tests {
 
     /// Boot + seed an already-paired device registry entry (no pending offer).
     fn fixture_paired(tag: &str, revoked: bool) -> Fixture {
+        fixture_paired_with(tag, revoked, |_| {})
+    }
+
+    fn fixture_paired_with(
+        tag: &str,
+        revoked: bool,
+        tweak: impl FnOnce(&mut crate::config::CompanionConfig),
+    ) -> Fixture {
         let dir = temp_dir(tag);
         let mut c = default_config();
         c.data_dir = dir.clone();
+        tweak(&mut c);
         let companion = Arc::new(Companion::boot(c).unwrap());
         let psk = [42u8; 32];
         let device_id = "dev-paired".to_string();
@@ -4391,6 +4426,58 @@ mod e2e_tests {
         let ack = next_sealed(&mut c, &mut sess, |v| is_type(v, "ack"));
         assert_eq!(json::get(&ack, "ok"), Some(&json::Json::Bool(false)));
         assert_eq!(json::get_str(&ack, "error"), Some("unknown workspace"));
+        shutdown(f);
+    }
+
+    /// ADR-018: `terminal.v1` is advertised only when enabled, and even on
+    /// loopback a run needs a live E2E session (a paired device).
+    #[test]
+    fn terminal_is_advertised_when_enabled_and_needs_a_session() {
+        let hello = format!(r#"{{"type":"hello","clientId":"c1","protocol":{PROTOCOL_VERSION}}}"#);
+        let run = r#"{"type":"terminal_run","commandId":"t-1","workspaceId":"000000000000","command":"echo hi"}"#;
+        let off = fixture_paired("term-off", false);
+        let mut c = connect(&off);
+        c.send_text(&hello).unwrap();
+        let ack = c
+            .next_text_matching(|t| t.contains("hello_ack"), Duration::from_secs(5))
+            .unwrap();
+        assert!(!ack.contains("terminal.v1"), "{ack}");
+        c.send_text(run).unwrap();
+        let refusal = c
+            .next_text_matching(|t| t.contains("t-1"), Duration::from_secs(5))
+            .unwrap();
+        assert!(refusal.contains("terminal is off"), "{refusal}");
+        shutdown(off);
+
+        let f = fixture_paired_with("term-on", false, |c| c.terminal_enabled = true);
+        let mut c = connect(&f);
+        c.send_text(&hello).unwrap();
+        let ack = c
+            .next_text_matching(|t| t.contains("hello_ack"), Duration::from_secs(5))
+            .unwrap();
+        assert!(ack.contains("terminal.v1"), "{ack}");
+        // loopback, token only, no session: refused
+        c.send_text(run).unwrap();
+        let refusal = c
+            .next_text_matching(|t| t.contains("t-1"), Duration::from_secs(5))
+            .unwrap();
+        assert!(refusal.contains("paired device"), "{refusal}");
+        let (_r, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        let mut sess = sess.unwrap();
+        c.send_text(&sess.seal(&run.replace("t-1", "t-2"))).unwrap();
+        let ack = next_sealed(&mut c, &mut sess, |v| is_type(v, "ack"));
+        // past the gate: the workspace check answers
+        assert_eq!(json::get_str(&ack, "error"), Some("unknown workspace"));
+        c.send_text(
+            &sess
+                .seal(r#"{"type":"terminal_stop","commandId":"t-3","workspaceId":"000000000000"}"#),
+        )
+        .unwrap();
+        let ack = next_sealed(&mut c, &mut sess, |v| is_type(v, "ack"));
+        assert_eq!(
+            json::get_str(&ack, "error"),
+            Some("nothing is running in this workspace")
+        );
         shutdown(f);
     }
 

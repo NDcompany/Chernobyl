@@ -181,7 +181,20 @@ Reads (`@/data/workspace` `useWorkspaceRead`) are request/response on the same t
 shown inline (never a toast). Git changes go through `useCommands` (ack errors toast, a lost ack
 is an unknown outcome) via `useGitChange`, which resolves with the command's `command_result`;
 git's own failure text shows in a "Git said" card, and the status is re-read after every change.
-Push always confirms with the exact `branch → upstream`.
+Push always confirms with the exact `branch → upstream`; Pull (fast-forward only, ADR-016 §7)
+with the exact `upstream → branch` (`pullSource` in `@/utils/workspace`).
+
+**Terminal (ADR-018):** shown only when `hello_ack.features` has `terminal.v1` (the PC opted in;
+off by default) and the workspace is listed; the simulation never advertises it, and a deep link
+says "The terminal is off on this PC". The screen always shows the `warning`/`warningBg` banner
+"Runs on your PC without approval prompts" (state colour, because it is a real risk, not
+decoration). `useTerminal` (`@/data/terminal`) sends `terminal_run` through `useCommands` (ack
+errors toast, a lost ack is an unknown outcome), subscribes before sending, appends
+`terminal_output` chunks into screen state (never persisted) and shows `terminal_exit` through
+`exitLabel` (`@/utils/terminal`, unit-tested): `success` for exit 0, `error` otherwise. Stop sends
+`terminal_stop` straight to the transport (ack-only, never toasts on success). Output renders in
+the Files `CodeView`. The last 20 command lines per workspace (`remember`) persist in
+`appStore.terminalHistory` (local only) and show as `Chip`s that fill the field.
 
 **Provenance travels with the data:** `Host`/`Agent` carry `simulated: true` when they come from a
 mock seed/engine (the app's offline mock or a companion's demo `mock` adapter); real adapters omit the
@@ -223,9 +236,10 @@ Tabs: `(tabs)/index` Home · `agents` → `agent/[id]` · `sessions` → `sessio
 `permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field; agents with `live.composer` `model` get a Model chip row, Default sending no `model`).
 Full-screen (no gesture back): `onboarding`, `sign-in`.
 Workspace (ADR-016): `files/[workspace]?path=` (one screen per folder, so Back walks up),
-`file/[workspace]?path=` (text viewer), `changes/[workspace]` (git). Entry points: the agent
-screen's Workspaces section and the Files / Changes chips in the live conversation header (the
-session's workspace is the one whose `path` equals `Session.project`).
+`file/[workspace]?path=` (text viewer), `changes/[workspace]` (git), `terminal/[workspace]`
+(ADR-018, only with `terminal.v1`). Entry points: the agent screen's Workspaces section (Files,
+Changes, and Terminal when enabled) and the Files / Changes chips in the live conversation header
+(the session's workspace is the one whose `path` equals `Session.project`).
 
 `session/[id]` is the live conversation (see Live sessions) or the classic workspace; its black
 header's chip row wraps: MCP, permission mode, model, context, then rename and End session on the

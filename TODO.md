@@ -349,6 +349,12 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
       read-only browsing, git status/diff/stage/unstage/commit/push in allow-listed
       workspaces, `workspace.v1`. Open: an emulator run of the three screens and one push to a
       hosted remote with a real credential helper.
+- [x] Phone extras (branch `feat/extras`, 2026-11-12): fast-forward-only `git_pull` with a Pull
+      button (ADR-016 §7); the opt-in one-shot terminal `terminal.v1` (ADR-018, off by
+      default); `setup-windows.ps1 -OpenCode/-StartOpenCode/-EnableTerminal/-ConfigOnly` and
+      `basicAuthEnv` (the OpenCode password from a user variable, never in the file);
+      `scripts/test-setup-windows.ps1`. Open: an emulator run of the Terminal screen and Pull,
+      and one `-StartOpenCode` login cycle on a real PC.
 - [x] Server-test flake `control_routes_refuse_a_missing_or_wrong_control_key` (os error
       10054): root cause found 2026-11-12 while git tests ran beside it. Child processes
       (git, claude.exe, codex) inherited the server's sockets: the backlog listener came from
