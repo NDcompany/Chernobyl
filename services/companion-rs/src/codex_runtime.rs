@@ -1,7 +1,8 @@
 //! ADR-015 §4.3 step 7: the Codex app-server as a [`LiveRuntime`]. One
 //! `codex app-server` child per adapter, spawned on the first
-//! `create_session` and again on the first one after it exited; each phone
-//! session is a codex thread inside it.
+//! `create_session` and again on the first command after it exited; each
+//! phone session is a codex thread inside it. A prompt to a session whose
+//! child exited respawns it and `thread/resume`s the thread (§10).
 //!
 //! [`Codex`] (the protocol core) turns codex output into [`Event`]s; this
 //! file routes them: transcript ops to the hub, approvals and withdrawals to
@@ -12,6 +13,7 @@
 //! neither the hub nor the engine calls a runtime.
 
 use crate::adapters::{AdapterError, Capability, LiveRuntime};
+use crate::claude_runtime::Timing;
 use crate::codex::{self, Codex, Event, LaunchConfig};
 use crate::protocol::{Agent, ClientMsg, EventKind, PermissionRequest, ServerMsg, Session, now_ms};
 use crate::runtime_io::{ChildEvent, ChildIo, child_env};
@@ -20,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -70,8 +72,9 @@ struct Inner {
     spawn: Spawn,
     /// Production health = the binary resolves; injected spawners are healthy.
     probe_binary: bool,
-    /// T1: at most one new session per this many ms (0 for injected test spawners).
-    create_every_ms: i64,
+    /// T1 create rate limit, the §4.6 interrupt and sign-in timers, and the
+    /// reader's timer tick (the Claude runtime's struct; tests shrink it).
+    timing: Timing,
     healthy: AtomicBool,
     st: Mutex<State>,
 }
@@ -110,9 +113,14 @@ impl CodexRuntime {
             let env = child_env(std::env::vars_os(), &[]);
             ChildIo::spawn(&binary, &argv, cwd, &env)
         });
-        Self::build(id, cfg, hub, sink, opener, spawn, true)
+        let timing = Timing {
+            create_every_ms: CREATE_EVERY_MS,
+            ..Timing::default()
+        };
+        Self::build(id, cfg, hub, sink, opener, spawn, true, timing)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         id: &str,
         cfg: LaunchConfig,
@@ -121,6 +129,7 @@ impl CodexRuntime {
         opener: Opener,
         spawn: Spawn,
         probe_binary: bool,
+        timing: Timing,
     ) -> Self {
         let inner = Arc::new(Inner {
             id: id.into(),
@@ -130,7 +139,7 @@ impl CodexRuntime {
             opener,
             spawn,
             probe_binary,
-            create_every_ms: if probe_binary { CREATE_EVERY_MS } else { 0 },
+            timing,
             healthy: AtomicBool::new(false),
             st: Mutex::new(State::default()),
         });
@@ -169,7 +178,7 @@ impl LiveRuntime for CodexRuntime {
     }
 
     /// Sessions outlive their process: a follow-up to one whose codex exited
-    /// is refused here, not handed to the engine.
+    /// stays here (it resumes the thread), it is not handed to the engine.
     fn owns_session(&self, session_id: &str) -> bool {
         let st = self.inner.st.lock().unwrap();
         st.sessions.iter().any(|s| s.id == session_id)
@@ -224,9 +233,7 @@ impl Inner {
                 command_id,
                 session_id,
                 text,
-            } => self.command(command_id, session_id, |c| {
-                c.prompt(session_id, text, command_id)
-            }),
+            } => self.prompt(command_id, session_id, text),
             ClientMsg::Interrupt {
                 command_id,
                 session_id,
@@ -325,7 +332,7 @@ impl Inner {
                 .filter(|s| !matches!(s.status.as_str(), "completed" | "failed" | "interrupted"))
                 .count()
                 + st.creating.len();
-            if let Err(e) = admit(st.last_create, now, self.create_every_ms, open) {
+            if let Err(e) = admit(st.last_create, now, self.timing.create_every_ms, open) {
                 return Ok(ServerMsg::ack_err(command_id, e));
             }
             st.last_create = Some(now);
@@ -363,6 +370,49 @@ impl Inner {
         })
     }
 
+    /// `submit_prompt`: on the live thread, or, when the session's app-server
+    /// exited, a respawn and `thread/resume` first (ADR-015 §10). A resume
+    /// is not a create: no T1 rate limit or session-cap slot is taken.
+    fn prompt(
+        self: &Arc<Self>,
+        command_id: &str,
+        session_id: &str,
+        text: &str,
+    ) -> Result<ServerMsg, AdapterError> {
+        {
+            let mut st = self.st.lock().unwrap();
+            let live = st
+                .codex
+                .as_ref()
+                .is_some_and(|c| c.owns_session(session_id));
+            if !live {
+                let Some(cwd) = st
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session_id && s.status != "completed")
+                    .map(|s| s.project.clone())
+                else {
+                    return Ok(ServerMsg::ack_err(
+                        command_id,
+                        "this Codex session has ended; start a new session",
+                    ));
+                };
+                let codex = self.running(&mut st, Path::new(&cwd))?;
+                return match codex.resume_session(session_id, &cwd, text, command_id) {
+                    Ok(events) => {
+                        st.tags.insert(command_id.into(), session_id.into());
+                        self.dispatch(&mut st, events);
+                        Ok(ServerMsg::ack_ok(command_id, Some(session_id)))
+                    }
+                    Err(e) => Ok(ServerMsg::ack_err(command_id, e)),
+                };
+            }
+        }
+        self.command(command_id, session_id, |c| {
+            c.prompt(session_id, text, command_id)
+        })
+    }
+
     /// A session command on a live thread: acked when written (G1).
     fn command(
         self: &Arc<Self>,
@@ -372,10 +422,16 @@ impl Inner {
     ) -> Result<ServerMsg, AdapterError> {
         let mut st = self.st.lock().unwrap();
         let Some(codex) = st.codex.as_mut().filter(|c| c.owns_session(session_id)) else {
-            return Ok(ServerMsg::ack_err(
-                command_id,
-                "this Codex session has ended (Codex exited); start a new session",
-            ));
+            let ended = st
+                .sessions
+                .iter()
+                .any(|s| s.id == session_id && s.status == "completed");
+            let why = if ended {
+                "this Codex session has ended; start a new session"
+            } else {
+                "Codex is not running for this session; send a prompt to resume it"
+            };
+            return Ok(ServerMsg::ack_err(command_id, why));
         };
         match f(codex) {
             Ok(events) => {
@@ -403,7 +459,9 @@ impl Inner {
             st.generation += 1;
             let generation = st.generation;
             let me = Arc::clone(self);
-            let core = Codex::new(io, &self.id, env!("CARGO_PKG_VERSION"));
+            let mut core = Codex::new(io, &self.id, env!("CARGO_PKG_VERSION"));
+            core.interrupt_ms = self.timing.interrupt_ms;
+            core.auth_ttl_ms = self.timing.auth_ttl_ms;
             thread::Builder::new()
                 .name("codex-events".into())
                 .spawn(move || me.read(generation, rx))
@@ -414,16 +472,27 @@ impl Inner {
         Ok(st.codex.as_mut().expect("spawned above"))
     }
 
-    /// The child's output, in order, until it exits.
+    /// The child's output, in order, until it exits; the §4.6 timers run
+    /// every `timing.tick` in between.
     fn read(self: Arc<Self>, generation: u64, rx: Receiver<ChildEvent>) {
-        for event in rx {
-            let exit = matches!(event, ChildEvent::Exit(_));
+        loop {
+            let event = match rx.recv_timeout(self.timing.tick) {
+                Ok(event) => Some(event),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
+            let exit = matches!(event, Some(ChildEvent::Exit(_)));
             let mut st = self.st.lock().unwrap();
             if st.generation != generation {
                 return;
             }
             let Some(core) = st.codex.as_mut() else {
                 return; // disposed
+            };
+            let Some(event) = event else {
+                let events = core.tick(now_ms());
+                self.dispatch(&mut st, events);
+                continue;
             };
             let before = core.malformed();
             let events = core.on_event(event);
@@ -432,7 +501,7 @@ impl Inner {
             }
             if exit {
                 eprintln!("[codex] {} exited: {}", self.id, core.stderr_tail().trim());
-                // the next create_session respawns it
+                // the next create_session or prompt respawns it
                 st.codex = None;
             }
             self.dispatch(&mut st, events);
@@ -650,6 +719,25 @@ pub(crate) mod tests {
         sink: Sink,
         opener: Opener,
     ) -> (CodexRuntime, Receiver<Peer>) {
+        piped_with(cfg, hub, sink, opener, fast())
+    }
+
+    /// Test timing: no create rate limit, a 10 ms timer tick.
+    pub(crate) fn fast() -> Timing {
+        Timing {
+            create_every_ms: 0,
+            tick: Duration::from_millis(10),
+            ..Timing::default()
+        }
+    }
+
+    pub(crate) fn piped_with(
+        cfg: LaunchConfig,
+        hub: HubHandle,
+        sink: Sink,
+        opener: Opener,
+        timing: Timing,
+    ) -> (CodexRuntime, Receiver<Peer>) {
         let (tx, peers) = mpsc::channel();
         let tx = Mutex::new(tx);
         let spawn: Spawn = Box::new(move |_cwd| {
@@ -666,7 +754,7 @@ pub(crate) mod tests {
             let _ = tx.lock().unwrap().send(Peer { frames, to_core });
             ChildIo::from_pipes(core_stdout, core_stdin)
         });
-        let rt = CodexRuntime::build("codex-1", cfg, hub, sink, opener, spawn, false);
+        let rt = CodexRuntime::build("codex-1", cfg, hub, sink, opener, spawn, false, timing);
         (rt, peers)
     }
 
@@ -753,11 +841,29 @@ pub(crate) mod tests {
         })
     }
 
-    fn handshake(peers: &Receiver<Peer>) -> Peer {
+    /// The next spawn, past `initialize` / `initialized`.
+    fn initialized(peers: &Receiver<Peer>) -> Peer {
         let mut peer = peers.recv_timeout(WAIT).expect("a spawn");
         assert!(peer.recv().contains(r#""method":"initialize""#));
         peer.line(r#"{"id":1,"result":{"userAgent":"fake"}}"#);
         assert_eq!(peer.recv(), r#"{"method":"initialized"}"#);
+        peer
+    }
+
+    fn rpc_id(frame: &str) -> crate::json::Json {
+        crate::json::get(&crate::json::parse(frame).unwrap(), "id")
+            .cloned()
+            .unwrap()
+    }
+
+    /// Answers the request `frame` with `result`.
+    fn reply(peer: &mut Peer, frame: &str, result: &str) {
+        let id = crate::json::stringify(&rpc_id(frame));
+        peer.line(&format!(r#"{{"id":{id},"result":{result}}}"#));
+    }
+
+    fn handshake(peers: &Receiver<Peer>) -> Peer {
+        let mut peer = initialized(peers);
         let start = peer.recv();
         assert!(start.contains(r#""method":"thread/start""#), "{start}");
         let id = crate::json::get(&crate::json::parse(&start).unwrap(), "id")
@@ -953,15 +1059,86 @@ pub(crate) mod tests {
         got.sort();
         let want = [("c1", "failed"), ("i1", "unknown"), ("p1", "failed")];
         assert_eq!(got, want.map(|(a, b)| (a.to_string(), b.to_string())));
+        // codex keeps the thread: the session idles instead of ending
         let ops = hub.ops("thr_1").join("\n");
-        assert!(ops.contains(r#""status":"ended""#), "{ops}");
+        assert!(!ops.contains(r#""status":"ended""#), "{ops}");
+        assert!(
+            ops.contains("the next prompt resumes this session"),
+            "{ops}"
+        );
+        assert_eq!(rt.sessions()[0].status, "idle");
+
+        // a prompt respawns codex and resumes the thread before its turn
+        let again = |cid: &str| ClientMsg::SubmitPrompt {
+            command_id: cid.into(),
+            session_id: "thr_1".into(),
+            text: "go on".into(),
+        };
+        let ack = rt.send(&again("p2")).unwrap();
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        let mut peer = initialized(&peers);
+        let resume = peer.recv();
+        assert!(
+            resume.contains(
+                r#""method":"thread/resume","params":{"threadId":"thr_1","cwd":"C:\\work""#
+            ),
+            "{resume}"
+        );
+        // one resume at a time
+        let busy = rt.send(&again("p3")).unwrap();
+        assert!(matches!(busy, ServerMsg::Ack { ok: false, .. }), "{busy:?}");
+        reply(
+            &mut peer,
+            &resume,
+            r#"{"thread":{"id":"thr_1"},"model":"gpt-test"}"#,
+        );
+        let turn = peer.recv();
+        assert!(turn.contains(r#""method":"turn/start""#), "{turn}");
+        reply(
+            &mut peer,
+            &turn,
+            r#"{"turn":{"id":"turn_2","status":"inProgress"}}"#,
+        );
+        peer.note(
+            "turn/completed",
+            r#"{"threadId":"thr_1","turn":{"id":"turn_2","status":"completed","error":null}}"#,
+        );
+        wait_until("the resumed prompt", || {
+            results(&seen).contains(&("p2".into(), "completed".into()))
+        });
+        assert_eq!(rt.sessions().len(), 1, "a resume is not a create");
+
+        // a thread codex no longer has: the prompt fails, the session ends
+        drop(peer);
+        wait_until("the second exit", || {
+            hub.ops("thr_1")
+                .iter()
+                .filter(|o| o.contains("the next prompt resumes"))
+                .count()
+                == 2
+        });
+        assert!(matches!(
+            rt.send(&again("p4")),
+            Ok(ServerMsg::Ack { ok: true, .. })
+        ));
+        let mut peer = initialized(&peers);
+        let resume = peer.recv();
+        peer.line(&format!(
+            r#"{{"id":{},"error":{{"code":-32600,"message":"no rollout found for thread id thr_1"}}}}"#,
+            crate::json::stringify(&rpc_id(&resume))
+        ));
+        wait_until("the failed resume", || {
+            results(&seen).contains(&("p4".into(), "failed".into()))
+        });
         assert_eq!(rt.sessions()[0].status, "completed");
-        // the old thread is gone with its process
-        let late = rt.send(&prompt).unwrap();
+        let ops = hub.ops("thr_1").join("\n");
+        assert!(ops.contains("could not resume this session"), "{ops}");
+        let late = rt.send(&again("p5")).unwrap();
         assert!(
             matches!(&late, ServerMsg::Ack { ok: false, error: Some(e), .. } if e.contains("ended")),
             "{late:?}"
         );
+        drop(peer);
         // the next session respawns codex
         let mut peer = started(&peers, || rt.send(&create("c2")).ok());
         peer.note(
@@ -971,6 +1148,53 @@ pub(crate) mod tests {
         wait_until("the respawned session's result", || {
             results(&seen).contains(&("c2".into(), "completed".into()))
         });
+    }
+
+    #[test]
+    fn interrupt_without_a_turn_end_resolves_unknown() {
+        let (sink, seen) = recorder();
+        let timing = Timing {
+            interrupt_ms: 50,
+            ..fast()
+        };
+        let (rt, peers) = piped_with(
+            launch(r"C:\work"),
+            HubHandle::default(),
+            sink,
+            no_opener(),
+            timing,
+        );
+        let mut peer = started(&peers, || rt.send(&create("c1")).ok());
+        wait_until("the running turn", || {
+            seen.lock().unwrap().iter().any(|k| {
+                matches!(k, EventKind::CommandProgress { command_id, state, .. }
+                    if command_id == "c1" && state == "running")
+            })
+        });
+        let interrupt = ClientMsg::Interrupt {
+            command_id: "i1".into(),
+            session_id: "thr_1".into(),
+        };
+        assert!(matches!(
+            rt.send(&interrupt),
+            Ok(ServerMsg::Ack { ok: true, .. })
+        ));
+        let frame = peer.recv();
+        assert!(frame.contains(r#""method":"turn/interrupt""#), "{frame}");
+        wait_until("the unknown interrupt", || {
+            results(&seen).contains(&("i1".into(), "unknown".into()))
+        });
+        // codex stops the turn after all: the prompt ends, i1 is not closed twice
+        reply(&mut peer, &frame, "{}");
+        peer.note(
+            "turn/completed",
+            r#"{"threadId":"thr_1","turn":{"id":"turn_1","status":"interrupted","error":null}}"#,
+        );
+        wait_until("the cancelled prompt", || {
+            results(&seen).contains(&("c1".into(), "cancelled".into()))
+        });
+        let i1 = results(&seen).iter().filter(|(c, _)| c == "i1").count();
+        assert_eq!(i1, 1);
     }
 
     /// `node` + the committed fake app-server as a codex entry (the real
@@ -1061,6 +1285,43 @@ pub(crate) mod tests {
         ));
         wait_until("the reconnect", || done("r1", "completed"));
         rt.dispose();
+    }
+
+    /// The real spawn path: the app-server goes away, the next prompt
+    /// respawns it and resumes the thread it saved.
+    #[test]
+    fn fake_app_server_resumes_a_thread_after_exit() {
+        let state =
+            std::env::temp_dir().join(format!("chernobyl-codex-state-{}", std::process::id()));
+        let state_arg = state.to_string_lossy().into_owned();
+        let Some(cfg) = fake_codex(&std::env::temp_dir(), &["--state-dir", &state_arg]) else {
+            return;
+        };
+        let (sink, seen) = recorder();
+        let rt = CodexRuntime::new("codex-1", cfg, HubHandle::default(), sink, no_opener());
+        let thread = match rt.send(&create("c1")).unwrap() {
+            ServerMsg::Ack {
+                ok: true,
+                session_id: Some(s),
+                ..
+            } => s,
+            other => panic!("{other:?}"),
+        };
+        let done = |cid: &str, status: &str| results(&seen).contains(&(cid.into(), status.into()));
+        wait_until("the first turn", || done("c1", "completed"));
+        rt.dispose(); // as after a crash or an idle shutdown
+        let prompt = ClientMsg::SubmitPrompt {
+            command_id: "p1".into(),
+            session_id: thread.clone(),
+            text: "hello again".into(),
+        };
+        let ack = rt.send(&prompt).unwrap();
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        wait_until("the resumed turn", || done("p1", "completed"));
+        assert_eq!(rt.sessions().len(), 1);
+        assert_eq!(rt.sessions()[0].id, thread);
+        rt.dispose();
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]

@@ -18,12 +18,12 @@ use crate::adapters::Capability;
 use crate::crypto;
 use crate::json::{self, Json};
 use crate::protocol::{AgentLive, LiveWorkspace, PermissionOption, PermissionRequest, now_ms};
-use crate::runtime_io::{ChildEvent, ChildIo, redact};
+use crate::runtime_io::{AUTH_TTL_MS, ChildEvent, ChildIo, redact};
 use crate::transcript::{
     Field, FileDiff, Item, ItemKind, LiveState, McpAuthState, McpServer, Op, PlanStep, ToolCall,
     ToolStatus, TurnState, Usage,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -48,6 +48,8 @@ const INVALID_REQUEST: i64 = -32600;
 /// `mcpServerStatus/list` pages are followed up to this many servers (the
 /// hub keeps 32 anyway).
 const MCP_SERVERS_MAX: usize = 256;
+/// §4.6: an interrupt with no turn end by then is `unknown`.
+pub const INTERRUPT_MS: i64 = 30_000;
 
 /* ------------------------------------------------------------------ */
 /* Public API                                                          */
@@ -105,6 +107,14 @@ enum Pending {
         cwd: String,
         prompt: String,
     },
+    /// `submit_prompt` to a thread whose app-server exited: the prompt
+    /// follows once codex has loaded the thread again.
+    ThreadResume {
+        tag: String,
+        thread: String,
+        cwd: String,
+        prompt: String,
+    },
     TurnStart {
         tag: String,
         thread: String,
@@ -133,11 +143,12 @@ enum Pending {
 
 impl Pending {
     /// The phone command riding on this request, and whether it is an interrupt.
-    fn tag(self) -> Option<(String, bool)> {
+    fn tag(&self) -> Option<(&str, bool)> {
         match self {
             Pending::Init | Pending::McpList(_) => None,
             Pending::Interrupt { tag, .. } => Some((tag, true)),
             Pending::ThreadStart { tag, .. }
+            | Pending::ThreadResume { tag, .. }
             | Pending::TurnStart { tag, .. }
             | Pending::Steer { tag, .. }
             | Pending::McpLogin { tag, .. }
@@ -215,6 +226,14 @@ pub struct Codex {
     /// `mcp_reconnect` commands after their reload: (server, tag, armed).
     /// Armed once a list started after the reload; settled by that list.
     reconnects: Vec<(String, String, bool)>,
+    /// §4.6 timers: (command, deadline, outcome) for interrupts (`unknown`)
+    /// and sign-ins (`expired`). Ones whose command ended meanwhile lapse.
+    timers: Vec<(String, i64, &'static str)>,
+    /// Threads waiting for their `thread/resume` reply.
+    resuming: HashSet<String>,
+    /// The §4.6 durations ([`INTERRUPT_MS`], `AUTH_TTL_MS`); tests shrink them.
+    pub interrupt_ms: i64,
+    pub auth_ttl_ms: i64,
     seq: u64,
     malformed: u64,
     exited: bool,
@@ -239,6 +258,10 @@ impl Codex {
             relist: false,
             logins: HashMap::new(),
             reconnects: Vec::new(),
+            timers: Vec::new(),
+            resuming: HashSet::new(),
+            interrupt_ms: INTERRUPT_MS,
+            auth_ttl_ms: AUTH_TTL_MS,
             seq: 0,
             malformed: 0,
             exited: false,
@@ -284,6 +307,41 @@ impl Codex {
         self.call("thread/start", Some(params), pending)
     }
 
+    /// `submit_prompt` to a session whose app-server exited (ADR-015 §10):
+    /// `thread/resume` with codex's thread id in its workspace, then the
+    /// prompt as a new turn once codex has loaded the thread. Not a create.
+    pub fn resume_session(
+        &mut self,
+        thread: &str,
+        cwd: &str,
+        prompt: &str,
+        tag: &str,
+    ) -> Result<Vec<Event>, &'static str> {
+        if self.resuming.contains(thread) {
+            return Err("Codex is still resuming this session; send again in a moment");
+        }
+        let params = json::obj(vec![
+            ("threadId", json::s(thread)),
+            ("cwd", json::s(cwd)),
+            ("approvalPolicy", json::s("on-request")),
+            ("sandbox", json::s("workspace-write")),
+        ]);
+        let pending = Pending::ThreadResume {
+            tag: tag.into(),
+            thread: thread.into(),
+            cwd: cwd.into(),
+            prompt: prompt.into(),
+        };
+        self.call("thread/resume", Some(params), pending)?;
+        self.resuming.insert(thread.into());
+        let state = LiveState {
+            status: "starting",
+            permission_mode: None,
+            model: None,
+        };
+        Ok(vec![Event::Op(thread.into(), Op::State(state))])
+    }
+
     /// `submit_prompt`: steers the running turn, or starts one when idle. The
     /// user bubble is made here; codex's echoed `userMessage` is dropped.
     pub fn prompt(
@@ -318,6 +376,8 @@ impl Codex {
             turn,
         };
         self.call("turn/interrupt", Some(params), pending)?;
+        let deadline = now_ms() + self.interrupt_ms;
+        self.timers.push((tag.into(), deadline, "unknown"));
         Ok(Vec::new())
     }
 
@@ -373,7 +433,49 @@ impl Codex {
             tag: tag.into(),
             server: server.into(),
         };
-        self.call("mcpServer/oauth/login", Some(params), pending)
+        self.call("mcpServer/oauth/login", Some(params), pending)?;
+        let deadline = now_ms() + self.auth_ttl_ms;
+        self.timers.push((tag.into(), deadline, "expired"));
+        Ok(())
+    }
+
+    /// The §4.6 timers, run by the runtime between child events: an
+    /// interrupt with no turn end in time is `unknown`, a sign-in that did
+    /// not complete in time is `expired`. A late answer then closes nothing.
+    pub fn tick(&mut self, now: i64) -> Vec<Event> {
+        let mut out = Vec::new();
+        let (late, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.timers)
+            .into_iter()
+            .partition(|t| now >= t.1);
+        self.timers = kept;
+        let mut expired = false;
+        for (tag, _, status) in late {
+            if !self.forget(&tag) {
+                continue; // ended in time
+            }
+            expired |= status == "expired";
+            let why = (status == "unknown").then(|| "no turn end from Codex within 30 s".into());
+            out.push(done(tag, status, why));
+        }
+        if expired {
+            self.emit_mcp(&mut out); // the "awaiting browser" badge goes
+        }
+        out
+    }
+
+    /// Drops every reference to an open command; false when it had none.
+    fn forget(&mut self, tag: &str) -> bool {
+        let refs = |c: &Codex| {
+            c.pending.len() + c.logins.len() + c.turns.values().map(|t| t.tags.len()).sum::<usize>()
+        };
+        let before = refs(self);
+        self.pending
+            .retain(|_, p| p.tag().is_none_or(|(t, _)| t != tag));
+        self.logins.retain(|_, t| t != tag);
+        for turn in self.turns.values_mut() {
+            turn.tags.retain(|(t, _)| t != tag);
+        }
+        refs(self) < before
     }
 
     /// `mcp_reconnect`: codex's closest equivalent reloads every server
@@ -584,6 +686,29 @@ impl Codex {
             (Pending::ThreadStart { tag, cwd, prompt }, Ok(r)) => {
                 self.thread_started(&r, tag, cwd, &prompt, out)
             }
+            (
+                Pending::ThreadResume {
+                    tag,
+                    thread,
+                    cwd,
+                    prompt,
+                },
+                res,
+            ) => {
+                self.resuming.remove(&thread);
+                match res {
+                    Ok(r) => {
+                        let model = json::get_str(&r, "model").map(str::to_string);
+                        self.open_thread(&thread, cwd, model, tag, &prompt, out);
+                    }
+                    // the thread is gone for good: the session ends
+                    Err(e) => {
+                        let why = format!("Codex could not resume this session: {e}");
+                        out.push(failed(tag, why.clone()));
+                        self.closed(thread, None, &why, "ended", out);
+                    }
+                }
+            }
             (Pending::TurnStart { tag, thread }, Ok(r)) => {
                 match json::get(&r, "turn").and_then(|t| json::get_str(t, "id")) {
                     Some(turn) => self.bind(tag, &thread, turn, false, out),
@@ -648,7 +773,7 @@ impl Codex {
             }
             (pending, Err(e)) => {
                 if let Some((tag, _)) = pending.tag() {
-                    out.push(failed(tag, e));
+                    out.push(failed(tag.into(), e));
                 }
             }
         }
@@ -671,6 +796,23 @@ impl Codex {
             return;
         };
         let model = json::get_str(r, "model").map(str::to_string);
+        out.push(Event::SessionStarted {
+            tag: tag.clone(),
+            thread: thread.into(),
+        });
+        self.open_thread(thread, cwd, model, tag, prompt, out);
+    }
+
+    /// A thread codex started or resumed: idle, then `prompt` as command `tag`.
+    fn open_thread(
+        &mut self,
+        thread: &str,
+        cwd: String,
+        model: Option<String>,
+        tag: String,
+        prompt: &str,
+        out: &mut Vec<Event>,
+    ) {
         let state = Thread {
             cwd,
             model: model.clone(),
@@ -678,10 +820,6 @@ impl Codex {
             last: None,
         };
         self.threads.insert(thread.into(), state);
-        out.push(Event::SessionStarted {
-            tag: tag.clone(),
-            thread: thread.into(),
-        });
         let state = LiveState {
             status: "idle",
             permission_mode: None,
@@ -1293,9 +1431,10 @@ impl Codex {
             let status = if interrupt { "unknown" } else { "failed" };
             done(tag, status, Some(why.clone()))
         };
+        self.timers.clear();
         for (_, pending) in self.pending.drain() {
             if let Some((tag, interrupt)) = pending.tag() {
-                out.push(fail(tag, interrupt));
+                out.push(fail(tag.into(), interrupt));
             }
         }
         for (_, tag) in self.logins.drain() {
@@ -1317,15 +1456,35 @@ impl Codex {
             .iter()
             .map(|(id, t)| (id.clone(), t.model.clone()))
             .collect();
+        // codex keeps its threads on disk: the next prompt resumes them
+        // (ADR-015 §10), so they idle instead of ending
+        let resumable = format!("{why}; the next prompt resumes this session");
         for (thread, model) in threads {
-            out.push(self.notice(&thread, "error", &why, None));
-            let state = LiveState {
-                status: "ended",
-                permission_mode: None,
-                model,
-            };
-            out.push(Event::Op(thread, Op::State(state)));
+            self.closed(thread, model, &resumable, "idle", out);
         }
+        // a resume cut short by the exit is a failed resume: those sessions end
+        for thread in std::mem::take(&mut self.resuming) {
+            self.closed(thread, None, &why, "ended", out);
+        }
+    }
+
+    /// An error notice, then the thread's state once its process (`idle`)
+    /// or its resume (`ended`) is gone.
+    fn closed(
+        &mut self,
+        thread: String,
+        model: Option<String>,
+        why: &str,
+        status: &'static str,
+        out: &mut Vec<Event>,
+    ) {
+        out.push(self.notice(&thread, "error", why, None));
+        let state = LiveState {
+            status,
+            permission_mode: None,
+            model,
+        };
+        out.push(Event::Op(thread, Op::State(state)));
     }
 
     /* ----------------------------- MCP ---------------------------- */
@@ -3131,6 +3290,8 @@ mod tests {
             dones(&events),
             [("c1", "cancelled", None), ("i1", "completed", None)]
         );
+        // ended in time: its 30 s timer lapses quietly
+        assert!(codex.tick(now_ms() + INTERRUPT_MS).is_empty());
         // idle: nothing to stop
         let events = codex.interrupt("thr_1", "i2").unwrap();
         assert_eq!(dones(&events), [("i2", "completed", None)]);
@@ -3354,11 +3515,123 @@ mod tests {
         results.sort_unstable();
         assert_eq!(results, [("c1", "failed", why), ("i1", "unknown", why)]);
         assert_eq!(turn_op(&events).status, "failed");
-        let ended = ops(&events)
+        // resumable: the thread idles, it does not end
+        let states: Vec<&str> = ops(&events)
             .into_iter()
-            .any(|op| matches!(op, Op::State(s) if s.status == "ended"));
-        assert!(ended);
+            .filter_map(|op| match op {
+                Op::State(s) => Some(s.status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, ["idle"]);
         assert_eq!(codex.prompt("thr_1", "x", "c2"), Err("Codex has exited"));
+    }
+
+    #[test]
+    fn interrupt_without_a_turn_end_is_unknown_once() {
+        let (mut codex, mut peer) = session();
+        codex.interrupt_ms = 50;
+        codex.interrupt("thr_1", "i1").unwrap();
+        peer.recv();
+        assert!(codex.tick(now_ms()).is_empty(), "not due yet");
+        let late = now_ms() + 50;
+        let events = codex.tick(late);
+        let why = Some("no turn end from Codex within 30 s");
+        assert_eq!(dones(&events), [("i1", "unknown", why)]);
+        assert!(codex.tick(late).is_empty(), "fires once");
+        // the late reply and turn end close the prompt only
+        assert!(dones(&peer.send(&mut codex, r#"{"id":4,"result":{}}"#)).is_empty());
+        let events = peer.note(&mut codex, "turn/completed", &turn_completed("interrupted"));
+        assert_eq!(dones(&events), [("c1", "cancelled", None)]);
+    }
+
+    #[test]
+    fn desktop_sign_in_expires_and_a_late_completion_is_ignored() {
+        let (mut codex, mut peer) = session();
+        codex.auth_ttl_ms = 50;
+        codex.mcp_login("fake-linear", "m1").unwrap();
+        peer.recv();
+        let url = "https://auth.fake-linear.example/oauth/authorize?state=abc";
+        peer.send(
+            &mut codex,
+            &format!(r#"{{"id":4,"result":{{"authorizationUrl":"{url}","loginId":"l1"}}}}"#),
+        );
+        let events = codex.tick(now_ms() + 50);
+        assert_eq!(dones(&events), [("m1", "expired", None)]);
+        // the badge goes with it
+        assert!(matches!(events.last(), Some(Event::Op(_, Op::Mcp(_)))));
+        let completed = r#"{"name":"fake-linear","threadId":null,"loginId":"l1","success":true}"#;
+        let events = peer.note(&mut codex, "mcpServer/oauthLogin/completed", completed);
+        assert!(dones(&events).is_empty(), "{events:?}");
+        // a sign-in codex never answered expires too, and its late URL opens nothing
+        codex.mcp_login("fake-linear", "m2").unwrap();
+        assert_eq!(dones(&codex.tick(now_ms() + 50)), [("m2", "expired", None)]);
+        let login = loop {
+            let frame = peer.recv();
+            if frame.contains("oauth/login") {
+                break json::parse(&frame).unwrap();
+            }
+        };
+        let id = json::get_i64(&login, "id").unwrap();
+        let reply =
+            format!(r#"{{"id":{id},"result":{{"authorizationUrl":"{url}","loginId":"l2"}}}}"#);
+        assert!(peer.send(&mut codex, &reply).is_empty());
+    }
+
+    #[test]
+    fn resume_reloads_the_thread_then_prompts() {
+        let (mut codex, mut peer) = connect();
+        peer.recv();
+        peer.send(&mut codex, INIT_OK);
+        peer.recv();
+        let events = codex
+            .resume_session("thr_1", r"C:\work", "again", "p1")
+            .unwrap();
+        assert!(
+            matches!(&events[..], [Event::Op(t, Op::State(s))] if t == "thr_1" && s.status == "starting")
+        );
+        assert_eq!(
+            peer.recv(),
+            r#"{"id":2,"method":"thread/resume","params":{"threadId":"thr_1","cwd":"C:\\work","approvalPolicy":"on-request","sandbox":"workspace-write"}}"#
+        );
+        // one resume at a time
+        assert!(
+            codex
+                .resume_session("thr_1", r"C:\work", "x", "p2")
+                .is_err()
+        );
+        assert!(!codex.owns_session("thr_1"));
+        let events = peer.send(
+            &mut codex,
+            r#"{"id":2,"result":{"thread":{"id":"thr_1","turns":[]},"model":"gpt-test"}}"#,
+        );
+        assert!(codex.owns_session("thr_1"));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::SessionStarted { .. }))
+        );
+        assert!(items(&events).iter().any(|i| i.text == "again"));
+        assert_eq!(
+            peer.recv(),
+            r#"{"id":3,"method":"turn/start","params":{"threadId":"thr_1","input":[{"type":"text","text":"again"}]}}"#
+        );
+        // a thread codex no longer has: the command fails and the session ends
+        let events = codex
+            .resume_session("thr_9", r"C:\work", "hi", "p3")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        peer.recv();
+        let events = peer.send(
+            &mut codex,
+            r#"{"id":4,"error":{"code":-32600,"message":"no rollout found for thread id thr_9"}}"#,
+        );
+        let why = "Codex could not resume this session: no rollout found for thread id thr_9";
+        assert_eq!(dones(&events), [("p3", "failed", Some(why))]);
+        assert!(
+            matches!(events.last(), Some(Event::Op(t, Op::State(s))) if t == "thr_9" && s.status == "ended")
+        );
+        assert!(!codex.owns_session("thr_9"));
     }
 
     #[test]

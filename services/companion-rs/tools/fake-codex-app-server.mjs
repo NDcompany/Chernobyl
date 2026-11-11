@@ -23,6 +23,11 @@
  * active, which codex treats as a steer) is answered with "Following up on: <text>" at the end of
  * the same turn.
  *
+ * Resume: thread/resume {threadId, cwd?, approvalPolicy?, sandbox?} returns a loaded thread as is,
+ * or one a previous process started when --state-dir <dir> is given (thread/start saves
+ * <dir>/<threadId>.json, as codex keeps rollouts on disk); otherwise -32600 "no rollout found for
+ * thread id <id>". The resumed thread comes back with `turns: []` (history is not replayed).
+ *
  * MCP: fake-docs (stdio, connected) and fake-linear (HTTP, authenticationRequired). One
  * mcpServer/startupStatus/updated per server follows the initialize response. A
  * mcpServer/oauth/login for fake-linear completes after --oauth-delay-ms (default 500, negative =
@@ -39,14 +44,14 @@
  * without item/completed; methods other than the ones above get -32600, as codex answers unknown
  * methods.
  *
- * Usage: node fake-codex-app-server.mjs [--transcript <file>] [--oauth-delay-ms <ms>]
+ * Usage: node fake-codex-app-server.mjs [--transcript <file>] [--oauth-delay-ms <ms>] [--state-dir <dir>]
  *        node fake-codex-app-server.mjs --self-test
  * --transcript appends "<ISO time> <- line" (in), "-> line" (out) and "!! text" (violation).
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -160,7 +165,7 @@ function uuidv7() {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
-function createServer({ write, log, transcript = null, oauthDelayMs = 500, answerTimeoutMs = 5000 }) {
+function createServer({ write, log, transcript = null, oauthDelayMs = 500, answerTimeoutMs = 5000, stateDir = null }) {
   const threads = new Map();
   // ponytail: requests are never pruned and status scans are O(n); fine for test-length sessions.
   const requests = new Map(); // JSON.stringify(id) -> server->client request (keys keep 0 and "0" apart)
@@ -562,21 +567,54 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
     if (p.cwd != null && !isStr(p.cwd)) throw invalid('Invalid request: invalid type for `cwd`, expected a string');
     const cwd = p.cwd ?? process.cwd();
     const model = isStr(p.model) ? p.model : 'gpt-fake';
-    const tid = uuidv7();
-    const t0 = nowSecs();
-    threads.set(tid, {
-      id: tid, cwd, model, approvalPolicy: approval, sandbox, turn: null, statusKey: '{"type":"idle"}',
-      usage: { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 },
-    });
-    const thread = {
-      id: tid, sessionId: tid, forkedFromId: null, parentThreadId: null, preview: '', ephemeral: p.ephemeral === true, section: null, sectionEnteredAt: null,
-      projectId: null, historyMode: 'legacy', modelProvider: 'openai', model, reasoningEffort: null, createdAt: t0, updatedAt: t0, recencyAt: t0,
-      status: { type: 'idle' }, path: null, cwd, cliVersion: '0.0.0-fake', originator: clientName, source: 'appServer',
-      threadSource: isStr(p.threadSource) ? p.threadSource : null, agentNickname: null, agentRole: null, gitInfo: null, name: null, turns: [],
-    };
-    respond(id, { thread, model, modelProvider: 'openai', serviceTier: null, disabledPluginIds: [], cwd, instructionSources: [], approvalPolicy: approval, approvalsReviewer: 'user', sandbox, reasoningEffort: null });
+    const t = newThread(uuidv7(), cwd, model, approval, sandbox);
+    if (stateDir && p.ephemeral !== true) {
+      mkdirSync(stateDir, { recursive: true });
+      writeFileSync(join(stateDir, `${t.id}.json`), JSON.stringify({ cwd, model }));
+    }
+    const thread = threadShape(t, p.ephemeral === true, isStr(p.threadSource) ? p.threadSource : null);
+    respond(id, threadResult(t, thread));
     notify('thread/started', { thread });
   }
+
+  function threadResume(id, p) {
+    const tid = field(p, 'threadId', isStr, 'a string');
+    const approval = p.approvalPolicy == null ? null : approvalPolicy(p.approvalPolicy, experimentalApi);
+    const sandbox = p.sandbox == null ? null : sandboxPolicy(variant(p.sandbox, SANDBOX_MODES));
+    if (p.cwd != null && !isStr(p.cwd)) throw invalid('Invalid request: invalid type for `cwd`, expected a string');
+    let t = threads.get(tid);
+    if (!t) {
+      let saved = null;
+      try {
+        if (stateDir && /^[\w-]+$/.test(tid)) saved = JSON.parse(readFileSync(join(stateDir, `${tid}.json`), 'utf8'));
+      } catch {}
+      if (!saved) throw invalid(`no rollout found for thread id ${tid}`);
+      t = newThread(tid, saved.cwd, saved.model, 'on-request', sandboxPolicy('read-only'));
+    }
+    if (approval) t.approvalPolicy = approval;
+    if (sandbox) t.sandbox = sandbox;
+    if (isStr(p.cwd)) t.cwd = p.cwd;
+    respond(id, threadResult(t, threadShape(t, false, null)));
+  }
+
+  function newThread(tid, cwd, model, approval, sandbox) {
+    const t = {
+      id: tid, cwd, model, approvalPolicy: approval, sandbox, turn: null, statusKey: '{"type":"idle"}', createdAt: nowSecs(),
+      usage: { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 },
+    };
+    threads.set(tid, t);
+    return t;
+  }
+  function threadShape(t, ephemeral, threadSource) {
+    const t0 = t.createdAt;
+    return {
+      id: t.id, sessionId: t.id, forkedFromId: null, parentThreadId: null, preview: '', ephemeral, section: null, sectionEnteredAt: null,
+      projectId: null, historyMode: 'legacy', modelProvider: 'openai', model: t.model, reasoningEffort: null, createdAt: t0, updatedAt: t0, recencyAt: t0,
+      status: { type: 'idle' }, path: null, cwd: t.cwd, cliVersion: '0.0.0-fake', originator: clientName, source: 'appServer',
+      threadSource, agentNickname: null, agentRole: null, gitInfo: null, name: null, turns: [],
+    };
+  }
+  const threadResult = (t, thread) => ({ thread, model: t.model, modelProvider: 'openai', serviceTier: null, disabledPluginIds: [], cwd: t.cwd, instructionSources: [], approvalPolicy: t.approvalPolicy, approvalsReviewer: 'user', sandbox: t.sandbox, reasoningEffort: null });
 
   function turnStart(id, p) {
     const thread = threadOf(p);
@@ -673,6 +711,7 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
   const HANDLERS = {
     initialize,
     'thread/start': threadStart,
+    'thread/resume': threadResume,
     'turn/start': turnStart,
     'turn/steer': turnSteer,
     'turn/interrupt': turnInterrupt,
@@ -924,6 +963,29 @@ async function selfTest() {
     assert.match((await c.call('turn/start', { threadId: res.result.thread.id, input: [{ text: 'x' }] })).error.message, /missing field `type`/);
     assert.match((await c.call('thread/read', { threadId: res.result.thread.id })).error.message, /unknown variant `thread\/read`/);
     assert.equal(c.server.end(), 0);
+  });
+
+  await check('thread/resume: a loaded thread, a saved one in a new process, else no rollout', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fake-codex-state-'));
+    try {
+      const { c: first, threadId } = await ready({ stateDir: dir });
+      const loaded = await first.call('thread/resume', { threadId, cwd: process.cwd(), approvalPolicy: 'on-request', sandbox: 'workspace-write' });
+      assert.equal(loaded.result.thread.id, threadId);
+      assert.equal(loaded.result.sandbox.type, 'workspaceWrite');
+      assert.equal(first.server.end(), 0);
+      const { c: second } = await ready({ stateDir: dir });
+      assert.match((await second.call('thread/resume', {})).error.message, /missing field `threadId`/);
+      assert.equal((await second.call('thread/resume', { threadId: 'nope' })).error.message, 'no rollout found for thread id nope');
+      const resumed = await second.call('thread/resume', { threadId, approvalPolicy: 'on-request', sandbox: 'workspace-write' });
+      assert.deepEqual([resumed.result.thread.id, resumed.result.thread.turns], [threadId, []]);
+      assert.match((await turn(second, threadId, 'hello')).text, /\S/);
+      assert.equal(second.server.end(), 0);
+      const { c: bare } = await ready();
+      assert.match((await bare.call('thread/resume', { threadId })).error.message, /no rollout found/);
+      assert.equal(bare.server.end(), 0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   const { c, threadId } = await ready();
@@ -1195,6 +1257,7 @@ if (args.includes('--self-test')) {
     log: (line) => process.stderr.write(`${line}\n`),
     transcript: transcriptFile ? (dir, line) => appendFileSync(transcriptFile, `${new Date().toISOString()} ${dir} ${line}\n`) : null,
     oauthDelayMs: Number(option('--oauth-delay-ms') ?? 500),
+    stateDir: option('--state-dir') ?? null,
   });
   process.stdout.on('error', () => {}); // the client went away; stdin EOF follows
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
