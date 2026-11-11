@@ -16,14 +16,25 @@
 # and pass its public URL, e.g. -TunnelUrl wss://chernobyl.example.com. The phone tries the LAN first,
 # then the tunnel. Tunnel traffic arrives from loopback, so this also turns on requireE2e: every
 # connection must complete the paired E2E handshake (the tunnel only ever sees ciphertext).
+#
+# ngrok shortcut: -NgrokDomain <name>.ngrok-free.dev runs `ngrok http <port> --url <domain>` hidden,
+# now and at every login (HKCU Run), and sets -TunnelUrl wss://<domain>. Run `ngrok config
+# add-authtoken <token>` yourself once first; the token never passes through this script.
 param(
   [Parameter(Mandatory = $true)][string[]]$Workspaces,
   [int]$Port = 8787,
   [string]$Exe = (Join-Path $PSScriptRoot '..\services\companion-rs\target\release\chernobyl-companion.exe'),
   [switch]$NoAutostart,
-  [string]$TunnelUrl
+  [string]$TunnelUrl,
+  [string]$NgrokDomain,
+  [string]$Ngrok = 'C:\ngrok\ngrok.exe'
 )
 $ErrorActionPreference = 'Stop'
+if ($NgrokDomain) {
+  if ($NgrokDomain -notmatch '^[a-z0-9-]+(\.[a-z0-9-]+)+$') { throw "-NgrokDomain must be a bare host name (got $NgrokDomain)" }
+  if (-not (Test-Path $Ngrok)) { throw "ngrok not found at $Ngrok (pass -Ngrok <path>)" }
+  $TunnelUrl = "wss://$NgrokDomain"
+}
 if ($TunnelUrl -and $TunnelUrl -notmatch '^wss://[^/\s]+/?$') { throw "-TunnelUrl must look like wss://host (got $TunnelUrl)" }
 
 if (-not (Test-Path $Exe)) { throw "No companion exe at $Exe. Build it first: cargo build --release --manifest-path services\companion-rs\Cargo.toml" }
@@ -79,6 +90,19 @@ if ($admin) {
   Write-Host "Firewall: inbound TCP $Port allowed on Private networks."
 } else {
   Write-Warning "Not elevated: no firewall rule added. If the phone can't connect, run this once in an admin PowerShell:`n  New-NetFirewallRule -DisplayName 'CHERNOBYL companion' -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Profile Private -Program '$target'"
+}
+
+# 5b. ngrok tunnel: hidden launcher, now and at login
+if ($NgrokDomain) {
+  $vbs = Join-Path $bin 'ngrok-tunnel.vbs'
+  $line = '""' + $Ngrok + '"" http ' + $Port + ' --url ' + $NgrokDomain + ' --log=false'
+  [IO.File]::WriteAllText($vbs, "CreateObject(""WScript.Shell"").Run ""$line"", 0, False`r`n", (New-Object Text.UTF8Encoding $false))
+  if (-not $NoAutostart) {
+    Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'CHERNOBYL ngrok' -Value "wscript.exe `"$vbs`""
+  }
+  Get-Process ngrok -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq (Resolve-Path $Ngrok).Path } | Stop-Process -Force
+  Start-Process wscript.exe -ArgumentList "`"$vbs`""
+  Write-Host "ngrok tunnel started: $TunnelUrl -> 127.0.0.1:$Port"
 }
 
 # 5. autostart + start
