@@ -1089,6 +1089,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn redact_empty_string_is_empty() {
+        assert_eq!(redact(""), "");
+    }
+
+    #[test]
+    fn redact_leaves_plain_numbers_and_booleans_under_token_keys_alone() {
+        assert_eq!(redact("TOKEN=1234"), "TOKEN=1234");
+        assert_eq!(redact("max_tokens=4096"), "max_tokens=4096");
+        assert_eq!(redact("use_token=true"), "use_token=true");
+        assert_eq!(redact("token=null"), "token=null");
+    }
+
+    #[test]
+    fn redact_masks_non_numeric_values_under_token_keys() {
+        assert_eq!(redact("TOKEN=my_secret_token"), "TOKEN=«redacted:secret»");
+        assert_eq!(redact("token=ghp_token123"), "token=«redacted:secret»");
+    }
+
+    #[test]
+    fn redact_handles_single_quoted_secrets() {
+        assert_eq!(
+            redact("api_key='my-super-secret'"),
+            "api_key='«redacted:secret»'"
+        );
+    }
+
+    #[test]
+    fn redact_handles_colon_with_quoted_yaml_style() {
+        assert_eq!(
+            redact("password: \"secret_val\""),
+            "password: \"«redacted:secret»\""
+        );
+    }
+
+    #[test]
+    fn redact_bearer_token_with_various_casing() {
+        assert_eq!(
+            redact("AUTHORIZATION: BEARER secret123"),
+            "AUTHORIZATION: BEARER «redacted:bearer»"
+        );
+        assert_eq!(
+            redact("Authorization: Bearer my-custom-jwt-or-token"),
+            "Authorization: Bearer «redacted:bearer»"
+        );
+    }
+
+    #[test]
+    fn redact_preserves_unicode_surrounding_tokens() {
+        let input = "🔐 sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456789 🔐";
+        assert_eq!(redact(input), "🔐 «redacted:anthropic-key» 🔐");
+    }
+
+    #[test]
+    fn redact_multiple_different_secrets_in_single_line() {
+        let input = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456789 with password=\"secret\"";
+        assert_eq!(
+            redact(input),
+            "«redacted:anthropic-key» with password=\"«redacted:secret»\""
+        );
+    }
+
+    #[test]
+    fn redact_handles_unterminated_quotes() {
+        let input = "password=\"unterminated";
+        let out = redact(input);
+        assert!(out.contains("«redacted:secret»"));
+    }
+
     /* -------------------------- child IO -------------------------- */
 
     const NO_ARGS: &[&str] = &[];

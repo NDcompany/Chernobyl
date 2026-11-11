@@ -33,8 +33,11 @@ pub fn decode(input: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.as_chunks::<4>().0 {
+    let chunks = bytes.as_chunks::<4>().0;
+    for (k, chunk) in chunks.iter().enumerate() {
+        // RFC 4648: '=' only in the final group ("Zg==Zg==" is refused)
         let pad = match chunk[3] {
+            _ if k + 1 < chunks.len() => 0,
             b'=' => {
                 if chunk[2] == b'=' {
                     2
@@ -118,5 +121,64 @@ mod tests {
     fn ws_key_decodes_to_16_bytes() {
         let raw = decode("dGhlIHNhbXBsZSBub25jZQ==").unwrap();
         assert_eq!(raw.len(), 16);
+    }
+
+    #[test]
+    fn empty_buffer_decodes_to_empty_vec() {
+        assert_eq!(decode("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn single_byte_padding_two_equals() {
+        assert_eq!(encode(&[0x41]), "QQ==");
+        assert_eq!(decode("QQ==").unwrap(), vec![0x41]);
+    }
+
+    #[test]
+    fn two_bytes_padding_one_equal() {
+        assert_eq!(encode(&[0x41, 0x42]), "QUI=");
+        assert_eq!(decode("QUI=").unwrap(), vec![0x41, 0x42]);
+    }
+
+    #[test]
+    fn three_bytes_no_padding() {
+        assert_eq!(encode(&[0x41, 0x42, 0x43]), "QUJD");
+        assert_eq!(decode("QUJD").unwrap(), vec![0x41, 0x42, 0x43]);
+    }
+
+    #[test]
+    fn strict_decode_rejects_whitespace_and_newlines() {
+        assert_eq!(decode("Zm9v\n"), None);
+        assert_eq!(decode(" Zm9v"), None);
+        assert_eq!(decode("Zm 9v"), None);
+        assert_eq!(decode("Zm9v\r\n"), None);
+    }
+
+    #[test]
+    fn strict_decode_rejects_urlsafe_substitutions() {
+        assert_eq!(decode("Zm-v"), None);
+        assert_eq!(decode("Zm_v"), None);
+    }
+
+    #[test]
+    fn strict_decode_rejects_non_zero_trailing_bits_pad_two() {
+        // "ZE==" has non-zero bits in the unused 4 bits of the second char
+        assert_eq!(decode("ZE=="), None);
+        // "Zg==" decodes cleanly to 'f'
+        assert_eq!(decode("Zg==").unwrap(), b"f");
+    }
+
+    // RFC 4648: '=' may only end the whole string, not an inner group
+    #[test]
+    fn strict_decode_rejects_embedded_padding_in_multiblock() {
+        // padding '=' can only appear at the end of the entire string
+        assert_eq!(decode("Zg==Zg=="), None);
+        assert_eq!(decode("QUI=QUI="), None);
+    }
+
+    #[test]
+    fn all_byte_values_round_trip() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        assert_eq!(decode(&encode(&bytes)).unwrap(), bytes);
     }
 }

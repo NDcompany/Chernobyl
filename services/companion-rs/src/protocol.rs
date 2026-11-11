@@ -1770,6 +1770,131 @@ mod tests {
     }
 
     #[test]
+    fn rejects_set_permission_mode_with_unauthorized_modes() {
+        for mode in [
+            "bypassPermissions",
+            "dontAsk",
+            "auto",
+            "admin",
+            "",
+            "unknown",
+        ] {
+            let msg = format!(
+                r#"{{"type":"set_permission_mode","commandId":"c1","sessionId":"s1","mode":"{mode}"}}"#
+            );
+            assert!(
+                parse_client_message(&msg).is_none(),
+                "mode {mode} must be rejected"
+            );
+        }
+        for valid in ["default", "acceptEdits", "plan"] {
+            let msg = format!(
+                r#"{{"type":"set_permission_mode","commandId":"c1","sessionId":"s1","mode":"{valid}"}}"#
+            );
+            assert!(
+                parse_client_message(&msg).is_some(),
+                "valid mode {valid} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_mcp_auth_with_unsupported_flow() {
+        for flow in ["oauth", "browser", "password", "token"] {
+            let msg = format!(
+                r#"{{"type":"mcp_auth","commandId":"c1","sessionId":"s1","server":"srv","flow":"{flow}"}}"#
+            );
+            assert!(
+                parse_client_message(&msg).is_none(),
+                "flow {flow} must be rejected"
+            );
+        }
+        for valid in ["desktop", "phone-callback"] {
+            let msg = format!(
+                r#"{{"type":"mcp_auth","commandId":"c1","sessionId":"s1","server":"srv","flow":"{valid}"}}"#
+            );
+            assert!(
+                parse_client_message(&msg).is_some(),
+                "valid flow {valid} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_mcp_auth_callback_with_non_http_or_oversize_url() {
+        // must start with http://
+        assert!(parse_client_message(
+            r#"{"type":"mcp_auth_callback","commandId":"c1","sessionId":"s1","server":"srv","callbackUrl":"https://localhost:8080/cb"}"#
+        ).is_none());
+        assert!(parse_client_message(
+            r#"{"type":"mcp_auth_callback","commandId":"c1","sessionId":"s1","server":"srv","callbackUrl":"javascript:alert(1)"}"#
+        ).is_none());
+
+        // oversize URL > 4096 bytes
+        let long_path = "a".repeat(4100);
+        let msg = format!(
+            r#"{{"type":"mcp_auth_callback","commandId":"c1","sessionId":"s1","server":"srv","callbackUrl":"http://localhost/{long_path}"}}"#
+        );
+        assert!(parse_client_message(&msg).is_none());
+    }
+
+    #[test]
+    fn rejects_submit_prompt_exceeding_character_limit() {
+        let text_ok = "a".repeat(32_000);
+        let msg_ok = format!(
+            r#"{{"type":"submit_prompt","commandId":"c1","sessionId":"s1","text":"{text_ok}"}}"#
+        );
+        assert!(parse_client_message(&msg_ok).is_some());
+
+        let text_over = "a".repeat(32_001);
+        let msg_over = format!(
+            r#"{{"type":"submit_prompt","commandId":"c1","sessionId":"s1","text":"{text_over}"}}"#
+        );
+        assert!(parse_client_message(&msg_over).is_none());
+    }
+
+    #[test]
+    fn rejects_permission_decision_with_oversize_option_id_or_message() {
+        let long_opt = "x".repeat(129);
+        let msg_opt = format!(
+            r#"{{"type":"permission_decision","commandId":"c1","permissionId":"p1","decision":"approve-once","revision":1,"optionId":"{long_opt}"}}"#
+        );
+        assert!(parse_client_message(&msg_opt).is_none());
+
+        let long_msg = "x".repeat(4097);
+        let msg_text = format!(
+            r#"{{"type":"permission_decision","commandId":"c1","permissionId":"p1","decision":"reject","revision":1,"message":"{long_msg}"}}"#
+        );
+        assert!(parse_client_message(&msg_text).is_none());
+    }
+
+    #[test]
+    fn rejects_session_subscribe_with_oversize_epoch() {
+        let long_epoch = "e".repeat(65);
+        let msg = format!(
+            r#"{{"type":"session_subscribe","commandId":"c1","sessionId":"s1","epoch":"{long_epoch}"}}"#
+        );
+        assert!(parse_client_message(&msg).is_none());
+    }
+
+    #[test]
+    fn rejects_mcp_server_names_exceeding_length_cap() {
+        let long_server = "s".repeat(257);
+        let msg = format!(
+            r#"{{"type":"mcp_reconnect","commandId":"c1","sessionId":"s1","server":"{long_server}"}}"#
+        );
+        assert!(parse_client_message(&msg).is_none());
+    }
+
+    #[test]
+    fn rejects_hs_hello_and_proof_with_missing_fields() {
+        assert!(parse_client_message(r#"{"type":"hs_hello"}"#).is_none());
+        assert!(parse_client_message(r#"{"type":"hs_hello","deviceId":""}"#).is_none());
+        assert!(parse_client_message(r#"{"type":"hs_proof"}"#).is_none());
+        assert!(parse_client_message(r#"{"type":"hs_proof","proof":""}"#).is_none());
+    }
+
+    #[test]
     fn hello_ack_serialization_shape() {
         let msg = ServerMsg::HelloAck {
             protocol: PROTOCOL_VERSION,
