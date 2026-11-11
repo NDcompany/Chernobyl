@@ -114,6 +114,8 @@ export function Screen({
 export interface PageHeaderProps {
   title?: string;
   subtitle?: string;
+  /** decoration before the subtitle, e.g. the agent's `AgentMark` */
+  subtitleIcon?: ReactNode;
   /** undefined → router.back(); null → no back button */
   onBack?: (() => void) | null;
   right?: ReactNode;
@@ -121,7 +123,7 @@ export interface PageHeaderProps {
   bordered?: boolean;
 }
 
-export function PageHeader({ title, subtitle, onBack, right, dark = false, bordered = true }: PageHeaderProps) {
+export function PageHeader({ title, subtitle, subtitleIcon, onBack, right, dark = false, bordered = true }: PageHeaderProps) {
   const router = useRouter();
   const showBack = onBack !== null;
   const handleBack = onBack ?? (() => router.back());
@@ -161,9 +163,12 @@ export function PageHeader({ title, subtitle, onBack, right, dark = false, borde
           </Text>
         ) : null}
         {subtitle ? (
-          <Text variant="xs" color={fg2} numberOfLines={1}>
-            {subtitle}
-          </Text>
+          <View style={styles.headerSubtitle}>
+            {subtitleIcon}
+            <Text variant="xs" color={fg2} numberOfLines={1} style={{ flexShrink: 1 }}>
+              {subtitle}
+            </Text>
+          </View>
         ) : null}
       </View>
       {/* a status pill is wider than the 44 px button slot: let it size itself */}
@@ -420,6 +425,7 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.sm,
     minHeight: 56,
   },
+  headerSubtitle: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs, maxWidth: '100%' },
   headerBtn: {
     width: 44,
     height: 44,

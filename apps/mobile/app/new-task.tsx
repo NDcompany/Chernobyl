@@ -18,6 +18,7 @@ import { zodHandler } from '@/forms/zodBridge';
 import { Button, Chip, SimulatedTag, StatusDot, Text, TextField } from '@/ui/primitives';
 import { Screen, PageHeader, Card, EmptyState } from '@/ui/surface';
 import { AgentIcon } from '@/ui/graphics';
+import { AgentMark } from '@/ui/agentMark';
 
 const taskSchema = z.object({
   agentId: z.string().min(1, 'Choose an agent'),
@@ -122,6 +123,7 @@ export default function NewTaskScreen() {
                 <Chip
                   key={a.id}
                   label={`${a.name} · ${agentKindLabel(a.kind)}`}
+                  icon={<AgentMark kind={a.kind} size={16} />}
                   active={selectedAgentId === a.id}
                   onPress={() => {
                     form.setValue('agentId', a.id, { shouldDirty: true });

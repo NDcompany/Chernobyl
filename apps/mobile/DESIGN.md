@@ -17,6 +17,9 @@ number, radius, or font size — import from `@/theme/tokens`. Borders are hairl
 - `colors`: `black #050505` (primary fill), `white`, `presentation #D0D0D0`, `surface2 #F3F3F3`
   (subtle fill), `text #111111` / `text2 #666666` / `text3 #8B8B8B` (3-step hierarchy),
   `border #D2D2D2`, `borderStrong` (= black). State only: `success #2F7D4F`(+Bg), `warning #9A6B00`(+Bg), `error #A32B2B`(+Bg).
+- `agentColors` (identity, used **only** by `AgentMark`, never for text or state): `claude #D97757`
+  terracotta · `codex #0F8A7E` teal · `opencode #5B5FC7` indigo · `generic #666666`. Each keeps ≥3:1
+  on both white and black (asserted in `agentIdentity.test.ts`); agent names stay in text colours.
 - `spacing`: xs 4 · sm 8 · md 12 · lg 16 · xl 20 · xxl 24 · xxxl 32 · huge 40.
 - `radii`: screen 34 · lg 24 · md 16 · sm 12 · pill 999.
 - `typography` (via `Text variant=`): display · h1 · h2 · h3 · body · bodyStrong · sm · smStrong ·
@@ -27,7 +30,7 @@ number, radius, or font size — import from `@/theme/tokens`. Borders are hairl
 
 **`primitives.tsx`** — `Text` (variant/color/center/accessibilityRole ∈ text|header|button|none|alert),
 `Button` (variant primary|secondary|ghost, size md|sm, loading, icon, fullWidth, `ringColor` focus
-ring), `Chip` (active/count filter), `StatusDot` (tone), `StatusPill` (protocol `SessionStatus` →
+ring), `Chip` (active/count filter; optional leading `icon`, e.g. an `AgentMark`), `StatusDot` (tone), `StatusPill` (protocol `SessionStatus` →
 label/colors), `RiskPill` (low|medium|high), `SimulatedTag` (grey "Simulated" provenance pill, ADR-009),
 `ProgressBar`, `StatCard`, `SearchField`, `SectionTitle`,
 `TextField` (RHF-backed — takes `form` + `name`, renders label/error/hint itself).
@@ -35,12 +38,12 @@ label/colors), `RiskPill` (low|medium|high), `SimulatedTag` (grey "Simulated" pr
 **`surface.tsx`** — `Screen` (layout shell: safe-area + scroll + `header`/`footer` slots +
 `safeTop=false` when the screen draws its own dark header + `bottomInset` for tab clearance +
 `scrollRef` for live-output autoscroll; a `KeyboardAvoidingView` with `padding` on both platforms
-keeps the footer above the keyboard, since edge-to-edge Android no longer resizes the window), `PageHeader` (`onBack`: undefined→`router.back()`, null→no
+keeps the footer above the keyboard, since edge-to-edge Android no longer resizes the window), `PageHeader` (`subtitleIcon` sits before the subtitle — the session screens put the agent's mark there; `onBack`: undefined→`router.back()`, null→no
 button; `dark` variant for black headers; a `right` element such as a status pill sizes itself, the 44 px slot is only a minimum), `Card` (`strong` = black outline), `EmptyState` (default
 `contour="bottom"`), `ToastHost` (global, reads `appStore.toasts`, tab-bar aware — mounted once in
 root layout), `ConfirmModal` (destructive confirmations; `note` = scope/safety line).
 
-**`lists.tsx`** — `AgentCard` (tile|row), `SessionRow`, `MonoBlock` (command on black), `PermissionCard`
+**`lists.tsx`** — `AgentCard` (tile|row), `SessionRow` (agent mark before the agent · host line), `MonoBlock` (command on black), `PermissionCard`
 (compact|full, `resolved` dims), `ActivityRow`, `PromptComposer` (RHF+zod, 32,000-char limit, Stop
 while `busy`; `promptWhileBusy` `merge`|`queue` keeps Send enabled mid-turn with "Joins the current
 turn" / "Runs after this turn", `none` blocks it), `Timeline`, `OutputBlock` (stderr→error color,
@@ -76,7 +79,14 @@ a status mark per `ToolStatus`; expands to input `MonoBlock`, output with trunca
 ends in a space so Android's pixel rounding cannot wrap the widest line out of the box), `InlineApproval` /
 `StandaloneApproval` (detail by kind; primary + secondary + "More…" with session/persistent grants and
 "Deny and tell <agent> why"; persistent grants confirm the exact rule and file), `PlanCard`,
-`NoticeRow`, `TurnFooter`, `McpChip` ("MCP 4/5" + warning dot), `McpSheet` (status + §4.7 sign-in
+`NoticeRow`, `TurnFooter`, reply heads (the first agent item after a prompt or of a new turn —
+`replyStarts` — shows a 16 px `AgentMark` + the agent's name; nested work and notices never do),
+`WorkingRow` (the list footer while a turn runs: animated mark, a status verb from `WORKING_VERBS`
+rotating every 3 s, "Running <tool>…" while a tool runs, "Waiting for you" while a request is
+pending, elapsed seconds and live tokens/cost when the turn reports them; gone when the turn ends, the
+footer stays. It ticks on its own `useNow(1000)`, so rows never re-render for it. One polite live
+region whose label only flips between "<agent> is working" and "<agent> is waiting for you"; iOS
+gets the same label via `announceForAccessibility`), `McpChip` ("MCP 4/5" + warning dot), `McpSheet` (status + §4.7 sign-in
 actions), `ModeChip` (Claude permission mode picker; `dark` variant for the black header).
 ADR-017: `UserBubble` shows an outlined "1 image" / "N images" chip (camera icon) above the text
 when the prompt carried photos (only the count comes back); `ModelChip` (current model, sheet of the
@@ -92,11 +102,22 @@ in a space), `GitFileRow` (porcelain letter, path cut in the middle via RN `Text
 `ellipsizeMode`, a pill Stage/Unstage toggle; tap the path to open its diff). Diffs reuse the
 transcript's `DiffView`.
 
+**`agentMark.tsx`** — `AgentMark({ kind, size, state })`, the one place agent identity is drawn. Keyed
+by `Agent.kind` via `markFor` (`@/utils/agentIdentity`): `claude-code` → ember (diamond spark with
+eyes), `codex` → antenna bot, `opencode` → braces around a dot, everything else (browser, local/Ollama,
+custom, unknown kinds) → round blob. ORIGINAL 8×8 pixel characters — never trace or copy a company's
+logo or mascot; the agent's name is always written beside the mark in text. Sizes 16/24/32/48 stay
+pixel-crisp; eyes are holes so the surface shows through. States: `idle`/`done` still · `thinking`
+slow bob + sparkle · `working` quicker bob + sparkle · `waiting` calm fade pulse · `error` dimmed.
+Motion is transform/opacity on the native driver only, and `useReducedMotion` always gets the still
+frame. Decorative (hidden from screen readers). Demo agents keep their mark *and* the `SimulatedTag`.
+
 **`icons.tsx`** — `Icon` + `IconName` (40 names, 24×24 stroke grid, `strokeWidth` prop). New icon =
 add path to `PATHS`, never inline Svg in a screen.
 
 **`graphics.tsx`** — `Contours` (frame|top|bottom|ambient — decorative, clipped, never touchable,
-~0.5 opacity) and `AgentIcon` (kind). The two signature brand elements. `LogoMark` (the owner's
+~0.5 opacity) and `AgentIcon` (kind: the agent's `AgentMark` on a black or outlined tile, sized to a
+multiple of 8). The two signature brand elements. `LogoMark` (the owner's
 mark, one colour: `black` on light, `white` on the dark header) and `Wordmark` (mark + letterspaced
 CHERNOBYL).
 

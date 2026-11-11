@@ -737,3 +737,20 @@ export function rowIndexFor(model: TranscriptModel, itemId: string): number {
     (r) => (r.type === 'item' && r.item.id === top) || (r.type === 'approval' && r.permission.toolItemId === itemId),
   );
 }
+
+/**
+ * Items that open a reply: the first agent item (text, thinking, tool, plan)
+ * after a user prompt or of a new turn. They carry the agent's mark so every
+ * reply is visibly from that agent; notices neither carry one nor break a reply.
+ */
+export function replyStarts(rows: TranscriptRow[]): Set<string> {
+  const out = new Set<string>();
+  let prev: TranscriptItem | undefined;
+  for (const r of rows) {
+    if (r.type !== 'item' || r.item.kind === 'notice') continue;
+    const it = r.item;
+    if (it.kind !== 'user' && (!prev || prev.kind === 'user' || prev.turnId !== it.turnId)) out.add(it.id);
+    prev = it;
+  }
+  return out;
+}

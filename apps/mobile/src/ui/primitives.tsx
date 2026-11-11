@@ -167,11 +167,13 @@ export interface ChipProps {
   label: string;
   active?: boolean;
   count?: number;
+  /** leading decoration (e.g. an `AgentMark`), hidden from screen readers; the label says it all */
+  icon?: ReactNode;
   onPress?: () => void;
   style?: StyleProp<ViewStyle>;
 }
 
-export function Chip({ label, active = false, count, onPress, style }: ChipProps) {
+export function Chip({ label, active = false, count, icon, onPress, style }: ChipProps) {
   return (
     <Pressable
       onPress={onPress}
@@ -184,10 +186,12 @@ export function Chip({ label, active = false, count, onPress, style }: ChipProps
       style={({ pressed }) => [
         styles.chip,
         active && styles.chipActive,
+        icon != null && styles.chipIcon,
         pressed && { opacity: 0.8 },
         style,
       ]}
     >
+      {icon}
       <RNText style={[typography.smStrong, { color: active ? colors.white : colors.text2 }]}>
         {label}
         {count != null ? ` ${count}` : ''}
@@ -578,6 +582,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   chipActive: { backgroundColor: colors.black, borderColor: colors.black },
+  chipIcon: { flexDirection: 'row', gap: spacing.sm, paddingLeft: spacing.md },
 
   pill: {
     paddingHorizontal: 9,

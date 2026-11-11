@@ -51,6 +51,7 @@ import {
   type ApprovalDecision,
 } from '@/ui/transcript';
 import { Icon } from '@/ui/icons';
+import { AgentMark } from '@/ui/agentMark';
 
 type TabKey = 'output' | 'files' | 'activity';
 
@@ -125,6 +126,7 @@ export default function SessionScreen() {
           bordered={false}
           title={session.title}
           subtitle={`${agentName}${host ? ` · ${host.name}` : ''}`}
+          subtitleIcon={<AgentMark kind={agent?.kind} size={16} />}
           right={<StatusPill status={session.status} inverse />}
         />
       </View>
@@ -342,6 +344,7 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
           bordered={false}
           title={session.title}
           subtitle={`${agentName}${host ? ` · ${host.name}` : ''}`}
+          subtitleIcon={<AgentMark kind={agent?.kind} size={16} />}
           right={<StatusPill status={session.status} inverse />}
         />
       </View>
@@ -457,6 +460,7 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
           onOpenLink={openExternal}
           promptWhileBusy={live?.promptWhileBusy}
           agentKind={agent?.kind}
+          agentName={agentName}
           truncatedBefore={view.truncatedBefore}
           focusItemId={focusItemId}
         />
