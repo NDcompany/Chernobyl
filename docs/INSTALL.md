@@ -59,13 +59,13 @@ tests first):
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File android-kitkat\build-release.ps1
-# -> release\chernobyl-kitkat-0.1.0.apk, signed v1 + v2 with CHB_KEYSTORE (default G:\Secrets\Android\chernobyl-release.jks)
+# -> release\chernobyl-kitkat-0.2.0.apk, signed v1 + v2 with CHB_KEYSTORE (default G:\Secrets\Android\chernobyl-release.jks)
 ```
 
 Install on the tablet:
 
 1. Settings → Security → turn on **Unknown sources**.
-2. Copy the APK over USB and open it in a file manager, or `adb install release\chernobyl-kitkat-0.1.0.apk`.
+2. Copy the APK over USB and open it in a file manager, or `adb install release\chernobyl-kitkat-0.2.0.apk`.
 3. Open **CHERNOBYL**. It starts on **Pair**.
 
 Pair:
@@ -84,7 +84,11 @@ Good to know on a real 4.4 tablet:
   Android 4.4 lacks, so ngrok URLs validate. A certificate error in "Status" means some other CA.
 - A foreground notification keeps the connection while the app is in the background. When the
   screen is off, KitKat may sleep the CPU and Wi-Fi; alerts then arrive when it wakes. Tick
-  **Keep the connection awake** on the Pair screen for instant alerts (costs battery).
+  **Keep the connection awake** in **Settings** for instant alerts (costs battery). Settings also
+  turns approval / session-finished alerts on or off and lists the approval audit history.
+- The tablet has the main app's session tools: model, permission mode, context, rename and End
+  chips, "/" commands, camera photos, the MCP sheet, PC sessions (Live on PC, fork), git pull and,
+  when the PC turned it on (`"terminal": {"enabled": true}`), the Terminal tab under Files.
 - "Refused: unauthorized" = wrong or missing token: type the right one and leave the payload field
   empty to keep the pairing. "Refused: unknown device" / "offer expired" = make a new offer.
   "device revoked" = pair again.

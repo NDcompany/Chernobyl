@@ -212,6 +212,12 @@ public final class Model {
         return out;
     }
 
+    /** The workspace a session runs in (`Session.project` is the workspace path), or null. */
+    public JSONObject workspaceForProject(String project) {
+        for (JSONObject w : workspaces()) if (w.optString("path").equals(project)) return w;
+        return null;
+    }
+
     /* ---------------- transcript view (transcript.ts applyTranscript) ---------------- */
 
     public static final class View {
@@ -222,6 +228,8 @@ public final class Model {
         public final Map<String, Integer> index = new HashMap<String, Integer>();
         public final Map<String, JSONObject> turns = new HashMap<String, JSONObject>();
         public JSONObject state = new JSONObject();
+        /** McpServerState[] (snapshot `mcp`, replaced by `mcp` ops). */
+        public JSONArray mcp = new JSONArray();
         public boolean truncatedBefore;
         /** The companion refused the subscription. */
         public String error;
@@ -300,6 +308,8 @@ public final class Model {
             v.seq = msg.optLong("seq");
             JSONObject st = msg.optJSONObject("state");
             v.state = st != null ? st : new JSONObject();
+            JSONArray mcp = msg.optJSONArray("mcp");
+            v.mcp = mcp != null ? mcp : new JSONArray();
             v.truncatedBefore = msg.optBoolean("truncatedBefore");
             v.error = null;
             v.version++;
@@ -337,8 +347,11 @@ public final class Model {
             } else if (kind.equals("state")) {
                 JSONObject st = op.optJSONObject("state");
                 if (st != null) v.state = st;
+            } else if (kind.equals("mcp")) {
+                JSONArray servers = op.optJSONArray("servers");
+                if (servers != null) v.mcp = servers;
             }
-            // 'mcp' and op kinds from a newer companion: their seq still counts
+            // op kinds from a newer companion: their seq still counts
         }
         v.seq = seq;
         v.version++;

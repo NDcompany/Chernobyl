@@ -1,6 +1,6 @@
 # ADR-019: A separate native client for Android 4.4 (KitKat) tablets
 
-Status: accepted, 2026-11-12. Code: `android-kitkat/`. Evidence: `docs/validation/evidence/kitkat/`.
+Status: accepted, 2026-11-12; parity addendum the same day (the parity addendum). Code: `android-kitkat/`. Evidence: `docs/validation/evidence/kitkat/`.
 
 ## Context
 
@@ -31,7 +31,8 @@ other paired device.
 | `E2e.java` | pairing payload, handshake proofs, key derivation, sealed frames (port of `packages/e2e`) |
 | `WebSocket.java` | RFC 6455 client over a plain or TLS socket (text, ping/pong, close codes) |
 | `Transport.java` | connection lifecycle (port of `packages/e2e/src/transport.ts`) |
-| `Model.java` | snapshot reducer, selectors, transcript views (port of `reducer.ts` and `transcript.ts`) |
+| `Model.java` | snapshot reducer, selectors, transcript views incl. MCP state (port of `reducer.ts` and `transcript.ts`) |
+| `Composer.java` | pure helpers: slash filter, image / frame budget, camera sizes, model / mode / context labels, MCP summary, working verbs, git pull / push labels, terminal run assembly and history (ports of `apps/mobile/src/utils/{composer,agentIdentity,terminal,workspace}.ts`) |
 | `Md.java` | markdown subset and diff line classes |
 | `App.java`, `ConnService.java`, `SecureStore.java` | process state, TLS sockets, notifications, foreground service, key storage |
 | `MainActivity.java`, `ConversationView.java`, `WorkspaceView.java`, `ScanActivity.java`, `Ui.java` | screens |
@@ -69,7 +70,7 @@ and the AEAD construction are plain Java. HMAC-SHA256 and SHA-256 come from `jav
 `java.security`. The CSPRNG XORs `SecureRandom` with bytes read straight from `/dev/urandom`, so a
 device still carrying the 2013 Android PRNG seeding bug stays safe.
 
-Proof (`gradlew test`, 31 JVM tests, all pass):
+Proof (`gradlew test`, 40 JVM tests, all pass):
 
 - RFC 8439 2.3.2 (block), 2.4.2 (encryption), 2.5.2 (Poly1305), 2.8.2 (AEAD tag
   `1ae10b594f09e26a7e902ecbd0600691`), Appendix A.3 Poly1305 reduction edge cases.
@@ -81,6 +82,10 @@ Proof (`gradlew test`, 31 JVM tests, all pass):
   sealed-frame rule of that file (replay, desync, tamper, nine hostile envelopes, wrong keys).
 - `kats.test.ts` proof binding and key derivation rules; base64 and UTF-8 strictness cases.
 - The repo's protocol fixtures (`packages/protocol/fixtures/live/*.json`) through the reducers.
+- `ComposerTest`: the composer, terminal, MCP and workspace fixtures through the parity helpers
+  (slash filter, image budget and sealed-frame size, camera size and downscale, model / mode /
+  context labels, MCP summary and callback check, working verbs equal to `agentIdentity.ts`'s,
+  terminal output / exit / lost-exit assembly and history, pull / push labels, markdown tables).
 - `TransportTest`: the real `Transport` + `WebSocket` against an in-test companion double that
   speaks the wire contract as the host: first endpoint refused then failover, the exact `Origin`
   header and `?token=`, handshake, `hs_rekey` stored then acked, a command acked through the sealed
@@ -126,11 +131,9 @@ card, a foreground service, Files and Changes (browse, read, git status, diff, s
 push). Legacy (non-transcript) sessions show their output lines and approvals. Demo data from the mock
 adapter carries a "Simulated" tag and a Home banner.
 
-Not built (yet): photos in prompts, slash-command suggestions, permission-mode / model / rename chips
-inside a session, the MCP sheet, sign-in / biometrics, the local audit trail, alert settings
-(approval alerts are always on while no screen of the app is visible), tables in markdown,
-`git pull` and a terminal (the protocol has neither: no `git_pull` message and no `terminal.v1`
-feature exist). The working row does not rotate verbs.
+Not built (yet): sign-in / biometrics, the agent detail screen, photos on the New session form
+(they attach in the conversation), gallery photos (camera only, like the main app). The
+"Parity addendum" below lists what the 2026-11-12 addendum added.
 
 QR scanning uses `android.hardware.Camera` preview frames + ZXing; the emulator camera shows no QR,
 so only the paste path is device-tested.
@@ -161,3 +164,85 @@ Companion built from this branch, isolated `CHERNOBYL_HOME`, port 18797, token o
 | Portrait single pane after rotation | PASS (blank pane fixed during the run) |
 | Camera QR scan | not run (emulator camera) |
 | Physical 4.4 tablet | not run |
+
+## Parity addendum (2026-11-12, branch `feat/kitkat-parity`)
+
+The tablet client now has what the main app gained in ADR-016 (addendum), ADR-017, ADR-018 and
+ADR-020, with the same messages and rules (`packages/protocol` is the source of truth):
+
+- **Composer (ADR-017)**, only for what `Agent.live.composer` lists: model chip + sheet
+  (`set_model`, models from `LiveState.models`, else the four aliases), slash menu on "/" (names
+  from `LiveState.slashCommands`, starts-with first, at most 8), "Context N%" chip, rename sheet
+  (`rename_session`, 1-80 characters, no control characters), permission-mode chip + sheet
+  (`set_permission_mode`, only default / acceptEdits / plan), End session with a confirm
+  (`session_end`), Files / Changes chips for the session's workspace.
+- **Photos**: the camera screen (`ScanActivity` in photo mode, `android.hardware.Camera`, no
+  file URI or FileProvider) shoots at most 1280 px on the long edge, decodes with a power-of-two
+  sample size, scales to ≤ 1280 px, re-encodes as JPEG at 70 / 50 / 35 / 20 / 10 until the base64
+  fits what is left of the 180,000-character budget; at most 4 per prompt, kept in memory only.
+  Before sending, the real serialized message (Android's org.json escapes "/") is sized as a
+  sealed frame and refused above 256,000 bytes. Not corrected for sensor rotation (the screen is
+  landscape like a tablet's back camera).
+- **PC sessions (ADR-018)**: "● Live on PC" replaces the status pill (list and header); the
+  view mirrors the PC's turn; Stop, mode, model, rename and End are hidden; the composer says
+  "Continue on phone (fork)…", sends `submit_prompt` with `fork: true` and opens the session the
+  ack names; "Forked from “…”" under the header and in the list; approvals carry "Approval needed
+  · from a PC session" and their notification "Approval needed (PC session)".
+- **git pull (ADR-016 addendum)**: "Pull N commit(s)" with a confirm naming upstream → branch;
+  Push now also confirms branch → upstream; both disabled without an upstream or on a detached HEAD.
+- **Terminal (ADR-020)**: a third tab on Files, live only with `terminal.v1` (otherwise it says
+  how to turn it on); the warning banner "Runs on your PC without approval prompts", Run / Stop
+  (`terminal_run` / `terminal_stop`), streamed `terminal_output`, the exit line from
+  `terminal_exit` (or the `command_result` after a reconnect), the last 20 command lines per
+  workspace in app-private preferences; output in memory only, the last 60,000 characters drawn.
+- **MCP sheet**: servers with status and error, Sign in on PC (`mcp_auth` desktop), finish on
+  this tablet (`mcp_auth` phone-callback, then the URL, a confirm before opening it, and the pasted
+  callback checked against `callbackPrefix` before `mcp_auth_callback`), Manage on claude.ai,
+  Reconnect (`mcp_reconnect`). The sheet follows `transcript_snapshot.mcp` and `mcp` ops.
+- **Settings tab**: approval alerts and session-finished alerts on/off (both on by default), the
+  keep-awake switch (moved from Pair), and the audit history: every resolved request (agent, risk,
+  decision, command, "from a PC session"), newest first, 200 kept in app-private preferences.
+- **Identity**: the working row now follows `workingStatus` / `workingLabel` (rotating verbs every
+  3 s seeded by the turn id, `Running <Tool>…`, "Waiting for you", elapsed, tokens, cost); marks
+  and reply heads were already the `agentMark.tsx` sprites.
+- **Markdown tables**: pipe tables become one aligned monospace block (header, rule, rows).
+
+### Parity results (emulator API 19, Nexus 7 2013 profile, 2026-11-12)
+
+Companion built from this branch, isolated `CHERNOBYL_HOME`, ports 18797 / 19497, token on,
+`"terminal": {"enabled": true}`, one Claude adapter on a temp git workspace with a local bare
+remote as upstream, `ANTHROPIC_MODEL=haiku`, no other `CLAUDE*` / `ANTHROPIC_*` variables. Live
+spend: about $0.055 (three tablet turns $0.026, three PC `claude -p` runs $0.029).
+
+| Feature | Result | Evidence |
+| --- | --- | --- |
+| JVM unit tests | PASS 40/40 | `gradlew testDebugUnitTest` |
+| Terminal: run, streamed output, exit code, history | PASS | 30, 35 |
+| Terminal: Stop kills a running command | PASS | 31, 32 |
+| git pull with confirm (upstream → branch), fast-forward landed | PASS | 33, 34 |
+| Stage, commit, push with confirm (branch → upstream), remote has it | PASS | 36, 37 |
+| New Claude session, working row with rotating verb, reply head, table reply | PASS | 40, 41 |
+| MCP sheet (32 servers from the PC's config), Reconnect reaches the companion | PASS | 42, 43 |
+| MCP sign-in flows (desktop, phone-callback) | NOT RUN (would start OAuth against the owner's real accounts) | — |
+| Permission mode chip + sheet, Plan applied, back to default | PASS | 44, 45 |
+| Model chip + sheet from `LiveState.models`, Sonnet applied, back to Haiku | PASS | 46, 47 |
+| Context chip, rename sheet, renamed in list and header | PASS | 48, 49, 50 |
+| Slash menu filters and inserts | PASS | 51, 52 |
+| Camera photo (640×480 emulator sensor, 26,540 base64 chars), sent, Claude described it | PASS | 53, 54, 55, 56 |
+| PC session: Live on PC tag, mirrored tool + approval "from a PC session", Allow, file written, reply mirrored | PASS | 60, 61, 62, 63 |
+| Fork from the tablet: new session opens, "Forked from", reply | PASS | 64, 65 |
+| Approval alert on: "Approval needed (PC session)" notification opens the card; deny with a reason | PASS | 71, 72, 73 |
+| Approval alert off: no notification while the request is pending; Approvals tab deny | PASS | 74, 75, 76 |
+| Settings: alerts, keep-awake, audit history | PASS | 70, 82 |
+| End session with confirm, composer closed | PASS | 77, 78 |
+| Portrait single pane with chips | PASS | 79 |
+| Session Changes chip opens that workspace | PASS | 80 |
+| Release APK 0.2.0 (v1 + v2 + v3 signed, min-sdk 19) installs, pairs, shows the chips | PASS | 81, 82 |
+| `Running <Tool>…` label on the device | not captured (unit-tested; tools ran too briefly) | — |
+
+Found on the way: with the mock adapter enabled beside a live Claude adapter, the companion's
+snapshot drops the mock agents and sessions but keeps the mock seed permissions and activity, so
+demo approvals appear without their agent and therefore without a "Simulated" tag (main app too).
+The run used the Claude adapter alone; the companion fix is open (`companion.rs` `snapshot`).
+A KitKat platform bug: making a selectable `TextView` unselectable again overflows the stack under
+accessibility (uiautomator); the slash rows therefore never use the selectable mono style.

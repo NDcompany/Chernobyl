@@ -2,12 +2,20 @@ package com.chernobyl.kitkat;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.ImageFormat;
 import android.hardware.Camera;
 import android.os.Bundle;
+import android.util.Base64;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.View;
+import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import com.google.zxing.BarcodeFormat;
 import com.google.zxing.BinaryBitmap;
@@ -16,14 +24,22 @@ import com.google.zxing.PlanarYUVLuminanceSource;
 import com.google.zxing.Result;
 import com.google.zxing.common.HybridBinarizer;
 import com.google.zxing.qrcode.QRCodeReader;
+import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.List;
 import java.util.Map;
 
 /**
  * Scans the companion's pairing QR with the KitKat camera API
  * (android.hardware.Camera preview frames) and ZXing core. Returns the decoded
  * text; the Pair screen validates it like a pasted line.
+ *
+ * With the "photoBudget" extra it takes one photo for a prompt instead
+ * (ADR-017): shot at most 1280 px on the long edge, scaled down if the camera
+ * gave more, re-encoded as JPEG at falling quality until its base64 fits the
+ * budget, returned as the "image" extra. It never leaves the tablet until sent.
  */
 @SuppressWarnings("deprecation")
 public final class ScanActivity extends Activity implements SurfaceHolder.Callback, Camera.PreviewCallback {
@@ -32,10 +48,14 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     private final Map<DecodeHintType, Object> hints = new EnumMap<DecodeHintType, Object>(DecodeHintType.class);
     private volatile boolean decoding;
     private TextView label;
+    /** Photo mode: base64 characters the photo may take; -1 = QR mode. */
+    private int budget;
+    private Button shoot;
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        budget = getIntent().getIntExtra("photoBudget", -1);
         hints.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
         hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
         FrameLayout root = new FrameLayout(this);
@@ -49,6 +69,23 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
         label.setPadding(0, Ui.dp(this, 24), 0, Ui.dp(this, 24));
         label.setBackgroundColor(0x99000000);
         root.addView(label, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
+        if (budget >= 0) {
+            label.setText("Take a photo for your next message. It goes to Claude on your PC when you send.");
+            LinearLayout bar = Ui.row(this);
+            bar.setPadding(Ui.dp(this, 16), Ui.dp(this, 16), Ui.dp(this, 16), Ui.dp(this, 16));
+            Button cancel = Ui.button(this, "Cancel", 1, new View.OnClickListener() {
+                @Override public void onClick(View v) { finish(); }
+            });
+            bar.addView(cancel);
+            bar.addView(Ui.gap(this, 12));
+            shoot = Ui.button(this, "Take photo", 0, new View.OnClickListener() {
+                @Override public void onClick(View v) { shoot(); }
+            });
+            shoot.setTextColor(Ui.BLACK);
+            shoot.setBackgroundDrawable(Ui.box(Ui.WHITE, 0, 22, this));
+            bar.addView(shoot);
+            root.addView(bar, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.END));
+        }
         setContentView(root);
     }
 
@@ -61,13 +98,20 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
             Camera.Parameters p = camera.getParameters();
             if (p.getSupportedFocusModes().contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE))
                 p.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+            if (budget >= 0) {
+                List<int[]> sizes = new ArrayList<int[]>();
+                for (Camera.Size s : p.getSupportedPictureSizes()) sizes.add(new int[] {s.width, s.height});
+                int[] pick = Composer.pickPictureSize(sizes, Composer.SHOT_EDGE);
+                if (pick != null) p.setPictureSize(pick[0], pick[1]);
+                p.setPictureFormat(ImageFormat.JPEG);
+            }
             camera.setParameters(p);
             camera.setDisplayOrientation(getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_PORTRAIT ? 90 : 0);
             camera.setPreviewDisplay(h);
-            camera.setPreviewCallback(this);
+            if (budget < 0) camera.setPreviewCallback(this);
             camera.startPreview();
         } catch (Exception e) {
-            label.setText("Camera unavailable: paste the payload line instead");
+            label.setText(budget >= 0 ? "Camera unavailable" : "Camera unavailable: paste the payload line instead");
         }
     }
 
@@ -92,6 +136,59 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
         camera.stopPreview();
         camera.release();
         camera = null;
+    }
+
+    private void shoot() {
+        if (camera == null || !shoot.isEnabled()) return;
+        shoot.setEnabled(false);
+        label.setText("Preparing the photo…");
+        camera.takePicture(null, null, new Camera.PictureCallback() {
+            @Override
+            public void onPictureTaken(final byte[] jpeg, Camera cam) {
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        final String data = encode(jpeg);
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (data != null) {
+                                    setResult(RESULT_OK, new Intent().putExtra("image", data));
+                                    finish();
+                                    return;
+                                }
+                                label.setText("This photo is too large to add. Remove a photo or send what you have.");
+                                shoot.setEnabled(true);
+                                if (camera != null) camera.startPreview();
+                            }
+                        });
+                    }
+                }).start();
+            }
+        });
+    }
+
+    // ponytail: no EXIF/sensor rotation; the activity is landscape like the tablet's back sensor
+    private String encode(byte[] jpeg) {
+        BitmapFactory.Options o = new BitmapFactory.Options();
+        o.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, o);
+        o.inJustDecodeBounds = false;
+        o.inSampleSize = Composer.sampleSize(o.outWidth, o.outHeight, Composer.SHOT_EDGE);
+        Bitmap b = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, o);
+        if (b == null) return null;
+        int[] to = Composer.scaledSize(b.getWidth(), b.getHeight(), Composer.SHOT_EDGE);
+        final Bitmap scaled = to[0] == b.getWidth() && to[1] == b.getHeight() ? b : Bitmap.createScaledBitmap(b, to[0], to[1], true);
+        String out = Composer.fitImage(new Composer.Encoder() {
+            @Override
+            public String jpegBase64(int quality) {
+                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                scaled.compress(Bitmap.CompressFormat.JPEG, quality, bytes);
+                return Base64.encodeToString(bytes.toByteArray(), Base64.NO_WRAP);
+            }
+        }, budget);
+        Log.i(App.TAG, "photo " + o.outWidth + "x" + o.outHeight + " -> " + to[0] + "x" + to[1] + ", base64 " + (out == null ? "too large" : out.length()) + " of " + budget);
+        return out;
     }
 
     @Override
