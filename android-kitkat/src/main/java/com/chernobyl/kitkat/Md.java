@@ -7,7 +7,8 @@ import java.util.regex.Pattern;
 
 /**
  * The markdown subset the conversation renders (paragraphs, headings, fenced
- * code, lists, rules, bold, italic, inline code, links) and unified-diff line
+ * code, lists, rules, pipe tables as aligned monospace text, bold, italic,
+ * inline code, links) and unified-diff line
  * classes. Pure Java, unit-tested; Ui turns it into spans. No HTML, no images,
  * no remote loads. Streaming-safe: an unclosed fence runs to the end, an
  * unclosed marker shows as typed.
@@ -15,7 +16,7 @@ import java.util.regex.Pattern;
 public final class Md {
     private Md() {}
 
-    public static final int PARA = 0, CODE = 1, HEADING = 2, BULLET = 3, NUMBERED = 4, RULE = 5, QUOTE = 6;
+    public static final int PARA = 0, CODE = 1, HEADING = 2, BULLET = 3, NUMBERED = 4, RULE = 5, QUOTE = 6, TABLE = 7;
 
     public static final class Run {
         public final String text;
@@ -57,6 +58,7 @@ public final class Md {
     private static final Pattern BULLET_RE = Pattern.compile("^\\s*[-*+]\\s+(.*)$");
     private static final Pattern NUM_RE = Pattern.compile("^\\s*(\\d{1,9})[.)]\\s+(.*)$");
     private static final Pattern RULE_RE = Pattern.compile("^\\s*([-*_])(\\s*\\1){2,}\\s*$");
+    private static final Pattern TABLE_SEP = Pattern.compile("^\\|?\\s*:?-+:?\\s*(\\|\\s*:?-+:?\\s*)*\\|?$");
 
     public static List<Block> parse(String src) {
         List<Block> out = new ArrayList<Block>();
@@ -75,6 +77,16 @@ public final class Md {
                 }
                 out.add(new Block(CODE, 0, code.toString(), null));
                 i = j; // past the closing fence (or the end while streaming)
+                continue;
+            }
+            if (t.startsWith("|") && i + 1 < lines.length && TABLE_SEP.matcher(lines[i + 1].trim()).matches()) {
+                if (para != null) { out.add(new Block(PARA, 0, null, inline(para.toString()))); para = null; }
+                List<String> rows = new ArrayList<String>();
+                rows.add(t);
+                int j = i + 2;
+                for (; j < lines.length && lines[j].trim().startsWith("|"); j++) rows.add(lines[j].trim());
+                out.add(new Block(TABLE, 0, table(rows), null));
+                i = j - 1;
                 continue;
             }
             Matcher m;
@@ -104,6 +116,40 @@ public final class Md {
         }
         if (para != null) out.add(new Block(PARA, 0, null, inline(para.toString())));
         return out;
+    }
+
+    /** Pipe-table rows (header first, separator left out) as padded columns joined by " │ ". */
+    static String table(List<String> rows) {
+        List<String[]> cells = new ArrayList<String[]>();
+        int cols = 0;
+        for (String r : rows) {
+            String body = r.substring(1);
+            if (body.endsWith("|")) body = body.substring(0, body.length() - 1);
+            String[] cs = body.split("\\|", -1);
+            for (int k = 0; k < cs.length; k++) cs[k] = cs[k].trim().replace("**", "").replace("`", "");
+            cells.add(cs);
+            cols = Math.max(cols, cs.length);
+        }
+        int[] width = new int[cols];
+        for (String[] cs : cells) for (int k = 0; k < cs.length; k++) width[k] = Math.max(width[k], cs[k].length());
+        StringBuilder sb = new StringBuilder();
+        for (int r = 0; r < cells.size(); r++) {
+            String[] cs = cells.get(r);
+            for (int k = 0; k < cols; k++) {
+                String c = k < cs.length ? cs[k] : "";
+                sb.append(k == 0 ? "" : " │ ").append(c);
+                if (k < cols - 1) for (int p = c.length(); p < width[k]; p++) sb.append(' ');
+            }
+            if (r == 0) {
+                sb.append('\n');
+                for (int k = 0; k < cols; k++) {
+                    if (k > 0) sb.append("─┼─");
+                    for (int p = 0; p < width[k]; p++) sb.append('─');
+                }
+            }
+            if (r < cells.size() - 1) sb.append('\n');
+        }
+        return sb.toString();
     }
 
     private static final Pattern BARE_URL = Pattern.compile("https?://[^\\s<>()\\[\\]]+[^\\s<>()\\[\\].,;:!?'\"]");

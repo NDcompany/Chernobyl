@@ -6,6 +6,7 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -35,6 +36,7 @@ import java.security.KeyStore;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
@@ -64,6 +66,13 @@ public final class App extends Application {
     private final Set<String> resubPending = new HashSet<String>();
     private final Map<String, JSONObject[]> wsResults = new HashMap<String, JSONObject[]>();
     private final Map<String, Result> cmdResults = new HashMap<String, Result>();
+    /** ADR-020: the last run per workspace (memory only; output never persisted). */
+    final Map<String, Composer.TerminalRun> terminals = new HashMap<String, Composer.TerminalRun>();
+    /** ADR-017: photos waiting for the next prompt, per session (memory only, base64 JPEG). */
+    final Map<String, List<String>> drafts = new HashMap<String, List<String>>();
+    /** The Files screen's workspace and tab (0 files, 1 changes, 2 terminal), kept across re-renders. */
+    String filesWs;
+    int filesTab;
 
     @Override
     public void onCreate() {
@@ -199,13 +208,23 @@ public final class App extends Application {
             if (slot != null) slot[0] = m.optJSONObject("result");
             return;
         }
+        if (type.equals("terminal_output") || type.equals("terminal_exit") || type.equals("command_result")) {
+            for (Composer.TerminalRun run : terminals.values()) if (run.apply(m)) changed();
+        }
         if (type.equals("command_result")) {
             Result r = cmdResults.remove(m.optString("commandId"));
             if (r != null) r.done(m, "completed".equals(m.optString("status")) ? null : m.optString("error", m.optString("status")));
         }
+        JSONObject before = type.equals("session_updated") && m.optJSONObject("session") != null ? model.session(m.optJSONObject("session").optString("id")) : null;
+        String wasStatus = before == null ? null : before.optString("status");
         if (model.apply(m)) {
             if (type.equals("permission_requested")) notifyApproval(m.optJSONObject("permission"));
-            if (type.equals("permission_resolved") && m.optJSONObject("permission") != null) cancelNotification(m.optJSONObject("permission").optString("id"));
+            if (type.equals("permission_resolved") && m.optJSONObject("permission") != null) {
+                cancelNotification(m.optJSONObject("permission").optString("id"));
+                audit(m.optJSONObject("permission"));
+            }
+            if (wasStatus != null && !wasStatus.equals("completed") && "completed".equals(m.optJSONObject("session").optString("status")))
+                notifySession(m.optJSONObject("session"));
             changed();
         }
     }
@@ -316,6 +335,91 @@ public final class App extends Application {
         }, 150_000);
     }
 
+    /* ---------------- terminal (ADR-020) ---------------- */
+
+    /** Starts a run; its output and exit arrive by commandId (to this connection only). */
+    void runTerminal(String workspaceId, String command) {
+        JSONObject m = msg("terminal_run", "workspaceId", workspaceId, "command", command);
+        final Composer.TerminalRun run = new Composer.TerminalRun(m.optString("commandId"), command);
+        terminals.put(workspaceId, run);
+        prefs().edit().putString("term_" + workspaceId, new JSONArray(Composer.remember(history(workspaceId), command)).toString()).commit();
+        command(m, null, new Result() {
+            @Override
+            public void done(JSONObject ack, String error) {
+                if (ack == null || !ack.optBoolean("ok")) {
+                    run.refused(ack != null ? ack.optString("error", null) : null);
+                    changed();
+                }
+            }
+        });
+        changed();
+    }
+
+    /** Ack-only; the run's own exit says "Stopped". */
+    void stopTerminal(String workspaceId) {
+        send(msg("terminal_stop", "workspaceId", workspaceId), new Result() {
+            @Override
+            public void done(JSONObject ack, String error) {
+                if (ack == null) toast("Could not reach the PC to stop the command");
+                else if (!ack.optBoolean("ok")) toast(ack.optString("error", "Could not stop the command"));
+            }
+        });
+    }
+
+    /** The last 20 command lines of a workspace, newest first (this tablet only). */
+    List<String> history(String workspaceId) {
+        List<String> out = new ArrayList<String>();
+        try {
+            JSONArray a = new JSONArray(prefs().getString("term_" + workspaceId, "[]"));
+            for (int i = 0; i < a.length(); i++) out.add(a.getString(i));
+        } catch (Exception ignored) { }
+        return out;
+    }
+
+    List<String> draft(String sessionId) {
+        List<String> d = drafts.get(sessionId);
+        if (d == null) drafts.put(sessionId, d = new ArrayList<String>());
+        return d;
+    }
+
+    /* ---------------- settings + audit ---------------- */
+
+    SharedPreferences prefs() {
+        return getSharedPreferences("settings", MODE_PRIVATE);
+    }
+
+    /** Alert toggles; on unless turned off in Settings. */
+    boolean setting(String key) {
+        return prefs().getBoolean(key, true);
+    }
+
+    /** Every resolved request, newest first, at most 200 (app-private storage on this tablet). */
+    private void audit(JSONObject p) {
+        String status = p.optString("status");
+        if (status.equals("pending")) return;
+        try {
+            JSONArray old = new JSONArray(prefs().getString("audit", "[]"));
+            String key = p.optString("id") + "#" + p.optInt("revision");
+            for (int i = 0; i < old.length(); i++) if (key.equals(old.getJSONObject(i).optString("key"))) return;
+            JSONObject a = model.agent(p.optString("agentId"));
+            JSONArray out = new JSONArray().put(new JSONObject().put("key", key)
+                    .put("agent", a != null ? a.optString("name", "Agent") : "Agent").put("command", p.optString("command"))
+                    .put("decision", p.optString("decision", status)).put("risk", p.optString("risk"))
+                    .put("fromPc", p.optBoolean("fromPc")).put("ts", p.optLong("decidedAt", System.currentTimeMillis())));
+            for (int i = 0; i < old.length() && out.length() < 200; i++) out.put(old.get(i));
+            prefs().edit().putString("audit", out.toString()).commit();
+        } catch (Exception ignored) { }
+    }
+
+    List<JSONObject> auditRows() {
+        List<JSONObject> out = new ArrayList<JSONObject>();
+        try {
+            JSONArray a = new JSONArray(prefs().getString("audit", "[]"));
+            for (int i = 0; i < a.length(); i++) out.add(a.getJSONObject(i));
+        } catch (Exception ignored) { }
+        return out;
+    }
+
     /* ---------------- live transcript subscriptions (data/live.ts) ---------------- */
 
     Model.View openView(String sessionId) {
@@ -376,7 +480,7 @@ public final class App extends Application {
     }
 
     void notifyApproval(JSONObject p) {
-        if (p == null || visible > 0 || !Model.isPending(p, System.currentTimeMillis())) return;
+        if (p == null || visible > 0 || !setting("approvalAlerts") || !Model.isPending(p, System.currentTimeMillis())) return;
         JSONObject a = model.agent(p.optString("agentId"));
         String who = a != null ? a.optString("name", "Agent") : "Agent";
         Intent open = new Intent(this, MainActivity.class).putExtra("sessionId", p.optString("sessionId"))
@@ -384,13 +488,26 @@ public final class App extends Application {
         PendingIntent pi = PendingIntent.getActivity(this, noteId(p.optString("id")), open,
                 PendingIntent.FLAG_UPDATE_CURRENT | (android.os.Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
         Notification.Builder b = new Notification.Builder(this).setSmallIcon(R.drawable.ic_note)
-                .setContentTitle("Approval needed")
+                .setContentTitle(p.optBoolean("fromPc") ? "Approval needed (PC session)" : "Approval needed")
                 .setContentText((p.optString("title").contains(" wants ") ? p.optString("title")
                         : who + " wants to " + p.optString("title").toLowerCase(java.util.Locale.ROOT)) + ": " + p.optString("command"))
                 .setContentIntent(pi).setAutoCancel(true).setDefaults(Notification.DEFAULT_ALL)
                 .setPriority(Notification.PRIORITY_HIGH);
         if (android.os.Build.VERSION.SDK_INT >= 26) b.setChannelId(ConnService.channel(this, "approvals", "Approvals", NotificationManager.IMPORTANCE_HIGH));
         ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(noteId(p.optString("id")), b.build());
+    }
+
+    void notifySession(JSONObject s) {
+        if (visible > 0 || !setting("sessionAlerts")) return;
+        Intent open = new Intent(this, MainActivity.class).putExtra("sessionId", s.optString("id"))
+                .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        int id = 2000 + (s.optString("id").hashCode() & 0xffffff);
+        PendingIntent pi = PendingIntent.getActivity(this, id, open,
+                PendingIntent.FLAG_UPDATE_CURRENT | (android.os.Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
+        Notification.Builder b = new Notification.Builder(this).setSmallIcon(R.drawable.ic_note).setContentTitle("Session finished")
+                .setContentText(s.optString("title")).setContentIntent(pi).setAutoCancel(true);
+        if (android.os.Build.VERSION.SDK_INT >= 26) b.setChannelId(ConnService.channel(this, "sessions", "Finished sessions", NotificationManager.IMPORTANCE_DEFAULT));
+        ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(id, b.build());
     }
 
     void cancelNotification(String permissionId) {

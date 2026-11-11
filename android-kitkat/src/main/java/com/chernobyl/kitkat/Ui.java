@@ -123,6 +123,54 @@ final class Ui {
         return pill(c, "Simulated", TEXT2, SURFACE2);
     }
 
+    /** ADR-018: a session a terminal or VS Code on the PC is writing right now. */
+    static TextView livePc(Context c, boolean inverse) {
+        SpannableStringBuilder sb = new SpannableStringBuilder("● Live on PC");
+        sb.setSpan(new ForegroundColorSpan(0xFF3FA66A), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        TextView t = text(c, sb, 12, inverse ? WHITE : TEXT, true);
+        t.setBackgroundDrawable(box(inverse ? BLACK : WHITE, inverse ? TEXT2 : BLACK, 999, c));
+        t.setPadding(dp(c, 10), dp(c, 3), dp(c, 10), dp(c, 3));
+        return t;
+    }
+
+    /** A tappable pill on the black session header (null listener = read-only). */
+    static TextView chip(Context c, CharSequence label, View.OnClickListener l) {
+        TextView t = text(c, label, 13, WHITE, true);
+        t.setBackgroundDrawable(box(BLACK, TEXT2, 999, c));
+        t.setPadding(dp(c, 12), dp(c, 7), dp(c, 12), dp(c, 7));
+        t.setSingleLine(true);
+        if (l != null) t.setOnClickListener(l);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.rightMargin = dp(c, 8);
+        t.setLayoutParams(lp);
+        return t;
+    }
+
+    /** A titled sheet (dialog) around `body`, scrollable; the caller adds rows that dismiss it. */
+    static AlertDialog sheet(Context c, String title, View body) {
+        android.widget.ScrollView sv = new android.widget.ScrollView(c);
+        int p = dp(c, 16);
+        body.setPadding(p, dp(c, 8), p, p);
+        sv.addView(body);
+        return new AlertDialog.Builder(c).setTitle(title).setView(sv).setNegativeButton("Close", null).create();
+    }
+
+    /** One radio-like row of a sheet: bold title, caption, a check when on. */
+    static View choiceRow(Context c, String title, String caption, boolean on, View.OnClickListener l) {
+        LinearLayout r = row(c);
+        r.setBackgroundDrawable(box(on ? SURFACE2 : WHITE, on ? BLACK : BORDER, 12, c));
+        int p = dp(c, 12);
+        r.setPadding(p, p, p, p);
+        LinearLayout t = col(c);
+        t.addView(text(c, title, 15, TEXT, true));
+        if (caption != null) t.addView(text(c, caption, 12, TEXT2, false));
+        r.addView(t, weight(1));
+        if (on) r.addView(text(c, "✓", 18, TEXT, true));
+        r.setOnClickListener(l);
+        addMargin(r, 0, 0, 0, 8);
+        return r;
+    }
+
     static String capital(String s) {
         return s.isEmpty() ? s : Character.toUpperCase(s.charAt(0)) + s.substring(1);
     }
@@ -300,10 +348,10 @@ final class Ui {
         LinearLayout box = col(c);
         SpannableStringBuilder sb = new SpannableStringBuilder();
         for (Md.Block b : Md.parse(src)) {
-            if (b.type == Md.CODE) {
+            if (b.type == Md.CODE || b.type == Md.TABLE) {
                 flushText(c, box, sb);
                 HorizontalScrollView hs = new HorizontalScrollView(c);
-                TextView code = mono(c, b.code + " ", WHITE, BLACK);
+                TextView code = b.type == Md.CODE ? mono(c, b.code + " ", WHITE, BLACK) : mono(c, b.code + " ", TEXT, SURFACE2);
                 hs.addView(code);
                 addMargin(hs, 0, 4, 0, 6);
                 box.addView(hs);
@@ -432,6 +480,8 @@ final class Ui {
         head.addView(pill(c, Ui.capital(risk) + " risk", risk.equals("high") ? ERROR : risk.equals("medium") ? WARNING : TEXT2,
                 risk.equals("high") ? ERROR_BG : risk.equals("medium") ? WARNING_BG : SURFACE2));
         box.addView(head);
+        // ADR-018: asked by a Claude Code session in a terminal or VS Code on the PC (Allow / Deny only)
+        if (p.optBoolean("fromPc")) box.addView(text(c, "Approval needed · from a PC session", 12, TEXT2, true));
         JSONObject d = p.optJSONObject("detail");
         if (d != null && "edit".equals(d.optString("kind")) && d.has("patch")) {
             View df = diff(c, d.optString("path"), d.optString("patch"));

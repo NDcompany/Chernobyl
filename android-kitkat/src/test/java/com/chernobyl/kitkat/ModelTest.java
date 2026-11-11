@@ -129,7 +129,9 @@ public class ModelTest {
         // every client message type this app sends appears in the shared valid fixture
         String valid = read("client-valid.json") + read("composer-valid.json");
         String[] sent = {"session_subscribe", "session_unsubscribe", "submit_prompt", "permission_decision",
-            "create_session", "fs_list", "fs_read", "git_status", "git_diff", "git_stage", "git_unstage", "git_commit", "git_push"};
+            "create_session", "fs_list", "fs_read", "git_status", "git_diff", "git_stage", "git_unstage", "git_commit", "git_push",
+            "git_pull", "terminal_run", "terminal_stop", "set_model", "rename_session", "set_permission_mode", "session_end",
+            "mcp_auth", "mcp_auth_callback", "mcp_reconnect"};
         for (String t : sent) assertTrue(t, valid.contains("\"" + t + "\""));
     }
 
