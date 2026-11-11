@@ -10,14 +10,21 @@
 #   3. creates an access token once, stored in the user variable HOST_TOKEN (never in a file)
 #   4. allows inbound TCP on the port for Private networks (if run as admin)
 #   5. registers start-on-login and starts the companion in the background
-#   6. prints the pairing QR for ws://<this PC's LAN IP>:<port>
+#   6. prints the pairing QR for ws://<this PC's LAN IP>:<port> (and -TunnelUrl after it)
+#
+# Away from home: point a free tunnel (Cloudflare Tunnel, ngrok, loophole) at http://127.0.0.1:<port>
+# and pass its public URL, e.g. -TunnelUrl wss://chernobyl.example.com. The phone tries the LAN first,
+# then the tunnel. Tunnel traffic arrives from loopback, so this also turns on requireE2e: every
+# connection must complete the paired E2E handshake (the tunnel only ever sees ciphertext).
 param(
   [Parameter(Mandatory = $true)][string[]]$Workspaces,
   [int]$Port = 8787,
   [string]$Exe = (Join-Path $PSScriptRoot '..\services\companion-rs\target\release\chernobyl-companion.exe'),
-  [switch]$NoAutostart
+  [switch]$NoAutostart,
+  [string]$TunnelUrl
 )
 $ErrorActionPreference = 'Stop'
+if ($TunnelUrl -and $TunnelUrl -notmatch '^wss://[^/\s]+/?$') { throw "-TunnelUrl must look like wss://host (got $TunnelUrl)" }
 
 if (-not (Test-Path $Exe)) { throw "No companion exe at $Exe. Build it first: cargo build --release --manifest-path services\companion-rs\Cargo.toml" }
 if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { Write-Warning 'claude is not on PATH: install Claude Code and sign in (run "claude" once) before starting sessions.' }
@@ -48,7 +55,7 @@ $cfg = [ordered]@{
   retention = [ordered]@{ events = 5000; eventsMaxAgeMs = 604800000 }
   diagnostics = [ordered]@{ port = 9487 }
   probeIntervalMs = 15000
-  server = [ordered]@{ port = $Port; bind = '0.0.0.0' }
+  server = [ordered]@{ port = $Port; bind = '0.0.0.0'; requireE2e = [bool]$TunnelUrl }
 }
 [IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding $false))
 Write-Host "Wrote $cfgPath"
@@ -91,6 +98,8 @@ Write-Host ''
 Write-Host "Phone setup: open CHERNOBYL > Pair with a host. Enter this access token in the token field, then scan the QR below."
 Write-Host "Access token: $token" -ForegroundColor Yellow
 Write-Host ''
-& $target --pair --endpoint "ws://${ip}:$Port"
+$endpoints = @('--endpoint', "ws://${ip}:$Port")
+if ($TunnelUrl) { $endpoints += @('--endpoint', $TunnelUrl.TrimEnd('/')) }
+& $target --pair @endpoints
 Write-Host ''
-Write-Host "Each QR works once. For a new one later: & '$target' --pair --endpoint ws://${ip}:$Port"
+Write-Host "Each QR works once. For a new one later: & '$target' --pair $($endpoints -join ' ')"
