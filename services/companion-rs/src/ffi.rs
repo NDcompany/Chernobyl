@@ -47,7 +47,8 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn WSAStartup(ver: u16, data: *mut u8) -> i32;
     fn WSAGetLastError() -> i32;
-    fn socket(af: i32, ty: i32, proto: i32) -> u64;
+    fn WSASocketW(af: i32, ty: i32, proto: i32, info: *const c_void, group: u32, flags: u32)
+    -> u64;
     fn bind(s: u64, addr: *const u8, len: i32) -> i32;
     fn listen(s: u64, backlog: i32) -> i32;
     fn closesocket(s: u64) -> i32;
@@ -58,6 +59,9 @@ const SOCK_STREAM: i32 = 1;
 const IPPROTO_TCP: i32 = 6;
 const INVALID_SOCKET: u64 = u64::MAX;
 const SOMAXCONN: i32 = 0x7fffffff;
+/// What std's own sockets use: overlapped, and never inherited by a child.
+const WSA_FLAG_OVERLAPPED: u32 = 0x01;
+const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
 
 /// `bind` + `listen(SOMAXCONN)` with a real backlog. std's TcpListener::bind
 /// exposes no backlog knob and effectively queues only ~128 handshakes: the
@@ -79,9 +83,20 @@ pub fn bind_listener_backlog(ipv4: &str, port: u16) -> Result<std::net::TcpListe
         .map_err(|_| format!("backlog listener needs an IPv4 bind address, got '{ipv4}'"))?
         .octets();
     unsafe {
-        let s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        // not `socket()`: its handle is inheritable, and so is every socket
+        // accept() returns from it, so each child the companion spawns (git,
+        // claude.exe, codex) held a copy of every live connection, which kept
+        // closed connections open or reset them when the child exited
+        let s = WSASocketW(
+            AF_INET,
+            SOCK_STREAM,
+            IPPROTO_TCP,
+            std::ptr::null(),
+            0,
+            WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+        );
         if s == INVALID_SOCKET {
-            return Err(format!("socket() failed: {}", WSAGetLastError()));
+            return Err(format!("WSASocketW() failed: {}", WSAGetLastError()));
         }
         let mut addr = [0u8; 16]; // sockaddr_in: family(le), port(be), addr, zero[8]
         addr[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
@@ -102,6 +117,46 @@ pub fn bind_listener_backlog(ipv4: &str, port: u16) -> Result<std::net::TcpListe
             s as std::os::windows::io::RawSocket,
         ))
     }
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn SetHandleInformation(handle: usize, mask: u32, flags: u32) -> i32;
+    fn GetHandleInformation(handle: usize, flags: *mut u32) -> i32;
+}
+
+const HANDLE_FLAG_INHERIT: u32 = 0x01;
+
+/// Clears the inherit flag, so a child process (git, claude.exe, codex) never
+/// holds a copy of the socket: std's Windows `try_clone` returns an
+/// inheritable handle (measured), and an inherited copy keeps a connection
+/// the companion closed open until that child exits, then resets it.
+pub fn no_inherit(s: &impl std::os::windows::io::AsRawSocket) -> std::io::Result<()> {
+    if unsafe { SetHandleInformation(s.as_raw_socket() as usize, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `TcpStream::try_clone` without the inheritable handle ([`no_inherit`]).
+pub fn clone_stream(s: &std::net::TcpStream) -> std::io::Result<std::net::TcpStream> {
+    let c = s.try_clone()?;
+    no_inherit(&c)?;
+    Ok(c)
+}
+
+/// `TcpListener::try_clone` without the inheritable handle ([`no_inherit`]).
+pub fn clone_listener(l: &std::net::TcpListener) -> std::io::Result<std::net::TcpListener> {
+    let c = l.try_clone()?;
+    no_inherit(&c)?;
+    Ok(c)
+}
+
+/// True when a child process would inherit this socket (tests).
+pub fn inheritable(s: &impl std::os::windows::io::AsRawSocket) -> bool {
+    let mut flags = 0u32;
+    let read = unsafe { GetHandleInformation(s.as_raw_socket() as usize, &mut flags) } != 0;
+    read && flags & HANDLE_FLAG_INHERIT != 0
 }
 
 #[repr(C)]
@@ -392,6 +447,28 @@ mod tests {
         assert!(a.iter().any(|&x| x != 0));
         // empty request is a no-op, not an error
         assert!(csprng_fill(&mut []).is_ok());
+    }
+
+    /// Children spawned while connections are open (git, claude.exe, codex)
+    /// must not inherit them: the backlog listener, what it accepts, and
+    /// every clone the server takes.
+    #[test]
+    fn server_sockets_are_never_inherited_by_children() {
+        let l = bind_listener_backlog("127.0.0.1", 0).unwrap();
+        let addr = l.local_addr().unwrap();
+        let _client = std::net::TcpStream::connect(addr).unwrap();
+        let (accepted, _) = l.accept().unwrap();
+        assert!(!inheritable(&l), "listener");
+        assert!(!inheritable(&accepted), "accepted socket");
+        assert!(
+            inheritable(&accepted.try_clone().unwrap()),
+            "std's clone is inheritable"
+        );
+        assert!(
+            !inheritable(&clone_stream(&accepted).unwrap()),
+            "clone_stream"
+        );
+        assert!(!inheritable(&clone_listener(&l).unwrap()), "clone_listener");
     }
 
     #[test]

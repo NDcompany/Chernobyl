@@ -8,6 +8,9 @@ export const PROTOCOL_VERSION = 2 as const;
 /** ADR-015: `hello_ack.features` entry for the live transcript extension (still v2). */
 export const FEATURE_TRANSCRIPT = 'transcript.v1';
 
+/** ADR-016: `hello_ack.features` entry for workspace files and git (still v2). */
+export const FEATURE_WORKSPACE = 'workspace.v1';
+
 /** Permission requests older than this are stale and must not be decided on. */
 export const PERMISSION_TTL_MS = 2 * 60_000;
 

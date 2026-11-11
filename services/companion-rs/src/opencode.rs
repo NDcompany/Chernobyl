@@ -378,7 +378,8 @@ impl OpenCodeAdapter {
             | ClientMsg::Ping { .. }
             | ClientMsg::ListState { .. }
             | ClientMsg::HsHello { .. }
-            | ClientMsg::HsProof { .. } => Err(AdapterError::Unsupported(
+            | ClientMsg::HsProof { .. }
+            | ClientMsg::Workspace { .. } => Err(AdapterError::Unsupported(
                 "session-neutral messages stay with the engine".into(),
             )),
             // No end or permission-mode equivalent (§4.4). Subscriptions
@@ -1849,9 +1850,8 @@ impl Inner {
             .set_read_timeout(Some(timeout))
             .map_err(|e| AdapterError::Unknown(e.to_string()))?;
         let _ = stream.set_nodelay(true);
-        let reader_stream = stream
-            .try_clone()
-            .map_err(|e| AdapterError::Unknown(e.to_string()))?;
+        let reader_stream =
+            crate::ffi::clone_stream(&stream).map_err(|e| AdapterError::Unknown(e.to_string()))?;
         reader_stream
             .set_read_timeout(Some(timeout))
             .map_err(|e| AdapterError::Unknown(e.to_string()))?;

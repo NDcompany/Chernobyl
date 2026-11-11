@@ -72,7 +72,9 @@ commands (decision D2): the E2E session handshake must complete first (see
 | Sign in | `/sign-in` | mock auth, no credentials checked |
 | Home dashboard | `/` (tabs) | stats, active agents, pending approvals, activity, search |
 | Agents | `/agents` | search + full list |
-| Agent details | `/agent/[id]` | capabilities, sessions, activity, start session |
+| Agent details | `/agent/[id]` | capabilities, workspaces (Files, Changes), sessions, activity, start session |
+| Files | `/files/[workspace]`, `/file/[workspace]` | read-only folder browser and text viewer of an allow-listed workspace |
+| Changes | `/changes/[workspace]` | git status, diffs, stage/unstage, commit, push (confirmed) |
 | Sessions | `/sessions` | All / Running / Waiting / Completed filters + search |
 | Session workspace | `/session/[id]` | live conversation for transcript sessions (see below); otherwise Output / Files / Activity, send, interrupt |
 | Approvals | `/approvals` | pending (live countdowns) + decided history |
@@ -128,6 +130,12 @@ servers load when the session starts. Drive roots, your user-profile root and an
 contains the CHERNOBYL data directory are refused. Bypass-permissions modes are never reachable
 from the phone. Per-runtime limits: `docs/INTEGRATIONS.md`; threats and controls:
 `docs/decisions/PHASE5-THREAT-MODEL.md` §3.12.
+
+**Files and Changes (ADR-016).** From an agent's workspace (agent screen, or the Files and
+Changes chips on a live conversation) the phone browses the allow-listed folder read-only
+(secrets masked, `.env*` values hidden) and reviews git: status, diffs, stage and unstage,
+commit, and push the current branch to its upstream (never forced). No pull, no file editing,
+no terminal.
 
 ## Backend runtime
 

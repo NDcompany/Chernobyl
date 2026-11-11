@@ -168,5 +168,18 @@
   {
     "why": "extras do not relax the decision whitelist",
     "msg": { "type": "permission_decision", "commandId": "c", "permissionId": "p", "decision": "allow", "revision": 1, "optionId": "allow" }
-  }
+  },
+  { "why": "workspace action without workspaceId", "msg": { "type": "git_status", "commandId": "c" } },
+  { "why": "workspace action with empty workspaceId", "msg": { "type": "git_push", "commandId": "c", "workspaceId": "" } },
+  { "why": "workspace action without commandId", "msg": { "type": "fs_list", "workspaceId": "w" } },
+  { "why": "fs_list path not a string", "msg": { "type": "fs_list", "commandId": "c", "workspaceId": "w", "path": 3 } },
+  { "why": "fs_read without path", "msg": { "type": "fs_read", "commandId": "c", "workspaceId": "w" } },
+  { "why": "fs_read with empty path", "msg": { "type": "fs_read", "commandId": "c", "workspaceId": "w", "path": "" } },
+  { "why": "git_diff staged not a boolean", "msg": { "type": "git_diff", "commandId": "c", "workspaceId": "w", "staged": "yes" } },
+  { "why": "git_stage without paths", "msg": { "type": "git_stage", "commandId": "c", "workspaceId": "w" } },
+  { "why": "git_stage with no paths", "msg": { "type": "git_stage", "commandId": "c", "workspaceId": "w", "paths": [] } },
+  { "why": "git_unstage with an empty path", "msg": { "type": "git_unstage", "commandId": "c", "workspaceId": "w", "paths": [""] } },
+  { "why": "git_unstage paths not strings", "msg": { "type": "git_unstage", "commandId": "c", "workspaceId": "w", "paths": [1] } },
+  { "why": "git_commit with empty message", "msg": { "type": "git_commit", "commandId": "c", "workspaceId": "w", "message": "" } },
+  { "why": "git_commit without message", "msg": { "type": "git_commit", "commandId": "c", "workspaceId": "w" } }
 ]

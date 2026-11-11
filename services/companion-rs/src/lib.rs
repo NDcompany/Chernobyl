@@ -18,6 +18,7 @@
 //! options, stdin encoders, launch and workspace policy). claude_runtime:
 //! ADR-015 Claude Code live runtime (driven processes behind LiveRuntime).
 //! claude_history: Claude Code sessions on disk (discovery and replay).
+//! workspace: ADR-016 read-only files and git for allow-listed workspaces.
 
 pub mod adapters;
 pub mod backup;
@@ -48,4 +49,5 @@ pub mod sha1;
 pub mod storage;
 pub mod transcript;
 pub mod tui;
+pub mod workspace;
 pub mod ws;

@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import {
   FEATURE_TRANSCRIPT,
+  FEATURE_WORKSPACE,
   MockEngine,
   applyTranscript,
   emptyTranscriptView,
@@ -100,7 +101,7 @@ test('server fixtures validate: transcript, snapshot, permission extras, hello_a
     assert.ok(isServerMessage(fixture(name)), name);
   }
   const hello = fixture('hello-ack.json') as Record<string, unknown>;
-  assert.deepEqual(hello.features, [FEATURE_TRANSCRIPT]);
+  assert.deepEqual(hello.features, [FEATURE_TRANSCRIPT, FEATURE_WORKSPACE]);
   assert.ok(!isServerMessage({ ...hello, features: FEATURE_TRANSCRIPT }), 'features must be an array');
   const { features: _omitted, ...legacyHello } = hello;
   assert.ok(isServerMessage(legacyHello), 'features stays optional');

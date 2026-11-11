@@ -533,7 +533,7 @@ fn start(name: &str, f: impl FnOnce() + Send + 'static) -> io::Result<()> {
 }
 
 /// `CREATE_NO_WINDOW`: a console runtime must not flash a window.
-fn no_window(cmd: &mut Command) -> &mut Command {
+pub(crate) fn no_window(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(cmd, 0x0800_0000);
     cmd

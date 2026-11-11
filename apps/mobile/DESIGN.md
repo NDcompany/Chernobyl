@@ -84,6 +84,14 @@ CLI's models or the `default`/`sonnet`/`opus`/`haiku` aliases), `ContextChip` ("
 warning dot from 80%, hidden while unknown) and `RenameChip` (pencil; sheet with a text field,
 80 characters) share the chip style and its `dark` variant.
 
+**`workspace.tsx`** — ADR-016 Files / Changes pieces, presentational only (pure logic in
+`src/utils/workspace.ts`, unit-tested): `WorkspaceUnavailable` ("Connect a PC" without
+`workspace.v1`, "Workspace not found" for an unknown id), `CodeView` (a text file mono on black
+like the transcript's code blocks, sideways scroll, rendered in 200-line chunks, each line ending
+in a space), `GitFileRow` (porcelain letter, path cut in the middle via RN `Text`'s
+`ellipsizeMode`, a pill Stage/Unstage toggle; tap the path to open its diff). Diffs reuse the
+transcript's `DiffView`.
+
 **`icons.tsx`** — `Icon` + `IconName` (40 names, 24×24 stroke grid, `strokeWidth` prop). New icon =
 add path to `PATHS`, never inline Svg in a screen.
 
@@ -144,6 +152,16 @@ own confirm or full-URL display. The app's mock runs `MockEngine` in live mode: 
 billing session plays one scripted transcript (thinking, plan, streamed text, an Edit diff, an
 inline `npm test` approval), badged Simulated because its agent and host are `simulated`.
 
+**Files and Changes (ADR-016):** shown only when `hello_ack.features` has `workspace.v1` and the
+agent lists the workspace (`Agent.live.workspaces`); the simulation never advertises it, so the
+entry points are hidden and a deep link shows `WorkspaceUnavailable` (ADR-009: no fake files).
+Reads (`@/data/workspace` `useWorkspaceRead`) are request/response on the same transport: the
+`workspace_result` arrives right before its ack, nothing is cached or persisted, and an error is
+shown inline (never a toast). Git changes go through `useCommands` (ack errors toast, a lost ack
+is an unknown outcome) via `useGitChange`, which resolves with the command's `command_result`;
+git's own failure text shows in a "Git said" card, and the status is re-read after every change.
+Push always confirms with the exact `branch → upstream`.
+
 **Provenance travels with the data:** `Host`/`Agent` carry `simulated: true` when they come from a
 mock seed/engine (the app's offline mock or a companion's demo `mock` adapter); real adapters omit the
 key. `SimulationBadge` shows while the transport is the app's mock OR the snapshot has any simulated
@@ -183,6 +201,10 @@ carry a `SimulatedTag`. Derived from the keystore pairing and store transport st
 Tabs: `(tabs)/index` Home · `agents` → `agent/[id]` · `sessions` → `session/[id]` · `approvals` →
 `permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field; agents with `live.composer` `model` get a Model chip row, Default sending no `model`).
 Full-screen (no gesture back): `onboarding`, `sign-in`.
+Workspace (ADR-016): `files/[workspace]?path=` (one screen per folder, so Back walks up),
+`file/[workspace]?path=` (text viewer), `changes/[workspace]` (git). Entry points: the agent
+screen's Workspaces section and the Files / Changes chips in the live conversation header (the
+session's workspace is the one whose `path` equals `Session.project`).
 
 `session/[id]` is the live conversation (see Live sessions) or the classic workspace; its black
 header's chip row wraps: MCP, permission mode, model, context, then rename and End session on the

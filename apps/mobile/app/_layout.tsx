@@ -37,6 +37,9 @@ export default function RootLayout() {
             <Stack.Screen name="session/[id]" />
             <Stack.Screen name="permission/[id]" />
             <Stack.Screen name="settings/[section]" />
+            <Stack.Screen name="files/[workspace]" />
+            <Stack.Screen name="file/[workspace]" />
+            <Stack.Screen name="changes/[workspace]" />
           </Stack>
           <StatusBar style="dark" />
           <SimulationBadge />

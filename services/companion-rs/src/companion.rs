@@ -14,11 +14,13 @@ use crate::ffi;
 use crate::ollama::OllamaAdapter;
 use crate::opencode::OpenCodeAdapter;
 use crate::protocol::{
-    Agent, ClientMsg, EventKind, PROTOCOL_VERSION, PromptImage, ServerMsg, Session, now_ms,
+    Agent, ClientMsg, EventKind, PROTOCOL_VERSION, PromptImage, ServerMsg, Session, WorkspaceOp,
+    now_ms,
 };
 use crate::server::Outbound;
 use crate::storage::{CommandRecord, Storage};
 use crate::transcript::{Hub, HubHandle};
+use crate::workspace::Workspace;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -79,6 +81,8 @@ enum Route {
     Runtime(Arc<dyn LiveRuntime>),
     /// Two healthy runtimes claim the same agent, session or permission id.
     Ambiguous,
+    /// ADR-016: a workspace file or git action, run by the companion itself.
+    Workspace,
 }
 
 pub struct Shared {
@@ -131,6 +135,8 @@ pub struct Companion {
     pub malformed_total: std::sync::atomic::AtomicU64,
     /// See [`CONTROL_KEY_FILE`].
     control_key: String,
+    /// ADR-016 T1: workspaces with a git action in flight (one at a time).
+    workspace_busy: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Companion {
@@ -256,6 +262,7 @@ impl Companion {
             events_total,
             malformed_total: std::sync::atomic::AtomicU64::new(0),
             control_key,
+            workspace_busy: Arc::default(),
         };
 
         // Boot reconciliation: unresolved commands → unknown (never re-run),
@@ -460,7 +467,7 @@ impl Companion {
                     permission_id,
                 });
             }
-            let kind = match msg {
+            let kind = match &msg {
                 ClientMsg::CreateSession { .. } => "create_session",
                 ClientMsg::SubmitPrompt { .. } => "submit_prompt",
                 ClientMsg::Interrupt { .. } => "interrupt",
@@ -472,6 +479,7 @@ impl Companion {
                 ClientMsg::McpReconnect { .. } => "mcp_reconnect",
                 ClientMsg::SetModel { .. } => "set_model",
                 ClientMsg::RenameSession { .. } => "rename_session",
+                ClientMsg::Workspace { op, .. } => op.kind(),
                 _ => unreachable!(),
             };
             let payload = json_text(&msg);
@@ -594,6 +602,14 @@ impl Companion {
                 msg_cmd_id.as_deref().unwrap_or(""),
                 AMBIGUOUS,
             )),
+            Route::Workspace => match &msg {
+                ClientMsg::Workspace {
+                    command_id,
+                    workspace_id,
+                    op,
+                } => Some(self.workspace_command(command_id, workspace_id, op)),
+                _ => None,
+            },
             Route::Engine => {
                 let mut engine = self.engine.lock().unwrap();
                 engine.handle(msg)
@@ -746,6 +762,140 @@ impl Companion {
         ServerMsg::ack_ok(command_id, Some(session_id))
     }
 
+    /// ADR-016: the allow-listed workspace `id` names (an entry of any
+    /// runtime's `Agent.live.workspaces`), opened for one action.
+    fn workspace(&self, id: &str) -> Result<Workspace, String> {
+        let path = self
+            .runtimes
+            .iter()
+            .flat_map(|r| r.agents())
+            .filter_map(|a| a.live)
+            .flat_map(|l| l.workspaces)
+            .find(|w| w.id == id)
+            .map(|w| w.path)
+            .ok_or("unknown workspace")?;
+        Workspace::open(&path, &self.shared.config.data_dir)
+    }
+
+    /// ADR-016 reads: `fs_list`, `fs_read`, `git_status`, `git_diff`. The
+    /// server calls it on the connection's read loop (so one connection
+    /// runs one read at a time) and sends the `workspace_result` to that
+    /// connection only, right before the ack. Never journaled.
+    pub fn workspace_query(
+        &self,
+        command_id: &str,
+        workspace_id: &str,
+        op: &WorkspaceOp,
+    ) -> (Option<ServerMsg>, ServerMsg) {
+        let result = self.workspace(workspace_id).and_then(|ws| match op {
+            WorkspaceOp::FsList { path } => ws.list(path),
+            WorkspaceOp::FsRead { path } => ws.read(path),
+            WorkspaceOp::GitStatus => ws.status(),
+            WorkspaceOp::GitDiff { path, staged } => ws.diff(path.as_deref(), *staged),
+            _ => Err("this action changes the repository; it is a command".into()),
+        });
+        match result {
+            Ok(result) => (
+                Some(ServerMsg::WorkspaceResult {
+                    command_id: command_id.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    result,
+                }),
+                ServerMsg::ack_ok(command_id, None),
+            ),
+            Err(e) => (None, ServerMsg::ack_err(command_id, &e)),
+        }
+    }
+
+    /// ADR-016 mutations (`git_stage`, `git_unstage`, `git_commit`,
+    /// `git_push`), after `handle_client_msg` persisted and deduplicated
+    /// them: one at a time per workspace (T1), acked on acceptance, run on
+    /// a worker thread, closed by exactly one `command_result` (G1). Commit
+    /// and push leave an audit record. A read arriving here (not through
+    /// the server) gets its ack only.
+    fn workspace_command(
+        &self,
+        command_id: &str,
+        workspace_id: &str,
+        op: &WorkspaceOp,
+    ) -> ServerMsg {
+        if !op.is_mutating() {
+            return self.workspace_query(command_id, workspace_id, op).1;
+        }
+        let ws = match self.workspace(workspace_id) {
+            Ok(ws) => ws,
+            Err(e) => return ServerMsg::ack_err(command_id, &e),
+        };
+        if !self
+            .workspace_busy
+            .lock()
+            .unwrap()
+            .insert(workspace_id.to_string())
+        {
+            return ServerMsg::ack_err(
+                command_id,
+                "another git action is still running in this workspace",
+            );
+        }
+        let (busy, sink, shared) = (
+            self.workspace_busy.clone(),
+            self.engine_sink(),
+            self.shared.clone(),
+        );
+        let (cmd, wid, job) = (command_id.to_string(), workspace_id.to_string(), op.clone());
+        let started = std::thread::Builder::new()
+            .name("workspace-git".into())
+            .spawn(move || {
+                let outcome = match &job {
+                    WorkspaceOp::GitStage { paths } => ws.stage(paths),
+                    WorkspaceOp::GitUnstage { paths } => ws.unstage(paths),
+                    WorkspaceOp::GitCommit { message } => ws.commit(message),
+                    _ => ws.push(),
+                };
+                busy.lock().unwrap().remove(&wid);
+                let audit = match &job {
+                    WorkspaceOp::GitCommit { message } => Some((
+                        "git-commit",
+                        message
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(72)
+                            .collect(),
+                    )),
+                    WorkspaceOp::GitPush => Some(("git-push", String::from("push"))),
+                    _ => None,
+                };
+                if let Some((kind, what)) = audit {
+                    let verdict = match &outcome {
+                        Ok(done) => format!("ok: {done}"),
+                        Err(e) => format!("failed: {e}"),
+                    };
+                    let _ = shared
+                        .storage
+                        .lock()
+                        .unwrap()
+                        .append_audit(kind, &format!("{wid}: {what} ({verdict})"));
+                }
+                let failed = outcome.is_err();
+                sink(EventKind::CommandResult {
+                    command_id: cmd,
+                    status: if failed { "failed" } else { "completed" }.into(),
+                    error: outcome.err(),
+                    session_id: None,
+                    permission_id: None,
+                });
+            });
+        match started {
+            Ok(_) => ServerMsg::ack_ok(command_id, None),
+            Err(e) => {
+                self.workspace_busy.lock().unwrap().remove(workspace_id);
+                ServerMsg::ack_err(command_id, &format!("could not start the git action: {e}"))
+            }
+        }
+    }
+
     /// Healthy runtimes for which `claimed` holds, in config order.
     fn claimants(&self, claimed: impl Fn(&dyn LiveRuntime) -> bool) -> Vec<Arc<dyn LiveRuntime>> {
         self.runtimes
@@ -820,6 +970,7 @@ impl Companion {
             | ClientMsg::HsProof { .. }
             | ClientMsg::SessionSubscribe { .. }
             | ClientMsg::SessionUnsubscribe { .. } => return Route::Engine,
+            ClientMsg::Workspace { .. } => return Route::Workspace,
         };
         match claimants.as_slice() {
             [] => Route::Engine,
@@ -1540,6 +1691,11 @@ fn json_text(msg: &ClientMsg) -> String {
             ("sessionId", json::s(session_id)),
             ("title", json::s(title)),
         ]),
+        ClientMsg::Workspace {
+            command_id,
+            workspace_id,
+            op,
+        } => op.to_json(command_id, workspace_id),
     };
     json::stringify(&v)
 }
@@ -2316,6 +2472,8 @@ mod tests {
         sessions: Vec<String>,
         permissions: Vec<String>,
         sent: Mutex<Vec<ClientMsg>>,
+        /// ADR-016: an allow-listed workspace on its agents' `live`.
+        workspace: Mutex<Option<crate::protocol::LiveWorkspace>>,
     }
 
     impl FakeRuntime {
@@ -2328,6 +2486,7 @@ mod tests {
                 sessions: owned(sessions),
                 permissions: owned(perms),
                 sent: Mutex::new(Vec::new()),
+                workspace: Mutex::new(None),
             })
         }
 
@@ -2348,17 +2507,27 @@ mod tests {
             self.healthy.load(Ordering::SeqCst)
         }
         fn agents(&self) -> Vec<Agent> {
-            let agent = |id: &String| Agent {
-                id: id.clone(),
-                host_id: self.id.clone(),
-                kind: "fake".into(),
-                name: id.clone(),
-                state: "online".into(),
-                capabilities: vec![],
-                accepts_new_session: true,
-                simulated: false,
-                live: None,
-            };
+            let agent =
+                |id: &String| Agent {
+                    id: id.clone(),
+                    host_id: self.id.clone(),
+                    kind: "fake".into(),
+                    name: id.clone(),
+                    state: "online".into(),
+                    capabilities: vec![],
+                    accepts_new_session: true,
+                    simulated: false,
+                    live: self.workspace.lock().unwrap().clone().map(|w| {
+                        crate::protocol::AgentLive {
+                            prompt_while_busy: "queue",
+                            interrupt: true,
+                            end: true,
+                            permission_modes: vec![],
+                            workspaces: vec![w],
+                            composer: Vec::new(),
+                        }
+                    }),
+                };
             self.agents.iter().map(agent).collect()
         }
         fn sessions(&self) -> Vec<Session> {
@@ -3281,6 +3450,179 @@ mod tests {
         comp.shutdown(true);
         let on_disk = std::fs::read_to_string(&journal).unwrap();
         assert!(!on_disk.contains(secret) && !on_disk.contains("\"two\""));
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    // ---- ADR-016: workspace files and git ----
+
+    /// A companion whose fake runtime allow-lists a fresh git repository.
+    fn with_workspace(tag: &str) -> (Companion, CompanionConfig, std::path::PathBuf, String) {
+        let c = temp_config(tag);
+        let mut comp = Companion::boot(c.clone()).unwrap();
+        let root = crate::workspace::tests::repo(tag);
+        let path = crate::claude_live::plain(&std::fs::canonicalize(&root).unwrap());
+        let id = crate::claude_live::workspace_id(&path);
+        let rt = FakeRuntime::new("fake-ws", &["agent-ws"], &[], &[]);
+        *rt.workspace.lock().unwrap() = Some(crate::protocol::LiveWorkspace {
+            id: id.clone(),
+            label: "repo".into(),
+            path,
+        });
+        comp.runtimes.push(rt);
+        (comp, c, root, id)
+    }
+
+    fn ws_msg(command_id: &str, workspace_id: &str, op: WorkspaceOp) -> ClientMsg {
+        ClientMsg::Workspace {
+            command_id: command_id.into(),
+            workspace_id: workspace_id.into(),
+            op,
+        }
+    }
+
+    /// Polls the command row until its terminal status shows up (the
+    /// reason travels on the `command_result` event and in the audit).
+    fn outcome(comp: &Companion, command_id: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Some(rec) = comp.shared.storage.lock().unwrap().commands.get(command_id)
+                && matches!(rec.status.as_str(), "completed" | "failed")
+            {
+                return rec.status.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{command_id} never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn workspace_reads_answer_with_a_result_then_an_ack() {
+        let (comp, c, root, id) = with_workspace("ws-read");
+        std::fs::write(root.join(".env"), "TOKEN=abc123\n").unwrap();
+        let (result, ack) = comp.workspace_query(
+            "r1",
+            &id,
+            &WorkspaceOp::FsRead {
+                path: ".env".into(),
+            },
+        );
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        let text = result.unwrap().to_text();
+        assert!(
+            text.contains("workspace_result") && !text.contains("abc123"),
+            "{text}"
+        );
+        // unknown workspace and escapes are refused, never journaled
+        let (none, ack) = comp.workspace_query("r2", "000000000000", &WorkspaceOp::GitStatus);
+        assert!(none.is_none());
+        assert!(
+            matches!(ack, ServerMsg::Ack { ok: false, error: Some(ref e), .. } if e == "unknown workspace")
+        );
+        let (none, _) = comp.workspace_query("r3", &id, &WorkspaceOp::FsList { path: "..".into() });
+        assert!(none.is_none());
+        let store = comp.shared.storage.lock().unwrap();
+        assert!(
+            !store.commands.contains_key("r1"),
+            "reads are never journaled"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    #[test]
+    fn git_commit_runs_once_per_command_id_and_is_audited() {
+        let (comp, c, root, id) = with_workspace("ws-commit");
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        let stage = ws_msg(
+            "s1",
+            &id,
+            WorkspaceOp::GitStage {
+                paths: vec!["a.txt".into()],
+            },
+        );
+        assert!(ok(comp.handle_client_msg(stage)));
+        assert_eq!(outcome(&comp, "s1"), "completed");
+
+        let commit = ws_msg(
+            "c1",
+            &id,
+            WorkspaceOp::GitCommit {
+                message: "add a".into(),
+            },
+        );
+        assert!(ok(comp.handle_client_msg(commit.clone())));
+        assert_eq!(outcome(&comp, "c1"), "completed");
+        // the transport's replay after a reconnect: the original ack, no second commit
+        match comp.handle_client_msg(commit) {
+            Some(ServerMsg::Ack {
+                ok: true,
+                duplicate: true,
+                ..
+            }) => {}
+            other => panic!("expected a duplicate ack, got {other:?}"),
+        }
+        let count = crate::workspace::tests::git(&root, &["rev-list", "--count", "HEAD"]);
+        assert_eq!(count.trim(), "2");
+        {
+            let store = comp.shared.storage.lock().unwrap();
+            assert!(
+                store
+                    .commands
+                    .get("c1")
+                    .unwrap()
+                    .payload
+                    .contains("git_commit")
+            );
+            let audit: Vec<_> = store
+                .audit
+                .iter()
+                .filter(|a| a.kind == "git-commit")
+                .collect();
+            assert_eq!(audit.len(), 1);
+            assert!(audit[0].text.contains("add a"), "{:?}", audit[0].text);
+        }
+        // nothing staged: the command fails with the honest reason
+        let again = ws_msg(
+            "c2",
+            &id,
+            WorkspaceOp::GitCommit {
+                message: "empty".into(),
+            },
+        );
+        assert!(ok(comp.handle_client_msg(again)));
+        assert_eq!(outcome(&comp, "c2"), "failed");
+        // a push without an upstream fails and is audited
+        assert!(ok(comp.handle_client_msg(ws_msg(
+            "p1",
+            &id,
+            WorkspaceOp::GitPush
+        ))));
+        assert_eq!(outcome(&comp, "p1"), "failed");
+        let store = comp.shared.storage.lock().unwrap();
+        let audit = |kind: &str, needle: &str| {
+            store
+                .audit
+                .iter()
+                .any(|a| a.kind == kind && a.text.contains(needle))
+        };
+        assert!(audit("git-commit", crate::workspace::NOTHING_TO_COMMIT));
+        assert!(audit("git-push", "no upstream"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    #[test]
+    fn one_git_action_at_a_time_per_workspace() {
+        let (comp, c, _root, id) = with_workspace("ws-busy");
+        comp.workspace_busy.lock().unwrap().insert(id.clone());
+        let e = refusal(comp.handle_client_msg(ws_msg("b1", &id, WorkspaceOp::GitPush)));
+        assert!(e.contains("still running"), "{e}");
+        comp.workspace_busy.lock().unwrap().clear();
+        let e = refusal(comp.handle_client_msg(ws_msg("b2", "000000000000", WorkspaceOp::GitPush)));
+        assert_eq!(e, "unknown workspace");
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 }

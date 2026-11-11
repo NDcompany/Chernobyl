@@ -298,13 +298,13 @@ pub fn start_with_caps(
 
     for (listener, token, diagnostics_only, cap) in [
         (
-            listener.try_clone().map_err(|e| e.to_string())?,
+            crate::ffi::clone_listener(&listener).map_err(|e| e.to_string())?,
             token.clone(),
             false,
             main_cap,
         ),
         (
-            diag_listener.try_clone().map_err(|e| e.to_string())?,
+            crate::ffi::clone_listener(&diag_listener).map_err(|e| e.to_string())?,
             None,
             true,
             diag_cap,
@@ -416,7 +416,8 @@ fn accept_loop(
                 // listener inherit nonblocking mode — force blocking immediately
                 stream.set_nonblocking(false).ok();
 
-                let stream_clone = match stream.try_clone() {
+                // never inherited by a child the companion spawns (ffi::no_inherit)
+                let stream_clone = match crate::ffi::clone_stream(&stream) {
                     Ok(s) => s,
                     Err(_) => {
                         listener_active.fetch_sub(1, Ordering::SeqCst);
@@ -510,7 +511,7 @@ fn handle_conn(
     // read), read through the short poll so a shutdown is not stuck behind a
     // half-sent request
     stream.set_read_timeout(Some(IDLE_POLL))?;
-    let mut reader = stream.try_clone()?;
+    let mut reader = crate::ffi::clone_stream(&stream)?;
     let mut writer = stream;
 
     let mut request = StopAwareReader {
@@ -1547,7 +1548,7 @@ fn serve_ws(
     // writer is spawned or the connection is registered — otherwise a
     // failure here would leak the registry entry and the writer thread.
     // dedicated handle for control frames (ping/pong/close)
-    let mut control = reader.try_clone()?;
+    let mut control = crate::ffi::clone_stream(&reader)?;
     // Short read timeout so shutdown is noticed promptly (audit P6). It only
     // ever fires while idle between frames (`peek` consumes nothing) or is
     // retried by `StopAwareReader` mid-frame, so a frame is never split. (On
@@ -1559,7 +1560,7 @@ fn serve_ws(
     writer.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
     let (outbound, rx) = Outbound::new(companion.shared.saturation.clone(), require_e2e);
-    outbound.set_control(reader.try_clone()?);
+    outbound.set_control(crate::ffi::clone_stream(&reader)?);
     let conn_id = companion
         .shared
         .next_conn_id
@@ -1903,6 +1904,24 @@ fn serve_ws(
                         command_id,
                         session_id,
                     } => Some(companion.unsubscribe(conn_id, command_id, session_id)),
+                    // ADR-016 reads: the result goes to this connection only,
+                    // right before its ack (the D2 gate above applies). Never
+                    // journaled; mutations take the command path below.
+                    ClientMsg::Workspace {
+                        command_id,
+                        workspace_id,
+                        op,
+                    } if !op.is_mutating() => {
+                        let (result, ack) = companion.workspace_query(command_id, workspace_id, op);
+                        if let Some(result) = result
+                            && outbound
+                                .enqueue_sealed(result.to_text().into_bytes(), MsgClass::Control)
+                                .is_err()
+                        {
+                            break Err(io::Error::other("outbound queue saturated"));
+                        }
+                        Some(ack)
+                    }
                     _ => companion.handle_client_msg(msg),
                 };
                 if let Some(reply) = reply {
@@ -4350,6 +4369,28 @@ mod e2e_tests {
         let ack = next_sealed(&mut c, &mut sess, |v| is_type(v, "ack"));
         assert_eq!(json::get(&ack, "ok"), Some(&json::Json::Bool(true)));
         assert_eq!(transcript_subs(&f), 1);
+        shutdown(f);
+    }
+
+    /// ADR-016: workspace reads need the E2E session like every live
+    /// message; once sealed, an unknown workspace is refused by the ack.
+    #[test]
+    fn workspace_reads_require_session_at_remote_posture() {
+        let f = fixture_remote("ws-d2");
+        let mut c = connect_remote(&f);
+        let list = r#"{"type":"fs_list","commandId":"fs-d2","workspaceId":"000000000000"}"#;
+        c.send_text(list).unwrap();
+        let refusal = c.next_text().unwrap();
+        assert!(
+            refusal.contains("e2e session required") && refusal.contains("fs-d2"),
+            "got: {refusal}"
+        );
+        let (_r, sess) = attempt(&mut c, &f.psk, &f.device_id);
+        let mut sess = sess.unwrap();
+        c.send_text(&sess.seal(list)).unwrap();
+        let ack = next_sealed(&mut c, &mut sess, |v| is_type(v, "ack"));
+        assert_eq!(json::get(&ack, "ok"), Some(&json::Json::Bool(false)));
+        assert_eq!(json::get_str(&ack, "error"), Some("unknown workspace"));
         shutdown(f);
     }
 

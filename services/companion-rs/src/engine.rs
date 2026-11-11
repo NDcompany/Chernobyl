@@ -363,7 +363,8 @@ impl Engine {
             | ClientMsg::McpAuthCallback { command_id, .. }
             | ClientMsg::McpReconnect { command_id, .. }
             | ClientMsg::SetModel { command_id, .. }
-            | ClientMsg::RenameSession { command_id, .. } => Some(ServerMsg::ack_err(
+            | ClientMsg::RenameSession { command_id, .. }
+            | ClientMsg::Workspace { command_id, .. } => Some(ServerMsg::ack_err(
                 command_id,
                 "not supported by this agent",
             )),

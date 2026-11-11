@@ -55,7 +55,14 @@ not store them: the journal keeps only each photo's type with the data replaced 
 and the live transcript and history show only how many images a prompt had. The phone keeps the
 preview only until the prompt is sent. Claude Code itself saves the prompt, images included, in
 its own session file under `%USERPROFILE%\.claude\projects`, as it does for terminal sessions.
-A model choice and a session name you set on the phone are journaled as sent. Two credentials are stored in plaintext: the OpenCode
+A model choice and a session name you set on the phone are journaled as sent.
+Workspace files and git (ADR-016): folder listings, file content,
+git status and diffs the phone opens are read on demand, sent only to the asking phone and
+never journaled; file content and diffs are redacted for known secret shapes, and `.env*`
+files reach the phone with every value masked. The git commands themselves (`git_stage`,
+`git_unstage`, `git_commit` with its message, `git_push`) are journaled like any command, and
+a commit or push adds an audit record with the workspace id, the message's first line and the
+outcome. Two credentials are stored in plaintext: the OpenCode
 `basicAuth` in `companion.json` and the control key. Only the folder's permissions protect
 them. The default `%APPDATA%\CHERNOBYL` is readable by your Windows account and administrators
 only, but the files go wherever a copy of the folder goes: a roaming profile, a support bundle,
@@ -77,7 +84,7 @@ or secrets. They are served on loopback; beyond loopback `/health` requires the 
 | Pairing payload (host id, endpoints, device id, per-device key) and the optional token | OS keystore (`expo-secure-store`, unlocked-device only) | until you unpair the host |
 | App settings, onboarding flag, display name | app SQLite database | until the app is uninstalled or data cleared |
 | Your approval decisions (permission id, agent, command text, decision, risk, time) | app SQLite database | newest **1 000** |
-| Live state (sessions, approvals, live transcripts) | memory, refreshed from the companion | not persisted |
+| Live state (sessions, approvals, live transcripts, opened files, git status and diffs) | memory, refreshed from the companion | not persisted |
 
 The phone shows local notifications for approval requests and finished sessions. There is no
 push service (no FCM/APNs), so notification content never leaves the device.
