@@ -217,7 +217,7 @@ pub fn workspace_id(canonical: &str) -> String {
 
 /// `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share` → `\\srv\share` (what
 /// `canonicalize` returns on Windows, minus the verbatim prefix).
-fn plain(p: &Path) -> String {
+pub(crate) fn plain(p: &Path) -> String {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
@@ -243,7 +243,7 @@ pub fn new_uuid() -> Result<String, &'static str> {
     ))
 }
 
-fn is_uuid(s: &str) -> bool {
+pub(crate) fn is_uuid(s: &str) -> bool {
     s.len() == 36
         && s.bytes().enumerate().all(|(i, c)| match i {
             8 | 13 | 18 | 23 => c == b'-',
@@ -462,6 +462,12 @@ impl Driver {
     /// The CLI's current permission mode (kept for a `--resume` respawn).
     pub fn permission_mode(&self) -> Option<&str> {
         self.permission_mode.as_deref()
+    }
+
+    /// The cumulative cost a `--resume` restores, for a session this driver
+    /// did not start (its turns report the difference).
+    pub fn restore_cost(&mut self, total: f64) {
+        self.cost_total = total;
     }
 
     /// No turn running, no prompt in flight and no request waiting: what the

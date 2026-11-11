@@ -100,6 +100,12 @@ pub trait LiveRuntime: Send + Sync {
     fn agents(&self) -> Vec<Agent>;
     fn sessions(&self) -> Vec<Session>;
     fn owns_session(&self, session_id: &str) -> bool;
+    /// True while the runtime streams this session itself, so hooks about
+    /// it would show it twice (§4.2.1). Claude also owns sessions it only
+    /// found on disk; those keep their hooks.
+    fn drives_session(&self, session_id: &str) -> bool {
+        self.owns_session(session_id)
+    }
     /// True while the runtime surfaced this permission request and still
     /// holds it natively (the routing gate for `permission_decision`).
     fn knows_permission(&self, permission_id: &str) -> bool;

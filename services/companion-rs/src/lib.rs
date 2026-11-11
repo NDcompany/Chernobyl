@@ -17,11 +17,13 @@
 //! claude_live: ADR-015 Claude Code driver core (frame decoder, permission
 //! options, stdin encoders, launch and workspace policy). claude_runtime:
 //! ADR-015 Claude Code live runtime (driven processes behind LiveRuntime).
+//! claude_history: Claude Code sessions on disk (discovery and replay).
 
 pub mod adapters;
 pub mod backup;
 pub mod base64;
 pub mod claude;
+pub mod claude_history;
 pub mod claude_live;
 pub mod claude_runtime;
 pub mod client;

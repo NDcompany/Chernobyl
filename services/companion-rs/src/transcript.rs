@@ -1330,6 +1330,14 @@ impl HubHandle {
         self.hub().malformed();
     }
 
+    /// True when the session's transcript holds at least one item.
+    pub fn has_items(&self, session: &str) -> bool {
+        self.hub()
+            .sessions
+            .get(session)
+            .is_some_and(|t| !t.items.is_empty())
+    }
+
     /// Test read-back for runtime tests: flushes the deltas and returns the
     /// session's ops as serialized (oldest first).
     #[cfg(test)]

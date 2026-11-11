@@ -1163,7 +1163,7 @@ impl Companion {
         // show it twice
         if let Ok(v) = crate::json::parse(payload)
             && let Some(sid) = crate::json::get_str(&v, "session_id")
-            && self.runtimes.iter().any(|r| r.owns_session(sid))
+            && self.runtimes.iter().any(|r| r.drives_session(sid))
         {
             return 200;
         }

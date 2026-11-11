@@ -16,10 +16,15 @@
 //!   timeouts, MCP polls, sign-in expiry and the idle reaper.
 //! - A process idle for 30 min with no subscriber and nothing pending gets
 //!   its stdin closed; the next command respawns it with `--resume`.
+//! - Every session on disk in a workspace (`claude_history`, scanned on the
+//!   probe cadence) is listed `idle`; the first subscriber gets its history,
+//!   and a prompt adopts it (`--resume` in its recorded cwd) unless another
+//!   process wrote it in the last two minutes.
 //!
 //! Frames carry tool input and OAuth codes: nothing here logs them.
 
 use crate::adapters::{AdapterError, Capability, LiveRuntime};
+use crate::claude_history::{self, Found, IN_USE, Scanner};
 use crate::claude_live::{
     self, Callback, Decision, Driver, Event, PERMISSION_MODES, PromptState, new_uuid, spawn_args,
     spawn_env,
@@ -63,6 +68,9 @@ pub struct LiveConfig {
     /// Flags after the SDK set. Never from the config file or the phone (no
     /// bypass mode is reachable, T1); the live test passes `--model haiku`.
     pub extra_args: Vec<String>,
+    /// Claude's `projects` folder, where every session's transcript lives
+    /// (`claude_history`); None lists only the sessions started here.
+    pub projects: Option<PathBuf>,
 }
 
 impl LiveConfig {
@@ -96,6 +104,10 @@ impl LiveConfig {
             max_sessions: entry.max_sessions.unwrap_or(3) as usize,
             permission_mode: entry.permission_mode.clone(),
             extra_args: Vec::new(),
+            projects: claude_history::projects_dir(
+                env("CLAUDE_CONFIG_DIR").as_deref(),
+                profile.as_deref().map(Path::as_os_str),
+            ),
         }))
     }
 }
@@ -188,10 +200,39 @@ struct Live {
     asked: Vec<PermissionRequest>,
 }
 
+impl Live {
+    /// No process yet: `start` spawns one.
+    fn new(session: Session, driver: Driver, now: i64) -> Live {
+        Live {
+            session,
+            driver,
+            io: None,
+            generation: 0,
+            ended: false,
+            reaping: false,
+            last_active: now,
+            last_mcp_poll: now,
+            auth_polls: 0,
+            create: None,
+            interrupts: Vec::new(),
+            end: None,
+            progress: Vec::new(),
+            mcp: Vec::new(),
+            waits: Vec::new(),
+            callbacks: PendingAuth::default(),
+            asked: Vec::new(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     sessions: Vec<Live>,
     last_create: Option<i64>,
+    /// Sessions on disk in a workspace that are not in `sessions`: idle and
+    /// resumable (`claude_history`). A command adopts one into `sessions`.
+    found: Vec<Found>,
+    scanned: bool,
 }
 
 struct Inner {
@@ -206,6 +247,7 @@ struct Inner {
     healthy: AtomicBool,
     stop: AtomicBool,
     state: Mutex<State>,
+    scanner: Mutex<Scanner>,
 }
 
 pub struct ClaudeRuntime {
@@ -279,6 +321,7 @@ impl ClaudeRuntime {
                 healthy: AtomicBool::new(false),
                 stop: AtomicBool::new(false),
                 state: Mutex::new(State::default()),
+                scanner: Mutex::new(Scanner::default()),
             }),
         }
     }
@@ -351,12 +394,21 @@ impl LiveRuntime for ClaudeRuntime {
         }]
     }
 
+    /// Started or adopted here, then the ones found on disk (newest first).
     fn sessions(&self) -> Vec<Session> {
         let st = self.inner.state.lock().unwrap();
-        st.sessions.iter().map(|l| l.session.clone()).collect()
+        let live = st.sessions.iter().map(|l| l.session.clone());
+        live.chain(st.found.iter().map(|f| self.inner.found_session(f)))
+            .collect()
     }
 
     fn owns_session(&self, session_id: &str) -> bool {
+        let st = self.inner.state.lock().unwrap();
+        st.sessions.iter().any(|l| l.session.id == session_id)
+            || st.found.iter().any(|f| f.id == session_id)
+    }
+
+    fn drives_session(&self, session_id: &str) -> bool {
         let st = self.inner.state.lock().unwrap();
         st.sessions.iter().any(|l| l.session.id == session_id)
     }
@@ -378,17 +430,27 @@ impl LiveRuntime for ClaudeRuntime {
         reply
     }
 
-    /// The first subscriber: MCP status at the next tick.
+    /// The first subscriber: MCP status at the next tick, or the history of
+    /// a session found on disk.
     fn on_subscribe(&self, session_id: &str) {
         let mut st = self.inner.state.lock().unwrap();
         if let Some(live) = st.sessions.iter_mut().find(|l| l.session.id == session_id) {
             live.last_mcp_poll = 0;
+            return;
         }
+        let Some(f) = st.found.iter().find(|f| f.id == session_id).cloned() else {
+            return;
+        };
+        drop(st);
+        self.inner.hydrate(&f);
     }
 
+    /// The probe, then the sessions on disk (the probe cadence, not every
+    /// snapshot).
     fn refresh(&self) -> Result<(), AdapterError> {
         let result = (self.inner.probe)();
         self.inner.healthy.store(result.is_ok(), Ordering::SeqCst);
+        self.inner.discover();
         result.map_err(AdapterError::RuntimeUnavailable)
     }
 
@@ -401,15 +463,18 @@ impl LiveRuntime for ClaudeRuntime {
             Capability::new("session.activity.stream", "available", None),
             Capability::new(
                 "session.history.read",
-                "unavailable",
-                Some("only the live transcript of companion-started sessions is streamed"),
+                "limited",
+                Some(
+                    "read from Claude Code's transcripts on the PC: the last 4 MiB of a \
+                     session, at most 300 items, redacted",
+                ),
             ),
             Capability::new(
                 "session.list",
                 "limited",
                 Some(
-                    "sessions started from the phone; desktop sessions arrive through the \
-                     hook ingress",
+                    "the 50 most recent sessions in the allow-listed workspaces, from the \
+                     phone, a terminal or VS Code; one in use on the PC is not resumed",
                 ),
             ),
             Capability::new(
@@ -552,6 +617,27 @@ impl Inner {
                 ));
             }
         };
+        if !st.sessions.iter().any(|l| l.session.id == *session_id)
+            && let Some(at) = st.found.iter().position(|f| f.id == *session_id)
+        {
+            // nothing of ours runs in it: stopping or ending it is a no-op
+            if matches!(
+                msg,
+                ClientMsg::Interrupt { .. } | ClientMsg::SessionEnd { .. }
+            ) {
+                out.push(EventKind::CommandResult {
+                    command_id: command_id.clone(),
+                    status: "completed".into(),
+                    error: None,
+                    session_id: Some(session_id.clone()),
+                    permission_id: None,
+                });
+                return Ok(ack(command_id, true, None, Some(session_id)));
+            }
+            if let Err(e) = self.adopt(st, at, now) {
+                return refuse(command_id, e);
+            }
+        }
         let running = st.sessions.iter().filter(|l| l.io.is_some()).count();
         let Some(live) = st.sessions.iter_mut().find(|l| l.session.id == *session_id) else {
             return Err(AdapterError::Unsupported("unknown session".into()));
@@ -709,40 +795,10 @@ impl Inner {
             ("", p) => p.chars().take(60).collect(),
             (t, _) => t.to_string(),
         };
-        let mut live = Live {
-            session: Session {
-                id: id.clone(),
-                agent_id: self.id.clone(),
-                host_id: self.id.clone(),
-                title,
-                project: ws.path.clone(),
-                status: "running".into(),
-                progress: 0,
-                created_at: now,
-                last_activity_at: now,
-                prompt: (!prompt.is_empty()).then(|| prompt.to_string()),
-                timeline: Vec::new(),
-                output: Vec::new(),
-                files: Vec::new(),
-                transcript: true,
-            },
-            driver: Driver::new(&self.id, &id, &ws.path),
-            io: None,
-            generation: 0,
-            ended: false,
-            reaping: false,
-            last_active: now,
-            last_mcp_poll: now,
-            auth_polls: 0,
-            create: Some((command_id.to_string(), prompt.trim().is_empty())),
-            interrupts: Vec::new(),
-            end: None,
-            progress: Vec::new(),
-            mcp: Vec::new(),
-            waits: Vec::new(),
-            callbacks: PendingAuth::default(),
-            asked: Vec::new(),
-        };
+        let mut session = self.session(&id, title, &ws.path, "running", now, now);
+        session.prompt = (!prompt.is_empty()).then(|| prompt.to_string());
+        let mut live = Live::new(session, Driver::new(&self.id, &id, &ws.path), now);
+        live.create = Some((command_id.to_string(), prompt.trim().is_empty()));
         let mode = self.cfg.permission_mode.clone();
         if let Err(e) = self.start(&mut live, false, mode.as_deref(), now) {
             return refuse(command_id, e);
@@ -774,6 +830,116 @@ impl Inner {
             "at most {} Claude Code sessions can run at once; end one first",
             self.cfg.max_sessions
         )
+    }
+
+    fn session(
+        &self,
+        id: &str,
+        title: String,
+        project: &str,
+        status: &str,
+        created_at: i64,
+        now: i64,
+    ) -> Session {
+        Session {
+            id: id.to_string(),
+            agent_id: self.id.clone(),
+            host_id: self.id.clone(),
+            title,
+            project: project.to_string(),
+            status: status.into(),
+            progress: 0,
+            created_at,
+            last_activity_at: now,
+            prompt: None,
+            timeline: Vec::new(),
+            output: Vec::new(),
+            files: Vec::new(),
+            transcript: true,
+        }
+    }
+
+    fn found_session(&self, f: &Found) -> Session {
+        let title = f.title.clone();
+        self.session(&f.id, title, &f.cwd, "idle", f.created_at, f.updated_at)
+    }
+
+    /* ----------------------- sessions on disk ---------------------- */
+
+    /// Lists the sessions on disk; new or renamed ones are published once
+    /// the first list is in place (the snapshot carries that one).
+    fn discover(&self) {
+        let Some(dir) = &self.cfg.projects else {
+            return;
+        };
+        let mut found = self.scanner.lock().unwrap().scan(dir, &self.cfg.workspaces);
+        let mut out = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap();
+            found.retain(|f| !st.sessions.iter().any(|l| l.session.id == f.id));
+            for f in &mut found {
+                let old = st.found.iter().find(|o| o.id == f.id);
+                f.hydrated = old.and_then(|o| o.hydrated);
+                if st.scanned && old.is_none_or(|o| o.title != f.title) {
+                    out.push(EventKind::SessionUpdated(self.found_session(f)));
+                }
+            }
+            st.found = found;
+            st.scanned = true;
+        }
+        self.publish(out);
+    }
+
+    /// Replays a found session's transcript into the hub, unless the hub
+    /// already holds it as of the file's current mtime.
+    fn hydrate(&self, f: &Found) {
+        let mtime = claude_history::mtime_ms(&f.path);
+        if f.hydrated.is_some() && f.hydrated == mtime && self.hub.has_items(&f.id) {
+            return;
+        }
+        match claude_history::replay(&f.path, &self.id, &f.id, &f.cwd) {
+            Ok(ops) => {
+                for op in ops {
+                    self.hub.push(&f.id, op);
+                }
+                let mut st = self.state.lock().unwrap();
+                if let Some(g) = st.found.iter_mut().find(|g| g.id == f.id) {
+                    g.hydrated = mtime;
+                }
+            }
+            Err(_) => self.hub.push(
+                &f.id,
+                Op::Item(crate::transcript::Item {
+                    id: "history-unreadable".into(),
+                    kind: crate::transcript::ItemKind::Notice,
+                    text: "The history of this session could not be read on the PC".into(),
+                    level: Some("warning"),
+                    done: true,
+                    ..Default::default()
+                }),
+            ),
+        }
+    }
+
+    /// A command for a session found on disk: refused while another process
+    /// writes it (T10), and only in a workspace still allow-listed (T11);
+    /// else it becomes a companion session whose process starts with
+    /// `--resume` in its recorded cwd, like a reaped one.
+    fn adopt(&self, st: &mut State, at: usize, now: i64) -> Result<(), String> {
+        let f = &st.found[at];
+        if claude_history::in_use(&f.path, now) {
+            return Err(IN_USE.into());
+        }
+        let cwd = claude_history::inside(&f.cwd, &self.cfg.workspaces).ok_or(
+            "this session's folder is no longer in a workspace configured for Claude Code",
+        )?;
+        let f = st.found.remove(at);
+        let mut session = self.found_session(&f);
+        session.project = cwd.clone();
+        let mut driver = Driver::new(&self.id, &f.id, &cwd);
+        driver.restore_cost(f.cost);
+        st.sessions.push(Live::new(session, driver, now));
+        Ok(())
     }
 
     /// A reaped session's process comes back with `--resume` (T10: this
@@ -1483,6 +1649,8 @@ pub(crate) mod tests {
         pub hub: HubHandle,
         pub events: Arc<Mutex<Vec<EventKind>>>,
         pub spawns: Arc<Mutex<Vec<Vec<String>>>>,
+        /// The cwd of each spawn.
+        pub cwds: Arc<Mutex<Vec<PathBuf>>>,
         pub opened: Arc<Mutex<Vec<String>>>,
         /// Every frame the fake processes read, in order.
         pub stdin: Arc<Mutex<Vec<String>>>,
@@ -1500,13 +1668,26 @@ pub(crate) mod tests {
         max_sessions: usize,
         peers: Vec<React>,
     ) -> Rig {
+        rig_with(hub, timing, max_sessions, peers, |_| {})
+    }
+
+    /// [`rig_with_hub`] whose config `edit` adjusts before the first probe.
+    pub(crate) fn rig_with(
+        hub: HubHandle,
+        timing: Timing,
+        max_sessions: usize,
+        peers: Vec<React>,
+        edit: impl FnOnce(&mut LiveConfig),
+    ) -> Rig {
         let peers = Arc::new(Mutex::new(VecDeque::from(peers)));
         let spawns = Arc::new(Mutex::new(Vec::new()));
+        let cwds = Arc::new(Mutex::new(Vec::new()));
         let stdin = Arc::new(Mutex::new(Vec::new()));
         let opened = Arc::new(Mutex::new(Vec::new()));
-        let (log, read) = (spawns.clone(), stdin.clone());
-        let spawn: Box<Spawn> = Box::new(move |args: &[String], _cwd: &Path| {
+        let (log, read, dirs) = (spawns.clone(), stdin.clone(), cwds.clone());
+        let spawn: Box<Spawn> = Box::new(move |args: &[String], cwd: &Path| {
             log.lock().unwrap().push(args.to_vec());
+            dirs.lock().unwrap().push(cwd.to_path_buf());
             let mut react = peers
                 .lock()
                 .unwrap()
@@ -1537,7 +1718,7 @@ pub(crate) mod tests {
             urls.lock().unwrap().push(url.to_string());
             Ok(())
         });
-        let cfg = LiveConfig {
+        let mut cfg = LiveConfig {
             workspaces: vec![LiveWorkspace {
                 id: WS.into(),
                 label: "work".into(),
@@ -1547,7 +1728,9 @@ pub(crate) mod tests {
             max_sessions,
             permission_mode: Some("default".into()),
             extra_args: Vec::new(),
+            projects: None,
         };
+        edit(&mut cfg);
         let rt = ClaudeRuntime::with_parts(
             "claude-1",
             cfg,
@@ -1566,6 +1749,7 @@ pub(crate) mod tests {
             hub,
             events,
             spawns,
+            cwds,
             opened,
             stdin,
         }
@@ -1914,6 +2098,175 @@ pub(crate) mod tests {
         r.create("cmd-e", "e");
     }
 
+    /* ------------------------ sessions on disk ---------------------- */
+
+    /// A temp workspace and a fake Claude `projects` folder.
+    struct Disk {
+        root: PathBuf,
+        projects: PathBuf,
+        ws: LiveWorkspace,
+    }
+
+    impl Disk {
+        fn new() -> Disk {
+            let root = std::env::temp_dir().join(format!("chb-claude-rt-{}", new_uuid().unwrap()));
+            std::fs::create_dir_all(root.join("work").join("app")).unwrap();
+            let work = root.join("work").to_string_lossy().into_owned();
+            let ws = claude_live::validate_workspace(&work, &root.join("data"), None).unwrap();
+            let projects = root.join("projects");
+            Disk { root, projects, ws }
+        }
+
+        /// One prompt and one answer in `cwd`, last written `age_ms` ago.
+        fn session(&self, cwd: &Path, id: &str, title: &str, age_ms: u64) {
+            let cwd_json = json::stringify(&json::s(&cwd.to_string_lossy()));
+            let lines = [
+                format!(
+                    r#"{{"type":"user","uuid":"u-{id}","cwd":{cwd_json},"timestamp":"2026-11-12T09:00:00.000Z","message":{{"role":"user","content":"{title}"}}}}"#
+                ),
+                format!(
+                    r#"{{"type":"assistant","uuid":"a-{id}","cwd":{cwd_json},"timestamp":"2026-11-12T09:00:03.000Z","message":{{"id":"msg-{id}","role":"assistant","content":[{{"type":"text","text":"Hello from history"}}]}}}}"#
+                ),
+                r#"{"type":"cost-state","totalCostUSD":0.4}"#.to_string(),
+            ];
+            let dir = self
+                .projects
+                .join(claude_history::encode(&cwd.to_string_lossy()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{id}.jsonl"));
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            let when = std::time::SystemTime::now() - Duration::from_millis(age_ms);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+
+        fn rig(&self, max_sessions: usize, peers: Vec<React>) -> Rig {
+            let (ws, projects) = (self.ws.clone(), self.projects.clone());
+            rig_with(HubHandle::default(), fast(), max_sessions, peers, |c| {
+                c.workspaces = vec![LiveWorkspace {
+                    id: WS.into(),
+                    ..ws
+                }];
+                c.projects = Some(projects);
+            })
+        }
+    }
+
+    impl Drop for Disk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    const OLD: &str = "0a0a0a0a-0000-4000-8000-000000000001";
+    const BUSY: &str = "0b0b0b0b-0000-4000-8000-000000000002";
+
+    #[test]
+    fn disk_sessions_are_listed_replayed_and_resumed_in_their_cwd() {
+        let d = Disk::new();
+        let app = PathBuf::from(&d.ws.path).join("app");
+        d.session(&app, OLD, "fix the parser", 10 * 60 * 1000);
+        d.session(Path::new(&d.ws.path), BUSY, "still typing", 5_000);
+        // the resumed CLI reports its cumulative cost, history included
+        let resumed: React = Box::new(|f| {
+            let done =
+                r#"{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5}"#;
+            let lines = if f.starts_with(r#"{"type":"user""#) {
+                vec![done.to_string()]
+            } else {
+                Vec::new()
+            };
+            (lines, false)
+        });
+        let r = d.rig(1, vec![idle(), resumed]);
+        // listed idle, newest first, with the recorded cwd; not driven
+        let list = r.rt.sessions();
+        let shape: Vec<(&str, &str, &str)> = list
+            .iter()
+            .map(|s| (s.id.as_str(), s.status.as_str(), s.title.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (BUSY, "idle", "still typing"),
+                (OLD, "idle", "fix the parser")
+            ]
+        );
+        assert_eq!(list[1].project, app.to_string_lossy());
+        assert!(list.iter().all(|s| s.transcript));
+        assert!(r.rt.owns_session(OLD) && !r.rt.drives_session(OLD));
+        // the first subscriber gets the history, once
+        r.rt.on_subscribe(OLD);
+        let texts = |r: &Rig| -> Vec<String> {
+            op_of(&r.ops(OLD), "item")
+                .iter()
+                .filter_map(|o| json::get(o, "item").and_then(|i| json::get_str(i, "text")))
+                .map(String::from)
+                .collect()
+        };
+        assert_eq!(texts(&r), ["fix the parser", "Hello from history"]);
+        r.rt.on_subscribe(OLD);
+        assert_eq!(
+            r.ops(OLD).len(),
+            3,
+            "two items and a turn, not replayed again"
+        );
+        // written 5 s ago by another process: refused, nothing spawned
+        let e = refusal(r.send(prompt("cmd-busy", BUSY, "hi")));
+        assert_eq!(e, IN_USE);
+        // ending one the companion never ran is a no-op; it stays listed
+        ok(r.send(ClientMsg::SessionEnd {
+            command_id: "cmd-end-busy".into(),
+            session_id: BUSY.into(),
+        }));
+        assert_eq!(
+            r.result_of("cmd-end-busy"),
+            Some(("completed".into(), None))
+        );
+        assert!(r.rt.owns_session(BUSY) && !r.rt.drives_session(BUSY));
+        // the one slot is taken: the resume waits like any session
+        let sid = r.create("cmd-create", "");
+        let e = refusal(r.send(prompt("cmd-full", OLD, "continue")));
+        assert!(e.starts_with("at most 1 Claude Code sessions"), "{e}");
+        ok(r.send(ClientMsg::SessionEnd {
+            command_id: "cmd-end".into(),
+            session_id: sid,
+        }));
+        assert_eq!(r.wait_result("cmd-end").0, "completed");
+        // now it resumes with `--resume <id>` in the recorded cwd
+        ok(r.send(prompt("cmd-go", OLD, "continue")));
+        {
+            let spawns = r.spawns.lock().unwrap();
+            assert_eq!(spawns.len(), 2);
+            assert!(
+                spawns[1]
+                    .windows(2)
+                    .any(|w| w[0] == "--resume" && w[1] == OLD),
+                "{:?}",
+                spawns[1]
+            );
+            assert_eq!(r.cwds.lock().unwrap()[1], app);
+        }
+        assert!(r.rt.drives_session(OLD));
+        assert_eq!(r.wait_result("cmd-go"), ("completed".into(), None));
+        let costs: Vec<f64> = op_of(&r.ops(OLD), "turn")
+            .iter()
+            .filter_map(|o| json::get(o, "turn").and_then(|t| json::get(t, "costUsd")))
+            .filter_map(json::as_f64)
+            .collect();
+        assert_eq!(costs.len(), 1, "{costs:?}");
+        assert!((costs[0] - 0.1).abs() < 1e-9, "this turn only: {costs:?}");
+        // a rescan does not list it twice
+        r.rt.refresh().unwrap();
+        let ids: Vec<String> = r.rt.sessions().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids.iter().filter(|i| *i == OLD).count(), 1, "{ids:?}");
+        assert_eq!(ids.len(), 3);
+    }
+
     /* ------------------------------ MCP ---------------------------- */
 
     /// A CLI with two remote servers that need a sign-in and a claude.ai
@@ -2071,6 +2424,143 @@ pub(crate) mod tests {
     }
 
     /* ---------------------------- live ---------------------------- */
+
+    /// A real transcript from `claude -p` on Haiku in a temp workspace is
+    /// found, refused while fresh, replayed, then continued with one prompt
+    /// (about $0.01): `CHERNOBYL_LIVE_CLAUDE=1 cargo test --lib
+    /// live_claude_haiku_disk_session -- --ignored --nocapture`. Prints
+    /// counts and the cost only, never the transcript.
+    #[test]
+    #[ignore = "spawns the real Claude Code CLI"]
+    fn live_claude_haiku_disk_session_is_found_replayed_and_resumed() {
+        if std::env::var_os("CHERNOBYL_LIVE_CLAUDE").is_none() {
+            return;
+        }
+        let parent = std::env::var_os("CHERNOBYL_LIVE_CLAUDE_DIR")
+            .map_or_else(std::env::temp_dir, PathBuf::from);
+        let root = parent.join(format!("chb-live-disk-{}", now_ms()));
+        let (work, data) = (root.join("work"), root.join("data"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let entry = AdapterEntryConfig {
+            id: "claude-1".into(),
+            kind: "claude".into(),
+            enabled: true,
+            workspaces: vec![work.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let mut cfg = LiveConfig::from_entry(&entry, &data).unwrap().unwrap();
+        cfg.extra_args = vec!["--model".into(), "haiku".into()];
+        let mut env = spawn_env(std::env::vars_os());
+        env.push(("ANTHROPIC_MODEL".into(), "haiku".into()));
+        let first = std::process::Command::new(&cfg.binary)
+            .args([
+                "-p",
+                "say hi",
+                "--model",
+                "haiku",
+                "--output-format",
+                "json",
+            ])
+            .current_dir(&cfg.workspaces[0].path)
+            .env_clear()
+            .envs(env)
+            .output()
+            .unwrap();
+        assert!(
+            first.status.success(),
+            "claude -p exited {:?}",
+            first.status
+        );
+        let out = json::parse(String::from_utf8_lossy(&first.stdout).trim()).unwrap();
+        let sid = json::get_str(&out, "session_id").unwrap().to_string();
+        let cost1 = json::get(&out, "total_cost_usd")
+            .and_then(json::as_f64)
+            .unwrap_or(0.0);
+        let hub = HubHandle::default();
+        let rt = ClaudeRuntime::new("claude-1", cfg, hub.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        rt.set_sink(Arc::new(move |k| sink.lock().unwrap().push(k)));
+        let started = Instant::now();
+        let _ = rt.refresh();
+        let scan_ms = started.elapsed().as_millis();
+        let listed = rt.sessions().into_iter().find(|s| s.id == sid);
+        let listed = listed.expect("the new session is listed");
+        assert_eq!(listed.status, "idle");
+        // just written: another process may still own it
+        let send = |cmd: &str| {
+            rt.send(&ClientMsg::SubmitPrompt {
+                command_id: cmd.into(),
+                session_id: sid.clone(),
+                text: "Reply with the single word: ok".into(),
+            })
+            .unwrap()
+        };
+        assert_eq!(refusal(send("p0")), IN_USE);
+        rt.on_subscribe(&sid);
+        let ops: Vec<Json> = hub
+            .ops(&sid)
+            .iter()
+            .map(|o| json::parse(o).unwrap())
+            .collect();
+        let kinds: Vec<&str> = op_of(&ops, "item")
+            .iter()
+            .filter_map(|o| json::get(o, "item").and_then(|i| json::get_str(i, "kind")))
+            .collect();
+        assert!(
+            kinds.contains(&"user") && kinds.contains(&"text"),
+            "{kinds:?}"
+        );
+        // an hour later as far as the in-use rule goes
+        let path = {
+            let st = rt.inner.state.lock().unwrap();
+            st.found.iter().find(|f| f.id == sid).unwrap().path.clone()
+        };
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        ok(send("p1"));
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let result = loop {
+            let found = events.lock().unwrap().iter().find_map(|e| match e {
+                EventKind::CommandResult {
+                    command_id, status, ..
+                } if command_id == "p1" => Some(status.clone()),
+                _ => None,
+            });
+            if let Some(s) = found {
+                break s;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no result for the resumed prompt"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let ops: Vec<Json> = hub
+            .ops(&sid)
+            .iter()
+            .map(|o| json::parse(o).unwrap())
+            .collect();
+        let cost2: f64 = op_of(&ops, "turn")
+            .iter()
+            .filter_map(|o| json::get(o, "turn").and_then(|t| json::get(t, "costUsd")))
+            .filter_map(json::as_f64)
+            .sum();
+        println!(
+            "live: scan_ms={scan_ms} history_items={} result={result} first_cost_usd={cost1:.4} \
+             resumed_turn_cost_usd={cost2:.4}",
+            kinds.len()
+        );
+        rt.dispose();
+        assert_eq!(result, "completed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The real companion server in-process, a WS client acting as the phone
     /// and the real CLI on Haiku (about $0.02): `CHERNOBYL_LIVE_CLAUDE=1
