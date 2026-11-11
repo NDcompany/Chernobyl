@@ -12,13 +12,8 @@ import type {
   Snapshot,
 } from '@chernobyl/protocol';
 
-let selectorsMod: typeof import('./selectors.ts') | null = null;
-try {
-  selectorsMod = await import('./selectors.ts');
-} catch {
-  // @chernobyl/protocol/dist/index.js is built by npm run build:protocol prior to npm test in CI.
-  // When running node --test directly without running the workspace compiler first, dynamic import is caught here.
-}
+// a missing @chernobyl/protocol build must fail the suite, never skip it silently
+import * as selectorsMod from './selectors.ts';
 
 const makeHost = (id: string, name = 'Host', simulated = false): Host => ({
   id,
@@ -86,7 +81,6 @@ const makePermission = (
 });
 
 test('isPending and pendingPermissions: filters out expired or non-pending requests', {
-  skip: !selectorsMod ? 'Requires compiled @chernobyl/protocol dist (built by npm run typecheck/build in CI)' : false,
 }, () => {
   const { isPending, pendingPermissions } = selectorsMod!;
   const p1 = makePermission('p1', 'pending', 2000);
@@ -112,7 +106,6 @@ test('isPending and pendingPermissions: filters out expired or non-pending reque
 });
 
 test('decidedPermissions: approved and rejected sorted descending by decidedAt / requestedAt', {
-  skip: !selectorsMod ? 'Requires compiled @chernobyl/protocol dist (built by npm run typecheck/build in CI)' : false,
 }, () => {
   const { decidedPermissions } = selectorsMod!;
   const p1 = makePermission('p1', 'approved', 2000, 1500);
@@ -133,7 +126,6 @@ test('decidedPermissions: approved and rejected sorted descending by decidedAt /
 });
 
 test('hasSimulatedData: detects simulation flag on hosts or agents', {
-  skip: !selectorsMod ? 'Requires compiled @chernobyl/protocol dist (built by npm run typecheck/build in CI)' : false,
 }, () => {
   const { hasSimulatedData } = selectorsMod!;
   const sEmpty: Snapshot = { hosts: [], agents: [], sessions: [], permissions: [], activity: [] };
@@ -150,7 +142,6 @@ test('hasSimulatedData: detects simulation flag on hosts or agents', {
 });
 
 test('lookup by ID: hostById, agentById, sessionById, permissionById', {
-  skip: !selectorsMod ? 'Requires compiled @chernobyl/protocol dist (built by npm run typecheck/build in CI)' : false,
 }, () => {
   const { hostById, agentById, sessionById, permissionById } = selectorsMod!;
   const h = makeHost('h1');
@@ -173,7 +164,6 @@ test('lookup by ID: hostById, agentById, sessionById, permissionById', {
 });
 
 test('permissionHref: routes to live transcript session with focus or standard screen', {
-  skip: !selectorsMod ? 'Requires compiled @chernobyl/protocol dist (built by npm run typecheck/build in CI)' : false,
 }, () => {
   const { permissionHref } = selectorsMod!;
   const sessTranscript = makeSession('s-live', 'a1', 'running', true);
@@ -199,7 +189,6 @@ test('permissionHref: routes to live transcript session with focus or standard s
 });
 
 test('sessionsForAgent and activeSessions: filters and sorts', {
-  skip: !selectorsMod ? 'Requires compiled @chernobyl/protocol dist (built by npm run typecheck/build in CI)' : false,
 }, () => {
   const { sessionsForAgent, activeSessions } = selectorsMod!;
   const s1 = { ...makeSession('s1', 'a1', 'completed'), lastActivityAt: 2000 };
@@ -226,7 +215,6 @@ test('sessionsForAgent and activeSessions: filters and sorts', {
 });
 
 test('counts: computes connected hosts, online/busy agents, active sessions and pending permissions', {
-  skip: !selectorsMod ? 'Requires compiled @chernobyl/protocol dist (built by npm run typecheck/build in CI)' : false,
 }, () => {
   const { counts } = selectorsMod!;
   const snapshot: Snapshot = {
@@ -262,7 +250,6 @@ test('counts: computes connected hosts, online/busy agents, active sessions and 
 });
 
 test('recentActivity and activityFor: sorts and slices', {
-  skip: !selectorsMod ? 'Requires compiled @chernobyl/protocol dist (built by npm run typecheck/build in CI)' : false,
 }, () => {
   const { recentActivity, activityFor } = selectorsMod!;
   const events: ActivityEvent[] = [
@@ -280,7 +267,6 @@ test('recentActivity and activityFor: sorts and slices', {
 });
 
 test('searchAgents: matches against name, kind, capabilities and host name', {
-  skip: !selectorsMod ? 'Requires compiled @chernobyl/protocol dist (built by npm run typecheck/build in CI)' : false,
 }, () => {
   const { searchAgents } = selectorsMod!;
   const h1 = makeHost('h1', 'Primary Desktop');
@@ -298,7 +284,6 @@ test('searchAgents: matches against name, kind, capabilities and host name', {
 });
 
 test('searchSessions: filters by status and matches title, project or agent name', {
-  skip: !selectorsMod ? 'Requires compiled @chernobyl/protocol dist (built by npm run typecheck/build in CI)' : false,
 }, () => {
   const { searchSessions } = selectorsMod!;
   const a1 = makeAgent('a1', 'Claude');

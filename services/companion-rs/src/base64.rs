@@ -33,8 +33,11 @@ pub fn decode(input: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.as_chunks::<4>().0 {
+    let chunks = bytes.as_chunks::<4>().0;
+    for (k, chunk) in chunks.iter().enumerate() {
+        // RFC 4648: '=' only in the final group ("Zg==Zg==" is refused)
         let pad = match chunk[3] {
+            _ if k + 1 < chunks.len() => 0,
             b'=' => {
                 if chunk[2] == b'=' {
                     2
@@ -165,11 +168,8 @@ mod tests {
         assert_eq!(decode("Zg==").unwrap(), b"f");
     }
 
-    // BUG in base64::decode: padding '=' in non-final 4-byte chunks is permitted because
-    // chunk parsing processes each 4-byte slice independently without tracking if a previous
-    // chunk contained padding; "Zg==Zg==" yields Some([102, 102]) instead of None.
+    // RFC 4648: '=' may only end the whole string, not an inner group
     #[test]
-    #[ignore = "bug: base64::decode accepts embedded padding '=' in non-final chunks (e.g. Zg==Zg==)"]
     fn strict_decode_rejects_embedded_padding_in_multiblock() {
         // padding '=' can only appear at the end of the entire string
         assert_eq!(decode("Zg==Zg=="), None);
