@@ -533,6 +533,40 @@ async function main() {
       JSON.stringify(agent?.live ?? null),
     );
 
+    // ADR-016: a sealed workspace read answers with its result, then the ack
+    writeFileSync(join(ws, '.env'), 'API_KEY=interop-secret-value\n');
+    const lsAck = await a.send({ type: 'fs_list', commandId: 'ws-ls', workspaceId: wsId });
+    const lsAt = msgs.findIndex((m) => m.type === 'workspace_result' && m.commandId === 'ws-ls');
+    const lsAckAt = msgs.findIndex((m) => m.type === 'ack' && m.commandId === 'ws-ls');
+    const listing = msgs[lsAt]?.result;
+    check(
+      'workspace: hello_ack advertises workspace.v1; fs_list answers with the listing before its ack',
+      (helloAck?.features ?? []).includes('workspace.v1') &&
+        lsAck.ok &&
+        lsAt >= 0 &&
+        lsAt < lsAckAt &&
+        listing?.entries?.some((e) => e.name === '.env'),
+      JSON.stringify(listing ?? null),
+    );
+    await a.send({ type: 'fs_read', commandId: 'ws-env', workspaceId: wsId, path: '.env' });
+    const env = msgs.find((m) => m.type === 'workspace_result' && m.commandId === 'ws-env')?.result;
+    check(
+      'workspace: a .env file reaches the phone masked',
+      env?.sensitive === true && !env.content.includes('interop-secret-value'),
+      JSON.stringify(env ?? null),
+    );
+    const escape = await a.send({ type: 'fs_read', commandId: 'ws-esc', workspaceId: wsId, path: '../x' });
+    const notRepo = await a.send({ type: 'git_status', commandId: 'ws-git', workspaceId: wsId });
+    check(
+      'workspace: escapes are refused; a folder without git says so',
+      !escape.ok && !notRepo.ok && notRepo.error === 'not a git repository',
+      `${escape.error} | ${notRepo.error}`,
+    );
+    check(
+      'workspace: an observer connection never sees another client\'s results',
+      !observed.some((m) => m.type === 'workspace_result'),
+    );
+
     const created = await a.send({
       type: 'create_session',
       commandId: 'cx-create',

@@ -1,0 +1,62 @@
+[
+  {
+    "type": "workspace_result",
+    "commandId": "c-ws-3",
+    "workspaceId": "3f2a9c1d0e4b",
+    "result": {
+      "kind": "fs_list",
+      "path": "src",
+      "entries": [
+        { "name": "ui", "kind": "dir", "size": 0, "mtime": 1761436800000 },
+        { "name": "main.ts", "kind": "file", "size": 1204, "mtime": 1761436800000 }
+      ],
+      "truncated": false
+    }
+  },
+  {
+    "type": "workspace_result",
+    "commandId": "c-ws-4",
+    "workspaceId": "3f2a9c1d0e4b",
+    "result": {
+      "kind": "fs_read",
+      "path": ".env",
+      "size": 29,
+      "truncated": false,
+      "redacted": true,
+      "sensitive": true,
+      "content": "API_KEY=«redacted:env»\n"
+    }
+  },
+  {
+    "type": "workspace_result",
+    "commandId": "c-ws-5",
+    "workspaceId": "3f2a9c1d0e4b",
+    "result": {
+      "kind": "git_status",
+      "branch": "main",
+      "upstream": "origin/main",
+      "ahead": 1,
+      "behind": 0,
+      "staged": [
+        { "path": "src/app.ts", "status": "M" },
+        { "path": "src/new.ts", "status": "R", "origPath": "src/old.ts" }
+      ],
+      "unstaged": [{ "path": "README.md", "status": "M" }],
+      "untracked": ["notes.md"],
+      "conflicted": [],
+      "truncated": false
+    }
+  },
+  {
+    "type": "workspace_result",
+    "commandId": "c-ws-7",
+    "workspaceId": "3f2a9c1d0e4b",
+    "result": {
+      "kind": "git_diff",
+      "path": "README.md",
+      "staged": true,
+      "truncated": false,
+      "patch": "diff --git a/README.md b/README.md\nindex 1f2b3c4..5d6e7f8 100644\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n hello\n+world\n"
+    }
+  }
+]

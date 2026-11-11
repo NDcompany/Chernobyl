@@ -361,7 +361,8 @@ impl Engine {
             | ClientMsg::SetPermissionMode { command_id, .. }
             | ClientMsg::McpAuth { command_id, .. }
             | ClientMsg::McpAuthCallback { command_id, .. }
-            | ClientMsg::McpReconnect { command_id, .. } => Some(ServerMsg::ack_err(
+            | ClientMsg::McpReconnect { command_id, .. }
+            | ClientMsg::Workspace { command_id, .. } => Some(ServerMsg::ack_err(
                 command_id,
                 "not supported by this agent",
             )),

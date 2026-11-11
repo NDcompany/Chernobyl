@@ -42,7 +42,13 @@ requests are journaled as before, with their command or patterns and, for an edi
 the runtime shows, redacted and capped. An `mcp_auth_callback` command is journaled with its
 callback URL replaced by `<redacted>`, because it carries a one-time authorization code. The
 answers to an agent's question (`permission_decision.answers`) are journaled with each value
-replaced by `<redacted>`. Two credentials are stored in plaintext: the OpenCode
+replaced by `<redacted>`. Workspace files and git (ADR-016): folder listings, file content,
+git status and diffs the phone opens are read on demand, sent only to the asking phone and
+never journaled; file content and diffs are redacted for known secret shapes, and `.env*`
+files reach the phone with every value masked. The git commands themselves (`git_stage`,
+`git_unstage`, `git_commit` with its message, `git_push`) are journaled like any command, and
+a commit or push adds an audit record with the workspace id, the message's first line and the
+outcome. Two credentials are stored in plaintext: the OpenCode
 `basicAuth` in `companion.json` and the control key. Only the folder's permissions protect
 them. The default `%APPDATA%\CHERNOBYL` is readable by your Windows account and administrators
 only, but the files go wherever a copy of the folder goes: a roaming profile, a support bundle,
@@ -64,7 +70,7 @@ or secrets. They are served on loopback; beyond loopback `/health` requires the 
 | Pairing payload (host id, endpoints, device id, per-device key) and the optional token | OS keystore (`expo-secure-store`, unlocked-device only) | until you unpair the host |
 | App settings, onboarding flag, display name | app SQLite database | until the app is uninstalled or data cleared |
 | Your approval decisions (permission id, agent, command text, decision, risk, time) | app SQLite database | newest **1 000** |
-| Live state (sessions, approvals, live transcripts) | memory, refreshed from the companion | not persisted |
+| Live state (sessions, approvals, live transcripts, opened files, git status and diffs) | memory, refreshed from the companion | not persisted |
 
 The phone shows local notifications for approval requests and finished sessions. There is no
 push service (no FCM/APNs), so notification content never leaves the device.

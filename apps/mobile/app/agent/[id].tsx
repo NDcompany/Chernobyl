@@ -9,6 +9,7 @@ import { StatusBar } from 'expo-status-bar';
 import { colors, spacing } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { useSnapshot } from '@/data/state';
+import { useWorkspaceEnabled } from '@/data/workspace';
 import {
   activityFor,
   agentById,
@@ -30,6 +31,7 @@ export default function AgentDetailScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const now = useNow(30_000);
+  const workspaceOn = useWorkspaceEnabled();
 
   if (!authed) return <Redirect href="/sign-in" />;
 
@@ -135,6 +137,45 @@ export default function AgentDetailScreen() {
         <Text variant="xs" color={colors.text3} center>
           This agent is not accepting new sessions right now.
         </Text>
+      ) : null}
+
+      {/* ADR-016: review and ship the agent's work in its allow-listed folders */}
+      {workspaceOn && agent.live?.workspaces?.length ? (
+        <View style={{ gap: spacing.md }}>
+          <Text variant="eyebrow" color={colors.text3} accessibilityRole="header">
+            Workspaces
+          </Text>
+          {agent.live.workspaces.map((w) => (
+            <Card key={w.id} style={{ gap: spacing.sm }}>
+              <View style={{ gap: 2 }}>
+                <Text variant="bodyStrong">{w.label}</Text>
+                <Text variant="mono" color={colors.text3} numberOfLines={1}>
+                  {w.path}
+                </Text>
+              </View>
+              <View style={styles.chips}>
+                <Button
+                  label="Files"
+                  icon="folder"
+                  variant="secondary"
+                  size="sm"
+                  fullWidth={false}
+                  onPress={() => router.push({ pathname: '/files/[workspace]', params: { workspace: w.id } })}
+                  accessibilityLabel={`Browse the files of ${w.label}`}
+                />
+                <Button
+                  label="Changes"
+                  icon="diff"
+                  variant="secondary"
+                  size="sm"
+                  fullWidth={false}
+                  onPress={() => router.push({ pathname: '/changes/[workspace]', params: { workspace: w.id } })}
+                  accessibilityLabel={`Review the git changes of ${w.label}`}
+                />
+              </View>
+            </Card>
+          ))}
+        </View>
       ) : null}
 
       <View style={{ gap: spacing.md }}>

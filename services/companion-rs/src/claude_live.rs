@@ -217,7 +217,7 @@ pub fn workspace_id(canonical: &str) -> String {
 
 /// `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share` → `\\srv\share` (what
 /// `canonicalize` returns on Windows, minus the verbatim prefix).
-fn plain(p: &Path) -> String {
+pub(crate) fn plain(p: &Path) -> String {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")

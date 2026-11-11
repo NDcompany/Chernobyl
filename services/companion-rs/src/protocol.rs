@@ -9,8 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const PROTOCOL_VERSION: u32 = 2;
 /// ADR-015: the live transcript extension (additive, protocol stays 2).
 pub const FEATURE_TRANSCRIPT: &str = "transcript.v1";
+/// ADR-016: workspace files (read-only) and git (additive, protocol stays 2).
+pub const FEATURE_WORKSPACE: &str = "workspace.v1";
 /// What `hello_ack.features` advertises.
-pub const FEATURES: &[&str] = &[FEATURE_TRANSCRIPT];
+pub const FEATURES: &[&str] = &[FEATURE_TRANSCRIPT, FEATURE_WORKSPACE];
 pub const PERMISSION_TTL_MS: i64 = 120_000;
 /// ADR-015: presentation expiry of runtime-sourced requests. None of the
 /// runtimes expires a request itself (PRD §13.4); mock and demo keep 120 s.
@@ -547,6 +549,15 @@ pub enum ClientMsg {
         session_id: String,
         server: String,
     },
+    /// ADR-016: one workspace file or git action. `workspace_id` names an
+    /// allow-listed `Agent.live.workspaces` entry; paths are checked by
+    /// `workspace.rs`, never here. Reads are answered with a
+    /// `workspace_result` then an ack; mutations get the G1 lifecycle.
+    Workspace {
+        command_id: String,
+        workspace_id: String,
+        op: WorkspaceOp,
+    },
     /// E2E handshake, step 1 (ADR-011): request to connect as `device_id`.
     /// Plaintext; the server answers with a fresh nonce+salt to bind the proof.
     /// `cnonce` is the client's fresh 16-byte nonce (base64), bound into both
@@ -579,23 +590,169 @@ impl ClientMsg {
             | ClientMsg::SetPermissionMode { command_id, .. }
             | ClientMsg::McpAuth { command_id, .. }
             | ClientMsg::McpAuthCallback { command_id, .. }
-            | ClientMsg::McpReconnect { command_id, .. } => Some(command_id),
+            | ClientMsg::McpReconnect { command_id, .. }
+            | ClientMsg::Workspace { command_id, .. } => Some(command_id),
+        }
+    }
+
+    pub fn is_mutating(&self) -> bool {
+        match self {
+            ClientMsg::Workspace { op, .. } => op.is_mutating(),
+            _ => matches!(
+                self,
+                ClientMsg::CreateSession { .. }
+                    | ClientMsg::SubmitPrompt { .. }
+                    | ClientMsg::Interrupt { .. }
+                    | ClientMsg::PermissionDecision { .. }
+                    | ClientMsg::SessionEnd { .. }
+                    | ClientMsg::SetPermissionMode { .. }
+                    | ClientMsg::McpAuth { .. }
+                    | ClientMsg::McpAuthCallback { .. }
+                    | ClientMsg::McpReconnect { .. }
+            ),
+        }
+    }
+}
+
+/// ADR-016 workspace actions. Paths are workspace-relative with `/` or `\`;
+/// shape is checked at the trust boundary, containment by `workspace.rs`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkspaceOp {
+    /// `path` "" = the workspace root.
+    FsList {
+        path: String,
+    },
+    FsRead {
+        path: String,
+    },
+    GitStatus,
+    /// `path` None = every changed file.
+    GitDiff {
+        path: Option<String>,
+        staged: bool,
+    },
+    GitStage {
+        paths: Vec<String>,
+    },
+    GitUnstage {
+        paths: Vec<String>,
+    },
+    GitCommit {
+        message: String,
+    },
+    GitPush,
+}
+
+/// ADR-016 bounds shared with the TS validator.
+pub const WS_PATH_MAX: usize = 1024;
+pub const WS_PATHS_MAX: usize = 256;
+pub const WS_MESSAGE_MAX: usize = 4096;
+pub const WS_ID_MAX: usize = 64;
+
+impl WorkspaceOp {
+    /// The wire `type` (also the journal's command kind).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            WorkspaceOp::FsList { .. } => "fs_list",
+            WorkspaceOp::FsRead { .. } => "fs_read",
+            WorkspaceOp::GitStatus => "git_status",
+            WorkspaceOp::GitDiff { .. } => "git_diff",
+            WorkspaceOp::GitStage { .. } => "git_stage",
+            WorkspaceOp::GitUnstage { .. } => "git_unstage",
+            WorkspaceOp::GitCommit { .. } => "git_commit",
+            WorkspaceOp::GitPush => "git_push",
         }
     }
 
     pub fn is_mutating(&self) -> bool {
         matches!(
             self,
-            ClientMsg::CreateSession { .. }
-                | ClientMsg::SubmitPrompt { .. }
-                | ClientMsg::Interrupt { .. }
-                | ClientMsg::PermissionDecision { .. }
-                | ClientMsg::SessionEnd { .. }
-                | ClientMsg::SetPermissionMode { .. }
-                | ClientMsg::McpAuth { .. }
-                | ClientMsg::McpAuthCallback { .. }
-                | ClientMsg::McpReconnect { .. }
+            WorkspaceOp::GitStage { .. }
+                | WorkspaceOp::GitUnstage { .. }
+                | WorkspaceOp::GitCommit { .. }
+                | WorkspaceOp::GitPush
         )
+    }
+
+    /// The message as the phone sent it (journal payload).
+    pub fn to_json(&self, command_id: &str, workspace_id: &str) -> Json {
+        let mut fields = vec![
+            ("type", json::s(self.kind())),
+            ("commandId", json::s(command_id)),
+            ("workspaceId", json::s(workspace_id)),
+        ];
+        let list = |ps: &[String]| Json::Arr(ps.iter().map(|p| json::s(p)).collect());
+        match self {
+            WorkspaceOp::FsList { path } | WorkspaceOp::FsRead { path } => {
+                fields.push(("path", json::s(path)))
+            }
+            WorkspaceOp::GitDiff { path, staged } => {
+                if let Some(p) = path {
+                    fields.push(("path", json::s(p)));
+                }
+                fields.push(("staged", Json::Bool(*staged)));
+            }
+            WorkspaceOp::GitStage { paths } | WorkspaceOp::GitUnstage { paths } => {
+                fields.push(("paths", list(paths)))
+            }
+            WorkspaceOp::GitCommit { message } => fields.push(("message", json::s(message))),
+            WorkspaceOp::GitStatus | WorkspaceOp::GitPush => {}
+        }
+        json::obj(fields)
+    }
+
+    /// `type` → op, or `None` when `typ` is not a workspace message or a
+    /// field is malformed (`Some(None)`).
+    fn parse(typ: &str, obj: &Json) -> Option<Option<WorkspaceOp>> {
+        let path = |k: &str| -> Option<String> {
+            json::get(obj, k)
+                .and_then(json::as_str)
+                .filter(|p| !p.is_empty() && fits(p, WS_PATH_MAX))
+                .map(str::to_string)
+        };
+        let paths = || -> Option<Vec<String>> {
+            let list = json::as_arr(json::get(obj, "paths")?)?;
+            if list.is_empty() || list.len() > WS_PATHS_MAX {
+                return None;
+            }
+            list.iter()
+                .map(|p| {
+                    json::as_str(p)
+                        .filter(|p| !p.is_empty() && fits(p, WS_PATH_MAX))
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+        Some(match typ {
+            "fs_list" => opt_str(obj, "path", WS_PATH_MAX).map(|p| WorkspaceOp::FsList {
+                path: p.unwrap_or_default(),
+            }),
+            "fs_read" => path("path").map(|path| WorkspaceOp::FsRead { path }),
+            "git_status" => Some(WorkspaceOp::GitStatus),
+            "git_diff" => {
+                let staged = match json::get(obj, "staged") {
+                    None => Some(false),
+                    Some(Json::Bool(b)) => Some(*b),
+                    Some(_) => None,
+                };
+                opt_str(obj, "path", WS_PATH_MAX)
+                    .zip(staged)
+                    .map(|(path, staged)| WorkspaceOp::GitDiff {
+                        path: path.filter(|p| !p.is_empty()),
+                        staged,
+                    })
+            }
+            "git_stage" => paths().map(|paths| WorkspaceOp::GitStage { paths }),
+            "git_unstage" => paths().map(|paths| WorkspaceOp::GitUnstage { paths }),
+            "git_commit" => json::get(obj, "message")
+                .and_then(json::as_str)
+                .filter(|m| !m.is_empty() && fits(m, WS_MESSAGE_MAX))
+                .map(|m| WorkspaceOp::GitCommit {
+                    message: m.to_string(),
+                }),
+            "git_push" => Some(WorkspaceOp::GitPush),
+            _ => return None,
+        })
     }
 }
 
@@ -797,7 +954,11 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
         "hs_proof" => Some(ClientMsg::HsProof {
             proof: req("proof")?,
         }),
-        _ => None,
+        other => Some(ClientMsg::Workspace {
+            op: WorkspaceOp::parse(other, obj)??,
+            command_id: req("commandId")?,
+            workspace_id: req("workspaceId").filter(|w| fits(w, WS_ID_MAX))?,
+        }),
     }
 }
 
@@ -873,6 +1034,14 @@ pub enum ServerMsg {
         epoch: String,
         seq: u64,
         body: Json,
+    },
+    /// ADR-016: the answer to a workspace read (fs_list, fs_read,
+    /// git_status, git_diff), sent to the asking connection only, right
+    /// before its ack. `result` carries `kind` and the op's fields.
+    WorkspaceResult {
+        command_id: String,
+        workspace_id: String,
+        result: Json,
     },
 }
 
@@ -1118,6 +1287,16 @@ impl ServerMsg {
                 }
                 Json::Obj(fields)
             }
+            ServerMsg::WorkspaceResult {
+                command_id,
+                workspace_id,
+                result,
+            } => json::obj(vec![
+                ("type", json::s("workspace_result")),
+                ("commandId", json::s(command_id)),
+                ("workspaceId", json::s(workspace_id)),
+                ("result", result.clone()),
+            ]),
         }
     }
 
@@ -1843,6 +2022,7 @@ mod tests {
             ClientMsg::McpAuthCallback { .. } => "mcp_auth_callback",
             ClientMsg::McpReconnect { .. } => "mcp_reconnect",
             ClientMsg::PermissionDecision { .. } => "permission_decision",
+            ClientMsg::Workspace { op, .. } => op.kind(),
             _ => "other",
         };
         for case in json::as_arr(&fixture!("client-valid.json")).unwrap() {
@@ -1985,8 +2165,105 @@ mod tests {
     }
 
     #[test]
+    fn parses_workspace_messages_within_bounds() {
+        let ws = |extra: &str| {
+            format!(r#"{{"type":"git_stage","commandId":"c","workspaceId":"w",{extra}}}"#)
+        };
+        let paths = |n: usize, len: usize| {
+            let p = format!(r#""{}""#, "p".repeat(len));
+            ws(&format!(r#""paths":[{}]"#, vec![p.as_str(); n].join(",")))
+        };
+        assert!(parse_client_message(&paths(WS_PATHS_MAX, WS_PATH_MAX)).is_some());
+        assert!(parse_client_message(&paths(WS_PATHS_MAX + 1, 1)).is_none());
+        assert!(parse_client_message(&paths(1, WS_PATH_MAX + 1)).is_none());
+        let commit = |n: usize| {
+            format!(
+                r#"{{"type":"git_commit","commandId":"c","workspaceId":"w","message":"{}"}}"#,
+                "m".repeat(n)
+            )
+        };
+        assert!(parse_client_message(&commit(WS_MESSAGE_MAX)).is_some());
+        assert!(parse_client_message(&commit(WS_MESSAGE_MAX + 1)).is_none());
+        let id = |n: usize| {
+            format!(
+                r#"{{"type":"git_status","commandId":"c","workspaceId":"{}"}}"#,
+                "w".repeat(n)
+            )
+        };
+        assert!(parse_client_message(&id(WS_ID_MAX)).is_some());
+        assert!(parse_client_message(&id(WS_ID_MAX + 1)).is_none());
+        // field mapping, mutation flag and the journal shape round trip
+        let raw =
+            r#"{"type":"git_diff","commandId":"c","workspaceId":"w","path":"","staged":true}"#;
+        let msg = parse_client_message(raw).unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::Workspace {
+                command_id: "c".into(),
+                workspace_id: "w".into(),
+                op: WorkspaceOp::GitDiff {
+                    path: None,
+                    staged: true
+                },
+            }
+        );
+        assert!(!msg.is_mutating());
+        for (typ, mutating) in [
+            (r#""fs_list""#, false),
+            (r#""git_push""#, true),
+            (r#""git_unstage","paths":["a"]"#, true),
+        ] {
+            let raw = format!(r#"{{"type":{typ},"commandId":"c","workspaceId":"w"}}"#);
+            let msg = parse_client_message(&raw).unwrap();
+            assert_eq!(msg.is_mutating(), mutating, "{raw}");
+            let ClientMsg::Workspace { op, .. } = &msg else {
+                panic!("{raw}")
+            };
+            let back = json::stringify(&op.to_json("c", "w"));
+            assert_eq!(parse_client_message(&back), Some(msg.clone()), "{back}");
+        }
+    }
+
+    #[test]
+    fn workspace_results_match_golden_fixtures() {
+        let golden = fixture!("workspace-results.json");
+        let golden = json::as_arr(&golden).unwrap();
+        let raw = [
+            "# branch.oid abc",
+            "# branch.head main",
+            "# branch.upstream origin/main",
+            "# branch.ab +1 -0",
+            "1 M. N... 100644 100644 100644 a b src/app.ts",
+            "1 .M N... 100644 100644 100644 a b README.md",
+            "2 R. N... 100644 100644 100644 a b R100 src/new.ts",
+            "src/old.ts",
+            "? notes.md",
+            "",
+        ]
+        .join("\0");
+        let status = ServerMsg::WorkspaceResult {
+            command_id: "c-ws-5".into(),
+            workspace_id: "3f2a9c1d0e4b".into(),
+            result: crate::workspace::parse_status(raw.as_bytes(), false).to_json(),
+        };
+        assert_eq!(canon(&status.to_json()), canon(&golden[2]));
+
+        let dir = crate::workspace::tests::temp("golden");
+        std::fs::write(dir.join(".env"), "API_KEY=sk-ant-api03-fixture\n").unwrap();
+        let ws =
+            crate::workspace::Workspace::open(&dir.to_string_lossy(), &dir.join("data")).unwrap();
+        let read = ServerMsg::WorkspaceResult {
+            command_id: "c-ws-4".into(),
+            workspace_id: "3f2a9c1d0e4b".into(),
+            result: ws.read(".env").unwrap(),
+        };
+        assert_eq!(canon(&read.to_json()), canon(&golden[1]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn hello_ack_advertises_transcript_feature() {
-        assert_eq!(FEATURES, ["transcript.v1"]);
+        assert_eq!(FEATURES, ["transcript.v1", "workspace.v1"]);
         let msg = ServerMsg::HelloAck {
             protocol: PROTOCOL_VERSION,
             server_time: 1_761_436_800_000,

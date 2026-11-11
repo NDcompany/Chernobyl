@@ -278,6 +278,17 @@ export class MockEngine {
       case 'mcp_reconnect':
         reply = ackErr(msg.commandId, 'not supported by this agent');
         break;
+      // ADR-016: the simulation has no files or git; never fake them (ADR-009)
+      case 'fs_list':
+      case 'fs_read':
+      case 'git_status':
+      case 'git_diff':
+      case 'git_stage':
+      case 'git_unstage':
+      case 'git_commit':
+      case 'git_push':
+        reply = ackErr(msg.commandId, 'connect a PC to browse files and git');
+        break;
       default:
         reply = undefined;
     }

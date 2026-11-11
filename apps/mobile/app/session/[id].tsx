@@ -18,6 +18,8 @@ import { useAppStore } from '@/store/appStore';
 import { useSnapshot } from '@/data/state';
 import { useCommands, commands } from '@/data/commands';
 import { useLiveEnabled, useLiveSession } from '@/data/live';
+import { useWorkspaceEnabled } from '@/data/workspace';
+import { workspaceForProject } from '@/utils/workspace';
 import {
   activityFor,
   agentById,
@@ -284,6 +286,8 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
   const connected = useAppStore((s) => s.connection === 'connected');
   const commandStates = useAppStore((s) => s.commandStates);
   const { view, error } = useLiveSession(session.id);
+  const router = useRouter();
+  const workspaceOn = useWorkspaceEnabled();
   const [mcpOpen, setMcpOpen] = useState(false);
   const [confirmEnd, setConfirmEnd] = useState(false);
 
@@ -314,6 +318,8 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
   const busy = turns.some((t) => t.status === 'running') || status === 'running' || status === 'waiting';
   const ended = status === 'ended';
   const canEnd = live?.end === true && !ended;
+  // ADR-016: the session's folder (Session.project is the workspace path)
+  const ws = workspaceOn ? workspaceForProject(snapshot.agents, session.project) : undefined;
 
   const header = (
     <View style={styles.headerBlock}>
@@ -326,9 +332,31 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
           right={<StatusPill status={session.status} inverse />}
         />
       </View>
-      {view.mcp.length > 0 || live?.permissionModes || canEnd ? (
+      {view.mcp.length > 0 || live?.permissionModes || canEnd || ws ? (
         <View style={styles.chipRow}>
           <McpChip dark servers={view.mcp} onPress={() => setMcpOpen(true)} />
+          {ws ? (
+            <>
+              <Pressable
+                onPress={() => router.push({ pathname: '/files/[workspace]', params: { workspace: ws.id } })}
+                accessibilityRole="button"
+                accessibilityLabel={`Files of ${ws.label}`}
+                style={({ pressed }) => [styles.endChip, pressed && styles.pressed]}
+              >
+                <Icon name="folder" size={12} color={colors.white} />
+                <RNText style={[typography.xs, styles.endText]}>Files</RNText>
+              </Pressable>
+              <Pressable
+                onPress={() => router.push({ pathname: '/changes/[workspace]', params: { workspace: ws.id } })}
+                accessibilityRole="button"
+                accessibilityLabel={`Git changes of ${ws.label}`}
+                style={({ pressed }) => [styles.endChip, pressed && styles.pressed]}
+              >
+                <Icon name="diff" size={12} color={colors.white} />
+                <RNText style={[typography.xs, styles.endText]}>Changes</RNText>
+              </Pressable>
+            </>
+          ) : null}
           {live?.permissionModes ? (
             <ModeChip
               dark

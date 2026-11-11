@@ -19,6 +19,8 @@
  *    clients can detect gaps.
  *  - ADR-015 (additive, still v2): live transcript messages, advertised by
  *    `hello_ack.features` (FEATURE_TRANSCRIPT); the reducer is ./transcript.
+ *  - ADR-016 (additive, still v2): workspace files and git, advertised by
+ *    FEATURE_WORKSPACE.
  *
  * All timestamps are epoch milliseconds (UTC). All ids are opaque strings.
  */
@@ -435,6 +437,84 @@ export type LiveServerMessage =
 // ServerMessage = existing union | LiveServerMessage.
 // hello_ack gains: features?: string[]
 
+/* ---------------- ADR-016 workspace files and git (additive; protocol stays 2) ---------------- */
+
+/** Bounds shared with the Rust validator. */
+export const WORKSPACE_PATH_MAX = 1024;
+export const WORKSPACE_PATHS_MAX = 256;
+export const WORKSPACE_MESSAGE_MAX = 4096;
+export const WORKSPACE_ID_MAX = 64;
+
+/**
+ * `workspaceId` is an `Agent.live.workspaces[].id`; paths are relative to that
+ * workspace (`/`-separated; '' = its root). Reads (fs_list, fs_read,
+ * git_status, git_diff) are answered with a `workspace_result` followed by an
+ * ack; never journaled. Mutations (git_stage, git_unstage, git_commit,
+ * git_push) get the full command lifecycle: ack on acceptance, then one
+ * `command_result` (its `error` carries git's own summary).
+ */
+export type WorkspaceClientMessage =
+  | { type: 'fs_list'; commandId: string; workspaceId: string; path?: string }
+  | { type: 'fs_read'; commandId: string; workspaceId: string; path: string }
+  | { type: 'git_status'; commandId: string; workspaceId: string }
+  | { type: 'git_diff'; commandId: string; workspaceId: string; path?: string; staged?: boolean }
+  | { type: 'git_stage'; commandId: string; workspaceId: string; paths: string[] }
+  | { type: 'git_unstage'; commandId: string; workspaceId: string; paths: string[] }
+  | { type: 'git_commit'; commandId: string; workspaceId: string; message: string }
+  | { type: 'git_push'; commandId: string; workspaceId: string };
+
+export interface FsEntry {
+  name: string;
+  kind: 'dir' | 'file';
+  /** Bytes; 0 for folders. */
+  size: number;
+  mtime: number;
+}
+
+export interface GitFile {
+  path: string;
+  /** Porcelain letter: M A D R C T U. */
+  status: string;
+  /** Renames and copies. */
+  origPath?: string;
+}
+
+export type WorkspaceResult =
+  | { kind: 'fs_list'; path: string; entries: FsEntry[]; truncated: boolean }
+  | {
+      kind: 'fs_read';
+      path: string;
+      /** Size on disk; `content` holds at most 256 KiB of it. */
+      size: number;
+      truncated: boolean;
+      /** Secret shapes were masked. */
+      redacted: boolean;
+      /** A `.env*` file: every value is masked. */
+      sensitive?: boolean;
+      content: string;
+    }
+  | {
+      kind: 'git_status';
+      /** null when HEAD is detached. */
+      branch: string | null;
+      upstream?: string;
+      ahead: number;
+      behind: number;
+      staged: GitFile[];
+      unstaged: GitFile[];
+      untracked: string[];
+      conflicted: string[];
+      truncated: boolean;
+    }
+  | { kind: 'git_diff'; path?: string; staged: boolean; truncated: boolean; patch: string };
+
+export type WorkspaceServerMessage = {
+  type: 'workspace_result';
+  commandId: string;
+  workspaceId: string;
+  result: WorkspaceResult;
+};
+
 /* ------------------------------------------------------------------ */
 /* Client → server messages                                            */
 /* ------------------------------------------------------------------ */
@@ -468,7 +548,8 @@ export type ClientMessage =
       answers?: Record<string, string[]>;
     }
   | { type: 'list_state'; commandId: string }
-  | LiveClientMessage;
+  | LiveClientMessage
+  | WorkspaceClientMessage;
 
 export type ClientMessageType = ClientMessage['type'];
 
@@ -544,7 +625,9 @@ export type ServerMessage =
       permissionId?: string;
     } & EventEnvelope)
   /** ADR-015: transcript frames reach only connections that subscribed; never journaled. */
-  | LiveServerMessage;
+  | LiveServerMessage
+  /** ADR-016: a workspace read's answer, to the asking connection only, before its ack. */
+  | WorkspaceServerMessage;
 
 export type ServerMessageType = ServerMessage['type'];
 
@@ -599,6 +682,14 @@ const CLIENT_TYPES: ReadonlySet<string> = new Set([
   'mcp_auth',
   'mcp_auth_callback',
   'mcp_reconnect',
+  'fs_list',
+  'fs_read',
+  'git_status',
+  'git_diff',
+  'git_stage',
+  'git_unstage',
+  'git_commit',
+  'git_push',
 ]);
 
 const SERVER_TYPES: ReadonlySet<string> = new Set([
@@ -618,6 +709,7 @@ const SERVER_TYPES: ReadonlySet<string> = new Set([
   'command_result',
   'transcript',
   'transcript_snapshot',
+  'workspace_result',
 ]);
 
 function hasCommandId(v: Record<string, unknown>): boolean {
@@ -629,9 +721,23 @@ function hasEnvelope(v: Record<string, unknown>): boolean {
   return isNum(v.seq) && isStr(v.eventId) && isNum(v.occurredAt);
 }
 
+/** ADR-016: a non-empty workspace path within bounds. */
+function isPath(v: unknown): boolean {
+  return isStr(v) && fits(v, WORKSPACE_PATH_MAX);
+}
+
+/** ADR-016: 1..256 non-empty paths. */
+function isPaths(v: unknown): boolean {
+  return Array.isArray(v) && v.length > 0 && v.length <= WORKSPACE_PATHS_MAX && v.every(isPath);
+}
+
 /** Validates an untrusted payload as a ClientMessage. */
 export function isClientMessage(v: unknown): v is ClientMessage {
   if (!isRecord(v) || !isStr(v.type) || !CLIENT_TYPES.has(v.type)) return false;
+  if (v.type.startsWith('fs_') || v.type.startsWith('git_')) {
+    // ADR-016: shape only; containment is the companion's job
+    if (!hasCommandId(v) || !isStr(v.workspaceId) || !fits(v.workspaceId, WORKSPACE_ID_MAX)) return false;
+  }
   switch (v.type) {
     case 'hello':
       return isStr(v.clientId) && isNum(v.protocol);
@@ -695,6 +801,23 @@ export function isClientMessage(v: unknown): v is ClientMessage {
       );
     case 'mcp_reconnect':
       return hasCommandId(v) && isStr(v.sessionId) && isStr(v.server) && fits(v.server, 256);
+    case 'fs_list':
+      return v.path === undefined || fits(v.path, WORKSPACE_PATH_MAX);
+    case 'fs_read':
+      return isPath(v.path);
+    case 'git_status':
+    case 'git_push':
+      return true;
+    case 'git_diff':
+      return (
+        (v.path === undefined || fits(v.path, WORKSPACE_PATH_MAX)) &&
+        (v.staged === undefined || typeof v.staged === 'boolean')
+      );
+    case 'git_stage':
+    case 'git_unstage':
+      return isPaths(v.paths);
+    case 'git_commit':
+      return isStr(v.message) && fits(v.message, WORKSPACE_MESSAGE_MAX);
     default:
       return false;
   }
@@ -787,6 +910,9 @@ export function isServerMessage(v: unknown): v is ServerMessage {
         isRecord(v.state) &&
         Array.isArray(v.mcp)
       );
+    case 'workspace_result':
+      // result kinds stay open (a newer companion may add some)
+      return hasCommandId(v) && isStr(v.workspaceId) && isRecord(v.result) && isStr(v.result.kind);
     default:
       return false;
   }

@@ -62,6 +62,15 @@ page records **which versions were verified** and the limits that matter in prac
   `sandbox: workspace-write` there. Workspaces are checked when the config loads, and a bad
   folder stops the companion from starting. Set `binary` to the real `codex.exe`; npm's
   `codex.cmd` shim is refused (no shell is ever used).
+- **Workspace files and git (ADR-016, `workspace.v1`).** Any Claude or Codex workspace on the
+  allow-list can be browsed read-only from the phone and committed and pushed from it. Git is
+  the desktop's own `git.exe` (found on PATH, else `C:\Program Files\Git\cmd\git.exe`; any
+  version with `git restore`, 2.23+), run with no shell and no prompts: a push that needs a
+  credential prompt fails instead of opening a window, so pushes rely on a credential
+  helper or SSH key that already works without asking. Git actions need the workspace to
+  be the repository root. Push sends the checked-out branch to its configured upstream only,
+  never forced; there is no pull. Verified against Git for Windows **2.55.0** with temporary
+  repositories and a local bare remote (`workspace::tests`); no hosted remote run yet.
 
 ## Updating this page
 

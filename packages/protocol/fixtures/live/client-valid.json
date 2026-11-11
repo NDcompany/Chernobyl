@@ -62,5 +62,16 @@
     "revision": 1,
     "message": "",
     "answers": {}
-  }
+  },
+  { "type": "fs_list", "commandId": "c-ws-1", "workspaceId": "3f2a9c1d0e4b" },
+  { "type": "fs_list", "commandId": "c-ws-2", "workspaceId": "3f2a9c1d0e4b", "path": "" },
+  { "type": "fs_list", "commandId": "c-ws-3", "workspaceId": "3f2a9c1d0e4b", "path": "src/ui" },
+  { "type": "fs_read", "commandId": "c-ws-4", "workspaceId": "3f2a9c1d0e4b", "path": "src/ui/App.tsx" },
+  { "type": "git_status", "commandId": "c-ws-5", "workspaceId": "3f2a9c1d0e4b" },
+  { "type": "git_diff", "commandId": "c-ws-6", "workspaceId": "3f2a9c1d0e4b" },
+  { "type": "git_diff", "commandId": "c-ws-7", "workspaceId": "3f2a9c1d0e4b", "path": "README.md", "staged": true },
+  { "type": "git_stage", "commandId": "c-ws-8", "workspaceId": "3f2a9c1d0e4b", "paths": ["README.md", "src/new file.ts"] },
+  { "type": "git_unstage", "commandId": "c-ws-9", "workspaceId": "3f2a9c1d0e4b", "paths": ["README.md"] },
+  { "type": "git_commit", "commandId": "c-ws-10", "workspaceId": "3f2a9c1d0e4b", "message": "Fix the login redirect\n\nCloses #12" },
+  { "type": "git_push", "commandId": "c-ws-11", "workspaceId": "3f2a9c1d0e4b" }
 ]
