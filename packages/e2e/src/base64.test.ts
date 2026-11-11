@@ -36,7 +36,9 @@ test('base64: round-trip on binary buffers of all remainder lengths', () => {
 test('base64: rejects invalid lengths (length mod 4 == 1)', () => {
   assert.equal(b64decode('A'), null);
   assert.equal(b64decode('AAAAA'), null);
-  assert.equal(b64decode('AAAA='), null); // 4 non-pad + 1 pad
+  // padding is optional on the phone side (kats.test.ts: unpadded input is
+  // accepted), so a trailing '=' after a whole group is tolerated
+  assert.deepEqual(b64decode('AAAA='), new Uint8Array([0, 0, 0]));
 });
 
 test('base64: rejects non-alphabet characters and URL-safe substitutes', () => {
