@@ -375,6 +375,17 @@ pub fn config_to_json(c: &CompanionConfig) -> Json {
 
 /// Loads the config at `path` (default location when omitted). Missing file
 /// → defaults written to disk; invalid file → Err (fail closed).
+/// ADR-018: the config as it is on disk, never writing a default (the
+/// permission hook runs inside Claude Code and must not create files).
+/// `None` when it is absent or invalid.
+pub fn read_config(path: Option<&Path>) -> Option<CompanionConfig> {
+    let file = path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_config_path);
+    let text = fs::read_to_string(file).ok()?;
+    validate_config(&json::parse(text.trim_start_matches('\u{feff}')).ok()?).ok()
+}
+
 pub fn load_config(path: Option<&Path>) -> Result<(CompanionConfig, PathBuf, bool), String> {
     let file = path
         .map(Path::to_path_buf)

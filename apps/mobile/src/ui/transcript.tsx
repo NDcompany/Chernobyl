@@ -536,7 +536,8 @@ export function InlineApproval({ permission, onDecide, agentKind, onOpenLink }: 
   return (
     <View style={styles.approval}>
       <Text variant="eyebrow" color={colors.text3}>
-        Approval needed
+        {/* ADR-018: asked by a session in a terminal or VS Code */}
+        {permission.fromPc ? 'Approval needed · from a PC session' : 'Approval needed'}
       </Text>
       <ApprovalDetail
         permission={permission}

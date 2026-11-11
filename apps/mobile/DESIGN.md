@@ -32,6 +32,7 @@ number, radius, or font size — import from `@/theme/tokens`. Borders are hairl
 `Button` (variant primary|secondary|ghost, size md|sm, loading, icon, fullWidth, `ringColor` focus
 ring), `Chip` (active/count filter; optional leading `icon`, e.g. an `AgentMark`), `StatusDot` (tone), `StatusPill` (protocol `SessionStatus` →
 label/colors), `RiskPill` (low|medium|high), `SimulatedTag` (grey "Simulated" provenance pill, ADR-009),
+`LivePcTag` (ADR-018: "Live on PC" pill, `success` dot, black hairline outline; `inverse` on the black header),
 `ProgressBar`, `StatCard`, `SearchField`, `SectionTitle`,
 `TextField` (RHF-backed — takes `form` + `name`, renders label/error/hint itself).
 
@@ -43,8 +44,9 @@ button; `dark` variant for black headers; a `right` element such as a status pil
 `contour="bottom"`), `ToastHost` (global, reads `appStore.toasts`, tab-bar aware — mounted once in
 root layout), `ConfirmModal` (destructive confirmations; `note` = scope/safety line).
 
-**`lists.tsx`** — `AgentCard` (tile|row), `SessionRow` (agent mark before the agent · host line), `MonoBlock` (command on black), `PermissionCard`
-(compact|full, `resolved` dims), `ActivityRow`, `PromptComposer` (RHF+zod, 32,000-char limit, Stop
+**`lists.tsx`** — `AgentCard` (tile|row), `SessionRow` (agent mark before the agent · host line; ADR-018: `LivePcTag` instead
+of the status pill while `session.livePc`, a `text3` "Forked from “…”" line when `forkedFrom`), `MonoBlock` (command on black), `PermissionCard`
+(compact|full, `resolved` dims; " · from a PC session" after the agent · host line when `fromPc`), `ActivityRow`, `PromptComposer` (RHF+zod, 32,000-char limit, Stop
 while `busy`; `promptWhileBusy` `merge`|`queue` keeps Send enabled mid-turn with "Joins the current
 turn" / "Runs after this turn", `none` blocks it), `Timeline`, `OutputBlock` (stderr→error color,
 system→italic), `FileRow` (+add/−del), `DetailRow`, `SegmentedTabs`. ADR-017 composer extras, each
@@ -77,7 +79,7 @@ a status mark per `ToolStatus`; expands to input `MonoBlock`, output with trunca
 `awaiting-approval` without a record shows "Waiting for approval…"), `DiffView` (+/− in
 `success`/`error`, hunks `text3`, first 200 lines then "Show more"; like code blocks, each line
 ends in a space so Android's pixel rounding cannot wrap the widest line out of the box), `InlineApproval` /
-`StandaloneApproval` (detail by kind; primary + secondary + "More…" with session/persistent grants and
+`StandaloneApproval` (detail by kind; eyebrow "Approval needed · from a PC session" when `fromPc`; primary + secondary + "More…" with session/persistent grants and
 "Deny and tell <agent> why"; persistent grants confirm the exact rule and file), `PlanCard`,
 `NoticeRow`, `TurnFooter`, reply heads (the first agent item after a prompt or of a new turn —
 `replyStarts` — shows a 16 px `AgentMark` + the agent's name; nested work and notices never do),
@@ -230,10 +232,16 @@ session's workspace is the one whose `path` equals `Session.project`).
 `session/[id]` is the live conversation (see Live sessions) or the classic workspace; its black
 header's chip row wraps: MCP, permission mode, model, context, then rename and End session on the
 right (model, context, rename, slash commands and the camera only for agents whose
-`live.composer` lists them, i.e. Claude);
+`live.composer` lists them, i.e. Claude). ADR-018: a `livePc` session (a terminal or VS Code is
+writing it) shows `LivePcTag` first in the chip row and hides mode, model, rename, End and Stop;
+the transcript is the companion's live mirror. Its composer reads "Continue on phone (fork)…"
+with the one-line hint "Live on PC: sending forks it into a new session here; the PC session is
+untouched", sends `submit_prompt {fork: true}` and, on an ok ack naming another session,
+`router.replace`s to it; a forked session shows "Forked from “…”; the PC session is unchanged."
+in the notes. Idle sessions from the PC keep the plain composer (they resume in place);
 `?focus=<toolItemId>` scrolls the conversation to that card. Requests open through
 `permissionHref` (`@/data/selectors`): the Approvals tab, Home's pending list and notification taps
 open a request from a live conversation at its card, any other request at `permission/[id]`. Local
-notifications carry that route in `data.url`; `onNotificationOpen` (`@/platform/notify`, wired in
+notifications carry that route in `data.url` (a `fromPc` request is titled "Approval needed (PC session)"); `onNotificationOpen` (`@/platform/notify`, wired in
 `TransportProvider`) opens it on tap, also when the tap launched the app, and accepts only
 `/session/…` and `/permission/…` routes.

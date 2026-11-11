@@ -444,6 +444,48 @@ pub fn stringify(v: &Json) -> String {
     s
 }
 
+/// Two-space indented text (a settings file a person also edits).
+pub fn pretty(v: &Json) -> String {
+    fn go(out: &mut String, v: &Json, depth: usize) {
+        let pad = |out: &mut String, d: usize| {
+            out.push('\n');
+            out.push_str(&"  ".repeat(d));
+        };
+        match v {
+            Json::Arr(items) if !items.is_empty() => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    pad(out, depth + 1);
+                    go(out, item, depth + 1);
+                }
+                pad(out, depth);
+                out.push(']');
+            }
+            Json::Obj(pairs) if !pairs.is_empty() => {
+                out.push('{');
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    pad(out, depth + 1);
+                    write_str(out, k);
+                    out.push_str(": ");
+                    go(out, v, depth + 1);
+                }
+                pad(out, depth);
+                out.push('}');
+            }
+            other => write(out, other),
+        }
+    }
+    let mut s = String::new();
+    go(&mut s, v, 0);
+    s
+}
+
 /* ------------------------------------------------------------------ */
 /* Object helpers used by protocol/seed/storage                        */
 /* ------------------------------------------------------------------ */

@@ -245,6 +245,11 @@ pub struct Session {
     /// ADR-015: a transcript stream exists for this session. Serialized only
     /// when true (the `simulated` precedent).
     pub transcript: bool,
+    /// ADR-018: a Claude Code session another process on the PC (a
+    /// terminal, VS Code) is writing right now. Serialized only when true.
+    pub live_pc: bool,
+    /// ADR-018: the title of the session this one was forked from.
+    pub forked_from: Option<String>,
 }
 
 impl Session {
@@ -277,6 +282,12 @@ impl Session {
         }
         if self.transcript {
             fields.push(("transcript", Json::Bool(true)));
+        }
+        if self.live_pc {
+            fields.push(("livePc", Json::Bool(true)));
+        }
+        if let Some(t) = &self.forked_from {
+            fields.push(("forkedFrom", json::s(t)));
         }
         json::obj(fields)
     }
@@ -311,6 +322,9 @@ pub struct PermissionRequest {
     pub tool_item_id: Option<String>,
     pub options: Vec<PermissionOption>,
     pub detail: Option<Json>,
+    /// ADR-018: asked by a Claude Code session on the PC through the
+    /// `PermissionRequest` hook. Serialized only when true.
+    pub from_pc: bool,
 }
 
 impl PermissionRequest {
@@ -367,6 +381,9 @@ impl PermissionRequest {
         }
         if let Some(d) = &self.detail {
             fields.push(("detail", d.clone()));
+        }
+        if self.from_pc {
+            fields.push(("fromPc", Json::Bool(true)));
         }
         json::obj(fields)
     }
@@ -577,6 +594,9 @@ pub enum ClientMsg {
         text: String,
         /// ADR-017: Claude only; other runtimes refuse a non-empty list.
         images: Vec<PromptImage>,
+        /// ADR-018: continue a Claude Code session on disk as a NEW session
+        /// (`--resume <id> --fork-session`); the ack names the new id.
+        fork: bool,
     },
     Interrupt {
         command_id: String,
@@ -977,6 +997,12 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
             // units (an emoji is 2 there, 1 here); bytes ≥ chars, hence the fast path.
             text: req("text").filter(|t| t.len() <= 32_000 || t.chars().count() <= 32_000)?,
             images: opt_images(obj)?,
+            // ADR-018: absent, or a boolean
+            fork: match json::get(obj, "fork") {
+                None => false,
+                Some(Json::Bool(b)) => *b,
+                Some(_) => return None,
+            },
         }),
         "set_model" => Some(ClientMsg::SetModel {
             command_id: req("commandId")?,
@@ -1739,6 +1765,7 @@ mod tests {
             context: String::new(),
             decided_at: None,
             decision: None,
+            from_pc: false,
             tool_item_id: None,
             options: vec![],
             detail: None,
@@ -2475,6 +2502,7 @@ mod tests {
             context: "Create a.txt containing hi".into(),
             decided_at: None,
             decision: None,
+            from_pc: false,
             tool_item_id: Some("toolu_01".into()),
             options: vec![
                 option("allow", "approve-once", "Allow", "once"),
@@ -2560,6 +2588,8 @@ mod tests {
             output: vec![],
             files: vec![],
             transcript: false,
+            live_pc: false,
+            forked_from: None,
         };
         assert!(json::get(&session.to_json(), "transcript").is_none());
         session.transcript = true;
@@ -2567,6 +2597,18 @@ mod tests {
             json::get(&session.to_json(), "transcript"),
             Some(&Json::Bool(true))
         );
+        // ADR-018: livePc and forkedFrom only when set
+        assert!(json::get(&session.to_json(), "livePc").is_none());
+        assert!(json::get(&session.to_json(), "forkedFrom").is_none());
+        session.live_pc = true;
+        session.forked_from = Some("fix the parser".into());
+        let v = session.to_json();
+        assert_eq!(json::get(&v, "livePc"), Some(&Json::Bool(true)));
+        assert_eq!(json::get_str(&v, "forkedFrom"), Some("fix the parser"));
+        let mut p = sample_permission();
+        assert!(json::get(&p.to_json(), "fromPc").is_none());
+        p.from_pc = true;
+        assert_eq!(json::get(&p.to_json(), "fromPc"), Some(&Json::Bool(true)));
     }
     /// ADR-017: the composer messages, from the fixtures the TS suite reads,
     /// plus the size bounds at their edges.
@@ -2594,8 +2636,25 @@ mod tests {
                     media_type: "image/png".into(),
                     data: png.into(),
                 }],
+                fork: false,
             })
         );
+        // ADR-018: fork is absent or a boolean
+        let fork = |v: &str| {
+            parse_client_message(&format!(
+                r#"{{"type":"submit_prompt","commandId":"c","sessionId":"s","text":"t","fork":{v}}}"#
+            ))
+        };
+        assert!(matches!(
+            fork("true"),
+            Some(ClientMsg::SubmitPrompt { fork: true, .. })
+        ));
+        assert!(matches!(
+            fork("false"),
+            Some(ClientMsg::SubmitPrompt { fork: false, .. })
+        ));
+        assert!(fork("\"yes\"").is_none());
+        assert!(fork("1").is_none());
         // the data cap is on all images together: 180,000 chars pass, one
         // more quad fails (also when split across images)
         let image = |len: usize| {

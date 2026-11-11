@@ -545,6 +545,15 @@ fn handle_conn(
                 "/hooks/claude" => {
                     return hook_ingress(&mut request, &mut writer, &handshake, &companion);
                 }
+                "/hooks/claude/permission" => {
+                    return hook_permission_ingress(
+                        &mut request,
+                        &mut writer,
+                        &handshake,
+                        &companion,
+                        &stop,
+                    );
+                }
                 "/pairing/offer" => {
                     return pairing_offer_ingress(
                         &mut request,
@@ -763,6 +772,104 @@ fn hook_ingress(
     writer.write_all(resp.as_bytes())
 }
 
+/// ADR-018: how long a `PermissionRequest` hook may wait for the phone
+/// (`?wait=<ms>`, clamped); the hook CLI asks for its own `--timeout`.
+pub const HOOK_WAIT_DEFAULT_MS: i64 = 120_000;
+pub const HOOK_WAIT_MAX_MS: i64 = 600_000;
+
+/// ADR-018 approvals from the phone for Claude Code sessions on the PC:
+/// loopback diagnostics only, the control key required, no Origin (like
+/// the other control routes). The body is the hook's stdin JSON. The
+/// answer is 200 `{"behavior":"allow"}` / `{"behavior":"deny","message"}`
+/// once the phone decides, or 204 (nothing to print, the PC asks as
+/// usual) when the request is not the phone's, its wait runs out, the
+/// companion stops, or the hook goes away first (the PC answered: the
+/// request becomes `stale`). Never longer than the wait.
+fn hook_permission_ingress(
+    reader: &mut StopAwareReader<'_>,
+    writer: &mut TcpStream,
+    h: &Handshake,
+    companion: &Companion,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    if h.header("origin").is_some() || !has_control_key(h, companion) {
+        drain_body(reader, h);
+        let _ = ws::write_http_error(writer, 403, "Forbidden", "");
+        return Ok(());
+    }
+    let clen = h
+        .header("content-length")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n <= ws::MAX_HOOK_BODY_BYTES);
+    let Some(clen) = clen else {
+        drain_body(reader, h);
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    };
+    let mut body = vec![0u8; clen];
+    if reader.read_exact(&mut body).is_err() {
+        let _ = ws::write_http_error(writer, 400, "Bad Request", "");
+        return Ok(());
+    }
+    let no_content = b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    let Ok(payload) = String::from_utf8(body) else {
+        return writer.write_all(no_content);
+    };
+    let wait_ms = h
+        .target
+        .split_once("?wait=")
+        .and_then(|(_, w)| w.parse::<i64>().ok())
+        .unwrap_or(HOOK_WAIT_DEFAULT_MS)
+        .clamp(1_000, HOOK_WAIT_MAX_MS);
+    let Some((id, rx, rt)) = companion.claude_hook_permission(&payload, wait_ms) else {
+        return writer.write_all(no_content);
+    };
+    let deadline = Instant::now() + Duration::from_millis(wait_ms as u64);
+    let end = loop {
+        match rx.recv_timeout(IDLE_POLL) {
+            Ok(verdict) => {
+                let body = match verdict {
+                    crate::claude_runtime::HookVerdict::Allow => {
+                        json::obj(vec![("behavior", json::s("allow"))])
+                    }
+                    crate::claude_runtime::HookVerdict::Deny(m) => json::obj(vec![
+                        ("behavior", json::s("deny")),
+                        ("message", json::s(&m)),
+                    ]),
+                };
+                let body = json::stringify(&body);
+                return writer.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+            // dropped by the runtime (disposed): nothing to say
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return writer.write_all(no_content);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
+            break crate::claude_runtime::HookEnd::Expired;
+        }
+        // the hook process is gone (Claude Code took the PC's answer and
+        // cancelled it): a closed or reset socket reads 0 or fails
+        let mut probe = [0u8; 1];
+        match reader.inner.peek(&mut probe) {
+            Ok(0) => break crate::claude_runtime::HookEnd::AnsweredOnPc,
+            Ok(_) => {}
+            Err(e) if is_timeout(&e) => {}
+            Err(_) => break crate::claude_runtime::HookEnd::AnsweredOnPc,
+        }
+    };
+    rt.hook_ended(&id, end);
+    let _ = writer.write_all(no_content);
+    Ok(())
+}
+
 /// In-process device revocation ingress (D4): reachable ONLY on the loopback diagnostics
 /// listener. Rejects requests with an Origin header (403), requires a valid JSON body
 /// with `{"deviceId":"<id>"}`, marks the device revoked in the companion's store,
@@ -915,11 +1022,24 @@ pub fn control_post(
     key: &str,
     body: &str,
 ) -> Result<crate::client::HttpResponse, String> {
+    control_post_within(url, key, body, Duration::from_secs(15))
+}
+
+/// [`control_post`] that waits up to `read` for the answer (ADR-018: the
+/// permission hook waits for the phone). A loopback connect gets 2 s.
+pub fn control_post_within(
+    url: &str,
+    key: &str,
+    body: &str,
+    read: Duration,
+) -> Result<crate::client::HttpResponse, String> {
     let (authority, path) = crate::client::split_url(url)?;
-    let mut s =
-        TcpStream::connect(authority.as_str()).map_err(|e| format!("connect {authority}: {e}"))?;
-    s.set_read_timeout(Some(Duration::from_secs(15)))
-        .map_err(|e| e.to_string())?;
+    let addr: std::net::SocketAddr = authority
+        .parse()
+        .map_err(|e| format!("address {authority}: {e}"))?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|e| format!("connect {authority}: {e}"))?;
+    s.set_read_timeout(Some(read)).map_err(|e| e.to_string())?;
     write!(
         s,
         "POST {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nContent-Type: application/json\r\n{CONTROL_KEY_HEADER}: {key}\r\nContent-Length: {}\r\n\r\n{body}",
@@ -3614,6 +3734,147 @@ mod e2e_tests {
         let revoke = control_post(&format!("{diag}/devices/revoke"), key, &revoke_body).unwrap();
         assert_eq!(revoke.status, 200, "got: {revoke:?}");
         shutdown(f);
+    }
+
+    /// ADR-018 end to end: the hook CLI's request becomes an engine
+    /// approval the phone answers; a hook that goes away (the PC answered)
+    /// leaves it `stale` and a late tap refused; a wait that runs out
+    /// leaves it `expired`; with no phone connected nothing is held.
+    #[test]
+    fn permission_hook_round_trip_through_the_companion() {
+        use crate::claude::permission_hook;
+        use crate::claude_runtime::tests as cl;
+        let dir = temp_dir("hook-perm");
+        let (work, data) = (dir.join("work"), dir.join("data"));
+        std::fs::create_dir_all(&work).unwrap();
+        let mut c = default_config();
+        c.data_dir = data.clone();
+        c.adapters.push(crate::config::AdapterEntryConfig {
+            id: "claude-1".into(),
+            kind: "claude".into(),
+            enabled: true,
+            ..Default::default()
+        });
+        let mut comp = Companion::boot(c).unwrap();
+        let ws =
+            crate::claude_live::validate_workspace(&work.to_string_lossy(), &data, None).unwrap();
+        let rig = cl::rig_with(comp.hub(), cl::fast(), 3, vec![], |cfg| {
+            cfg.workspaces = vec![ws.clone()];
+        });
+        comp.attach_claude_live(rig.rt.clone());
+        let comp = Arc::new(comp);
+        let handle = start("127.0.0.1", 0, 0, None, comp.clone()).unwrap();
+        let (port, key) = (handle.diagnostics_port, comp.control_key().to_string());
+        let ask = format!(
+            r#"{{"session_id":"5e55e55e-0000-4000-8000-000000000001","transcript_path":"x","cwd":{},"permission_mode":"default","hook_event_name":"PermissionRequest","tool_name":"Write","tool_input":{{"file_path":"a.txt","content":"hi"}}}}"#,
+            json::stringify(&json::s(&ws.path))
+        );
+        let pending = |comp: &Companion| {
+            comp.snapshot()
+                .permissions
+                .into_iter()
+                .find(|p| p.from_pc && p.status == "pending")
+        };
+        let status = |comp: &Companion, id: &str| {
+            comp.snapshot()
+                .permissions
+                .into_iter()
+                .find(|p| p.id == id)
+                .map(|p| p.status)
+        };
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // no phone connected: answered at once with nothing
+        let t0 = Instant::now();
+        assert_eq!(
+            permission_hook(&ask, port, &key, Duration::from_secs(30)),
+            None
+        );
+        assert!(t0.elapsed() < Duration::from_secs(3));
+        assert!(pending(&comp).is_none());
+        // a wrong key never reaches the runtime
+        assert_eq!(
+            permission_hook(&ask, port, "nope", Duration::from_secs(30)),
+            None
+        );
+
+        let mut phone =
+            WsClient::connect(&format!("127.0.0.1:{}", handle.port), "/", None).unwrap();
+        phone.hello().unwrap();
+        // 1. the phone allows
+        let (a, k) = (ask.clone(), key.clone());
+        let hook = thread::spawn(move || permission_hook(&a, port, &k, Duration::from_secs(30)));
+        until("the request", &|| pending(&comp).is_some());
+        let p = pending(&comp).unwrap();
+        assert!(
+            p.expires_at - now_ms() <= 32_000,
+            "the hook's wait, not 24 h"
+        );
+        let decide = |cmd: &str, id: &str| ClientMsg::PermissionDecision {
+            command_id: cmd.into(),
+            permission_id: id.into(),
+            decision: "approve-once".into(),
+            revision: 1.0,
+            option_id: Some("allow".into()),
+            message: None,
+            answers: vec![],
+        };
+        assert!(matches!(
+            comp.handle_client_msg(decide("d1", &p.id)),
+            Some(ServerMsg::Ack { ok: true, .. })
+        ));
+        let out = hook.join().unwrap().expect("a decision to print");
+        assert_eq!(
+            out,
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
+        );
+        assert_eq!(status(&comp, &p.id).as_deref(), Some("approved"));
+
+        // 2. the hook goes away first (Claude Code took the PC's answer)
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            s,
+            "POST /hooks/claude/permission?wait=30000 HTTP/1.1\r\nHost: x\r\n{CONTROL_KEY_HEADER}: {key}\r\nContent-Length: {}\r\n\r\n{ask}",
+            ask.len()
+        )
+        .unwrap();
+        until("the second request", &|| pending(&comp).is_some());
+        let p = pending(&comp).unwrap();
+        drop(s);
+        until("stale", &|| {
+            status(&comp, &p.id).as_deref() == Some("stale")
+        });
+        match comp.handle_client_msg(decide("d2", &p.id)) {
+            Some(ServerMsg::Ack {
+                ok: false,
+                error: Some(e),
+                ..
+            }) => assert_eq!(e, crate::claude_runtime::ANSWERED_ON_PC),
+            other => panic!("{other:?}"),
+        }
+
+        // 3. nobody answers: the wait runs out, the PC asks
+        assert_eq!(
+            permission_hook(&ask, port, &key, Duration::from_millis(1_000)),
+            None
+        );
+        let expired = comp
+            .snapshot()
+            .permissions
+            .into_iter()
+            .filter(|p| p.from_pc && p.status == "expired")
+            .count();
+        assert_eq!(expired, 1);
+
+        drop(phone);
+        let clean = handle.stop();
+        comp.shutdown(clean);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

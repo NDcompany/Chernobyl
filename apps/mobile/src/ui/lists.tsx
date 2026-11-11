@@ -24,6 +24,7 @@ import {
 import { colors, spacing, radii, typography } from '@/theme/tokens';
 import {
   Button,
+  LivePcTag,
   RiskPill,
   SimulatedTag,
   StatusDot,
@@ -146,7 +147,7 @@ export function SessionRow({ session, agent, host, onPress, style }: SessionRowP
   return (
     <Card
       onPress={onPress}
-      accessibilityLabel={`${session.title}, ${session.status}, ${agent?.name ?? ''}${simulated ? ', simulated' : ''}`}
+      accessibilityLabel={`${session.title}, ${session.status}, ${agent?.name ?? ''}${session.livePc ? ', live on PC' : ''}${simulated ? ', simulated' : ''}`}
       style={[styles.sessionRow, style]}
     >
       <View style={{ flexDirection: 'row', gap: spacing.sm, alignItems: 'flex-start' }}>
@@ -160,9 +161,15 @@ export function SessionRow({ session, agent, host, onPress, style }: SessionRowP
               {agent?.name ?? 'Agent'} · {host?.name ?? 'host'}
             </Text>
           </View>
+          {session.forkedFrom ? (
+            <Text variant="xs" color={colors.text3} numberOfLines={1}>
+              Forked from “{session.forkedFrom}”
+            </Text>
+          ) : null}
           {simulated ? <SimulatedTag /> : null}
         </View>
-        <StatusPill status={session.status} />
+        {/* ADR-018: written by a terminal or VS Code right now */}
+        {session.livePc ? <LivePcTag /> : <StatusPill status={session.status} />}
       </View>
       <View style={styles.sessionMeta}>
         <Icon name="folder" size={13} color={colors.text3} />
@@ -229,7 +236,9 @@ export function PermissionCard({
   const countdownText =
     permission.status === 'pending' ? countdown(permission.expiresAt, nowMs) : '';
   const simulated = Boolean(agent?.simulated || host?.simulated);
-  const simLabel = simulated ? ', simulated' : '';
+  const simLabel = `${permission.fromPc ? ', from a PC session' : ''}${simulated ? ', simulated' : ''}`;
+  // ADR-018: asked by a Claude Code session in a terminal or VS Code
+  const origin = permission.fromPc ? ' · from a PC session' : '';
 
   if (variant === 'compact') {
     return (
@@ -247,6 +256,7 @@ export function PermissionCard({
           </Text>
           <Text variant="xs" color={colors.text3} numberOfLines={1}>
             {agent?.name ?? 'Agent'} · {host?.name ?? 'host'}
+            {origin}
           </Text>
           {simulated ? <SimulatedTag /> : null}
         </View>
@@ -273,6 +283,7 @@ export function PermissionCard({
           <Text variant="xs" color={colors.text2} numberOfLines={1}>
             {agent?.name ?? 'Agent'} · {host?.name ?? 'host'}
             {session ? ` · ${session.title}` : ''}
+            {origin}
           </Text>
           {simulated ? <SimulatedTag /> : null}
         </View>

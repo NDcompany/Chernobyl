@@ -288,6 +288,25 @@ export function SimulatedTag() {
   );
 }
 
+/**
+ * ADR-018: a Claude Code session another process on the PC (a terminal,
+ * VS Code) is writing right now. A state, so its dot is `success`.
+ */
+export function LivePcTag({ inverse = false }: { inverse?: boolean }) {
+  return (
+    <View
+      style={[styles.pill, styles.livePcTag, inverse && styles.livePcInverse]}
+      accessible
+      accessibilityLabel="Live on PC: this session is running on your PC right now"
+    >
+      <View style={[styles.dot, { backgroundColor: colors.success }]} />
+      <RNText style={[typography.xs, { color: inverse ? colors.white : colors.text, fontWeight: '700' }]}>
+        Live on PC
+      </RNText>
+    </View>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* Progress                                                            */
 /* ------------------------------------------------------------------ */
@@ -595,6 +614,14 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.border,
   },
+  livePcTag: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.black,
+  },
+  livePcInverse: { borderColor: colors.text2 },
 
   track: {
     height: 6,

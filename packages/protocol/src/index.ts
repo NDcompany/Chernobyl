@@ -192,6 +192,10 @@ export interface Session {
   files: FileChange[];
   /** ADR-015: present only when a transcript stream exists for this session. */
   transcript?: true;
+  /** ADR-018: a Claude Code session another process on the PC is writing right now. */
+  livePc?: true;
+  /** ADR-018: the title of the session this one was forked from. */
+  forkedFrom?: string;
 }
 
 export interface PermissionRequest {
@@ -231,6 +235,8 @@ export interface PermissionRequest {
   options?: PermissionOption[];
   /** ADR-015: what is being asked (command, diff, questions, plan). */
   detail?: PermissionDetail;
+  /** ADR-018: asked by a Claude Code session on the PC through its hook. */
+  fromPc?: true;
 }
 
 export interface ActivityEvent {
@@ -549,7 +555,18 @@ export type ClientMessage =
       /** ADR-017 (Claude): `--model` at spawn; must pass isModelName. */
       model?: string;
     }
-  | { type: 'submit_prompt'; commandId: string; sessionId: string; text: string; images?: PromptImage[] }
+  | {
+      type: 'submit_prompt';
+      commandId: string;
+      sessionId: string;
+      text: string;
+      images?: PromptImage[];
+      /**
+       * ADR-018 (Claude): continue a session from the PC as a NEW session
+       * (`--resume <id> --fork-session`); the ack's sessionId names it.
+       */
+      fork?: boolean;
+    }
   | { type: 'interrupt'; commandId: string; sessionId: string }
   | {
       type: 'permission_decision';
@@ -847,7 +864,8 @@ export function isClientMessage(v: unknown): v is ClientMessage {
         isStr(v.sessionId) &&
         isStr(v.text) &&
         fits(v.text, 32_000) &&
-        (v.images === undefined || isPromptImages(v.images))
+        (v.images === undefined || isPromptImages(v.images)) &&
+        (v.fork === undefined || typeof v.fork === 'boolean')
       );
     case 'set_model':
       return hasCommandId(v) && isStr(v.sessionId) && isModelName(v.model);

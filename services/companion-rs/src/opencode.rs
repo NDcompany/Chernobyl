@@ -299,6 +299,10 @@ impl OpenCodeAdapter {
     /// validation fault for the caller to surface.
     pub fn send(&self, msg: &ClientMsg) -> Result<ServerMsg, AdapterError> {
         match msg {
+            // ADR-018: forking is Claude's
+            ClientMsg::SubmitPrompt { fork: true, .. } => Err(AdapterError::Unsupported(
+                "OpenCode sessions cannot be forked from the phone".into(),
+            )),
             // ADR-017: the composer extras are Claude's
             ClientMsg::CreateSession { images, .. } | ClientMsg::SubmitPrompt { images, .. }
                 if !images.is_empty() =>
@@ -766,6 +770,8 @@ impl Inner {
             // ADR-015: every OpenCode session streams on demand (the first
             // subscriber hydrates it), so the phone opens the conversation
             transcript: true,
+            live_pc: false,
+            forked_from: None,
         })
     }
 
@@ -2916,6 +2922,7 @@ fn permission_request(host: &str, props: &Json, question: bool) -> Option<Permis
         },
         decided_at: None,
         decision: None,
+        from_pc: false,
         tool_item_id: call,
         options,
         detail: Some(detail),
@@ -3350,6 +3357,7 @@ pub(crate) mod tests {
             session_id: "ses_test1".into(),
             text: "hello".into(),
             images: vec![],
+            fork: false,
         })
         .unwrap()
     }
@@ -3400,6 +3408,7 @@ pub(crate) mod tests {
                 session_id: "ses_test1".into(),
                 text: "hi".into(),
                 images: vec![],
+                fork: false,
             })
             .unwrap_err();
         assert_eq!(err.code(), "invalid-response");
@@ -3703,6 +3712,7 @@ pub(crate) mod tests {
                 session_id: "s".into(),
                 text: "t".into(),
                 images: vec![],
+                fork: false,
             })
             .unwrap_err();
         assert_eq!(err.code(), "runtime-unavailable");
@@ -4222,6 +4232,7 @@ pub(crate) mod tests {
                 session_id: sid.into(),
                 text: "hello".into(),
                 images: vec![],
+                fork: false,
             })
             .unwrap();
         assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }));

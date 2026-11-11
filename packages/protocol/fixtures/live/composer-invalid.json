@@ -162,5 +162,11 @@
       "title": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
   },
-  { "why": "rename without sessionId", "msg": { "type": "rename_session", "commandId": "c", "title": "x" } }
+  { "why": "rename without sessionId", "msg": { "type": "rename_session", "commandId": "c", "title": "x" } },
+  {
+    "why": "fork as a string",
+    "msg": { "type": "submit_prompt", "commandId": "c", "sessionId": "s", "text": "t", "fork": "yes" }
+  },
+  { "why": "fork as a number", "msg": { "type": "submit_prompt", "commandId": "c", "sessionId": "s", "text": "t", "fork": 1 } },
+  { "why": "fork null", "msg": { "type": "submit_prompt", "commandId": "c", "sessionId": "s", "text": "t", "fork": null } }
 ]

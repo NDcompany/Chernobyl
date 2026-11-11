@@ -1,4 +1,6 @@
 [
+  { "type": "submit_prompt", "commandId": "c-fork-1", "sessionId": "ses_live_1", "text": "carry on", "fork": true },
+  { "type": "submit_prompt", "commandId": "c-fork-2", "sessionId": "ses_live_1", "text": "go", "fork": false },
   {
     "type": "submit_prompt",
     "commandId": "c-img-1",

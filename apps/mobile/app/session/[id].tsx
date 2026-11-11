@@ -30,7 +30,7 @@ import {
 } from '@/data/selectors';
 import { relativeTime } from '@/utils/format';
 import { useReducedMotion, useNow } from '@/hooks/useReducedMotion';
-import { ProgressBar, SimulatedTag, StatusDot, StatusPill, Text } from '@/ui/primitives';
+import { LivePcTag, ProgressBar, SimulatedTag, StatusDot, StatusPill, Text } from '@/ui/primitives';
 import { Screen, PageHeader, Card, ConfirmModal, EmptyState } from '@/ui/surface';
 import {
   ActivityRow,
@@ -326,13 +326,26 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
         (c.permissionId !== undefined && permissionById(snapshot, c.permissionId)?.sessionId === sessionId)),
   );
   const status = view.state.status;
-  const busy = turns.some((t) => t.status === 'running') || status === 'running' || status === 'waiting';
+  // ADR-018: a terminal or VS Code is writing this session: the view mirrors
+  // it, and a prompt forks it into a new session (never Stop, mode or End)
+  const livePc = session.livePc === true;
+  const busy =
+    !livePc && (turns.some((t) => t.status === 'running') || status === 'running' || status === 'waiting');
   const ended = status === 'ended';
-  const canEnd = live?.end === true && !ended;
+  const canEnd = live?.end === true && !ended && !livePc;
   // ADR-017: the composer extras this runtime takes (Claude); the rest stay hidden
   const composer = new Set(live?.composer ?? []);
-  const showModel = composer.has('model') && !ended;
-  const showRename = composer.has('rename') && !ended;
+  const showModel = composer.has('model') && !ended && !livePc;
+  const showRename = composer.has('rename') && !ended && !livePc;
+  const showMode = Boolean(live?.permissionModes) && !livePc;
+  const onSubmit = (text: string, images?: Parameters<typeof commands.submitPrompt>[2]) => {
+    if (!livePc) return void send(commands.submitPrompt(sessionId, text, images));
+    void send(commands.submitPrompt(sessionId, text, images, true)).then((ack) => {
+      if (ack?.ok && ack.sessionId && ack.sessionId !== sessionId) {
+        router.replace({ pathname: '/session/[id]', params: { id: ack.sessionId } });
+      }
+    });
+  };
   // ADR-016: the session's folder (Session.project is the workspace path)
   const ws = workspaceOn ? workspaceForProject(snapshot.agents, session.project) : undefined;
 
@@ -348,8 +361,9 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
           right={<StatusPill status={session.status} inverse />}
         />
       </View>
-      {view.mcp.length > 0 || live?.permissionModes || canEnd || showModel || ws ? (
+      {view.mcp.length > 0 || showMode || canEnd || showModel || ws || livePc ? (
         <View style={styles.chipRow}>
+          {livePc ? <LivePcTag inverse /> : null}
           <McpChip dark servers={view.mcp} onPress={() => setMcpOpen(true)} />
           {ws ? (
             <>
@@ -373,7 +387,7 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
               </Pressable>
             </>
           ) : null}
-          {live?.permissionModes ? (
+          {showMode && live?.permissionModes ? (
             <ModeChip
               dark
               mode={view.state.permissionMode}
@@ -419,18 +433,20 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
           busy={busy}
           promptWhileBusy={live?.promptWhileBusy}
           disabled={hasUnknown || ended}
-          placeholder={`Message ${agentName}…`}
+          placeholder={livePc ? 'Continue on phone (fork)…' : `Message ${agentName}…`}
           hint={
             hasUnknown
               ? 'Outcome unknown — the host may have run it'
               : ended
                 ? 'This session has ended'
-                : status === 'starting'
-                  ? `Starting ${agentName}…`
-                  : undefined
+                : livePc
+                  ? 'Live on PC: sending forks it into a new session here; the PC session is untouched'
+                  : status === 'starting'
+                    ? `Starting ${agentName}…`
+                    : undefined
           }
-          onSubmit={(text, images) => void send(commands.submitPrompt(sessionId, text, images))}
-          onInterrupt={live?.interrupt ? () => void send(commands.interrupt(sessionId)) : undefined}
+          onSubmit={onSubmit}
+          onInterrupt={live?.interrupt && !livePc ? () => void send(commands.interrupt(sessionId)) : undefined}
           slashCommands={composer.has('commands') ? view.state.slashCommands : undefined}
           canAttach={composer.has('images')}
         />
@@ -439,9 +455,14 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
       <StatusBar style="light" />
 
       {/* ADR-009: a session on a demo agent/host never reads as live */}
-      {agent?.simulated || host?.simulated || hasUnknown || (!connected && view.epoch) ? (
+      {agent?.simulated || host?.simulated || hasUnknown || (!connected && view.epoch) || session.forkedFrom ? (
         <View style={styles.notes}>
           {agent?.simulated || host?.simulated ? <SimulatedTag /> : null}
+          {session.forkedFrom ? (
+            <Text variant="xs" color={colors.text2}>
+              Forked from “{session.forkedFrom}”; the PC session is unchanged.
+            </Text>
+          ) : null}
           {!connected && view.epoch ? (
             <Text variant="xs" color={colors.warning}>
               Not connected: showing what arrived so far. The conversation catches up on reconnect.

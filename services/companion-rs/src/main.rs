@@ -20,6 +20,12 @@
 //!   --devices                list the paired-device registry, exit
 //!   --revoke <device-id>     revoke a paired device (blocks future E2E handshakes), exit
 //!   --require-e2e            force remote E2E session posture on any bind (e.g. tunnels)
+//!   --hook permission-request  ADR-018: Claude Code's PermissionRequest command hook:
+//!                            stdin JSON to the running companion, waits for the phone
+//!                            (--timeout <s>, default 120), prints the decision or
+//!                            nothing; always exits 0
+//!   --install-hooks          add that hook to ~/.claude/settings.json (backup first)
+//!   --uninstall-hooks        remove it again
 //!   --tui                    boot the daemon and open the terminal UI (status,
 //!                            sessions, approvals, pairing, keybinds) on loopback
 //!   --soak smoke|<seconds>   soak harness (soak.rs): run this exe as the server under
@@ -61,6 +67,10 @@ fn run(args: &[String]) -> i32 {
     let mut list_devices = false;
     let mut revoke: Option<String> = None;
     let mut claude_hooks = false;
+    let mut hook: Option<String> = None;
+    let mut hook_timeout: Option<u64> = None;
+    let mut install_hooks = false;
+    let mut uninstall_hooks = false;
     let mut backup_path: Option<String> = None;
     let mut restore_path: Option<String> = None;
     let mut background = false;
@@ -97,6 +107,10 @@ fn run(args: &[String]) -> i32 {
             "--devices" => list_devices = true,
             "--revoke" => revoke = take(&mut i),
             "--claude-hooks" => claude_hooks = true,
+            "--hook" => hook = Some(take(&mut i).unwrap_or_default()),
+            "--timeout" => hook_timeout = take(&mut i).and_then(|v| v.parse().ok()),
+            "--install-hooks" => install_hooks = true,
+            "--uninstall-hooks" => uninstall_hooks = true,
             "--backup" => backup_path = take(&mut i),
             "--restore" => restore_path = take(&mut i),
             "--background" => background = true,
@@ -112,12 +126,19 @@ fn run(args: &[String]) -> i32 {
             "--token" => token_override = take(&mut i),
             "--diagnostics-port" => diag_override = take(&mut i).and_then(|v| v.parse().ok()),
             "--exit-after" => exit_after = take(&mut i).and_then(|v| v.parse().ok()),
+            // the hook never fails Claude Code's tool call over a flag
+            _ if args.iter().any(|a| a == "--hook") => {}
             other => {
                 eprintln!("unknown flag: {other}");
                 return 2;
             }
         }
         i += 1;
+    }
+
+    // ADR-018: inside Claude Code, before anything that could write a file
+    if let Some(mode) = hook {
+        return hook_main(&mode, hook_timeout, config_path.as_deref());
     }
 
     // The soak harness drives child processes of this same exe. Dispatched
@@ -196,6 +217,10 @@ fn run(args: &[String]) -> i32 {
     // companion never writes the user's settings.json). Socket-free.
     if claude_hooks {
         return claude_hooks_main(&cfg);
+    }
+    // ADR-018: written only on this explicit command, after a backup
+    if install_hooks || uninstall_hooks {
+        return install_hooks_main(&cfg_path, install_hooks, hook_timeout);
     }
     // Phase 8: `companion backup <path>` / `companion restore <path>` —
     // snapshot/restore the durable journal with a SHA-256 sidecar. Socket-free.
@@ -623,6 +648,103 @@ fn claude_hooks_main(cfg: &config::CompanionConfig) -> i32 {
     let ingress = format!("http://127.0.0.1:{}/hooks/claude", cfg.diagnostics_port);
     print!("{}", chernobyl_companion::claude::bridge_config(&ingress));
     0
+}
+
+/// ADR-018 `--hook permission-request`: Claude Code's `PermissionRequest`
+/// command hook. Reads the hook JSON on stdin, asks the running companion
+/// (loopback diagnostics, control key) and prints its decision. Prints
+/// nothing and exits 0 whenever it cannot: Claude Code then asks on the
+/// PC as usual. Never writes a file, never blocks past `--timeout`.
+fn hook_main(mode: &str, timeout_s: Option<u64>, config_path: Option<&str>) -> i32 {
+    use std::io::Read;
+    if mode != "permission-request" {
+        return 0;
+    }
+    let mut input = String::new();
+    let cap = chernobyl_companion::claude::ClaudeAdapter::MAX_HOOK_PAYLOAD_BYTES as u64 + 1;
+    if std::io::stdin()
+        .take(cap)
+        .read_to_string(&mut input)
+        .is_err()
+    {
+        return 0;
+    }
+    let Some(cfg) = config::read_config(config_path.map(std::path::Path::new)) else {
+        return 0;
+    };
+    // the control key goes only to the companion that holds this journal
+    if !companion_running(&cfg.data_dir) {
+        return 0;
+    }
+    let wait = Duration::from_secs(
+        timeout_s
+            .unwrap_or(chernobyl_companion::claude::HOOK_TIMEOUT_S)
+            .clamp(1, 600),
+    );
+    let key = control_key(&cfg);
+    if let Some(out) =
+        chernobyl_companion::claude::permission_hook(&input, cfg.diagnostics_port, &key, wait)
+    {
+        println!("{out}");
+    }
+    0
+}
+
+/// A companion holds `companion.lock` exclusively while it runs: opening
+/// it fails with a sharing violation. Only a read handle is tried, and
+/// dropped at once, so a booting companion is not kept out.
+fn companion_running(data_dir: &std::path::Path) -> bool {
+    match std::fs::File::open(data_dir.join("companion.lock")) {
+        Ok(_) => cfg!(not(windows)),
+        Err(e) => e.raw_os_error() == Some(32),
+    }
+}
+
+/// ADR-018 `--install-hooks` / `--uninstall-hooks`: adds or removes exactly
+/// the `PermissionRequest` hook in Claude Code's user `settings.json`
+/// (`CLAUDE_CONFIG_DIR` or `%USERPROFILE%\.claude`), backing the file up
+/// first; invalid JSON is refused untouched.
+fn install_hooks_main(cfg_path: &std::path::Path, install: bool, timeout_s: Option<u64>) -> i32 {
+    use chernobyl_companion::claude;
+    let Some(settings) = claude::settings_path(
+        std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+    ) else {
+        eprintln!("[companion] hooks: no USERPROFILE or CLAUDE_CONFIG_DIR");
+        return 1;
+    };
+    let result = if install {
+        let timeout = timeout_s.unwrap_or(claude::HOOK_TIMEOUT_S).clamp(1, 600);
+        let exe = std::env::current_exe().map_err(|e| format!("this exe's path: {e}"));
+        let cfg = std::fs::canonicalize(cfg_path)
+            .map(|p| std::path::PathBuf::from(chernobyl_companion::claude_live::plain(&p)))
+            .map_err(|e| format!("{}: {e}", cfg_path.display()));
+        exe.and_then(|exe| {
+            let exe = std::fs::canonicalize(&exe)
+                .map(|p| std::path::PathBuf::from(chernobyl_companion::claude_live::plain(&p)))
+                .unwrap_or(exe);
+            cfg.and_then(|c| claude::hook_command(&exe, &c, timeout))
+        })
+        .and_then(|cmd| claude::install_hook(&settings, &cmd, timeout))
+    } else {
+        claude::uninstall_hook(&settings)
+    };
+    match result {
+        Ok(msg) => {
+            println!("{msg}");
+            if install {
+                println!(
+                    "approvals reach the phone only for sessions in the workspaces configured for \
+                     Claude Code, while a phone is connected; otherwise the PC asks as usual"
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("[companion] hooks: {e}");
+            1
+        }
+    }
 }
 
 /// Phase 8: `companion backup <path>` / `companion restore <path>`. Copies the
@@ -1086,6 +1208,27 @@ mod tests {
             ),
             r#""C:\x.exe" --background --config "C:\cfg dir\companion.json""#
         );
+    }
+
+    /// ADR-018: the hook path writes nothing and only talks to a companion
+    /// that holds the journal lock.
+    #[test]
+    fn hook_mode_writes_no_config_and_sees_only_a_running_companion() {
+        use chernobyl_companion::{config, storage};
+        let dir = std::env::temp_dir().join(format!("chb-hook-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("companion.json");
+        assert!(config::read_config(Some(&cfg)).is_none());
+        assert!(!cfg.exists(), "no default config written");
+        assert!(!super::companion_running(&dir));
+        let lock = storage::lock_data_dir(&dir).unwrap();
+        assert!(super::companion_running(&dir));
+        drop(lock);
+        assert!(!super::companion_running(&dir));
+        // an unknown hook mode is a silent no-op
+        assert_eq!(super::hook_main("pre-tool-use", None, None), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

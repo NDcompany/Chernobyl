@@ -192,6 +192,8 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
                 file("src/api/routes.ts", 24, 24, "modified"),
             ],
             transcript: false,
+            live_pc: false,
+            forked_from: None,
         },
         Session {
             id: "s2".into(),
@@ -225,6 +227,8 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             ],
             files: vec![],
             transcript: false,
+            live_pc: false,
+            forked_from: None,
         },
         Session {
             id: "s3".into(),
@@ -265,6 +269,8 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             ],
             files: vec![file("tests/retry/rate-limit.test.ts", 8, 3, "modified")],
             transcript: false,
+            live_pc: false,
+            forked_from: None,
         },
         Session {
             id: "s4".into(),
@@ -293,6 +299,8 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             ],
             files: vec![file("work/monitoring/pricing-2026-10.md", 62, 0, "added")],
             transcript: false,
+            live_pc: false,
+            forked_from: None,
         },
         Session {
             id: "s5".into(),
@@ -317,6 +325,8 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
             )],
             files: vec![],
             transcript: false,
+            live_pc: false,
+            forked_from: None,
         },
     ];
 
@@ -358,6 +368,7 @@ pub fn create_seed_snapshot(now: i64) -> Snapshot {
         context: context.into(),
         decided_at: None,
         decision: None,
+        from_pc: false,
         tool_item_id: None,
         options: vec![],
         detail: None,

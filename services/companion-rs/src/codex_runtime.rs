@@ -222,6 +222,10 @@ impl LiveRuntime for CodexRuntime {
 impl Inner {
     fn send(self: &Arc<Self>, msg: &ClientMsg) -> Result<ServerMsg, AdapterError> {
         match msg {
+            // ADR-018: forking is Claude's
+            ClientMsg::SubmitPrompt { fork: true, .. } => Err(AdapterError::Unsupported(
+                "Codex sessions cannot be forked from the phone".into(),
+            )),
             // ADR-017: the composer extras are Claude's
             ClientMsg::CreateSession { images, .. } | ClientMsg::SubmitPrompt { images, .. }
                 if !images.is_empty() =>
@@ -557,6 +561,8 @@ impl Inner {
                         output: vec![],
                         files: vec![],
                         transcript: true,
+                        live_pc: false,
+                        forked_from: None,
                     };
                     st.sessions.push(session.clone());
                     st.tags.insert(tag, thread.clone());
@@ -1045,6 +1051,7 @@ pub(crate) mod tests {
             session_id: "thr_1".into(),
             text: "also lint".into(),
             images: vec![],
+            fork: false,
         };
         assert!(matches!(
             rt.send(&prompt),
@@ -1089,6 +1096,7 @@ pub(crate) mod tests {
             session_id: "thr_1".into(),
             text: "go on".into(),
             images: vec![],
+            fork: false,
         };
         let ack = rt.send(&again("p2")).unwrap();
         assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
@@ -1331,6 +1339,7 @@ pub(crate) mod tests {
             session_id: thread.clone(),
             text: "hello again".into(),
             images: vec![],
+            fork: false,
         };
         let ack = rt.send(&prompt).unwrap();
         assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");

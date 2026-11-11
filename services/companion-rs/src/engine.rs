@@ -122,7 +122,10 @@ impl Engine {
         if !pr.options.is_empty() {
             pr.supported_decisions = legacy_decisions(&pr.options);
         }
-        pr.expires_at = now_ms() + LIVE_PERMISSION_TTL_MS;
+        // ADR-018: a hook request lives only as long as its hook waits
+        if !pr.from_pc {
+            pr.expires_at = now_ms() + LIVE_PERMISSION_TTL_MS;
+        }
         self.state.permissions.insert(0, pr.clone());
         let agent_name = self
             .find_session(&pr.session_id)
@@ -258,6 +261,8 @@ impl Engine {
         let (status, decision) = match (status, decision) {
             ("approved", Some(d @ ("approve-once" | "approve-session"))) => ("approved", Some(d)),
             ("rejected", _) => ("rejected", Some("reject")),
+            // ADR-018: a hook request whose wait ran out
+            ("expired", _) => ("expired", None),
             _ => ("stale", None),
         };
         let now = now_ms();
@@ -275,6 +280,7 @@ impl Engine {
         self.broadcast(EventKind::PermissionResolved(p.clone()));
         let text = match status {
             "stale" => format!("“{}” was withdrawn by the runtime", p.command),
+            "expired" => format!("“{}” expired", p.command),
             s => format!("“{}” was {s} in the runtime", p.command),
         };
         self.push_activity("permission", &text, Some(&p.id));
@@ -459,6 +465,8 @@ impl Engine {
             output: vec![],
             files: vec![],
             transcript: false,
+            live_pc: false,
+            forked_from: None,
         };
         self.state.sessions.insert(0, session.clone());
         self.broadcast(EventKind::SessionCreated(session.clone()));
@@ -480,11 +488,12 @@ impl Engine {
             session_id,
             text,
             images,
+            fork,
         } = msg
         else {
             return None;
         };
-        if !images.is_empty() {
+        if !images.is_empty() || fork {
             return Some(ServerMsg::ack_err(
                 &command_id,
                 "not supported by this agent",
@@ -938,6 +947,7 @@ impl Engine {
             context: spec.context.clone(),
             decided_at: None,
             decision: None,
+            from_pc: false,
             tool_item_id: None,
             options: vec![],
             detail: None,
@@ -1492,6 +1502,7 @@ mod tests {
             session_id: session_id.clone(),
             text: "again".into(),
             images: vec![],
+            fork: false,
         }));
         assert_eq!(second.as_ref().map(|a| a.1), Some(false));
         assert!(second.unwrap().4.unwrap().contains("already running"));
@@ -1549,6 +1560,7 @@ mod tests {
             session_id: "s4".into(),
             text: "go".into(),
             images: vec![],
+            fork: false,
         }));
         assert_eq!(ack.as_ref().map(|a| a.1), Some(true));
         assert!(events.lock().unwrap().iter().any(|e| matches!(
@@ -1579,6 +1591,7 @@ mod tests {
             session_id: "s4".into(),
             text: "run".into(),
             images: vec![],
+            fork: false,
         });
         // fast-forward: plan reaches the ask at step 3 (~1.35s of steps)
         let deadline = now_ms() + 10_000;
@@ -1862,6 +1875,7 @@ mod tests {
             context: String::new(),
             decided_at: None,
             decision: None,
+            from_pc: false,
             tool_item_id: Some("tool-1".into()),
             options,
             detail: None,

@@ -20,11 +20,17 @@
 # ngrok shortcut: -NgrokDomain <name>.ngrok-free.dev runs `ngrok http <port> --url <domain>` hidden,
 # now and at every login (HKCU Run), and sets -TunnelUrl wss://<domain>. Run `ngrok config
 # add-authtoken <token>` yourself once first; the token never passes through this script.
+#
+# -PhoneApprovals (ADR-018): also adds the companion's PermissionRequest hook to
+# %USERPROFILE%\.claude\settings.json (`--install-hooks`, backup in settings.json.chernobyl-backup),
+# so Claude Code sessions in a terminal or VS Code ask the phone too; the PC still asks if the
+# phone does not answer in 120 s. Undo: & "$env:LOCALAPPDATA\Programs\CHERNOBYL\chernobyl-companion.exe" --uninstall-hooks
 param(
   [Parameter(Mandatory = $true)][string[]]$Workspaces,
   [int]$Port = 8787,
   [string]$Exe = (Join-Path $PSScriptRoot '..\services\companion-rs\target\release\chernobyl-companion.exe'),
   [switch]$NoAutostart,
+  [switch]$PhoneApprovals,
   [string]$TunnelUrl,
   [string]$NgrokDomain,
   [string]$Ngrok = 'C:\ngrok\ngrok.exe'
@@ -114,6 +120,9 @@ foreach ($i in 1..50) {
 }
 if (-not $up) { throw 'The companion did not come up. Run it in a terminal to see why: & "' + $target + '"' }
 Write-Host 'Companion is running.'
+
+# 5d. approvals for PC sessions (only on request: this edits Claude Code's own settings.json)
+if ($PhoneApprovals) { & $target --install-hooks | Out-Host }
 
 # 5c. prove the tunnel reaches the companion: /health without the token answers 401 from the
 # companion itself (a non-browser user agent skips ngrok's browser warning page)

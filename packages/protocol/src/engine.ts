@@ -366,7 +366,8 @@ export class MockEngine {
   }
 
   private submitPrompt(msg: Extract<ClientMessage, { type: 'submit_prompt' }>): ServerMessage {
-    if (msg.images?.length) return ackErr(msg.commandId, 'not supported by this agent');
+    // ADR-018: forking is the live Claude runtime's (parity with the Rust engine)
+    if (msg.images?.length || msg.fork) return ackErr(msg.commandId, 'not supported by this agent');
     const session = this.findSession(msg.sessionId);
     if (!session) return ackErr(msg.commandId, 'unknown session');
     const live = this.live.get(session.id);

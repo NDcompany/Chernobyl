@@ -983,6 +983,7 @@ impl Codex {
             context: clip(&reason, CONTEXT_CAP).0,
             decided_at: None,
             decision: None,
+            from_pc: false,
             tool_item_id: Some(item.into()),
             options: Vec::new(),
             detail: None,

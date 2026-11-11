@@ -44,7 +44,8 @@ async function handleSideEffect(msg: ServerMessage): Promise<void> {
     const snapshot = queryClient.getQueryData<Snapshot>(STATE_KEY);
     const live = useAppStore.getState().features.includes(FEATURE_TRANSCRIPT);
     await notify(
-      'Approval needed',
+      // ADR-018: asked by a session in a terminal or VS Code
+      msg.permission.fromPc ? 'Approval needed (PC session)' : 'Approval needed',
       `${agentName(snapshot, msg.permission.agentId)} wants to ${msg.permission.title.toLowerCase()}: ${msg.permission.command}`,
       // the tap opens the conversation at its card (ADR-015 §5), else the request
       snapshot ? permissionHref(snapshot, msg.permission, live) : `/permission/${msg.permission.id}`,

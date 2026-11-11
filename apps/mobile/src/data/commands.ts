@@ -35,13 +35,18 @@ export const commands = {
     revision,
     ...extra,
   }),
-  /** ADR-017: `images` only for agents whose `live.composer` has 'images'. */
-  submitPrompt: (sessionId: string, text: string, images?: PromptImage[]): ClientMessage => ({
+  /**
+   * ADR-017: `images` only for agents whose `live.composer` has 'images'.
+   * ADR-018: `fork` continues a session that is live on the PC as a new
+   * session (the ack's sessionId); the PC session is untouched.
+   */
+  submitPrompt: (sessionId: string, text: string, images?: PromptImage[], fork?: boolean): ClientMessage => ({
     type: 'submit_prompt',
     commandId: nextId('cmd'),
     sessionId,
     text,
     ...(images?.length ? { images } : {}),
+    ...(fork ? { fork: true } : {}),
   }),
   interrupt: (sessionId: string): ClientMessage => ({
     type: 'interrupt',

@@ -137,6 +137,8 @@ pub struct Companion {
     control_key: String,
     /// ADR-016 T1: workspaces with a git action in flight (one at a time).
     workspace_busy: Arc<Mutex<HashSet<String>>>,
+    /// ADR-018: the Claude Code runtime, for `PermissionRequest` hooks.
+    claude_live: Option<Arc<ClaudeRuntime>>,
 }
 
 impl Companion {
@@ -263,6 +265,7 @@ impl Companion {
             malformed_total: std::sync::atomic::AtomicU64::new(0),
             control_key,
             workspace_busy: Arc::default(),
+            claude_live: None,
         };
 
         // Boot reconciliation: unresolved commands → unknown (never re-run),
@@ -410,6 +413,7 @@ impl Companion {
             mgr.attach_claude(rt.id(), caps);
             mgr.probe_result(rt.id(), probe.err().map(|e| e.to_string()));
         }
+        self.claude_live = Some(rt.clone());
         self.runtimes.push(rt);
     }
 
@@ -536,7 +540,14 @@ impl Companion {
                         )
                     };
                     match verdict {
-                        Err(e) => Some(ServerMsg::ack_err(command_id, &e)),
+                        // ADR-018: a hook request that ended says why
+                        Err(e) => Some(ServerMsg::ack_err(
+                            command_id,
+                            self.claude_live
+                                .as_ref()
+                                .and_then(|c| c.hook_gone(permission_id))
+                                .unwrap_or(&e),
+                        )),
                         Ok(selected) => {
                             // T4: a persistent grant (a rule the runtime writes to
                             // a settings file) gets its own audit record
@@ -1341,6 +1352,38 @@ impl Companion {
         }
     }
 
+    /// ADR-018: a `PermissionRequest` hook from a Claude Code session on the
+    /// PC (the loopback, control-key route calls it). `None` means "not the
+    /// phone's": no Claude runtime, a malformed or other hook, no phone
+    /// connected (holding the PC's prompt would help nobody), or the
+    /// runtime declined it; the hook then prints nothing and the PC asks.
+    pub fn claude_hook_permission(
+        &self,
+        payload: &str,
+        wait_ms: i64,
+    ) -> Option<(
+        String,
+        std::sync::mpsc::Receiver<crate::claude_runtime::HookVerdict>,
+        Arc<ClaudeRuntime>,
+    )> {
+        let rt = self.claude_live.clone()?;
+        if payload.len() > ClaudeAdapter::MAX_HOOK_PAYLOAD_BYTES {
+            return None;
+        }
+        let v = crate::json::parse(payload).ok()?;
+        if crate::json::get_str(&v, "hook_event_name") != Some("PermissionRequest") {
+            return None;
+        }
+        if let Some(cl) = self.shared.claude.lock().unwrap().clone() {
+            let _ = cl.ingest(payload); // counted: proof the bridge delivers
+        }
+        if self.shared.clients.lock().unwrap().is_empty() {
+            return None;
+        }
+        let (id, rx) = rt.hook_permission(&v, wait_ms)?;
+        Some((id, rx, rt))
+    }
+
     /// Sweeps permission expiry and advances mock runs. Driven by the
     /// scheduler thread (parity with the Node host heartbeat tick). Also
     /// hosts the adapter probe loop (`probe_interval_ms`): health + list
@@ -1524,6 +1567,7 @@ fn json_text(msg: &ClientMsg) -> String {
             session_id,
             text,
             images,
+            fork,
         } => {
             let mut fields = vec![
                 ("type", json::s("submit_prompt")),
@@ -1532,6 +1576,9 @@ fn json_text(msg: &ClientMsg) -> String {
                 ("text", json::s(text)),
             ];
             images_json(&mut fields, images);
+            if *fork {
+                fields.push(("fork", Json::Bool(true)));
+            }
             json::obj(fields)
         }
         ClientMsg::Interrupt {
@@ -1870,6 +1917,7 @@ mod tests {
             session_id: session_id.clone(),
             text: "again".into(),
             images: vec![],
+            fork: false,
         });
         assert!(matches!(
             refused,
@@ -1909,6 +1957,7 @@ mod tests {
             session_id,
             text: "again".into(),
             images: vec![],
+            fork: false,
         });
         match replay_refused {
             Some(ServerMsg::Ack {
@@ -2035,6 +2084,7 @@ mod tests {
             session_id: "ses_test1".into(),
             text: "run it".into(),
             images: vec![],
+            fork: false,
         });
         assert!(matches!(reply, Some(ServerMsg::Ack { ok: true, .. })));
         {
@@ -2319,6 +2369,7 @@ mod tests {
                 session_id: "s1".into(),
                 text: "what color".into(),
                 images: vec![image.clone()],
+                fork: false,
             },
             ClientMsg::CreateSession {
                 command_id: "cmd-img-new".into(),
@@ -2546,6 +2597,8 @@ mod tests {
                 output: vec![],
                 files: vec![],
                 transcript: false,
+                live_pc: false,
+                forked_from: None,
             };
             self.sessions.iter().map(session).collect()
         }
@@ -2629,6 +2682,7 @@ mod tests {
                 session_id: sid.clone(),
                 text: "go".into(),
                 images: vec![],
+                fork: false,
             },
             ClientMsg::Interrupt {
                 command_id: cmd(2),
@@ -2668,6 +2722,7 @@ mod tests {
             session_id: "ses-a".into(),
             text: "go".into(),
             images: vec![],
+            fork: false,
         })));
         assert_eq!(b.got(), (1..=7).map(cmd).collect::<Vec<_>>());
         assert_eq!(a.got(), vec![cmd(8)]);
@@ -2677,6 +2732,7 @@ mod tests {
             session_id: "ses-none".into(),
             text: "go".into(),
             images: vec![],
+            fork: false,
         }));
         assert!(!refused.is_empty());
         assert_eq!((a.got().len(), b.got().len()), (1, 7));
@@ -2720,6 +2776,7 @@ mod tests {
                     context: String::new(),
                     decided_at: None,
                     decision: None,
+                    from_pc: false,
                     tool_item_id: Some("tool-1".into()),
                     options: vec![
                         option("allow", "approve-once", false),
@@ -2825,6 +2882,7 @@ mod tests {
                     context: String::new(),
                     decided_at: None,
                     decision: None,
+                    from_pc: false,
                     tool_item_id: None,
                     options: vec![
                         option("once", "approve-once", "once"),
@@ -2890,6 +2948,7 @@ mod tests {
             session_id: "ses-dup".into(),
             text: "which one?".into(),
             images: vec![],
+            fork: false,
         }));
         assert!(refused.contains("more than one runtime"), "{refused}");
         assert!(a.got().is_empty() && b.got().is_empty());
@@ -3207,6 +3266,7 @@ mod tests {
                 session_id: session.into(),
                 text: text.into(),
                 images: vec![],
+                fork: false,
             })
         };
 

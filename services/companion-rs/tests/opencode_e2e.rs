@@ -272,6 +272,7 @@ fn live_opencode_end_to_end() {
         session_id: sid.clone(),
         text: "Reply with exactly: PHASE3OK".into(),
         images: vec![],
+        fork: false,
     });
     assert!(matches!(reply, Some(ServerMsg::Ack { ok: true, .. })));
     eprintln!("E2E evidence: prompt accepted (204) — outcome follows on SSE");
@@ -502,6 +503,7 @@ fn prompt(comp: &Companion, sid: &str, cmd: &str, text: &str) {
         session_id: sid.into(),
         text: text.into(),
         images: vec![],
+        fork: false,
     });
     assert!(
         matches!(reply, Some(ServerMsg::Ack { ok: true, .. })),

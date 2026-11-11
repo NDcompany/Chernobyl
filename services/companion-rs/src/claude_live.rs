@@ -231,7 +231,7 @@ pub fn workspace_id(canonical: &str) -> String {
 
 /// `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share` → `\\srv\share` (what
 /// `canonicalize` returns on Windows, minus the verbatim prefix).
-pub(crate) fn plain(p: &Path) -> String {
+pub fn plain(p: &Path) -> String {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
@@ -2023,6 +2023,7 @@ pub fn permission_request(
         context,
         decided_at: None,
         decision: None,
+        from_pc: false,
         tool_item_id: json::get_str(req, "tool_use_id")
             .filter(|t| !t.is_empty())
             .map(String::from),

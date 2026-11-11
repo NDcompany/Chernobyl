@@ -24,13 +24,14 @@
 //! Frames carry tool input and OAuth codes: nothing here logs them.
 
 use crate::adapters::{AdapterError, Capability, LiveRuntime};
-use crate::claude_history::{self, Found, IN_USE, Scanner};
+use crate::claude_history::{self, Found, IN_USE, IN_USE_MS, Scanner, Tail};
 use crate::claude_live::{
-    self, Callback, Decision, Driver, Event, PERMISSION_MODES, PromptState, new_uuid, spawn_args,
-    spawn_env,
+    self, Callback, Decision, Driver, Event, PERMISSION_MODES, PromptState, is_uuid, new_uuid,
+    spawn_args, spawn_env,
 };
 use crate::codex_runtime::Sink;
 use crate::config::AdapterEntryConfig;
+use crate::json::{self, Json};
 use crate::protocol::{
     Agent, AgentLive, ClientMsg, DecisionError, EventKind, FileChange, LiveWorkspace,
     PermissionRequest, PromptImage, ServerMsg, Session, is_model, now_ms,
@@ -39,11 +40,12 @@ use crate::runtime_io::{
     AUTH_TTL_MS, ChildEvent, ChildIo, KILL_GRACE, PendingAuth, check_callback_url,
     open_url_on_desktop,
 };
-use crate::transcript::{HubHandle, McpAuthState, McpServer, Op, ToolStatus};
+use crate::transcript::{HubHandle, Item, ItemKind, McpAuthState, McpServer, Op, ToolStatus};
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,6 +55,16 @@ const ENDED_KEPT: usize = 32;
 /// run 4 needed one after the callback (unverified for the CLI's own
 /// listener, §4.7).
 const RECONNECT_EVERY: u64 = 5;
+/// ADR-018: hook requests waiting for the phone at once; more get no
+/// answer from here (the PC asks as usual).
+pub const HOOKS_MAX: usize = 16;
+/// Hook requests that ended without the phone, kept to refuse a late tap
+/// honestly.
+const GONE_KEPT: usize = 32;
+/// A hook request outlives its wait by this much in the engine.
+const HOOK_GRACE_MS: i64 = 2_000;
+pub const ANSWERED_ON_PC: &str = "This request was already answered on the PC";
+pub const HOOK_EXPIRED: &str = "This request timed out; the PC asked again there";
 
 /* ------------------------------------------------------------------ */
 /* Configuration                                                       */
@@ -127,6 +139,10 @@ pub struct Timing {
     pub auth_ttl_ms: i64,
     /// Reader wakeup for the timers.
     pub tick: Duration,
+    /// ADR-018: the live mirror's poll of a transcript the PC writes.
+    pub mirror_every: Duration,
+    /// ADR-018: a mirrored transcript quiet this long is no longer live.
+    pub mirror_idle_ms: i64,
 }
 
 impl Default for Timing {
@@ -139,6 +155,8 @@ impl Default for Timing {
             auth_poll_ms: 2_000,
             auth_ttl_ms: AUTH_TTL_MS,
             tick: Duration::from_millis(250),
+            mirror_every: Duration::from_millis(750),
+            mirror_idle_ms: IN_USE_MS,
         }
     }
 }
@@ -198,6 +216,9 @@ struct Live {
     callbacks: PendingAuth<Callback>,
     /// Copies of the pending requests, to resolve them `stale` by id.
     asked: Vec<PermissionRequest>,
+    /// ADR-018: the session this one forks (`--resume <id> --fork-session`
+    /// on its first start only).
+    fork_of: Option<String>,
 }
 
 impl Live {
@@ -221,6 +242,7 @@ impl Live {
             waits: Vec::new(),
             callbacks: PendingAuth::default(),
             asked: Vec::new(),
+            fork_of: None,
         }
     }
 }
@@ -233,6 +255,36 @@ struct State {
     /// resumable (`claude_history`). A command adopts one into `sessions`.
     found: Vec<Found>,
     scanned: bool,
+    /// ADR-018: found sessions whose transcript a mirror thread follows.
+    mirrors: Vec<String>,
+    /// ADR-018: `PermissionRequest` hooks waiting for the phone.
+    hooks: Vec<HookAsk>,
+    /// Hook requests that ended without the phone: (id, why).
+    gone: VecDeque<(String, &'static str)>,
+}
+
+/// ADR-018: one `PermissionRequest` hook from a Claude Code session on the
+/// PC; its HTTP request waits on the other end of `reply`.
+struct HookAsk {
+    request: PermissionRequest,
+    reply: mpsc::Sender<HookVerdict>,
+}
+
+/// The phone's answer to a hook request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HookVerdict {
+    Allow,
+    Deny(String),
+}
+
+/// Why a hook request ended without the phone's answer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HookEnd {
+    /// The wait ran out: the hook prints nothing, the PC asks.
+    Expired,
+    /// The hook went away first: the PC's own prompt was answered (or the
+    /// session moved on).
+    AnsweredOnPc,
 }
 
 struct Inner {
@@ -340,6 +392,111 @@ impl ClaudeRuntime {
     pub fn set_sink(&self, sink: Sink) {
         *self.inner.sink.lock().unwrap() = Some(sink);
     }
+
+    /// ADR-018: one `PermissionRequest` hook payload from a Claude Code
+    /// session on the PC becomes an engine permission request (allow once
+    /// or deny; no rules) that expires after `wait_ms`. The caller waits on
+    /// the receiver. `None`: not the phone's to answer (a cwd outside the
+    /// workspaces, a session this companion drives, a question or a plan,
+    /// which need the PC's own dialog, or too many waiting); the hook then
+    /// prints nothing and the PC asks as usual.
+    pub fn hook_permission(
+        &self,
+        payload: &Json,
+        wait_ms: i64,
+    ) -> Option<(String, Receiver<HookVerdict>)> {
+        let inner = &self.inner;
+        let now = now_ms();
+        let tool = json::get_str(payload, "tool_name").filter(|t| !t.is_empty())?;
+        if matches!(tool, "AskUserQuestion" | "ExitPlanMode") {
+            return None;
+        }
+        let input = json::get(payload, "tool_input").filter(|i| matches!(i, Json::Obj(_)))?;
+        let sid = json::get_str(payload, "session_id").filter(|s| is_uuid(s))?;
+        let cwd = claude_history::inside(json::get_str(payload, "cwd")?, &inner.cfg.workspaces)?;
+        let known = {
+            let st = inner.state.lock().unwrap();
+            if st.sessions.iter().any(|l| l.session.id == sid) || st.hooks.len() >= HOOKS_MAX {
+                return None;
+            }
+            st.found.iter().any(|f| f.id == sid)
+        };
+        if !known {
+            inner.discover(); // a session started since the last scan
+        }
+        let rid = format!("hook-{}", new_uuid().ok()?);
+        let mut fields = vec![
+            ("tool_name", json::s(tool)),
+            ("input", input.clone()),
+            // the hook path never writes a rule (no persistent grants)
+            ("suppress_always_allow_rule", Json::Bool(true)),
+        ];
+        if let Some(d) = json::get_str(input, "description") {
+            fields.push(("description", json::s(d)));
+        }
+        let req = json::obj(fields);
+        let raw = json::stringify(&req);
+        let asked =
+            claude_live::permission_request(&inner.id, sid, &cwd, &rid, &req, &raw, now).ok()?;
+        let mut pr = asked.request;
+        pr.from_pc = true;
+        // a little after the hook gives up, so the runtime ends it first
+        pr.expires_at = now + wait_ms + HOOK_GRACE_MS;
+        if pr.context.is_empty() {
+            pr.context = "Asked by Claude Code on the PC".into();
+        }
+        let (tx, rx) = mpsc::channel();
+        let id = pr.id.clone();
+        {
+            let mut st = inner.state.lock().unwrap();
+            if st.hooks.len() >= HOOKS_MAX {
+                return None;
+            }
+            st.hooks.push(HookAsk {
+                request: pr.clone(),
+                reply: tx,
+            });
+        }
+        inner.publish(vec![EventKind::PermissionRequested(pr)]);
+        Some((id, rx))
+    }
+
+    /// ADR-018: why a hook request ended without the phone, if it did.
+    pub fn hook_gone(&self, permission_id: &str) -> Option<&'static str> {
+        let st = self.inner.state.lock().unwrap();
+        st.gone
+            .iter()
+            .find(|(id, _)| id == permission_id)
+            .map(|(_, why)| *why)
+    }
+
+    /// ADR-018: a hook request ended without the phone's answer; the phone
+    /// sees it `expired` or `stale`, and a late tap is refused with why.
+    pub fn hook_ended(&self, permission_id: &str, why: HookEnd) {
+        let ended = {
+            let mut st = self.inner.state.lock().unwrap();
+            let Some(at) = st.hooks.iter().position(|h| h.request.id == permission_id) else {
+                return;
+            };
+            let h = st.hooks.remove(at);
+            let text = match why {
+                HookEnd::Expired => HOOK_EXPIRED,
+                HookEnd::AnsweredOnPc => ANSWERED_ON_PC,
+            };
+            st.gone.push_back((h.request.id.clone(), text));
+            if st.gone.len() > GONE_KEPT {
+                st.gone.pop_front();
+            }
+            h.request
+        };
+        let mut p = ended;
+        p.status = match why {
+            HookEnd::Expired => "expired",
+            HookEnd::AnsweredOnPc => "stale",
+        }
+        .into();
+        self.inner.publish(vec![EventKind::PermissionResolved(p)]);
+    }
 }
 
 /// `claude --version` through the same scrubbed, windowless spawn path.
@@ -428,6 +585,8 @@ impl LiveRuntime for ClaudeRuntime {
         st.sessions
             .iter()
             .any(|l| l.driver.knows_permission(permission_id))
+            || st.hooks.iter().any(|h| h.request.id == permission_id)
+            || st.gone.iter().any(|(id, _)| id == permission_id)
     }
 
     fn send(&self, msg: &ClientMsg) -> Result<ServerMsg, AdapterError> {
@@ -441,7 +600,7 @@ impl LiveRuntime for ClaudeRuntime {
     }
 
     /// The first subscriber: MCP status at the next tick, or the history of
-    /// a session found on disk.
+    /// a session found on disk (and, while the PC writes it, the mirror).
     fn on_subscribe(&self, session_id: &str) {
         let mut st = self.inner.state.lock().unwrap();
         if let Some(live) = st.sessions.iter_mut().find(|l| l.session.id == session_id) {
@@ -510,6 +669,7 @@ impl LiveRuntime for ClaudeRuntime {
         for live in &mut st.sessions {
             live.io = None; // closes stdin, kills after the grace
         }
+        st.hooks.clear(); // every waiting hook answers nothing: the PC asks
     }
 }
 
@@ -566,6 +726,41 @@ impl Inner {
             ..
         } = msg
         {
+            // ADR-018: a hook request from a session on the PC
+            if let Some(at) = st.hooks.iter().position(|h| h.request.id == *permission_id) {
+                let h = st.hooks.remove(at);
+                let verdict = if decision == "reject" {
+                    HookVerdict::Deny(
+                        message
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or("Denied from the phone")
+                            .to_string(),
+                    )
+                } else {
+                    HookVerdict::Allow
+                };
+                if h.reply.send(verdict).is_err() {
+                    // the hook went away just now: the PC answered first
+                    st.gone.push_back((h.request.id.clone(), ANSWERED_ON_PC));
+                    let mut p = h.request;
+                    p.status = "stale".into();
+                    out.push(EventKind::PermissionResolved(p));
+                    return refuse(command_id, ANSWERED_ON_PC);
+                }
+                let mut reply = ack(command_id, true, None, Some(&h.request.session_id));
+                if let ServerMsg::Ack {
+                    permission_id: p, ..
+                } = &mut reply
+                {
+                    *p = Some(permission_id.clone());
+                }
+                return Ok(reply);
+            }
+            if let Some((_, why)) = st.gone.iter().find(|(id, _)| id == permission_id) {
+                return refuse(command_id, *why);
+            }
             let Some(live) = st
                 .sessions
                 .iter_mut()
@@ -646,6 +841,15 @@ impl Inner {
                 ));
             }
         };
+        if let ClientMsg::SubmitPrompt {
+            text,
+            images,
+            fork: true,
+            ..
+        } = msg
+        {
+            return self.fork(st, command_id, session_id, text, images, now, out);
+        }
         if !st.sessions.iter().any(|l| l.session.id == *session_id)
             && let Some(at) = st.found.iter().position(|f| f.id == *session_id)
         {
@@ -865,6 +1069,92 @@ impl Inner {
         Ok(ack(command_id, true, None, Some(&id)))
     }
 
+    /// ADR-018: a session on disk (in use on the PC or not) continues as a
+    /// NEW session: `--resume <id> --fork-session --session-id <new>` in its
+    /// recorded cwd, so the original is never touched. The new session gets
+    /// the original's history first, then the prompt; the ack names it.
+    #[allow(clippy::too_many_arguments)]
+    fn fork(
+        self: &Arc<Self>,
+        st: &mut State,
+        command_id: &str,
+        session_id: &str,
+        text: &str,
+        images: &[PromptImage],
+        now: i64,
+        out: &mut Vec<EventKind>,
+    ) -> Result<ServerMsg, AdapterError> {
+        let Some(f) = st.found.iter().find(|f| f.id == session_id).cloned() else {
+            return refuse(
+                command_id,
+                "only a session from the PC can be forked; send a normal prompt",
+            );
+        };
+        let Some(cwd) = claude_history::inside(&f.cwd, &self.cfg.workspaces) else {
+            return refuse(
+                command_id,
+                "this session's folder is no longer in a workspace configured for Claude Code",
+            );
+        };
+        if st
+            .last_create
+            .is_some_and(|t| now - t < self.timing.create_every_ms)
+        {
+            return refuse(
+                command_id,
+                "a Claude Code session was just started; try again in a few seconds",
+            );
+        }
+        if st.sessions.iter().filter(|l| l.io.is_some()).count() >= self.cfg.max_sessions {
+            return refuse(command_id, self.full());
+        }
+        let id = new_uuid().map_err(|e| AdapterError::Unknown(e.into()))?;
+        let mut session = self.session(&id, f.title.clone(), &cwd, "running", now, now);
+        session.prompt = (!text.is_empty()).then(|| text.to_string());
+        session.forked_from = Some(f.title.clone());
+        let mut live = Live::new(session, Driver::new(&self.id, &id, &cwd), now);
+        live.fork_of = Some(f.id.clone());
+        let mode = self.cfg.permission_mode.clone();
+        if let Err(e) = self.start(&mut live, false, mode.as_deref(), None, now) {
+            return refuse(command_id, e);
+        }
+        // the conversation so far, as the fork's own history
+        if let Ok((ops, _)) = claude_history::replay(&f.path, &self.id, &id, &cwd, false) {
+            for op in ops {
+                self.hub.push(&id, op);
+            }
+        }
+        self.hub.push(
+            &id,
+            Op::Item(Item {
+                id: "forked-from".into(),
+                kind: ItemKind::Notice,
+                text: format!(
+                    "Forked from \u{201c}{}\u{201d}; the PC session is unchanged",
+                    f.title
+                ),
+                level: Some("info"),
+                done: true,
+                ts: now,
+                ..Default::default()
+            }),
+        );
+        match live
+            .driver
+            .user_prompt(command_id, text, images, now, |fr| tx(&live.io, fr))
+        {
+            Ok(op) => self.hub.push(&id, op),
+            Err(e) => {
+                live.io = None;
+                return refuse(command_id, e);
+            }
+        }
+        st.last_create = Some(now);
+        out.push(EventKind::SessionCreated(live.session.clone()));
+        st.sessions.push(live);
+        Ok(ack(command_id, true, None, Some(&id)))
+    }
+
     fn full(&self) -> String {
         format!(
             "at most {} Claude Code sessions can run at once; end one first",
@@ -896,55 +1186,91 @@ impl Inner {
             output: Vec::new(),
             files: Vec::new(),
             transcript: true,
+            live_pc: false,
+            forked_from: None,
         }
     }
 
     fn found_session(&self, f: &Found) -> Session {
         let title = f.title.clone();
-        self.session(&f.id, title, &f.cwd, "idle", f.created_at, f.updated_at)
+        let mut s = self.session(&f.id, title, &f.cwd, "idle", f.created_at, f.updated_at);
+        s.live_pc = f.live;
+        s
     }
 
     /* ----------------------- sessions on disk ---------------------- */
 
     /// Lists the sessions on disk; new or renamed ones are published once
     /// the first list is in place (the snapshot carries that one).
-    fn discover(&self) {
+    fn discover(self: &Arc<Self>) {
         let Some(dir) = &self.cfg.projects else {
             return;
         };
         let mut found = self.scanner.lock().unwrap().scan(dir, &self.cfg.workspaces);
+        let now = now_ms();
         let mut out = Vec::new();
+        // ADR-018: watched sessions the PC started writing again
+        let mut wake = Vec::new();
         {
             let mut st = self.state.lock().unwrap();
             found.retain(|f| !st.sessions.iter().any(|l| l.session.id == f.id));
             for f in &mut found {
                 let old = st.found.iter().find(|o| o.id == f.id);
                 f.hydrated = old.and_then(|o| o.hydrated);
-                if st.scanned && old.is_none_or(|o| o.title != f.title) {
+                // ADR-018: a mirror decides while it runs
+                f.live = if st.mirrors.contains(&f.id) {
+                    old.is_some_and(|o| o.live)
+                } else {
+                    now - f.updated_at < IN_USE_MS
+                };
+                if st.scanned && old.is_none_or(|o| o.title != f.title || o.live != f.live) {
                     out.push(EventKind::SessionUpdated(self.found_session(f)));
+                }
+                if f.live && !st.mirrors.contains(&f.id) && self.hub.is_subscribed(&f.id) {
+                    wake.push(f.clone());
                 }
             }
             st.found = found;
             st.scanned = true;
         }
         self.publish(out);
+        for f in wake {
+            self.hydrate(&f);
+        }
     }
 
     /// Replays a found session's transcript into the hub, unless the hub
-    /// already holds it as of the file's current mtime.
-    fn hydrate(&self, f: &Found) {
+    /// already holds it as of the file's current mtime. ADR-018: one the PC
+    /// is writing keeps its last turn open and gets a mirror thread.
+    fn hydrate(self: &Arc<Self>, f: &Found) {
         let mtime = claude_history::mtime_ms(&f.path);
-        if f.hydrated.is_some() && f.hydrated == mtime && self.hub.has_items(&f.id) {
+        let live = claude_history::in_use(&f.path, now_ms());
+        if !live && f.hydrated.is_some() && f.hydrated == mtime && self.hub.has_items(&f.id) {
             return;
         }
-        match claude_history::replay(&f.path, &self.id, &f.id, &f.cwd) {
-            Ok(ops) => {
+        if live && self.state.lock().unwrap().mirrors.contains(&f.id) {
+            return;
+        }
+        match claude_history::replay(&f.path, &self.id, &f.id, &f.cwd, live) {
+            Ok((ops, tail)) => {
                 for op in ops {
                     self.hub.push(&f.id, op);
                 }
                 let mut st = self.state.lock().unwrap();
                 if let Some(g) = st.found.iter_mut().find(|g| g.id == f.id) {
                     g.hydrated = mtime;
+                }
+                if live && !st.mirrors.contains(&f.id) {
+                    st.mirrors.push(f.id.clone());
+                    drop(st);
+                    let (inner, sid) = (Arc::clone(self), f.id.clone());
+                    let since = mtime.unwrap_or_else(now_ms);
+                    let spawned = std::thread::Builder::new()
+                        .name("claude-mirror".into())
+                        .spawn(move || inner.mirror(&sid, tail, since));
+                    if spawned.is_err() {
+                        self.state.lock().unwrap().mirrors.retain(|m| *m != f.id);
+                    }
                 }
             }
             Err(_) => self.hub.push(
@@ -958,6 +1284,61 @@ impl Inner {
                     ..Default::default()
                 }),
             ),
+        }
+    }
+
+    /// ADR-018 live mirror: polls a transcript the PC writes and pushes what
+    /// it adds, until nobody watches, the session leaves the list, or the
+    /// file has been quiet for `mirror_idle_ms` (then its turn ends and the
+    /// session is no longer "Live on PC").
+    fn mirror(self: Arc<Self>, sid: &str, mut tail: Tail, mut last_write: i64) {
+        loop {
+            std::thread::sleep(self.timing.mirror_every);
+            let now = now_ms();
+            let idle = now - last_write >= self.timing.mirror_idle_ms;
+            let mut out = Vec::new();
+            {
+                // decided under the lock `hydrate` checks, so a subscriber
+                // arriving now either sees this mirror or starts its own
+                let mut st = self.state.lock().unwrap();
+                let listed = st.found.iter().any(|f| f.id == sid);
+                if self.stop.load(Ordering::SeqCst)
+                    || !listed
+                    || idle
+                    || !self.hub.is_subscribed(sid)
+                {
+                    st.mirrors.retain(|m| m != sid);
+                    if idle && let Some(f) = st.found.iter_mut().find(|f| f.id == sid) {
+                        for op in tail.close() {
+                            self.hub.push(sid, op);
+                        }
+                        f.live = false;
+                        f.hydrated = None; // the next subscriber replays it whole
+                        let f = f.clone();
+                        out.push(EventKind::SessionUpdated(self.found_session(&f)));
+                    }
+                    drop(st);
+                    self.publish(out);
+                    return;
+                }
+            }
+            let Ok((ops, grew)) = tail.poll() else {
+                self.state.lock().unwrap().mirrors.retain(|m| m != sid);
+                return;
+            };
+            for op in ops {
+                self.hub.push(sid, op);
+            }
+            if grew {
+                last_write = now;
+                let mut st = self.state.lock().unwrap();
+                if let Some(f) = st.found.iter_mut().find(|f| f.id == sid && !f.live) {
+                    f.live = true;
+                    let f = f.clone();
+                    out.push(EventKind::SessionUpdated(self.found_session(&f)));
+                }
+            }
+            self.publish(out);
         }
     }
 
@@ -1021,6 +1402,10 @@ impl Inner {
     ) -> Result<(), String> {
         let sid = live.session.id.clone();
         let mut args = spawn_args(&sid, resume, mode, model)?;
+        // ADR-018: a fork's first process; a respawn resumes the fork itself
+        if let Some(parent) = live.fork_of.take() {
+            args.extend(["--resume".into(), parent, "--fork-session".into()]);
+        }
         args.extend(self.cfg.extra_args.iter().cloned());
         let (io, rx) = (self.spawn)(&args, Path::new(&live.session.project))
             .map_err(|e| format!("could not start Claude Code: {e}"))?;
@@ -1625,6 +2010,8 @@ pub(crate) mod tests {
             auth_poll_ms: 20,
             auth_ttl_ms: AUTH_TTL_MS,
             tick: Duration::from_millis(10),
+            mirror_every: Duration::from_millis(10),
+            mirror_idle_ms: IN_USE_MS,
         }
     }
 
@@ -1918,6 +2305,7 @@ pub(crate) mod tests {
             session_id: sid.into(),
             text: text.into(),
             images: vec![],
+            fork: false,
         }
     }
 
@@ -2318,6 +2706,328 @@ pub(crate) mod tests {
         let ids: Vec<String> = r.rt.sessions().into_iter().map(|s| s.id).collect();
         assert_eq!(ids.iter().filter(|i| *i == OLD).count(), 1, "{ids:?}");
         assert_eq!(ids.len(), 3);
+    }
+
+    /* ------------------------- ADR-018 ---------------------------- */
+
+    /// A rig over `d` whose hub tests can subscribe to, with a short mirror
+    /// idle time.
+    fn pc_rig(
+        d: &Disk,
+        idle_ms: i64,
+        peers: Vec<React>,
+    ) -> (Rig, Arc<Mutex<crate::transcript::Hub>>) {
+        let hub = Arc::new(Mutex::new(crate::transcript::Hub::default()));
+        let (ws, projects) = (d.ws.clone(), d.projects.clone());
+        let mut timing = fast();
+        timing.mirror_idle_ms = idle_ms;
+        let r = rig_with(HubHandle::new(hub.clone()), timing, 3, peers, |c| {
+            c.workspaces = vec![LiveWorkspace {
+                id: WS.into(),
+                ..ws
+            }];
+            c.projects = Some(projects);
+        });
+        (r, hub)
+    }
+
+    fn watch(hub: &Arc<Mutex<crate::transcript::Hub>>, sid: &str) {
+        let (out, rx) =
+            crate::server::Outbound::new(Arc::new(crate::companion::Saturation::default()), false);
+        std::mem::forget(rx); // nobody reads it; the subscription is what counts
+        let mut h = hub.lock().unwrap();
+        h.ensure(sid, now_ms());
+        h.subscribe(1, out, sid, None).unwrap();
+    }
+
+    fn transcript_of(d: &Disk, id: &str) -> PathBuf {
+        d.projects
+            .join(claude_history::encode(&d.ws.path))
+            .join(format!("{id}.jsonl"))
+    }
+
+    fn append_line(path: &Path, line: &str) {
+        use std::io::Write;
+        let mut f = std::fs::File::options().append(true).open(path).unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    fn item_ids(r: &Rig, sid: &str) -> Vec<String> {
+        op_of(&r.ops(sid), "item")
+            .iter()
+            .filter_map(|o| json::get(o, "item").and_then(|i| json::get_str(i, "id")))
+            .map(String::from)
+            .collect()
+    }
+
+    /// The live mirror: a session another process writes is listed "Live on
+    /// PC", its new lines stream to a subscriber as they land, and it stops
+    /// being live (its turn closed) once the file goes quiet.
+    #[test]
+    fn pc_session_is_mirrored_live_then_goes_quiet() {
+        let d = Disk::new();
+        d.session(Path::new(&d.ws.path), BUSY, "still typing", 1_000);
+        let (r, hub) = pc_rig(&d, 1_500, vec![]);
+        let busy = r.rt.sessions().into_iter().find(|s| s.id == BUSY).unwrap();
+        assert!(busy.live_pc, "written a second ago");
+        watch(&hub, BUSY);
+        r.rt.on_subscribe(BUSY);
+        assert_eq!(
+            item_ids(&r, BUSY),
+            [format!("u-{BUSY}"), format!("msg-{BUSY}#0")]
+        );
+        assert_eq!(r.rt.inner.state.lock().unwrap().mirrors, [BUSY]);
+        // the PC runs a tool, then answers and ends the turn
+        let path = transcript_of(&d, BUSY);
+        append_line(
+            &path,
+            r#"{"type":"user","uuid":"u2","timestamp":"2026-11-12T09:01:00.000Z","message":{"role":"user","content":"list files"}}"#,
+        );
+        append_line(
+            &path,
+            r#"{"type":"assistant","uuid":"a2","timestamp":"2026-11-12T09:01:01.000Z","message":{"id":"msg-2","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_9","name":"Bash","input":{"command":"ls"}}]}}"#,
+        );
+        r.wait("the tool call", |r| {
+            item_ids(r, BUSY).contains(&"toolu_9".into())
+        });
+        append_line(
+            &path,
+            r#"{"type":"user","uuid":"u3","timestamp":"2026-11-12T09:01:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_9","content":"a.txt"}]},"toolUseResult":{"stdout":"a.txt","stderr":""}}"#,
+        );
+        append_line(
+            &path,
+            r#"{"type":"assistant","uuid":"a3","timestamp":"2026-11-12T09:01:03.000Z","message":{"id":"msg-3","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"One file."}]}}"#,
+        );
+        r.wait("the answer", |r| {
+            item_ids(r, BUSY).contains(&"msg-3#0".into())
+        });
+        let tool = op_of(&r.ops(BUSY), "item")
+            .into_iter()
+            .filter_map(|o| json::get(o, "item"))
+            .rfind(|i| json::get_str(i, "id") == Some("toolu_9"))
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            json::get(&tool, "tool").and_then(|t| json::get_str(t, "output")),
+            Some("a.txt")
+        );
+        // quiet for 1.5 s: no longer live, said once to the phone
+        r.wait("quiet", |r| {
+            r.rt.inner.state.lock().unwrap().mirrors.is_empty()
+        });
+        let busy = r.rt.sessions().into_iter().find(|s| s.id == BUSY).unwrap();
+        assert!(!busy.live_pc);
+        assert!(
+            r.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, EventKind::SessionUpdated(s) if s.id == BUSY && !s.live_pc))
+        );
+        // written again while still watched: the next scan starts a new
+        // mirror; unwatched: it stops
+        append_line(&path, r#"{"type":"last-prompt","lastPrompt":"x"}"#);
+        r.rt.refresh().unwrap();
+        assert_eq!(r.rt.inner.state.lock().unwrap().mirrors, [BUSY]);
+        hub.lock().unwrap().unsubscribe(1, Some(BUSY));
+        r.wait("unwatched", |r| {
+            r.rt.inner.state.lock().unwrap().mirrors.is_empty()
+        });
+    }
+
+    /// Fork: a session in use on the PC continues as a new session through
+    /// `--resume <id> --fork-session --session-id <new>`; the file of the
+    /// original is never written, and a plain prompt is still refused.
+    #[test]
+    fn fork_spawns_a_new_session_and_leaves_the_pc_one_alone() {
+        let d = Disk::new();
+        d.session(Path::new(&d.ws.path), BUSY, "still typing", 1_000);
+        let before = std::fs::read(transcript_of(&d, BUSY)).unwrap();
+        let (r, _hub) = pc_rig(&d, IN_USE_MS, vec![idle()]);
+        assert_eq!(refusal(r.send(prompt("p0", BUSY, "hi"))), IN_USE);
+        let fork = |cmd: &str, sid: &str| ClientMsg::SubmitPrompt {
+            command_id: cmd.into(),
+            session_id: sid.into(),
+            text: "carry on".into(),
+            images: vec![],
+            fork: true,
+        };
+        let new = match r.send(fork("f1", BUSY)) {
+            ServerMsg::Ack {
+                ok: true,
+                session_id: Some(s),
+                ..
+            } => s,
+            other => panic!("{other:?}"),
+        };
+        assert!(new != BUSY && claude_live::is_uuid(&new));
+        let args = r.spawns.lock().unwrap()[0].clone();
+        let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(pair("--session-id", &new), "{args:?}");
+        assert!(pair("--resume", BUSY), "{args:?}");
+        assert!(args.contains(&"--fork-session".to_string()), "{args:?}");
+        assert_eq!(r.cwds.lock().unwrap()[0], PathBuf::from(&d.ws.path));
+        let s = r.rt.sessions().into_iter().find(|s| s.id == new).unwrap();
+        assert_eq!(s.forked_from.as_deref(), Some("still typing"));
+        assert!(r.rt.drives_session(&new) && !r.rt.drives_session(BUSY));
+        // its view: the history, a notice, then the prompt
+        let ids = item_ids(&r, &new);
+        assert_eq!(
+            ids[..3],
+            [
+                format!("u-{BUSY}"),
+                format!("msg-{BUSY}#0"),
+                "forked-from".into()
+            ]
+        );
+        assert_eq!(ids.len(), 4, "{ids:?}");
+        assert_eq!(std::fs::read(transcript_of(&d, BUSY)).unwrap(), before);
+        // a session the companion drives is not forked
+        let e = refusal(r.send(fork("f2", &new)));
+        assert!(e.starts_with("only a session from the PC"), "{e}");
+    }
+
+    fn hook_payload(d: &Disk, sid: &str, tool: &str) -> Json {
+        json::parse(&format!(
+            r#"{{"session_id":"{sid}","transcript_path":"x","cwd":{},"permission_mode":"default","hook_event_name":"PermissionRequest","tool_name":"{tool}","tool_input":{{"command":"rm -rf build","description":"Clean the build"}}}}"#,
+            json::stringify(&json::s(&d.ws.path))
+        ))
+        .unwrap()
+    }
+
+    fn hook_decision(cmd: &str, pid: &str, decision: &str, message: Option<&str>) -> ClientMsg {
+        ClientMsg::PermissionDecision {
+            command_id: cmd.into(),
+            permission_id: pid.into(),
+            decision: decision.into(),
+            revision: 1.0,
+            option_id: None,
+            message: message.map(String::from),
+            answers: vec![],
+        }
+    }
+
+    /// Approvals for PC sessions: allow once or deny with a reason, nothing
+    /// persistent; a request whose hook went away (the PC answered) or ran
+    /// out is refused honestly afterwards.
+    #[test]
+    fn hook_requests_are_answered_by_the_phone_or_end_on_the_pc() {
+        let d = Disk::new();
+        d.session(Path::new(&d.ws.path), BUSY, "still typing", 1_000);
+        let (r, _hub) = pc_rig(&d, IN_USE_MS, vec![]);
+        let now = now_ms();
+        let (pid, rx) =
+            r.rt.hook_permission(&hook_payload(&d, BUSY, "Bash"), 60_000)
+                .unwrap();
+        let asked = r
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|e| match e {
+                EventKind::PermissionRequested(p) if p.id == pid => Some(p.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(asked.from_pc && asked.session_id == BUSY);
+        assert_eq!(asked.command, "rm -rf build");
+        let opts: Vec<(&str, &str, &str)> = asked
+            .options
+            .iter()
+            .map(|o| (o.id.as_str(), o.decision.as_str(), o.scope))
+            .collect();
+        assert_eq!(
+            opts,
+            [
+                ("allow", "approve-once", "once"),
+                ("deny", "reject", "once")
+            ]
+        );
+        assert!((asked.expires_at - now - 60_000).abs() < 5_000);
+        assert!(r.rt.knows_permission(&pid));
+        ok(r.send(hook_decision("d1", &pid, "approve-once", None)));
+        assert_eq!(rx.recv().unwrap(), HookVerdict::Allow);
+        assert!(!refusal(r.send(hook_decision("d1b", &pid, "approve-once", None))).is_empty());
+
+        let (pid, rx) =
+            r.rt.hook_permission(&hook_payload(&d, BUSY, "Bash"), 60_000)
+                .unwrap();
+        ok(r.send(hook_decision("d2", &pid, "reject", Some("not on main"))));
+        assert_eq!(rx.recv().unwrap(), HookVerdict::Deny("not on main".into()));
+
+        // the PC answered first: the hook is gone
+        let (pid, _rx) =
+            r.rt.hook_permission(&hook_payload(&d, BUSY, "Bash"), 60_000)
+                .unwrap();
+        r.rt.hook_ended(&pid, HookEnd::AnsweredOnPc);
+        assert!(r.events.lock().unwrap().iter().any(
+            |e| matches!(e, EventKind::PermissionResolved(p) if p.id == pid && p.status == "stale")
+        ));
+        assert_eq!(
+            refusal(r.send(hook_decision("d3", &pid, "approve-once", None))),
+            ANSWERED_ON_PC
+        );
+        // its waiter vanished before the tap
+        let (pid, rx) =
+            r.rt.hook_permission(&hook_payload(&d, BUSY, "Bash"), 60_000)
+                .unwrap();
+        drop(rx);
+        assert_eq!(
+            refusal(r.send(hook_decision("d4", &pid, "approve-once", None))),
+            ANSWERED_ON_PC
+        );
+        // the wait ran out
+        let (pid, _rx) =
+            r.rt.hook_permission(&hook_payload(&d, BUSY, "Bash"), 60_000)
+                .unwrap();
+        r.rt.hook_ended(&pid, HookEnd::Expired);
+        assert!(r.events.lock().unwrap().iter().any(
+            |e| matches!(e, EventKind::PermissionResolved(p) if p.id == pid && p.status == "expired")
+        ));
+        assert_eq!(
+            refusal(r.send(hook_decision("d5", &pid, "approve-once", None))),
+            HOOK_EXPIRED
+        );
+
+        // not the phone's: a question, a cwd outside, a bad id, too many
+        assert!(
+            r.rt.hook_permission(&hook_payload(&d, BUSY, "AskUserQuestion"), 1_000)
+                .is_none()
+        );
+        let mut outside = hook_payload(&d, BUSY, "Bash");
+        if let Json::Obj(f) = &mut outside {
+            f.retain(|(k, _)| k != "cwd");
+            f.push(("cwd".into(), json::s(&d.root.to_string_lossy())));
+        }
+        assert!(r.rt.hook_permission(&outside, 1_000).is_none());
+        assert!(
+            r.rt.hook_permission(&hook_payload(&d, "not-a-uuid", "Bash"), 1_000)
+                .is_none()
+        );
+        let held: Vec<_> = (0..HOOKS_MAX)
+            .map(|_| {
+                r.rt.hook_permission(&hook_payload(&d, BUSY, "Bash"), 1_000)
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            r.rt.hook_permission(&hook_payload(&d, BUSY, "Bash"), 1_000)
+                .is_none()
+        );
+        drop(held);
+    }
+
+    /// A session the companion drives answers through its own stdio
+    /// permission channel: its hook gets nothing from here.
+    #[test]
+    fn hooks_from_a_driven_session_are_not_doubled() {
+        let d = Disk::new();
+        let (r, _hub) = pc_rig(&d, IN_USE_MS, vec![idle()]);
+        let sid = r.create("c1", "");
+        assert!(
+            r.rt.hook_permission(&hook_payload(&d, &sid, "Bash"), 1_000)
+                .is_none()
+        );
     }
 
     /* ------------------------------ MCP ---------------------------- */
@@ -2731,6 +3441,7 @@ pub(crate) mod tests {
                     media_type: "image/png".into(),
                     data: png.into(),
                 }],
+                fork: false,
             })
             .unwrap());
         assert_eq!(result_of("p1").0, "completed");
@@ -2874,6 +3585,7 @@ pub(crate) mod tests {
                 session_id: sid.clone(),
                 text: "Reply with the single word: ok".into(),
                 images: vec![],
+                fork: false,
             })
             .unwrap()
         };

@@ -14,7 +14,11 @@
 //!   most [`REPLAY_OPS`] ops. Tool calls end `completed`, turns end with the
 //!   next prompt, and no permission request is ever raised.
 //! - [`in_use`]: a transcript written in the last [`IN_USE_MS`] belongs to a
-//!   process elsewhere on the PC, so it is never resumed (T10).
+//!   process elsewhere on the PC, so it is never resumed (T10); it can be
+//!   forked (ADR-018).
+//! - [`Tail`] (ADR-018 live mirror): a session in use is followed from
+//!   where [`replay`] stopped, through the same driver, a bounded read per
+//!   poll.
 //!
 //! Transcripts are the user's conversations: nothing here logs them, titles
 //! are redacted, and the hub redacts and caps every op it is given.
@@ -45,8 +49,8 @@ pub const REPLAY_OPS: usize = 300;
 /// A transcript written this recently is in use by a process the companion
 /// does not own (a terminal, VS Code): prompts are refused.
 pub const IN_USE_MS: i64 = 2 * 60 * 1000;
-pub const IN_USE: &str =
-    "This session is active on the PC right now; continue it there or wait a moment";
+pub const IN_USE: &str = "This session is active on the PC right now; continue it there, \
+     or fork it to continue on the phone";
 
 /// `CLAUDE_CONFIG_DIR`, else `%USERPROFILE%\.claude`, plus `projects`.
 pub fn projects_dir(config_dir: Option<&OsStr>, profile: Option<&OsStr>) -> Option<PathBuf> {
@@ -73,6 +77,9 @@ pub struct Found {
     pub cost: f64,
     /// The mtime the hub's copy was replayed at (kept by the runtime).
     pub hydrated: Option<i64>,
+    /// ADR-018: written by another process on the PC right now (kept by
+    /// the runtime; the phone shows "Live on PC").
+    pub live: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +155,7 @@ impl Scanner {
                     path: path.clone(),
                     cost: m.cost,
                     hydrated: None,
+                    live: false,
                 });
             }
             self.cache.push((path, mtime, len, meta));
@@ -307,68 +315,70 @@ fn iso_ms(s: &str) -> Option<i64> {
     Some(((days * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + frac)
 }
 
-/// The end of one session's transcript as hub ops (items and turns, each
-/// once in its final state, oldest first). `assistant` lines go through the
-/// live driver as they are; `user` lines too, with `toolUseResult` under
-/// the stream-json name. A user prompt closes the turn before it.
-pub fn replay(path: &Path, adapter: &str, sid: &str, cwd: &str) -> io::Result<Vec<Op>> {
-    let mut f = File::open(path)?;
-    let len = f.metadata()?.len();
-    let start = len.saturating_sub(REPLAY_BYTES);
-    let lines = lines_at(&mut f, start, REPLAY_BYTES, len)?;
-    let mut d = Driver::new(adapter, sid, cwd);
-    let (mut ops, mut ts) = (Vec::new(), 0);
-    for line in &lines {
-        let Ok(mut v) = json::parse(line) else {
-            continue;
-        };
-        if json::get_bool(&v, "isSidechain") == Some(true) {
-            continue;
-        }
-        ts = json::get_str(&v, "timestamp")
-            .and_then(iso_ms)
-            .unwrap_or(ts);
-        match json::get_str(&v, "type") {
-            Some("assistant") => keep(&mut ops, d.on_line(line, ts), false),
-            Some("user") if json::get_bool(&v, "isMeta") != Some(true) => {
-                let content = json::get(&v, "message").and_then(|m| json::get(m, "content"));
-                let tools = content.and_then(json::as_arr).is_some_and(|b| {
-                    b.iter()
-                        .any(|b| json::get_str(b, "type") == Some("tool_result"))
-                });
-                // ADR-017: only how many images the prompt had, never their bytes
-                let images = content.and_then(json::as_arr).map_or(0, |b| {
-                    b.iter()
-                        .filter(|b| json::get_str(b, "type") == Some("image"))
-                        .count() as u32
-                });
-                let text = user_text(&v).or_else(|| (images > 0 && !tools).then(String::new));
-                if let Some(text) = text {
-                    if !tools {
-                        close(&mut d, ts, &mut ops);
-                    }
-                    ops.push(Op::Item(Item {
-                        id: json::get_str(&v, "uuid").unwrap_or("user").to_string(),
-                        kind: ItemKind::User,
-                        ts,
-                        text,
-                        done: true,
-                        images,
-                        ..Default::default()
-                    }));
-                }
-                if let Json::Obj(fields) = &mut v
-                    && let Some(at) = fields.iter().position(|(k, _)| k == "toolUseResult")
-                {
-                    fields[at].0 = "tool_use_result".into();
-                }
-                keep(&mut ops, d.on_line(&json::stringify(&v), ts), false);
-            }
-            _ => {}
-        }
+/// One transcript line into hub ops. `assistant` lines go through the live
+/// driver as they are; `user` lines too, with `toolUseResult` under the
+/// stream-json name. A user prompt closes the turn before it, and so does
+/// an assistant message that ended the turn (`end_turn`, …).
+fn feed(d: &mut Driver, line: &str, ts: &mut i64, ops: &mut Vec<Op>) {
+    let Ok(mut v) = json::parse(line) else {
+        return;
+    };
+    if json::get_bool(&v, "isSidechain") == Some(true) {
+        return;
     }
-    close(&mut d, ts, &mut ops);
-    // each item and turn once, where it first appeared, in its last state
+    *ts = json::get_str(&v, "timestamp")
+        .and_then(iso_ms)
+        .unwrap_or(*ts);
+    let ts = *ts;
+    match json::get_str(&v, "type") {
+        Some("assistant") => {
+            keep(ops, d.on_line(line, ts), false);
+            let stop = json::get(&v, "message").and_then(|m| json::get_str(m, "stop_reason"));
+            if stop.is_some_and(|s| s != "tool_use") {
+                close(d, ts, ops);
+            }
+        }
+        Some("user") if json::get_bool(&v, "isMeta") != Some(true) => {
+            let content = json::get(&v, "message").and_then(|m| json::get(m, "content"));
+            let tools = content.and_then(json::as_arr).is_some_and(|b| {
+                b.iter()
+                    .any(|b| json::get_str(b, "type") == Some("tool_result"))
+            });
+            // ADR-017: only how many images the prompt had, never their bytes
+            let images = content.and_then(json::as_arr).map_or(0, |b| {
+                b.iter()
+                    .filter(|b| json::get_str(b, "type") == Some("image"))
+                    .count() as u32
+            });
+            let text = user_text(&v).or_else(|| (images > 0 && !tools).then(String::new));
+            if let Some(text) = text {
+                if !tools {
+                    close(d, ts, ops);
+                }
+                ops.push(Op::Item(Item {
+                    id: json::get_str(&v, "uuid").unwrap_or("user").to_string(),
+                    kind: ItemKind::User,
+                    ts,
+                    text,
+                    done: true,
+                    images,
+                    ..Default::default()
+                }));
+            }
+            if let Json::Obj(fields) = &mut v
+                && let Some(at) = fields.iter().position(|(k, _)| k == "toolUseResult")
+            {
+                fields[at].0 = "tool_use_result".into();
+            }
+            keep(ops, d.on_line(&json::stringify(&v), ts), false);
+        }
+        _ => {}
+    }
+}
+
+/// Each item and turn once, where it first appeared, in its last state;
+/// the newest `max` kept. Returns (ops, how many were cut).
+fn dedupe(ops: Vec<Op>, max: usize) -> (Vec<Op>, usize) {
     let mut out: Vec<Op> = Vec::new();
     let mut at: HashMap<(bool, String), usize> = HashMap::new();
     for op in ops {
@@ -385,8 +395,42 @@ pub fn replay(path: &Path, adapter: &str, sid: &str, cwd: &str) -> io::Result<Ve
             }
         }
     }
-    let cut = out.len().saturating_sub(REPLAY_OPS);
-    let mut out = out.split_off(cut);
+    let cut = out.len().saturating_sub(max);
+    (out.split_off(cut), cut)
+}
+
+/// The end of one session's transcript as hub ops (items and turns, each
+/// once in its final state, oldest first), and the [`Tail`] that goes on
+/// from there. `live`: another process is writing it, so its last turn
+/// stays open for the tail; otherwise it is closed and its tools end
+/// `completed`.
+pub fn replay(
+    path: &Path,
+    adapter: &str,
+    sid: &str,
+    cwd: &str,
+    live: bool,
+) -> io::Result<(Vec<Op>, Tail)> {
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(REPLAY_BYTES);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    (&mut f).take(REPLAY_BYTES).read_to_end(&mut buf)?;
+    // whole lines only: a last line still being written is the tail's
+    let whole = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let read_to = start + whole as u64;
+    let text = String::from_utf8_lossy(&buf[..whole]);
+    let mut d = Driver::new(adapter, sid, cwd);
+    let (mut ops, mut ts) = (Vec::new(), 0);
+    // a cut first line is dropped
+    for line in text.split('\n').skip(usize::from(start > 0)) {
+        feed(&mut d, line, &mut ts, &mut ops);
+    }
+    if !live {
+        close(&mut d, ts, &mut ops);
+    }
+    let (mut out, cut) = dedupe(ops, REPLAY_OPS);
     if start > 0 || cut > 0 {
         out.insert(
             0,
@@ -400,7 +444,106 @@ pub fn replay(path: &Path, adapter: &str, sid: &str, cwd: &str) -> io::Result<Ve
             }),
         );
     }
-    Ok(out)
+    let tail = Tail {
+        head: head(&mut f)?,
+        path: path.to_path_buf(),
+        offset: read_to,
+        partial: Vec::new(),
+        skipping: false,
+        driver: d,
+        ts,
+    };
+    Ok((out, tail))
+}
+
+/// The first bytes of a transcript: a different head is a different file.
+fn head(f: &mut File) -> io::Result<Vec<u8>> {
+    f.seek(SeekFrom::Start(0))?;
+    let mut buf = Vec::new();
+    f.take(HEAD_ID_BYTES).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Bytes one [`Tail::poll`] reads at most.
+pub const TAIL_POLL_BYTES: u64 = 256 << 10;
+/// Ops one [`Tail::poll`] hands the hub at most (the newest kept).
+pub const TAIL_OPS: usize = 200;
+/// A line longer than this is skipped: a tail never buffers more.
+pub const LINE_MAX: usize = 4 << 20;
+const HEAD_ID_BYTES: u64 = 256;
+
+/// ADR-018 live mirror: follows a transcript another process is writing,
+/// from where [`replay`] stopped, through the same driver. Whole lines
+/// only (a line being written waits for its newline); a truncated or
+/// replaced file is followed again from near its end.
+pub struct Tail {
+    path: PathBuf,
+    head: Vec<u8>,
+    offset: u64,
+    partial: Vec<u8>,
+    /// Dropping an over-long line up to its newline.
+    skipping: bool,
+    driver: Driver,
+    ts: i64,
+}
+
+impl Tail {
+    /// New ops since the last poll (at most [`TAIL_POLL_BYTES`] read and
+    /// [`TAIL_OPS`] returned), and whether the file had new bytes.
+    pub fn poll(&mut self) -> io::Result<(Vec<Op>, bool)> {
+        let mut f = File::open(&self.path)?;
+        let len = f.metadata()?.len();
+        let mut ops = Vec::new();
+        let now_head = head(&mut f)?;
+        let same = now_head.len() >= self.head.len() && now_head.starts_with(&self.head);
+        if len < self.offset || !same {
+            // truncated or replaced: go on near its end, after a cut line
+            self.offset = len.saturating_sub(TAIL_POLL_BYTES);
+            self.skipping = self.offset > 0;
+            self.partial.clear();
+            ops.push(Op::Item(Item {
+                id: format!("mirror-rewritten-{}", self.ts),
+                kind: ItemKind::Notice,
+                text: "The session file on the PC was rewritten; following it from here".into(),
+                level: Some("info"),
+                done: true,
+                ..Default::default()
+            }));
+        }
+        self.head = now_head;
+        f.seek(SeekFrom::Start(self.offset))?;
+        let mut buf = Vec::new();
+        f.take(TAIL_POLL_BYTES).read_to_end(&mut buf)?;
+        self.offset += buf.len() as u64;
+        let mut rest = &buf[..];
+        while let Some(i) = rest.iter().position(|&b| b == b'\n') {
+            let line = &rest[..i];
+            rest = &rest[i + 1..];
+            if std::mem::take(&mut self.skipping) {
+                self.partial.clear();
+                continue;
+            }
+            self.partial.extend_from_slice(line);
+            let text = String::from_utf8_lossy(&self.partial).into_owned();
+            self.partial.clear();
+            feed(&mut self.driver, &text, &mut self.ts, &mut ops);
+        }
+        if !self.skipping {
+            self.partial.extend_from_slice(rest);
+            if self.partial.len() > LINE_MAX {
+                self.partial.clear();
+                self.skipping = true;
+            }
+        }
+        Ok((dedupe(ops, TAIL_OPS).0, !buf.is_empty()))
+    }
+
+    /// The writer went quiet: its open turn ends here.
+    pub fn close(&mut self) -> Vec<Op> {
+        let mut ops = Vec::new();
+        close(&mut self.driver, self.ts, &mut ops);
+        dedupe(ops, TAIL_OPS).0
+    }
 }
 
 /// Items and turns only; history tools always end `completed`.
@@ -651,7 +794,7 @@ mod tests {
             "{broken".into(),
         ];
         let path = f.write(&work, ID1, &lines, 0);
-        let ops = replay(&path, "claude-1", ID1, &f.ws.path).unwrap();
+        let ops = replay(&path, "claude-1", ID1, &f.ws.path, false).unwrap().0;
         let items: Vec<&Item> = ops
             .iter()
             .filter_map(|o| match o {
@@ -715,7 +858,7 @@ mod tests {
         };
         let lines = vec![prompt("u1", "what color"), prompt("u2", "")];
         let path = f.write(&work, ID1, &lines, 0);
-        let ops = replay(&path, "claude-1", ID1, &f.ws.path).unwrap();
+        let ops = replay(&path, "claude-1", ID1, &f.ws.path, false).unwrap().0;
         let users: Vec<(&str, &str, u32)> = ops
             .iter()
             .filter_map(|o| match o {
@@ -744,7 +887,7 @@ mod tests {
             .map(|i| user(&work, &format!("u{i}"), &format!("prompt {i}")))
             .collect();
         let path = f.write(&work, ID1, &lines, 0);
-        let ops = replay(&path, "claude-1", ID1, &f.ws.path).unwrap();
+        let ops = replay(&path, "claude-1", ID1, &f.ws.path, false).unwrap().0;
         assert_eq!(ops.len(), REPLAY_OPS + 1);
         let Op::Item(first) = &ops[0] else { panic!() };
         assert_eq!(
@@ -755,6 +898,135 @@ mod tests {
             panic!()
         };
         assert_eq!(last.text, format!("prompt {}", REPLAY_OPS + 9));
+    }
+
+    fn append(path: &Path, bytes: &str) {
+        use std::io::Write;
+        File::options()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes.as_bytes())
+            .unwrap();
+    }
+
+    fn ids(ops: &[Op]) -> Vec<String> {
+        ops.iter()
+            .filter_map(|o| match o {
+                Op::Item(i) => Some(i.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// ADR-018: the mirror goes on where replay stopped, keeps the last turn
+    /// open while the PC writes, waits for a line's newline, and closes the
+    /// turn on `end_turn`.
+    #[test]
+    fn tail_follows_new_lines_and_waits_for_whole_ones() {
+        let f = Fake::new();
+        let work = PathBuf::from(&f.ws.path);
+        let tool = r#"{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}"#;
+        let path = f.write(
+            &work,
+            ID1,
+            &[user(&work, "u1", "list"), assistant("a1", "msg_1", tool)],
+            0,
+        );
+        // replay of a live session leaves the turn and the tool open
+        let (ops, mut tail) = replay(&path, "claude-1", ID1, &f.ws.path, true).unwrap();
+        assert_eq!(ids(&ops), ["u1", "toolu_1"]);
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o, Op::Turn(t) if t.ended_at.is_some()))
+        );
+        assert!(tail.poll().unwrap().0.is_empty());
+
+        // half a line: nothing yet; the rest: the tool result
+        let result = tool_result("u2", "toolu_1", "a.txt") + "\n";
+        let (a, b) = result.split_at(40);
+        append(&path, a);
+        let (ops, grew) = tail.poll().unwrap();
+        assert!(grew && ops.is_empty());
+        append(&path, b);
+        let (ops, _) = tail.poll().unwrap();
+        let Some(Op::Item(t)) = ops
+            .iter()
+            .find(|o| matches!(o, Op::Item(i) if i.id == "toolu_1"))
+        else {
+            panic!("{ops:?}")
+        };
+        assert_eq!(t.tool.as_ref().unwrap().output, "a.txt");
+
+        // an end_turn message ends the turn
+        let done = r#"{"type":"assistant","uuid":"a2","isSidechain":false,"timestamp":"2026-11-12T10:00:10.000Z","message":{"id":"msg_2","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}]}}"#;
+        append(&path, &format!("{done}\n"));
+        let (ops, _) = tail.poll().unwrap();
+        assert!(ids(&ops).contains(&"msg_2#0".to_string()), "{ops:?}");
+        assert!(
+            ops.iter()
+                .any(|o| matches!(o, Op::Turn(t) if t.ended_at.is_some()))
+        );
+        assert_eq!(tail.poll().unwrap(), (vec![], false));
+        assert!(tail.close().is_empty(), "nothing left open");
+    }
+
+    #[test]
+    fn tail_survives_truncation_and_replacement() {
+        let f = Fake::new();
+        let work = PathBuf::from(&f.ws.path);
+        let path = f.write(&work, ID1, &[user(&work, "u1", "first")], 0);
+        let (_, mut tail) = replay(&path, "claude-1", ID1, &f.ws.path, true).unwrap();
+        // truncated: a notice, then the new lines
+        std::fs::write(&path, user(&work, "u9", "again") + "\n").unwrap();
+        let (ops, _) = tail.poll().unwrap();
+        let got = ids(&ops);
+        assert!(got[0].starts_with("mirror-rewritten"), "{got:?}");
+        assert_eq!(&got[1..], ["u9"]);
+        // replaced by a longer file with another head: followed again
+        let lines: Vec<String> = (0..3)
+            .map(|i| user(&work, &format!("r{i}"), &format!("{i} {}", "x".repeat(300))))
+            .collect();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let got = ids(&tail.poll().unwrap().0);
+        assert!(got[0].starts_with("mirror-rewritten"), "{got:?}");
+        assert_eq!(&got[1..], ["r0", "r1", "r2"]);
+    }
+
+    /// Bounded: one poll reads at most TAIL_POLL_BYTES and returns at most
+    /// TAIL_OPS; an over-long line is skipped whole, never buffered.
+    #[test]
+    fn tail_is_bounded_per_poll_and_skips_huge_lines() {
+        let f = Fake::new();
+        let work = PathBuf::from(&f.ws.path);
+        let path = f.write(&work, ID1, &[user(&work, "u0", "start")], 0);
+        let (_, mut tail) = replay(&path, "claude-1", ID1, &f.ws.path, true).unwrap();
+        let huge = format!(
+            r#"{{"type":"attachment","pad":"{}"}}"#,
+            "x".repeat(LINE_MAX + 10)
+        );
+        let many: String = (0..TAIL_OPS + 50)
+            .map(|i| user(&work, &format!("m{i}"), "p") + "\n")
+            .collect();
+        append(&path, &format!("{huge}\n{many}"));
+        let mut seen = Vec::new();
+        let mut polls = 0;
+        loop {
+            let (ops, grew) = tail.poll().unwrap();
+            assert!(ops.len() <= TAIL_OPS);
+            seen.extend(ids(&ops));
+            if !grew {
+                break;
+            }
+            polls += 1;
+        }
+        let file = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            polls as u64 >= file / TAIL_POLL_BYTES,
+            "{polls} polls for {file} bytes"
+        );
+        assert_eq!(seen.last().map(String::as_str), Some("m249"));
+        assert!(seen.iter().all(|i| i.starts_with('m')));
     }
 
     #[test]
