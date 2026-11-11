@@ -1,7 +1,7 @@
 # CHERNOBYL — privacy and data retention
 
 **Applies to:** the desktop companion (`chernobyl-companion.exe`) and the CHERNOBYL phone app.
-**Last reviewed:** 2026-11-04 against `62c0aba` (ADR-015 live agent sessions).
+**Last reviewed:** 2026-11-12 against `bd999f6` (Claude Code session history on the phone).
 
 ## The short version
 
@@ -34,7 +34,13 @@ What it does **not** store: the transport token (environment variable only), you
 conversation history, or file contents. Live transcripts (prompts, replies, reasoning, tool
 input and output, diffs) that a subscribed phone watches are held **in memory only**: redacted
 for known secret shapes, size-capped, and dropped an hour after a session ends. They are never
-journaled. OpenCode conversation text used to be republished as journaled activity events;
+journaled. With Claude Code workspaces configured, the phone can also read past Claude Code
+conversations: every session whose folder is inside an allow-listed workspace, including ones
+started in a terminal or VS Code. The companion reads them from Claude Code's own files
+(`%USERPROFILE%\.claude\projects`) on your PC, only the last 4 MiB of one session at a time and
+only when your phone opens it, and redacts and caps them before they leave the PC, the same as
+live transcripts. Each listed session's title (at most 80 characters, redacted) is part of the
+session events the journal keeps. OpenCode conversation text used to be republished as journaled activity events;
 since ADR-015 step 5 it is not. What you type on the phone is different: a prompt
 (`create_session`, `submit_prompt`) and a deny reason (`permission_decision.message`) are part
 of the command record, journaled as sent and kept with the newest 5 000 commands. Permission
