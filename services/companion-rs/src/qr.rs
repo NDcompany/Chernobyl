@@ -18,7 +18,9 @@ impl Qr {
 }
 
 // Total codewords (data + ECC) per version; index 0 unused.
-const TOTAL_CODEWORDS: [usize; 11] = [0, 26, 44, 70, 100, 134, 172, 196, 242, 292, 346];
+const TOTAL_CODEWORDS: [usize; 16] = [
+    0, 26, 44, 70, 100, 134, 172, 196, 242, 292, 346, 404, 466, 532, 581, 655,
+];
 
 /// Level-M block layout: EC codewords per block, plus `(block_count, data_codewords)`
 /// groups. Index 0 unused.
@@ -26,7 +28,7 @@ struct MLayout {
     ec_per_block: u8,
     groups: &'static [(u8, u8)],
 }
-const LEVEL_M: [MLayout; 11] = [
+const LEVEL_M: [MLayout; 16] = [
     MLayout {
         ec_per_block: 0,
         groups: &[],
@@ -71,10 +73,35 @@ const LEVEL_M: [MLayout; 11] = [
         ec_per_block: 26,
         groups: &[(4, 43), (1, 44)],
     },
+    // v11-15 (ISO/IEC 18004 Table 9): a pairing QR with LAN + tunnel endpoints
+    // is ~250 bytes, past v10's 213
+    MLayout {
+        ec_per_block: 30,
+        groups: &[(1, 50), (4, 51)],
+    },
+    MLayout {
+        ec_per_block: 22,
+        groups: &[(6, 36), (2, 37)],
+    },
+    MLayout {
+        ec_per_block: 22,
+        groups: &[(8, 37), (1, 38)],
+    },
+    MLayout {
+        ec_per_block: 24,
+        groups: &[(4, 40), (5, 41)],
+    },
+    MLayout {
+        ec_per_block: 24,
+        groups: &[(5, 41), (5, 42)],
+    },
 ];
 
+/// Highest version this encoder emits (v15-M: 412 bytes).
+pub const MAX_VERSION: u8 = 15;
+
 /// Alignment-pattern centre coordinates per version; index 0 unused.
-const ALIGN: [&[u8]; 11] = [
+const ALIGN: [&[u8]; 16] = [
     &[],
     &[],
     &[6, 18],
@@ -86,6 +113,11 @@ const ALIGN: [&[u8]; 11] = [
     &[6, 24, 42],
     &[6, 26, 46],
     &[6, 28, 50],
+    &[6, 30, 54],
+    &[6, 32, 58],
+    &[6, 34, 62],
+    &[6, 26, 46, 66],
+    &[6, 26, 48, 70],
 ];
 
 /// Maximum byte-mode payload for level M at `version` (v1-9 use an 8-bit length
@@ -102,22 +134,22 @@ fn byte_capacity(version: u8) -> usize {
 
 /// Encode `data` in byte mode at EC level M, auto-picking the smallest version.
 pub fn encode(data: &[u8]) -> Result<Qr, String> {
-    for version in 1..=10u8 {
+    for version in 1..=MAX_VERSION {
         if data.len() <= byte_capacity(version) {
             return encode_forced(data, version, None);
         }
     }
     Err(format!(
-        "payload of {} bytes exceeds QR v10-M capacity ({} bytes)",
+        "payload of {} bytes exceeds QR v{MAX_VERSION}-M capacity ({} bytes)",
         data.len(),
-        byte_capacity(10)
+        byte_capacity(MAX_VERSION)
     ))
 }
 
 /// Encode at an exact version; `mask` forces a mask (tests) or `None` to pick
 /// the lowest-penalty mask.
 pub fn encode_forced(data: &[u8], version: u8, mask: Option<u8>) -> Result<Qr, String> {
-    assert!((1..=10).contains(&version), "version out of range");
+    assert!((1..=MAX_VERSION).contains(&version), "version out of range");
     if data.len() > byte_capacity(version) {
         return Err(format!(
             "payload of {} bytes exceeds QR v{version}-M capacity ({} bytes)",
@@ -688,6 +720,9 @@ mod tests {
         assert_eq!(byte_capacity(2), 26);
         assert_eq!(byte_capacity(9), 180);
         assert_eq!(byte_capacity(10), 213);
+        assert_eq!(byte_capacity(11), 251);
+        assert_eq!(byte_capacity(13), 331);
+        assert_eq!(byte_capacity(15), 412);
     }
 
     #[test]
@@ -700,8 +735,38 @@ mod tests {
     }
 
     #[test]
+    fn matches_reference_tunnel_pairing_v11_m1() {
+        // LAN + ngrok endpoints: the payload that outgrew v10
+        check(
+            refdata::REF_TUNNEL_V11_M1_PAYLOAD,
+            11,
+            1,
+            refdata::REF_TUNNEL_V11_M1,
+        );
+        let auto = encode(refdata::REF_TUNNEL_V11_M1_PAYLOAD.as_bytes()).unwrap();
+        assert_eq!(auto.size, 61, "247 bytes should select v11");
+    }
+
+    #[test]
+    fn matches_reference_v14_m4_and_v15_m6() {
+        // v14+: four alignment rows and 3 remainder bits
+        check(
+            refdata::REF_PAYLOAD_V14_M4_PAYLOAD,
+            14,
+            4,
+            refdata::REF_PAYLOAD_V14_M4,
+        );
+        check(
+            refdata::REF_PAYLOAD_V15_M6_PAYLOAD,
+            15,
+            6,
+            refdata::REF_PAYLOAD_V15_M6,
+        );
+    }
+
+    #[test]
     fn rejects_oversized_payload() {
-        let big = vec![b'a'; 300];
+        let big = vec![b'a'; 413];
         assert!(encode(&big).is_err());
     }
 

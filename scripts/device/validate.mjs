@@ -99,14 +99,14 @@ async function dismissSystemDialogs() {
     if (n) await a.tap(n);
   }
 }
-async function freshPair(row, { token } = {}) {
+async function freshPair(row, { token, endpoints } = {}) {
   a.shell(`pm clear ${PKG}`);
   launch();
   await untilScreen(/Skip onboarding/);
   await a.tap('Skip onboarding');
   await a.waitFor('Pair with a host');
   // the pairing deep link opens the confirm step straight from the entry screen
-  const { payload } = c.pair(comp);
+  const { payload } = endpoints ? c.pair(comp, endpoints) : c.pair(comp);
   deviceId = JSON.parse(payload).dev;
   lastPayload = payload;
   if (token) {
@@ -133,6 +133,20 @@ async function freshPair(row, { token } = {}) {
 }
 
 const ROWS = {
+  // T.1: away from home. The QR carries ONLY the tunnel URL (TUNNEL_URL, e.g.
+  // wss://x.ngrok-free.dev forwarding to 127.0.0.1:8787), so a connection
+  // proves the app reaches the companion through the tunnel, with requireE2e.
+  async 'T.1'() {
+    const url = process.env.TUNNEL_URL;
+    if (!url) return record('T.1', null, 'TUNNEL_URL not set');
+    await start({ port: 8787, diag: 19487, token: TOKEN, requireE2e: true });
+    await freshPair('T.1', { token: TOKEN, endpoints: [url] });
+    const t = await waitText(/hosts? online/, 60_000);
+    shot('T.1', 'home');
+    const h = await c.health(comp);
+    saveLog('T.1');
+    record('T.1', !!t && h.clients >= 1, `QR endpoints=[${url}] only; home: ${t ? /\d+ hosts? online/.exec(t)[0] : 'not connected'}; companion clients=${h.clients}`);
+  },
   // 1.1 + 3.1 + 1.2(loopback, no token): pairing by pasted payload, mutual handshake, live snapshot
   async '1.1'() {
     await start();
@@ -1237,7 +1251,7 @@ const netOn = () => {
 
 const pick = process.argv.slice(2);
 // section 9 drives the real Claude CLI (it costs money): named rows or LIVE=1 only
-const order = pick.length ? pick : Object.keys(ROWS).filter((r) => !r.startsWith('9.') || process.env.LIVE === '1');
+const order = pick.length ? pick : Object.keys(ROWS).filter((r) => (!r.startsWith('9.') || process.env.LIVE === '1') && !r.startsWith('T.'));
 try {
   netOn();
   await dismissSystemDialogs();

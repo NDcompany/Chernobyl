@@ -115,6 +115,21 @@ foreach ($i in 1..50) {
 if (-not $up) { throw 'The companion did not come up. Run it in a terminal to see why: & "' + $target + '"' }
 Write-Host 'Companion is running.'
 
+# 5c. prove the tunnel reaches the companion: /health without the token answers 401 from the
+# companion itself (a non-browser user agent skips ngrok's browser warning page)
+if ($TunnelUrl) {
+  $probe = ($TunnelUrl -replace '^wss://', 'https://').TrimEnd('/') + '/health'
+  $seen = $null
+  foreach ($i in 1..15) {
+    try { Invoke-WebRequest -Uri $probe -UseBasicParsing -UserAgent 'chernobyl-setup' -TimeoutSec 5 | Out-Null; $seen = 200 }
+    catch { $seen = [int]$_.Exception.Response.StatusCode }
+    if ($seen -eq 401) { break }
+    Start-Sleep -Seconds 2
+  }
+  if ($seen -eq 401) { Write-Host "Tunnel OK: $TunnelUrl reaches the companion." }
+  else { Write-Warning "Tunnel check failed (last HTTP status: $seen). If you use ngrok, run it once in a terminal to see why: & '$Ngrok' http $Port --url $NgrokDomain" }
+}
+
 # 6. pairing QR for the LAN address
 $ip = (Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } | Select-Object -First 1).IPv4Address.IPAddress
 if (-not $ip) { throw 'No LAN IPv4 address with a default gateway found.' }
