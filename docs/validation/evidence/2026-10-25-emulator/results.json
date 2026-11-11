@@ -184,5 +184,10 @@
     "pass": true,
     "observed": "isolated opencode serve 1.19 on Ollama qwen3.5:4b; inline card \"Tool bash: awaiting approval\" -> Allow once -> bash completed, output \"(no output)\"; the poem streamed (47 chars when Stop was tapped, 51 at the end)=true; Stop -> footer \"Stopped\"=true, companion turn interrupted",
     "at": "2026-11-04T19:13:06.589Z"
+  },
+  "T.1": {
+    "pass": true,
+    "observed": "QR endpoints=[wss://example-tunnel-for-testing.ngrok-free.dev] only; home: 2 hosts online; companion clients=1",
+    "at": "2026-11-11T20:27:04.209Z"
   }
 }
