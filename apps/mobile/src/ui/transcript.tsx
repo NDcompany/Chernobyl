@@ -49,6 +49,15 @@ import { Button, StatusDot, Text, type Tone } from '@/ui/primitives';
 import { ConfirmModal } from '@/ui/surface';
 import { MonoBlock } from '@/ui/lists';
 import { Icon, type IconName } from '@/ui/icons';
+import { AgentMark } from '@/ui/agentMark';
+import { useNow } from '@/hooks/useReducedMotion';
+import {
+  formatElapsed,
+  workingA11yLabel,
+  workingLabel,
+  workingStatus,
+  type WorkingStatus,
+} from '@/utils/agentIdentity';
 import {
   DIFF_PREVIEW_LINES,
   agentShortName,
@@ -56,12 +65,15 @@ import {
   buildTranscript,
   collectAnswers,
   diffCounts,
+  formatCost,
+  formatTokens,
   isCallbackUrl,
   isModeChoice,
   mcpSummary,
   modeLabel,
   parseDiff,
   parseMarkdown,
+  replyStarts,
   rowIndexFor,
   turnFooter,
   type ApprovalChoice,
@@ -963,14 +975,69 @@ export interface TranscriptListProps {
   onOpenLink: (url: string) => void;
   /** `Agent.live.promptWhileBusy`: picks the queued prompt's caption */
   promptWhileBusy?: PromptWhileBusy;
-  /** names the agent in "Deny and tell Claude why" */
+  /** names the agent in "Deny and tell Claude why" and picks its `AgentMark` */
   agentKind?: AgentKind;
+  /** `Agent.name`: heads each reply and the working row (default: the kind's short name) */
+  agentName?: string;
   /** snapshot `truncatedBefore`: older items exist only on the PC */
   truncatedBefore?: boolean;
   /** deep link (Approvals tab, notification): scroll this item's card into view once it is there, and highlight it briefly */
   focusItemId?: string;
   style?: StyleProp<ViewStyle>;
 }
+
+export interface WorkingRowProps {
+  state: WorkingStatus['state'];
+  /** the running turn: id seeds the verbs, startedAt drives the counter */
+  turnId: string;
+  startedAt: number;
+  tool?: string;
+  /** mid-turn usage when the runtime reports it */
+  tokens?: number;
+  costUsd?: number;
+  agentKind?: AgentKind;
+  agentName: string;
+}
+
+/**
+ * The live "working" line under a running turn: the animated mark, a status
+ * verb that rotates every few seconds (or the running tool, or "Waiting for
+ * you"), elapsed time and live usage. Ticks on its own once a second, so the
+ * transcript rows never re-render for it. Screen readers get one polite live
+ * region whose label changes only between working and waiting.
+ */
+export const WorkingRow = memo(function WorkingRow({
+  state,
+  turnId,
+  startedAt,
+  tool,
+  tokens,
+  costUsd,
+  agentKind,
+  agentName,
+}: WorkingRowProps) {
+  const now = useNow(1000);
+  const elapsed = now - startedAt;
+  const a11y = workingA11yLabel(state, agentName);
+  useEffect(() => {
+    // iOS has no live regions; Android's polite region below speaks the same label
+    if (Platform.OS === 'ios') AccessibilityInfo.announceForAccessibility(a11y);
+  }, [a11y]);
+  const meta = [formatElapsed(elapsed)];
+  if (tokens) meta.push(formatTokens(tokens));
+  if (costUsd != null) meta.push(formatCost(costUsd));
+  return (
+    <View style={styles.working} accessible accessibilityLabel={a11y} accessibilityLiveRegion="polite">
+      <AgentMark kind={agentKind} size={24} state={state} />
+      <Text variant="smStrong" color={state === 'waiting' ? colors.text : colors.text2} numberOfLines={1} style={styles.flexShrink}>
+        {workingLabel(state, elapsed, turnId, tool)}
+      </Text>
+      <Text variant="xs" color={colors.text3} numberOfLines={1}>
+        {meta.join(' · ')}
+      </Text>
+    </View>
+  );
+});
 
 const FLASH_MS = 1600;
 const FOCUS_POSITION = 0.3; // the focused card sits in the upper third
@@ -985,9 +1052,27 @@ interface ItemViewProps {
   onOpenLink: (url: string) => void;
   agentKind?: AgentKind;
   promptWhileBusy?: PromptWhileBusy;
+  /** the first agent item of a reply: carries the agent's mark and name */
+  replyStart?: boolean;
+  agentName?: string;
 }
 
-const ItemView = memo(function ItemView({ item, ...p }: ItemViewProps) {
+const ItemView = memo(function ItemView({ replyStart, agentName, ...p }: ItemViewProps) {
+  if (!replyStart) return itemBody(p);
+  return (
+    <View style={styles.gapSm}>
+      <View style={styles.replyHead}>
+        <AgentMark kind={p.agentKind} size={16} />
+        <Text variant="smStrong" color={colors.text2} numberOfLines={1}>
+          {agentName}
+        </Text>
+      </View>
+      {itemBody(p)}
+    </View>
+  );
+});
+
+function itemBody({ item, ...p }: ItemViewProps): ReactNode {
   switch (item.kind) {
     case 'user':
       return <UserBubble text={item.text} queued={item.queued} promptWhileBusy={p.promptWhileBusy} />;
@@ -1024,7 +1109,7 @@ const ItemView = memo(function ItemView({ item, ...p }: ItemViewProps) {
     default:
       return null;
   }
-});
+}
 
 const rowKey = (row: TranscriptRow) => row.key;
 
@@ -1042,11 +1127,14 @@ export function TranscriptList({
   onOpenLink,
   promptWhileBusy,
   agentKind,
+  agentName = agentShortName(agentKind),
   truncatedBefore,
   focusItemId,
   style,
 }: TranscriptListProps) {
   const model = useMemo(() => buildTranscript(items, turns, permissions), [items, turns, permissions]);
+  const starts = useMemo(() => replyStarts(model.rows), [model.rows]);
+  const working = useMemo(() => workingStatus(items, turns, permissions), [items, turns, permissions]);
   const listRef = useRef<FlatList<TranscriptRow>>(null);
   const atBottom = useRef(true);
   const [showJump, setShowJump] = useState(false);
@@ -1125,6 +1213,8 @@ export function TranscriptList({
       onOpenLink={onOpenLink}
       agentKind={agentKind}
       promptWhileBusy={promptWhileBusy}
+      replyStart={starts.has(item.id)}
+      agentName={agentName}
     />
   );
   const renderRow = ({ item: row }: ListRenderItemInfo<TranscriptRow>) => (
@@ -1160,6 +1250,20 @@ export function TranscriptList({
         contentContainerStyle={styles.listContent}
         ListHeaderComponent={
           truncatedBefore ? <NoticeRow level="info" text="Earlier messages are only on the PC" /> : undefined
+        }
+        ListFooterComponent={
+          working ? (
+            <WorkingRow
+              state={working.state}
+              turnId={working.turn.id}
+              startedAt={working.turn.startedAt}
+              tool={working.tool}
+              tokens={working.turn.usage ? working.turn.usage.inputTokens + working.turn.usage.outputTokens : undefined}
+              costUsd={working.turn.costUsd}
+              agentKind={agentKind}
+              agentName={agentName}
+            />
+          ) : undefined
         }
       />
       {showJump ? (
@@ -1463,6 +1567,9 @@ export function ModeChip({ mode, modes, onChange, dark = false }: ModeChipProps)
 const styles = StyleSheet.create({
   flex: { flex: 1 },
   gapXs: { gap: spacing.xs },
+  flexShrink: { flexShrink: 1 },
+  replyHead: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  working: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, minHeight: 44, paddingTop: spacing.xs },
   gapSm: { gap: spacing.sm },
   gapMd: { gap: spacing.md },
   pressed: { opacity: 0.7 },

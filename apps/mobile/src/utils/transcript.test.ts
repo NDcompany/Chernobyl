@@ -19,6 +19,7 @@ import {
   parseDiff,
   parseInline,
   parseMarkdown,
+  replyStarts,
   rowIndexFor,
   turnFooter,
   type MdBlock,
@@ -401,6 +402,30 @@ test('rows: the row that shows an item (Approvals and notification deep links)',
   assert.equal(rowIndexFor(m, 'g1'), 1, 'nested work scrolls to its top-level card');
   assert.equal(rowIndexFor(m, 'gone'), 2, 'a request whose card is not in view: its standalone card');
   assert.equal(rowIndexFor(m, 'missing'), -1);
+});
+
+test('rows: the first agent item of each reply carries the mark', () => {
+  const t = (id: string, turnId: string | undefined, kind: 'user' | 'text' | 'notice'): TranscriptItem =>
+    kind === 'user'
+      ? { id, ts: 0, turnId, kind, text: 'go' }
+      : kind === 'notice'
+        ? { id, ts: 0, turnId, kind, level: 'info', text: 'note' }
+        : { id, ts: 0, turnId, kind, text: 'ok', done: true };
+  const items: TranscriptItem[] = [
+    t('x0', undefined, 'text'),
+    t('u1', 't1', 'user'),
+    t('x1', 't1', 'text'),
+    t('n1', 't1', 'notice'),
+    t('x2', 't1', 'text'),
+    { id: 'T', ts: 0, turnId: 't1', kind: 'tool', tool: { name: 'Task', status: 'completed' } },
+    { id: 'c1', ts: 0, turnId: 't1', parentId: 'T', kind: 'text', text: 'sub', done: true },
+    t('x3', 't2', 'text'),
+    t('u3', 't3', 'user'),
+    t('u4', 't3', 'user'),
+    t('x4', 't3', 'text'),
+  ];
+  const m = buildTranscript(items, [], []);
+  assert.deepEqual([...replyStarts(m.rows)], ['x0', 'x1', 'x3', 'x4'], 'notices and nested work never start one');
 });
 
 test('mode labels, MCP summary and callback precheck', () => {

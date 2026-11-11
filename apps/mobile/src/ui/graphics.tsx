@@ -10,7 +10,7 @@ import { Svg, Path, Rect } from 'react-native-svg';
 import type { StyleProp, ViewStyle } from 'react-native';
 import { colors } from '@/theme/tokens';
 import type { AgentKind } from '@chernobyl/protocol';
-import { Icon, type IconName } from '@/ui/icons';
+import { AgentMark } from '@/ui/agentMark';
 import { LOGO_MARK_PATH } from '@/ui/logoPath';
 
 /* ------------------------------------------------------------------ */
@@ -190,24 +190,15 @@ export function Wordmark({ size = 15, color = colors.black, showMark = true, sty
 /* Agent icon                                                          */
 /* ------------------------------------------------------------------ */
 
-const AGENT_GLYPH: Record<AgentKind, IconName> = {
-  'claude-code': 'spark',
-  opencode: 'code',
-  codex: 'grid',
-  browser: 'globe',
-  local: 'chip',
-  custom: 'terminal',
-};
-
 export interface AgentIconProps {
   kind: AgentKind;
   size?: number;
-  /** solid: black tile + white glyph (default). outline: white tile + black border. */
+  /** solid: black tile (default). outline: white tile + black border. Either way the agent's mark sits inside. */
   variant?: 'solid' | 'outline';
 }
 
+/** The agent's mark (`AgentMark`) on a tile, sized to a multiple of 8 so its pixels stay crisp. */
 export function AgentIcon({ kind, size = 44, variant = 'solid' }: AgentIconProps) {
-  const glyph = AGENT_GLYPH[kind];
   const solid = variant === 'solid';
   return (
     <View
@@ -222,7 +213,7 @@ export function AgentIcon({ kind, size = 44, variant = 'solid' }: AgentIconProps
         justifyContent: 'center',
       }}
     >
-      <Icon name={glyph} size={size * 0.52} color={solid ? colors.white : colors.black} strokeWidth={1.7} />
+      <AgentMark kind={kind} size={Math.max(8, Math.round((size * 0.55) / 8) * 8)} />
     </View>
   );
 }

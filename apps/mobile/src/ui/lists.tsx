@@ -28,6 +28,7 @@ import {
 } from '@/ui/primitives';
 import { Card } from '@/ui/surface';
 import { AgentIcon } from '@/ui/graphics';
+import { AgentMark } from '@/ui/agentMark';
 import { Icon, type IconName } from '@/ui/icons';
 import { zodHandler } from '@/forms/zodBridge';
 import { transportKind } from '@/data/transport';
@@ -139,9 +140,12 @@ export function SessionRow({ session, agent, host, onPress, style }: SessionRowP
           <Text variant="bodyStrong" numberOfLines={2}>
             {session.title}
           </Text>
-          <Text variant="xs" color={colors.text2} numberOfLines={1}>
-            {agent?.name ?? 'Agent'} · {host?.name ?? 'host'}
-          </Text>
+          <View style={styles.sessionAgent}>
+            <AgentMark kind={agent?.kind} size={16} />
+            <Text variant="xs" color={colors.text2} numberOfLines={1} style={{ flexShrink: 1 }}>
+              {agent?.name ?? 'Agent'} · {host?.name ?? 'host'}
+            </Text>
+          </View>
           {simulated ? <SimulatedTag /> : null}
         </View>
         <StatusPill status={session.status} />
@@ -606,6 +610,7 @@ const styles = StyleSheet.create({
   },
 
   sessionRow: { gap: spacing.sm, minHeight: 88, justifyContent: 'center' },
+  sessionAgent: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
   sessionMeta: {
     flexDirection: 'row',
     alignItems: 'center',
