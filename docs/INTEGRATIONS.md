@@ -54,9 +54,10 @@ page records **which versions were verified** and the limits that matter in prac
   proposed exec-policy amendment as a persistent option, deny, deny and stop); follow-ups
   steer the running turn; interrupt, MCP status, desktop MCP sign-in and reconnect (a
   config reload) work. Not offered: ending a session, permission modes, phone-side MCP
-  sign-in. A session dies with its app-server process and is not resumed; the next new
-  session respawns the app-server. An interrupt has no 30 s timeout and a desktop sign-in
-  no 10-min expiry. Sessions are capped at 8 open per adapter and one new session per 5 s. **Adding a folder to `workspaces`
+  sign-in. When the app-server process exits, its sessions idle; the next prompt to one
+  respawns it and resumes the thread (`thread/resume`), and a resume Codex refuses ends the
+  session. An interrupt with no turn end in 30 s is `unknown`; a desktop sign-in expires
+  after 10 min. Sessions are capped at 8 open per adapter and one new session per 5 s. **Adding a folder to `workspaces`
   is trusting it:** Codex runs with `approvalPolicy: on-request` and
   `sandbox: workspace-write` there. Workspaces are checked when the config loads, and a bad
   folder stops the companion from starting. Set `binary` to the real `codex.exe`; npm's
