@@ -1,0 +1,166 @@
+[
+  { "why": "images not an array", "msg": { "type": "submit_prompt", "commandId": "c", "sessionId": "s", "text": "t", "images": {} } },
+  {
+    "why": "five images",
+    "msg": {
+      "type": "submit_prompt",
+      "commandId": "c",
+      "sessionId": "s",
+      "text": "t",
+      "images": [
+        { "mediaType": "image/gif", "data": "R0lGODlhAQABAAAAACw=" },
+        { "mediaType": "image/gif", "data": "R0lGODlhAQABAAAAACw=" },
+        { "mediaType": "image/gif", "data": "R0lGODlhAQABAAAAACw=" },
+        { "mediaType": "image/gif", "data": "R0lGODlhAQABAAAAACw=" },
+        { "mediaType": "image/gif", "data": "R0lGODlhAQABAAAAACw=" }
+      ]
+    }
+  },
+  {
+    "why": "media type bmp",
+    "msg": { "type": "submit_prompt", "commandId": "c", "sessionId": "s", "text": "t", "images": [{ "mediaType": "image/bmp", "data": "Qk0=" }] }
+  },
+  {
+    "why": "media type svg",
+    "msg": {
+      "type": "submit_prompt",
+      "commandId": "c",
+      "sessionId": "s",
+      "text": "t",
+      "images": [{ "mediaType": "image/svg+xml", "data": "PHN2Zz4=" }]
+    }
+  },
+  {
+    "why": "media type missing",
+    "msg": { "type": "submit_prompt", "commandId": "c", "sessionId": "s", "text": "t", "images": [{ "data": "R0lGODlhAQABAAAAACw=" }] }
+  },
+  {
+    "why": "data not base64",
+    "msg": {
+      "type": "submit_prompt",
+      "commandId": "c",
+      "sessionId": "s",
+      "text": "t",
+      "images": [{ "mediaType": "image/png", "data": "iVBORw0KGgo!!!!!" }]
+    }
+  },
+  {
+    "why": "data as a data: URL",
+    "msg": {
+      "type": "submit_prompt",
+      "commandId": "c",
+      "sessionId": "s",
+      "text": "t",
+      "images": [{ "mediaType": "image/png", "data": "data:image/png;base64,iVBORw0KGgo=" }]
+    }
+  },
+  {
+    "why": "data length not a multiple of 4",
+    "msg": {
+      "type": "submit_prompt",
+      "commandId": "c",
+      "sessionId": "s",
+      "text": "t",
+      "images": [{ "mediaType": "image/gif", "data": "R0lGODlhAQABAAAAACw" }]
+    }
+  },
+  {
+    "why": "padding in the middle",
+    "msg": {
+      "type": "submit_prompt",
+      "commandId": "c",
+      "sessionId": "s",
+      "text": "t",
+      "images": [{ "mediaType": "image/gif", "data": "R0lGOD=hAQABAAAAACw=" }]
+    }
+  },
+  {
+    "why": "three padding chars",
+    "msg": {
+      "type": "submit_prompt",
+      "commandId": "c",
+      "sessionId": "s",
+      "text": "t",
+      "images": [{ "mediaType": "image/gif", "data": "R0lGODlhAQABAAAAA===" }]
+    }
+  },
+  {
+    "why": "png type with jpeg bytes",
+    "msg": {
+      "type": "submit_prompt",
+      "commandId": "c",
+      "sessionId": "s",
+      "text": "t",
+      "images": [{ "mediaType": "image/png", "data": "/9j/4AAQSkZJRgABAQAAAQABAAD/2w==" }]
+    }
+  },
+  {
+    "why": "empty data",
+    "msg": { "type": "submit_prompt", "commandId": "c", "sessionId": "s", "text": "t", "images": [{ "mediaType": "image/png", "data": "" }] }
+  },
+  {
+    "why": "create_session with an image that is not base64",
+    "msg": {
+      "type": "create_session",
+      "commandId": "c",
+      "agentId": "a",
+      "title": "t",
+      "prompt": "p",
+      "images": [{ "mediaType": "image/jpeg", "data": "/9j/ not base64 " }]
+    }
+  },
+  {
+    "why": "create_session model gpt-5",
+    "msg": { "type": "create_session", "commandId": "c", "agentId": "a", "title": "t", "prompt": "p", "model": "gpt-5" }
+  },
+  {
+    "why": "create_session model empty",
+    "msg": { "type": "create_session", "commandId": "c", "agentId": "a", "title": "t", "prompt": "p", "model": "" }
+  },
+  {
+    "why": "create_session model a flag",
+    "msg": {
+      "type": "create_session",
+      "commandId": "c",
+      "agentId": "a",
+      "title": "t",
+      "prompt": "p",
+      "model": "--dangerously-skip-permissions"
+    }
+  },
+  { "why": "set_model without model", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s" } },
+  { "why": "set_model without sessionId", "msg": { "type": "set_model", "commandId": "c", "model": "opus" } },
+  { "why": "set_model empty", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "" } },
+  { "why": "set_model unknown alias", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "best" } },
+  { "why": "set_model alias in the wrong case", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "Opus" } },
+  { "why": "set_model bare prefix", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "claude-" } },
+  { "why": "set_model uppercase id", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "claude-Opus-5" } },
+  { "why": "set_model with a space", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "claude-opus 5" } },
+  { "why": "set_model with a 1M suffix", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "sonnet[1m]" } },
+  { "why": "set_model with a shell character", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "claude-opus;calc" } },
+  {
+    "why": "set_model longer than 64 chars",
+    "msg": {
+      "type": "set_model",
+      "commandId": "c",
+      "sessionId": "s",
+      "model": "claude-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  { "why": "set_model as a number", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": 5 } },
+  { "why": "rename without title", "msg": { "type": "rename_session", "commandId": "c", "sessionId": "s" } },
+  { "why": "rename empty", "msg": { "type": "rename_session", "commandId": "c", "sessionId": "s", "title": "" } },
+  { "why": "rename blank", "msg": { "type": "rename_session", "commandId": "c", "sessionId": "s", "title": "   " } },
+  { "why": "rename with a newline", "msg": { "type": "rename_session", "commandId": "c", "sessionId": "s", "title": "a\nb" } },
+  { "why": "rename with an escape", "msg": { "type": "rename_session", "commandId": "c", "sessionId": "s", "title": "a\u001b[31mb" } },
+  {
+    "why": "rename 81 chars",
+    "msg": {
+      "type": "rename_session",
+      "commandId": "c",
+      "sessionId": "s",
+      "title": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  { "why": "rename without sessionId", "msg": { "type": "rename_session", "commandId": "c", "title": "x" } }
+]

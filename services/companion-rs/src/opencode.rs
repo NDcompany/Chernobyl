@@ -299,6 +299,17 @@ impl OpenCodeAdapter {
     /// validation fault for the caller to surface.
     pub fn send(&self, msg: &ClientMsg) -> Result<ServerMsg, AdapterError> {
         match msg {
+            // ADR-017: the composer extras are Claude's
+            ClientMsg::CreateSession { images, .. } | ClientMsg::SubmitPrompt { images, .. }
+                if !images.is_empty() =>
+            {
+                Err(AdapterError::Unsupported(
+                    "OpenCode does not take images yet".into(),
+                ))
+            }
+            ClientMsg::CreateSession { model: Some(_), .. } => Err(AdapterError::Unsupported(
+                "OpenCode sessions use the agent's configured model".into(),
+            )),
             ClientMsg::CreateSession {
                 command_id,
                 title,
@@ -312,6 +323,7 @@ impl OpenCodeAdapter {
                 command_id,
                 session_id,
                 text,
+                ..
             } => {
                 self.inner.prompt_accept(session_id, text)?;
                 self.inner.track_prompt(session_id, command_id);
@@ -374,7 +386,9 @@ impl OpenCodeAdapter {
             ClientMsg::SessionSubscribe { .. }
             | ClientMsg::SessionUnsubscribe { .. }
             | ClientMsg::SessionEnd { .. }
-            | ClientMsg::SetPermissionMode { .. } => Err(AdapterError::Unsupported(
+            | ClientMsg::SetPermissionMode { .. }
+            | ClientMsg::SetModel { .. }
+            | ClientMsg::RenameSession { .. } => Err(AdapterError::Unsupported(
                 "not supported by this agent".into(),
             )),
         }
@@ -778,6 +792,7 @@ impl Inner {
                 end: false,
                 permission_modes: Vec::new(),
                 workspaces: Vec::new(),
+                composer: Vec::new(),
             }),
         })
     }
@@ -3334,6 +3349,7 @@ pub(crate) mod tests {
             command_id: cmd.into(),
             session_id: "ses_test1".into(),
             text: "hello".into(),
+            images: vec![],
         })
         .unwrap()
     }
@@ -3383,6 +3399,7 @@ pub(crate) mod tests {
                 command_id: "cmd-1".into(),
                 session_id: "ses_test1".into(),
                 text: "hi".into(),
+                images: vec![],
             })
             .unwrap_err();
         assert_eq!(err.code(), "invalid-response");
@@ -3597,6 +3614,8 @@ pub(crate) mod tests {
                 title: "Fresh".into(),
                 prompt: "first turn".into(),
                 project: Some(r"C:\Users".into()),
+                images: vec![],
+                model: None,
             })
             .unwrap();
         assert!(
@@ -3617,6 +3636,8 @@ pub(crate) mod tests {
                 title: "Fresh".into(),
                 prompt: "first turn".into(),
                 project: None,
+                images: vec![],
+                model: None,
             })
             .unwrap();
         match msg {
@@ -3681,6 +3702,7 @@ pub(crate) mod tests {
                 command_id: "cmd-x".into(),
                 session_id: "s".into(),
                 text: "t".into(),
+                images: vec![],
             })
             .unwrap_err();
         assert_eq!(err.code(), "runtime-unavailable");
@@ -4199,6 +4221,7 @@ pub(crate) mod tests {
                 command_id: cmd.into(),
                 session_id: sid.into(),
                 text: "hello".into(),
+                images: vec![],
             })
             .unwrap();
         assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }));

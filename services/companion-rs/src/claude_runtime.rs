@@ -33,7 +33,7 @@ use crate::codex_runtime::Sink;
 use crate::config::AdapterEntryConfig;
 use crate::protocol::{
     Agent, AgentLive, ClientMsg, DecisionError, EventKind, FileChange, LiveWorkspace,
-    PermissionRequest, ServerMsg, Session, now_ms,
+    PermissionRequest, PromptImage, ServerMsg, Session, is_model, now_ms,
 };
 use crate::runtime_io::{
     AUTH_TTL_MS, ChildEvent, ChildIo, KILL_GRACE, PendingAuth, check_callback_url,
@@ -275,6 +275,15 @@ fn refuse(command_id: &str, error: impl Into<String>) -> Result<ServerMsg, Adapt
     Ok(ack(command_id, false, Some(error.into()), None))
 }
 
+/// What a `create_session` asks for.
+struct New<'a> {
+    title: &'a str,
+    prompt: &'a str,
+    project: Option<&'a str>,
+    images: &'a [PromptImage],
+    model: Option<&'a str>,
+}
+
 /* ------------------------------------------------------------------ */
 /* Construction + LiveRuntime                                          */
 /* ------------------------------------------------------------------ */
@@ -390,6 +399,7 @@ impl LiveRuntime for ClaudeRuntime {
                 end: true,
                 permission_modes: PERMISSION_MODES.iter().map(|m| m.to_string()).collect(),
                 workspaces: self.inner.cfg.workspaces.clone(),
+                composer: vec!["model", "images", "commands", "context", "rename"],
             }),
         }]
     }
@@ -532,10 +542,19 @@ impl Inner {
             title,
             prompt,
             project,
+            images,
+            model,
             ..
         } = msg
         {
-            return self.create(st, command_id, title, prompt, project.as_deref(), now, out);
+            let new = New {
+                title,
+                prompt,
+                project: project.as_deref(),
+                images,
+                model: model.as_deref(),
+            };
+            return self.create(st, command_id, new, now, out);
         }
         if let ClientMsg::PermissionDecision {
             command_id,
@@ -607,6 +626,16 @@ impl Inner {
                 ..
             }
             | ClientMsg::McpReconnect {
+                command_id,
+                session_id,
+                ..
+            }
+            | ClientMsg::SetModel {
+                command_id,
+                session_id,
+                ..
+            }
+            | ClientMsg::RenameSession {
                 command_id,
                 session_id,
                 ..
@@ -720,13 +749,20 @@ impl Inner {
                     return refuse(command_id, e);
                 }
                 let sent = match msg {
-                    ClientMsg::SubmitPrompt { text, .. } => live
+                    ClientMsg::SubmitPrompt { text, images, .. } => live
                         .driver
-                        .user_prompt(command_id, text, now, |f| tx(&live.io, f))
+                        .user_prompt(command_id, text, images, now, |f| tx(&live.io, f))
                         .map(|op| self.hub.push(session_id, op)),
                     ClientMsg::SetPermissionMode { mode, .. } => {
                         live.driver
                             .set_permission_mode(command_id, mode, |f| tx(&live.io, f))
+                    }
+                    ClientMsg::SetModel { model, .. } => {
+                        live.driver
+                            .set_model(command_id, model, |f| tx(&live.io, f))
+                    }
+                    ClientMsg::RenameSession { title, .. } => {
+                        live.driver.rename(command_id, title, |f| tx(&live.io, f))
                     }
                     ClientMsg::McpAuth { server, flow, .. } => {
                         return self.mcp_auth(live, command_id, server, flow, now, out);
@@ -754,17 +790,21 @@ impl Inner {
         Ok(ack(command_id, true, None, Some(session_id)))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create(
         self: &Arc<Self>,
         st: &mut State,
         command_id: &str,
-        title: &str,
-        prompt: &str,
-        project: Option<&str>,
+        new: New,
         now: i64,
         out: &mut Vec<EventKind>,
     ) -> Result<ServerMsg, AdapterError> {
+        let New {
+            title,
+            prompt,
+            project,
+            images,
+            model,
+        } = new;
         let Some(ws) = self
             .cfg
             .workspaces
@@ -800,14 +840,14 @@ impl Inner {
         let mut live = Live::new(session, Driver::new(&self.id, &id, &ws.path), now);
         live.create = Some((command_id.to_string(), prompt.trim().is_empty()));
         let mode = self.cfg.permission_mode.clone();
-        if let Err(e) = self.start(&mut live, false, mode.as_deref(), now) {
+        if let Err(e) = self.start(&mut live, false, mode.as_deref(), model, now) {
             return refuse(command_id, e);
         }
         st.last_create = Some(now);
         if !prompt.trim().is_empty() {
             match live
                 .driver
-                .user_prompt(command_id, prompt, now, |f| tx(&live.io, f))
+                .user_prompt(command_id, prompt, images, now, |f| tx(&live.io, f))
             {
                 Ok(op) => self.hub.push(&id, op),
                 Err(e) => {
@@ -962,7 +1002,12 @@ impl Inner {
             .filter(|m| PERMISSION_MODES.contains(m))
             .map(str::to_string)
             .or_else(|| self.cfg.permission_mode.clone());
-        self.start(live, true, mode.as_deref(), now)
+        let model = live
+            .driver
+            .model()
+            .filter(|m| is_model(m))
+            .map(str::to_string);
+        self.start(live, true, mode.as_deref(), model.as_deref(), now)
     }
 
     /// Spawn → `state starting` → `initialize`; the reader owns the events.
@@ -971,10 +1016,11 @@ impl Inner {
         live: &mut Live,
         resume: bool,
         mode: Option<&str>,
+        model: Option<&str>,
         now: i64,
     ) -> Result<(), String> {
         let sid = live.session.id.clone();
-        let mut args = spawn_args(&sid, resume, mode)?;
+        let mut args = spawn_args(&sid, resume, mode, model)?;
         args.extend(self.cfg.extra_args.iter().cloned());
         let (io, rx) = (self.spawn)(&args, Path::new(&live.session.project))
             .map_err(|e| format!("could not start Claude Code: {e}"))?;
@@ -1119,6 +1165,9 @@ impl Inner {
                         for (cmd, _) in std::mem::take(&mut live.interrupts) {
                             self.result(live, out, &cmd, "completed", None);
                         }
+                        // ADR-017 context meter: cheap (no API call); a dead
+                        // process just has none
+                        let _ = live.driver.context_usage(|f| tx(&live.io, f));
                     }
                     if let Op::Item(item) = &op
                         && let Some(tool) = &item.tool
@@ -1212,6 +1261,7 @@ impl Inner {
                         }
                     }
                     self.poll(live, now);
+                    let _ = live.driver.context_usage(|f| tx(&live.io, f));
                 }
                 // the exit fails the first prompt (and with it the create)
                 Err(_) => {
@@ -1233,7 +1283,7 @@ impl Inner {
                     }
                 }
             }
-            "set_permission_mode" => {
+            "set_permission_mode" | "set_model" | "rename_session" => {
                 if let Some(cmd) = command_id {
                     match result {
                         Ok(()) => self.result(live, out, &cmd, "completed", None),
@@ -1857,6 +1907,8 @@ pub(crate) mod tests {
             title: String::new(),
             prompt: prompt.into(),
             project: Some(WS.into()),
+            images: vec![],
+            model: None,
         }
     }
 
@@ -1865,6 +1917,7 @@ pub(crate) mod tests {
             command_id: command_id.into(),
             session_id: sid.into(),
             text: text.into(),
+            images: vec![],
         }
     }
 
@@ -2423,7 +2476,333 @@ pub(crate) mod tests {
         assert_eq!(e, "permission mode must be default, acceptEdits or plan");
     }
 
+    /// A CLI that answers the ADR-017 requests the way 2.1.322 does.
+    fn composer_peer() -> React {
+        Box::new(move |f| {
+            let v = json::parse(f).unwrap();
+            if json::get_str(&v, "type") == Some("user") {
+                let init = r#"{"type":"system","subtype":"init","model":"claude-haiku-5-5","permissionMode":"default","slash_commands":["compact","clear","context","__remote-workflow","review"]}"#;
+                let done = r#"{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.001}"#;
+                return (vec![init.into(), done.into()], false);
+            }
+            let id = json::get_str(&v, "request_id").unwrap_or("").to_string();
+            let req = json::get(&v, "request").cloned().unwrap_or(Json::Null);
+            let ok = |body: &str| {
+                format!(
+                    r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{body}}}}}"#
+                )
+            };
+            let lines = match json::get_str(&req, "subtype").unwrap_or("") {
+                "initialize" => vec![ok(
+                    r#"{"models":[{"value":"default","displayName":"Default (recommended)"},{"value":"haiku","displayName":"Haiku 5.5"},{"value":"sonnet[1m]","displayName":"Sonnet (1M)"}],"commands":[{"name":"compact","description":"…"},{"name":"clear"},{"name":"heapdump"},{"name":"review"}],"account":{"email":"never@example.com"}}"#,
+                )],
+                "get_context_usage" => vec![ok(
+                    r#"{"totalTokens":22900,"maxTokens":200000,"percentage":11}"#,
+                )],
+                "set_model" => match json::get_str(&req, "model") {
+                    Some("opus") => vec![ok(r#"{"model":"claude-opus-5-5"}"#)],
+                    _ => vec![format!(
+                        r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{id}","error":"Model 'claude-nope-1' not found"}}}}"#
+                    )],
+                },
+                "rename_session" => {
+                    let title = json::get_str(&req, "title").unwrap_or("");
+                    vec![
+                        format!(
+                            r#"{{"type":"system","subtype":"session_title_changed","title":{}}}"#,
+                            json::stringify(&json::s(title))
+                        ),
+                        ok("{}"),
+                    ]
+                }
+                "mcp_status" => vec![ok(r#"{"mcpServers":[]}"#)],
+                _ => Vec::new(),
+            };
+            (lines, false)
+        })
+    }
+
+    #[test]
+    fn composer_model_images_commands_context_and_rename() {
+        let r = rig(fast(), 3, vec![composer_peer()]);
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEUlEQVR4nGP4z8DwnwGMgRQAH+4D/dJQfRoAAAAASUVORK5CYII=";
+        let image = PromptImage {
+            media_type: "image/png".into(),
+            data: png.into(),
+        };
+        let mut create = create_msg("cmd-create", "What color is this?");
+        if let ClientMsg::CreateSession { images, model, .. } = &mut create {
+            *images = vec![image];
+            *model = Some("haiku".into());
+        }
+        let sid = match r.send(create) {
+            ServerMsg::Ack {
+                ok: true,
+                session_id: Some(s),
+                ..
+            } => s,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(r.wait_result("cmd-create").0, "completed");
+        let args = r.spawns.lock().unwrap()[0].join(" ");
+        assert!(args.contains("--model haiku"), "{args}");
+        // the image goes to the CLI first in the user frame…
+        let user = r
+            .stdin
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|f| f.starts_with(r#"{"type":"user""#))
+            .cloned();
+        let user = user.expect("a user frame");
+        let content = format!(
+            r#""content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{png}"}}}},{{"type":"text","text":"What color is this?"}}]"#
+        );
+        assert!(user.contains(&content), "{user}");
+        // …and never into the hub: the user item holds a count
+        r.wait("context", |r| {
+            r.ops(&sid)
+                .iter()
+                .any(|o| json::stringify(o).contains("usedTokens"))
+        });
+        let ops = r.ops(&sid);
+        let all: String = ops.iter().map(json::stringify).collect();
+        assert!(!all.contains(&png[..20]), "image bytes reached the hub");
+        let item = op_of(&ops, "item")
+            .into_iter()
+            .filter_map(|o| json::get(o, "item"))
+            .find(|i| json::get_str(i, "kind") == Some("user"))
+            .unwrap();
+        assert_eq!(json::get_i64(item, "images"), Some(1));
+        // state: models the phone may pick, commands minus the hidden ones, context
+        let state = op_of(&ops, "state")
+            .last()
+            .and_then(|o| json::get(o, "state"))
+            .unwrap();
+        assert_eq!(
+            json::stringify(json::get(state, "slashCommands").unwrap()),
+            r#"["compact","context","review"]"#
+        );
+        assert_eq!(
+            json::stringify(json::get(state, "models").unwrap()),
+            r#"[{"value":"default","label":"Default (recommended)"},{"value":"haiku","label":"Haiku 5.5"}]"#
+        );
+        assert_eq!(
+            json::stringify(json::get(state, "context").unwrap()),
+            r#"{"usedTokens":22900,"maxTokens":200000}"#
+        );
+        assert!(!all.contains("never@example.com"));
+        // set_model: the resolved id lands on state; an unknown model fails
+        ok(r.send(ClientMsg::SetModel {
+            command_id: "cmd-model".into(),
+            session_id: sid.clone(),
+            model: "opus".into(),
+        }));
+        assert_eq!(r.wait_result("cmd-model"), ("completed".into(), None));
+        let model = |r: &Rig| {
+            op_of(&r.ops(&sid), "state")
+                .last()
+                .and_then(|o| json::get(o, "state"))
+                .and_then(|s| json::get_str(s, "model"))
+                .map(String::from)
+        };
+        assert_eq!(model(&r).as_deref(), Some("claude-opus-5-5"));
+        ok(r.send(ClientMsg::SetModel {
+            command_id: "cmd-model-bad".into(),
+            session_id: sid.clone(),
+            model: "claude-nope-1".into(),
+        }));
+        let (status, error) = r.wait_result("cmd-model-bad");
+        assert_eq!(status, "failed");
+        assert!(error.unwrap().contains("not found"));
+        assert_eq!(model(&r).as_deref(), Some("claude-opus-5-5"));
+        let e = refusal(r.send(ClientMsg::SetModel {
+            command_id: "cmd-model-flag".into(),
+            session_id: sid.clone(),
+            model: "--dangerously-skip-permissions".into(),
+        }));
+        assert!(e.starts_with("model must be"), "{e}");
+        // rename: the CLI's own title event renames the session
+        ok(r.send(ClientMsg::RenameSession {
+            command_id: "cmd-name".into(),
+            session_id: sid.clone(),
+            title: "Colour check".into(),
+        }));
+        assert_eq!(r.wait_result("cmd-name"), ("completed".into(), None));
+        r.wait("title", |r| r.rt.sessions()[0].title == "Colour check");
+        let frame = r.stdin.lock().unwrap().iter().any(|f| {
+            f.contains(&format!(
+                r#""request":{{"subtype":"rename_session","title":"Colour check","source":"host","session_id":"{sid}"}}"#
+            ))
+        });
+        assert!(frame);
+    }
+
     /* ---------------------------- live ---------------------------- */
+
+    /// ADR-017 on the real CLI (Haiku, about $0.01): set_model, a 2x2 red
+    /// PNG with "what color", rename, context usage and the slash command
+    /// list: `CHERNOBYL_LIVE_CLAUDE=1 ANTHROPIC_MODEL=haiku cargo test --lib
+    /// live_claude_haiku_composer -- --ignored --nocapture`. Prints counts,
+    /// the answer word and the cost only.
+    #[test]
+    #[ignore = "spawns the real Claude Code CLI"]
+    fn live_claude_haiku_composer() {
+        if std::env::var_os("CHERNOBYL_LIVE_CLAUDE").is_none() {
+            return;
+        }
+        let parent = std::env::var_os("CHERNOBYL_LIVE_CLAUDE_DIR")
+            .map_or_else(std::env::temp_dir, PathBuf::from);
+        let root = parent.join(format!("chb-live-composer-{}", now_ms()));
+        let (work, data) = (root.join("work"), root.join("data"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let entry = AdapterEntryConfig {
+            id: "claude-1".into(),
+            kind: "claude".into(),
+            enabled: true,
+            workspaces: vec![work.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let mut cfg = LiveConfig::from_entry(&entry, &data).unwrap().unwrap();
+        cfg.projects = None;
+        let ws = cfg.workspaces[0].id.clone();
+        let hub = HubHandle::default();
+        let rt = ClaudeRuntime::new("claude-1", cfg, hub.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        rt.set_sink(Arc::new(move |k| sink.lock().unwrap().push(k)));
+        rt.refresh().unwrap();
+        let result_of = |cmd: &str| {
+            let deadline = Instant::now() + Duration::from_secs(180);
+            loop {
+                let found = events.lock().unwrap().iter().find_map(|e| match e {
+                    EventKind::CommandResult {
+                        command_id,
+                        status,
+                        error,
+                        ..
+                    } if command_id == cmd => Some((status.clone(), error.clone())),
+                    _ => None,
+                });
+                if let Some(r) = found {
+                    return r;
+                }
+                assert!(Instant::now() < deadline, "no result for {cmd}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let sid = match rt
+            .send(&ClientMsg::CreateSession {
+                command_id: "c1".into(),
+                agent_id: "claude-1".into(),
+                title: "live composer".into(),
+                prompt: String::new(),
+                project: Some(ws),
+                images: vec![],
+                model: None,
+            })
+            .unwrap()
+        {
+            ServerMsg::Ack {
+                ok: true,
+                session_id: Some(s),
+                ..
+            } => s,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(result_of("c1").0, "completed");
+        ok(rt
+            .send(&ClientMsg::SetModel {
+                command_id: "m1".into(),
+                session_id: sid.clone(),
+                model: "haiku".into(),
+            })
+            .unwrap());
+        assert_eq!(result_of("m1"), ("completed".into(), None));
+        // a 2x2 red PNG (the bytes of the research probe)
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEUlEQVR4nGP4z8DwnwGMgRQAH+4D/dJQfRoAAAAASUVORK5CYII=";
+        ok(rt
+            .send(&ClientMsg::SubmitPrompt {
+                command_id: "p1".into(),
+                session_id: sid.clone(),
+                text: "What color is this image? Answer with one word, no tools.".into(),
+                images: vec![PromptImage {
+                    media_type: "image/png".into(),
+                    data: png.into(),
+                }],
+            })
+            .unwrap());
+        assert_eq!(result_of("p1").0, "completed");
+        ok(rt
+            .send(&ClientMsg::RenameSession {
+                command_id: "r1".into(),
+                session_id: sid.clone(),
+                title: "Live composer check".into(),
+            })
+            .unwrap());
+        assert_eq!(result_of("r1"), ("completed".into(), None));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let ops = loop {
+            let ops: Vec<Json> = hub
+                .ops(&sid)
+                .iter()
+                .map(|o| json::parse(o).unwrap())
+                .collect();
+            let titled = rt
+                .sessions()
+                .iter()
+                .any(|s| s.title == "Live composer check");
+            let context = ops
+                .iter()
+                .any(|o| json::stringify(o).contains("usedTokens"));
+            if titled && context {
+                break ops;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "title {titled} context {context}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let all: String = ops.iter().map(json::stringify).collect();
+        assert!(!all.contains(&png[..20]), "image bytes reached the hub");
+        let answer: String = op_of(&ops, "item")
+            .iter()
+            .filter_map(|o| json::get(o, "item"))
+            .filter(|i| json::get_str(i, "kind") == Some("text"))
+            .filter_map(|i| json::get_str(i, "text"))
+            .collect();
+        let state = op_of(&ops, "state")
+            .last()
+            .and_then(|o| json::get(o, "state"))
+            .cloned()
+            .unwrap();
+        let commands = json::get(&state, "slashCommands")
+            .and_then(json::as_arr)
+            .map_or(0, |c| c.len());
+        let models = json::get(&state, "models")
+            .and_then(json::as_arr)
+            .map_or(0, |c| c.len());
+        let context = json::get(&state, "context")
+            .map(json::stringify)
+            .unwrap_or_default();
+        let cost: f64 = op_of(&ops, "turn")
+            .iter()
+            .filter_map(|o| json::get(o, "turn").and_then(|t| json::get(t, "costUsd")))
+            .filter_map(json::as_f64)
+            .sum();
+        println!(
+            "live: model={:?} answer={:?} commands={commands} models={models} context={context} cost_usd={cost:.4}",
+            json::get_str(&state, "model"),
+            answer.trim()
+        );
+        rt.dispose();
+        assert!(answer.to_ascii_lowercase().contains("red"), "{answer}");
+        assert!(json::get_str(&state, "model").is_some_and(|m| m.contains("haiku")));
+        assert!(commands > 0 && models > 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A real transcript from `claude -p` on Haiku in a temp workspace is
     /// found, refused while fresh, replayed, then continued with one prompt
@@ -2494,6 +2873,7 @@ pub(crate) mod tests {
                 command_id: cmd.into(),
                 session_id: sid.clone(),
                 text: "Reply with the single word: ok".into(),
+                images: vec![],
             })
             .unwrap()
         };

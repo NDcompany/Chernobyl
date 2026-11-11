@@ -1,0 +1,51 @@
+[
+  {
+    "type": "submit_prompt",
+    "commandId": "c-img-1",
+    "sessionId": "ses_live_1",
+    "text": "What color is this?",
+    "images": [
+      {
+        "mediaType": "image/png",
+        "data": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEUlEQVR4nGP4z8DwnwGMgRQAH+4D/dJQfRoAAAAASUVORK5CYII="
+      }
+    ]
+  },
+  {
+    "type": "submit_prompt",
+    "commandId": "c-img-4",
+    "sessionId": "ses_live_1",
+    "text": "Compare these",
+    "images": [
+      { "mediaType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAE=" },
+      { "mediaType": "image/jpeg", "data": "/9j/4AAQSkZJRgABAQAAAQABAAD/2w==" },
+      { "mediaType": "image/gif", "data": "R0lGODlhAQABAAAAACw=" },
+      { "mediaType": "image/webp", "data": "UklGRiQAAABXRUJQVlA4IA==" }
+    ]
+  },
+  { "type": "submit_prompt", "commandId": "c-img-0", "sessionId": "ses_live_1", "text": "no images", "images": [] },
+  {
+    "type": "create_session",
+    "commandId": "c-new-1",
+    "agentId": "claude-1",
+    "title": "Screenshot",
+    "prompt": "Describe the screenshot",
+    "project": "3f2a9c1d0e4b",
+    "model": "sonnet",
+    "images": [{ "mediaType": "image/jpeg", "data": "/9j/4AAQSkZJRgABAQAAAQABAAD/2w==" }]
+  },
+  {
+    "type": "create_session",
+    "commandId": "c-new-2",
+    "agentId": "claude-1",
+    "title": "t",
+    "prompt": "p",
+    "model": "claude-haiku-4-5-20251001"
+  },
+  { "type": "set_model", "commandId": "c-model-1", "sessionId": "ses_live_1", "model": "default" },
+  { "type": "set_model", "commandId": "c-model-2", "sessionId": "ses_live_1", "model": "opus" },
+  { "type": "set_model", "commandId": "c-model-3", "sessionId": "ses_live_1", "model": "haiku" },
+  { "type": "set_model", "commandId": "c-model-4", "sessionId": "ses_live_1", "model": "claude-sonnet-5-5" },
+  { "type": "rename_session", "commandId": "c-name-1", "sessionId": "ses_live_1", "title": "Fix the login bug" },
+  { "type": "rename_session", "commandId": "c-name-2", "sessionId": "ses_live_1", "title": "Ünïcode ✓ title" }
+]

@@ -60,6 +60,10 @@ const ERROR_MAX: usize = 1 << 10;
 const URL_MAX: usize = 4 << 10;
 const PLAN_STEPS: usize = 100;
 const MCP_SERVERS: usize = 32;
+/// ADR-017: the model and slash-command lists on `state`, and each name.
+const MODELS_MAX: usize = 32;
+const COMMANDS_MAX: usize = 200;
+const NAME_MAX: usize = 64;
 
 const OUTPUT_MARKER: &str = "\n… output truncated …\n";
 /// A diff "meta" line (git's `\ No newline…` shape), so a viewer shows it as
@@ -157,6 +161,9 @@ pub struct Item {
     pub level: Option<&'static str>,
     pub tool: Option<ToolCall>,
     pub steps: Vec<PlanStep>,
+    /// ADR-017 (user): how many images the prompt carried. The bytes never
+    /// enter the hub.
+    pub images: u32,
 }
 
 /// Which item field an `append` grows.
@@ -198,6 +205,12 @@ pub struct LiveState {
     pub status: &'static str,
     pub permission_mode: Option<String>,
     pub model: Option<String>,
+    /// ADR-017 (Claude): the models the CLI offers, (value, label).
+    pub models: Vec<(String, String)>,
+    /// ADR-017 (Claude): slash command names, without the slash.
+    pub commands: Vec<String>,
+    /// ADR-017 (Claude): context window use, (used, max) tokens.
+    pub context: Option<(i64, i64)>,
 }
 
 impl Default for LiveState {
@@ -206,6 +219,9 @@ impl Default for LiveState {
             status: "idle",
             permission_mode: None,
             model: None,
+            models: Vec::new(),
+            commands: Vec::new(),
+            context: None,
         }
     }
 }
@@ -357,6 +373,9 @@ impl Item {
             ItemKind::User => {
                 f.push(("text", json::s(&self.text)));
                 flag(&mut f, "queued", self.queued);
+                if self.images > 0 {
+                    f.push(("images", Json::Int(self.images as i64)));
+                }
             }
             ItemKind::Text | ItemKind::Thinking => {
                 f.push(("text", json::s(&self.text)));
@@ -422,6 +441,25 @@ impl LiveState {
         let mut f = vec![("status", json::s(self.status))];
         opt_str(&mut f, "permissionMode", self.permission_mode.as_deref());
         opt_str(&mut f, "model", self.model.as_deref());
+        if !self.models.is_empty() {
+            let models = self.models.iter().map(|(value, label)| {
+                json::obj(vec![("value", json::s(value)), ("label", json::s(label))])
+            });
+            f.push(("models", Json::Arr(models.collect())));
+        }
+        if !self.commands.is_empty() {
+            let list = self.commands.iter().map(|c| json::s(c)).collect();
+            f.push(("slashCommands", Json::Arr(list)));
+        }
+        if let Some((used, max)) = self.context {
+            f.push((
+                "context",
+                json::obj(vec![
+                    ("usedTokens", Json::Int(used)),
+                    ("maxTokens", Json::Int(max)),
+                ]),
+            ));
+        }
         json::obj(f)
     }
 }
@@ -652,6 +690,15 @@ fn bound(op: &mut Op) -> bool {
         Op::State(state) => {
             clip_opt(&mut state.permission_mode, LABEL_MAX);
             clip_opt(&mut state.model, LABEL_MAX);
+            state.models.truncate(MODELS_MAX);
+            for (value, label) in &mut state.models {
+                clip(value, NAME_MAX);
+                clip(label, NAME_MAX);
+            }
+            state.commands.truncate(COMMANDS_MAX);
+            for c in &mut state.commands {
+                clip(c, NAME_MAX);
+            }
             true
         }
         // runtime-produced auth URLs must keep working: capped, not redacted
@@ -1960,6 +2007,7 @@ mod tests {
             status,
             permission_mode: Some("default".into()),
             model: Some("claude-haiku-4-5".into()),
+            ..Default::default()
         };
         // transcript-snapshot.json: what a subscriber sees for this state
         let hub = HubHandle::default();
@@ -2141,5 +2189,51 @@ mod tests {
             canon(&json::parse(&frame.to_text()).unwrap()),
             canon(&golden)
         );
+    }
+    /// ADR-017: the user item's image count and the composer state (models,
+    /// slash commands, context) match the golden fixture both stacks read.
+    #[test]
+    fn composer_ops_match_the_golden_fixture() {
+        let golden = fixture!("composer-transcript.json");
+        let user = Op::Item(Item {
+            id: "u_img".into(),
+            ts: 1_761_436_800_000,
+            kind: ItemKind::User,
+            text: "What color is this?".into(),
+            done: true,
+            images: 2,
+            ..Default::default()
+        });
+        let state = Op::State(LiveState {
+            status: "idle",
+            permission_mode: Some("default".into()),
+            model: Some("claude-haiku-5-5".into()),
+            models: vec![
+                ("default".into(), "Default (recommended)".into()),
+                ("haiku".into(), "Haiku 5.5".into()),
+            ],
+            commands: vec!["compact".into(), "context".into(), "code-review".into()],
+            context: Some((22_900, 1_000_000)),
+        });
+        let ops = json::get(&golden, "ops").and_then(json::as_arr).unwrap();
+        for (i, op) in [user, state].iter().enumerate() {
+            let got = json::parse(&op_text(i as u64 + 1, op)).unwrap();
+            assert_eq!(canon(&got), canon(&ops[i]), "op {i}");
+        }
+        // the hub keeps the count and the lists, and caps the lists
+        let mut hub = Hub::default();
+        let mut big = LiveState {
+            commands: (0..300)
+                .map(|i| format!("c{i}{}", "x".repeat(100)))
+                .collect(),
+            ..Default::default()
+        };
+        big.models = vec![("haiku".into(), "y".repeat(200)); 40];
+        hub.push(S, Op::State(big), 0);
+        let state = hub.sessions[S].state.clone();
+        assert_eq!(state.commands.len(), COMMANDS_MAX);
+        assert!(state.commands.iter().all(|c| c.len() <= NAME_MAX));
+        assert_eq!(state.models.len(), MODELS_MAX);
+        assert!(state.models.iter().all(|(_, l)| l.len() <= NAME_MAX));
     }
 }

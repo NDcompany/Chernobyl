@@ -4,17 +4,22 @@
  * rows and segmented tabs.
  */
 import { useForm } from 'react-hook-form';
-import { useState } from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { useRef, useState } from 'react';
+import { ActivityIndicator, Image, Modal, Pressable, StyleSheet, View } from 'react-native';
 import type { StyleProp, ViewStyle } from 'react-native';
-import type {
-  ActivityEvent,
-  Agent,
-  FileChange,
-  Host,
-  PermissionRequest,
-  Session,
-  SessionStep,
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { CameraView, useCameraPermissions } from 'expo-camera';
+import {
+  PROMPT_IMAGES_DATA_MAX,
+  PROMPT_IMAGES_MAX,
+  type ActivityEvent,
+  type Agent,
+  type FileChange,
+  type Host,
+  type PermissionRequest,
+  type PromptImage,
+  type Session,
+  type SessionStep,
 } from '@chernobyl/protocol';
 import { colors, spacing, radii, typography } from '@/theme/tokens';
 import {
@@ -31,6 +36,15 @@ import { AgentIcon } from '@/ui/graphics';
 import { Icon, type IconName } from '@/ui/icons';
 import { zodHandler } from '@/forms/zodBridge';
 import { transportKind } from '@/data/transport';
+import {
+  FRAME_MAX_BYTES,
+  cleanBase64,
+  filterSlashCommands,
+  imageBudgetLeft,
+  pickPictureSize,
+  sealedFrameBytes,
+  slashQuery,
+} from '@/utils/composer';
 import { useAppStore } from '@/store/appStore';
 import { z } from 'zod';
 import {
@@ -333,7 +347,8 @@ const BUSY_CAPTION = {
 } as const;
 
 export interface PromptComposerProps {
-  onSubmit: (text: string) => void;
+  /** `images` is empty unless `canAttach` and the user added photos (ADR-017). */
+  onSubmit: (text: string, images: PromptImage[]) => void;
   /** shows Stop while busy */
   onInterrupt?: () => void;
   /** a turn is running (or the session waits) */
@@ -347,6 +362,15 @@ export interface PromptComposerProps {
   disabled?: boolean;
   hint?: string;
   placeholder?: string;
+  /** ADR-017: slash command names; a leading "/" lists the matching ones. */
+  slashCommands?: string[];
+  /** ADR-017: the camera button (agents whose `live.composer` has 'images'). */
+  canAttach?: boolean;
+}
+
+/** A photo waiting in the composer; `uri` is the local preview, never sent. */
+interface ComposerImage extends PromptImage {
+  uri: string;
 }
 
 export function PromptComposer({
@@ -357,10 +381,28 @@ export function PromptComposer({
   disabled = false,
   hint,
   placeholder = 'Ask the agent…',
+  slashCommands,
+  canAttach = false,
 }: PromptComposerProps) {
   const form = useForm<{ prompt: string }>({ defaultValues: { prompt: '' } });
+  const [images, setImages] = useState<ComposerImage[]>([]);
+  const [camera, setCamera] = useState(false);
+  const [tooLarge, setTooLarge] = useState(false);
+  const text = form.watch('prompt') ?? '';
+  const query = slashCommands?.length ? slashQuery(text) : null;
+  const matches = query === null || !slashCommands ? [] : filterSlashCommands(slashCommands, query);
   const submit = zodHandler(promptSchema, form, (data) => {
-    onSubmit(data.prompt.trim());
+    const prompt = data.prompt.trim();
+    const payload = images.map(({ mediaType, data: b64 }) => ({ mediaType, data: b64 }));
+    // one WebSocket frame carries the whole prompt (ADR-017): check before sending
+    const probe = { type: 'submit_prompt', commandId: 'x'.repeat(48), sessionId: 'x'.repeat(64), text: prompt, images: payload };
+    if (payload.length && sealedFrameBytes(probe) > FRAME_MAX_BYTES) {
+      setTooLarge(true);
+      return;
+    }
+    setTooLarge(false);
+    onSubmit(prompt, payload);
+    setImages([]);
     form.reset({ prompt: '' });
   });
   // ADR-009 honesty: never tell a live-companion user "nothing is executed
@@ -374,6 +416,44 @@ export function PromptComposer({
 
   return (
     <View style={styles.composer}>
+      {matches.length ? (
+        <View style={styles.slashMenu}>
+          {matches.map((name) => (
+            <Pressable
+              key={name}
+              onPress={() => form.setValue('prompt', `/${name} `, { shouldDirty: true })}
+              accessibilityRole="button"
+              accessibilityLabel={`Insert /${name}`}
+              style={({ pressed }) => [styles.slashRow, pressed && styles.pressed]}
+            >
+              <Text variant="mono" numberOfLines={1}>
+                /{name}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
+      {images.length ? (
+        <View style={styles.thumbRow}>
+          {images.map((im, i) => (
+            <View key={im.uri} style={styles.thumb}>
+              <Image source={{ uri: im.uri }} style={styles.thumbImage} accessibilityIgnoresInvertColors />
+              <Pressable
+                onPress={() => {
+                  setTooLarge(false);
+                  setImages(images.filter((_, j) => j !== i));
+                }}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel={`Remove photo ${i + 1}`}
+                style={styles.thumbRemove}
+              >
+                <Icon name="x" size={12} color={colors.white} />
+              </Pressable>
+            </View>
+          ))}
+        </View>
+      ) : null}
       <TextField
         form={form}
         name="prompt"
@@ -381,10 +461,32 @@ export function PromptComposer({
         multiline
         onSubmitEditing={submit}
       />
+      {tooLarge ? (
+        <Text variant="xs" color={colors.error} accessibilityRole="alert">
+          Too large to send in one message: remove a photo or shorten the text.
+        </Text>
+      ) : null}
       <View style={styles.composerRow}>
         <Text variant="xs" color={colors.text3} style={{ flex: 1 }} numberOfLines={1}>
-          {hint ?? (busy ? BUSY_CAPTION[promptWhileBusy] : idleCaption)}
+          {hint ?? (busy ? BUSY_CAPTION[promptWhileBusy] : images.length ? `${images.length} of ${PROMPT_IMAGES_MAX} photos` : idleCaption)}
         </Text>
+        {canAttach ? (
+          <Pressable
+            onPress={() => setCamera(true)}
+            disabled={disabled || images.length >= PROMPT_IMAGES_MAX}
+            hitSlop={6}
+            accessibilityRole="button"
+            accessibilityLabel="Attach a photo"
+            accessibilityState={{ disabled: disabled || images.length >= PROMPT_IMAGES_MAX }}
+            style={({ pressed }) => [
+              styles.iconButton,
+              (disabled || images.length >= PROMPT_IMAGES_MAX) && styles.dimmed,
+              pressed && styles.pressed,
+            ]}
+          >
+            <Icon name="camera" size={18} />
+          </Pressable>
+        ) : null}
         {busy && onInterrupt ? (
           <Button
             label="Stop"
@@ -406,7 +508,141 @@ export function PromptComposer({
           accessibilityLabel="Send prompt to agent"
         />
       </View>
+      {canAttach ? (
+        <PhotoCapture
+          visible={camera}
+          budget={imageBudgetLeft(images, PROMPT_IMAGES_DATA_MAX)}
+          onClose={() => setCamera(false)}
+          onCapture={(im) => setImages((list) => [...list, im].slice(0, PROMPT_IMAGES_MAX))}
+        />
+      ) : null}
     </View>
+  );
+}
+
+/** The camera shoots at most this long edge (Claude downsizes past 1568 px anyway). */
+const SHOT_EDGE = 1280;
+/** JPEG qualities tried in turn until the photo fits what is left of the budget. */
+const SHOT_QUALITIES = [0.7, 0.5, 0.35, 0.2, 0.1];
+
+/**
+ * ADR-017: one photo from the camera (expo-camera, already in the app for the
+ * pairing QR). Gallery picking would need expo-image-picker, which the app
+ * does not ship. The photo is re-encoded at falling JPEG quality until its
+ * base64 fits `budget`; it stays on the phone until the prompt is sent.
+ */
+function PhotoCapture({
+  visible,
+  budget,
+  onClose,
+  onCapture,
+}: {
+  visible: boolean;
+  budget: number;
+  onClose: () => void;
+  onCapture: (image: ComposerImage) => void;
+}) {
+  const [permission, requestPermission] = useCameraPermissions();
+  const ref = useRef<CameraView>(null);
+  const insets = useSafeAreaInsets();
+  const [size, setSize] = useState<string>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+
+  const close = () => {
+    setError(undefined);
+    onClose();
+  };
+  const shoot = async () => {
+    const cam = ref.current;
+    if (!cam || busy) return;
+    setBusy(true);
+    setError(undefined);
+    try {
+      const pic = await cam.takePictureAsync({ pictureRef: true, shutterSound: false });
+      try {
+        for (const quality of SHOT_QUALITIES) {
+          const out = await pic.savePictureAsync({ quality, base64: true });
+          const data = cleanBase64(out.base64 ?? '');
+          if (data.startsWith('/9j/') && data.length <= budget) {
+            onCapture({ uri: out.uri, mediaType: 'image/jpeg', data });
+            close();
+            return;
+          }
+        }
+        setError('This photo is too large to add. Remove a photo or send what you have.');
+      } finally {
+        pic.release();
+      }
+    } catch (e) {
+      setError(e instanceof Error && e.message ? e.message : 'The camera could not take a photo');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal visible={visible} animationType="slide" onRequestClose={close} statusBarTranslucent>
+      <View style={[styles.cameraScreen, { paddingTop: insets.top + spacing.md, paddingBottom: insets.bottom + spacing.xl }]}>
+        <View style={styles.cameraHead}>
+          <Text variant="h3" color={colors.white} style={{ flex: 1 }} accessibilityRole="header">
+            Attach a photo
+          </Text>
+          <Pressable onPress={close} hitSlop={10} accessibilityRole="button" accessibilityLabel="Close camera">
+            <Icon name="x" size={20} color={colors.white} />
+          </Pressable>
+        </View>
+        {!permission ? (
+          <ActivityIndicator color={colors.white} style={{ flex: 1 }} />
+        ) : permission.granted ? (
+          <View style={styles.cameraBox}>
+            {visible ? (
+              <CameraView
+                ref={ref}
+                style={StyleSheet.absoluteFill}
+                facing="back"
+                pictureSize={size}
+                onCameraReady={() => {
+                  void ref.current
+                    ?.getAvailablePictureSizesAsync()
+                    .then((sizes) => setSize(pickPictureSize(sizes, SHOT_EDGE)))
+                    .catch(() => undefined);
+                }}
+                onMountError={(e) => setError(e.message || 'The camera failed to start')}
+              />
+            ) : null}
+          </View>
+        ) : (
+          <View style={styles.cameraAsk}>
+            <Text variant="body" color={colors.white} center>
+              {permission.canAskAgain
+                ? 'CHERNOBYL needs the camera to take the photo. It is sent to Claude on your PC with your next message.'
+                : 'Camera access is off. Turn it on for CHERNOBYL in the system settings to attach photos.'}
+            </Text>
+            {permission.canAskAgain ? (
+              <Button label="Allow camera" variant="primary" ringColor={colors.white} onPress={() => void requestPermission()} />
+            ) : null}
+          </View>
+        )}
+        {error ? (
+          <Text variant="sm" color={colors.white} center accessibilityRole="alert">
+            {error}
+          </Text>
+        ) : null}
+        {permission?.granted ? (
+          <Pressable
+            onPress={() => void shoot()}
+            disabled={busy}
+            accessibilityRole="button"
+            accessibilityLabel="Take photo"
+            accessibilityState={{ disabled: busy, busy }}
+            style={({ pressed }) => [styles.shutter, pressed && styles.pressed]}
+          >
+            {busy ? <ActivityIndicator color={colors.black} /> : null}
+          </Pressable>
+        ) : null}
+      </View>
+    </Modal>
   );
 }
 
@@ -642,6 +878,53 @@ const styles = StyleSheet.create({
     padding: spacing.md,
   },
   composerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  pressed: { opacity: 0.7 },
+  dimmed: { opacity: 0.4 },
+  iconButton: {
+    minWidth: 36,
+    minHeight: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radii.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+  },
+  slashMenu: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    borderRadius: radii.sm,
+    paddingVertical: spacing.xs,
+  },
+  slashRow: { minHeight: 36, justifyContent: 'center', paddingHorizontal: spacing.md },
+  thumbRow: { flexDirection: 'row', gap: spacing.sm },
+  thumb: { width: 56, height: 56, borderRadius: radii.sm, overflow: 'hidden', backgroundColor: colors.surface2 },
+  thumbImage: { width: '100%', height: '100%' },
+  thumbRemove: {
+    position: 'absolute',
+    top: 2,
+    right: 2,
+    width: 20,
+    height: 20,
+    borderRadius: radii.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.black,
+  },
+  cameraScreen: { flex: 1, backgroundColor: colors.black, paddingHorizontal: spacing.xl, gap: spacing.lg },
+  cameraHead: { flexDirection: 'row', alignItems: 'center' },
+  cameraBox: { flex: 1, borderRadius: radii.md, overflow: 'hidden' },
+  cameraAsk: { flex: 1, justifyContent: 'center', gap: spacing.lg },
+  shutter: {
+    alignSelf: 'center',
+    width: 72,
+    height: 72,
+    borderRadius: radii.pill,
+    borderWidth: 4,
+    borderColor: colors.text3,
+    backgroundColor: colors.white,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 
   timelineRow: { flexDirection: 'row', gap: spacing.md },
   timelineGutter: { width: 16, alignItems: 'center' },

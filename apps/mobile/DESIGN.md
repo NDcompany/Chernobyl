@@ -44,7 +44,15 @@ root layout), `ConfirmModal` (destructive confirmations; `note` = scope/safety l
 (compact|full, `resolved` dims), `ActivityRow`, `PromptComposer` (RHF+zod, 32,000-char limit, Stop
 while `busy`; `promptWhileBusy` `merge`|`queue` keeps Send enabled mid-turn with "Joins the current
 turn" / "Runs after this turn", `none` blocks it), `Timeline`, `OutputBlock` (stderr→error color,
-system→italic), `FileRow` (+add/−del), `DetailRow`, `SegmentedTabs`.
+system→italic), `FileRow` (+add/−del), `DetailRow`, `SegmentedTabs`. ADR-017 composer extras, each
+only when the parent passes it (from `Agent.live.composer`): `slashCommands` (a leading `/` lists up
+to 8 matching names above the field, prefix matches first; a tap inserts `/<name> `), `canAttach`
+(a camera icon button; `PhotoCapture` is a full-screen black modal on `expo-camera` that shoots at
+≤1280 px and re-encodes the JPEG at falling quality until it fits the base64 budget; 56 px
+thumbnails with a black × above the field, "N of 4 photos" as the caption; before sending, the
+sealed frame size is checked and "Too large to send in one message" shows in `error`). No gallery:
+that needs `expo-image-picker`, which the app does not ship. Pure helpers in `src/utils/composer.ts`
+(unit-tested).
 
 **`transcript.tsx`** — ADR-015 conversation view, presentational only (data + callbacks as props;
 pure logic in `src/utils/transcript.ts`, unit-tested by `npm test -w @chernobyl/mobile`).
@@ -70,8 +78,13 @@ ends in a space so Android's pixel rounding cannot wrap the widest line out of t
 "Deny and tell <agent> why"; persistent grants confirm the exact rule and file), `PlanCard`,
 `NoticeRow`, `TurnFooter`, `McpChip` ("MCP 4/5" + warning dot), `McpSheet` (status + §4.7 sign-in
 actions), `ModeChip` (Claude permission mode picker; `dark` variant for the black header).
+ADR-017: `UserBubble` shows an outlined "1 image" / "N images" chip (camera icon) above the text
+when the prompt carried photos (only the count comes back); `ModelChip` (current model, sheet of the
+CLI's models or the `default`/`sonnet`/`opus`/`haiku` aliases), `ContextChip` ("Context N%",
+warning dot from 80%, hidden while unknown) and `RenameChip` (pencil; sheet with a text field,
+80 characters) share the chip style and its `dark` variant.
 
-**`icons.tsx`** — `Icon` + `IconName` (38 names, 24×24 stroke grid, `strokeWidth` prop). New icon =
+**`icons.tsx`** — `Icon` + `IconName` (40 names, 24×24 stroke grid, `strokeWidth` prop). New icon =
 add path to `PATHS`, never inline Svg in a screen.
 
 **`graphics.tsx`** — `Contours` (frame|top|bottom|ambient — decorative, clipped, never touchable,
@@ -168,10 +181,13 @@ carry a `SimulatedTag`. Derived from the keystore pairing and store transport st
 ## Routes (`app/`)
 
 Tabs: `(tabs)/index` Home · `agents` → `agent/[id]` · `sessions` → `session/[id]` · `approvals` →
-`permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field).
+`permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field; agents with `live.composer` `model` get a Model chip row, Default sending no `model`).
 Full-screen (no gesture back): `onboarding`, `sign-in`.
 
-`session/[id]` is the live conversation (see Live sessions) or the classic workspace;
+`session/[id]` is the live conversation (see Live sessions) or the classic workspace; its black
+header's chip row wraps: MCP, permission mode, model, context, then rename and End session on the
+right (model, context, rename, slash commands and the camera only for agents whose
+`live.composer` lists them, i.e. Claude);
 `?focus=<toolItemId>` scrolls the conversation to that card. Requests open through
 `permissionHref` (`@/data/selectors`): the Approvals tab, Home's pending list and notification taps
 open a request from a live conversation at its card, any other request at `permission/[id]`. Local

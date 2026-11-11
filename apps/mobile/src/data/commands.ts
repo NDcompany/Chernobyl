@@ -4,7 +4,7 @@
  * ack errors as toasts and reports host-unreachable failures honestly.
  */
 import { useCallback } from 'react';
-import { nextId, type ClientMessage, type PermissionDecision } from '@chernobyl/protocol';
+import { nextId, type ClientMessage, type PermissionDecision, type PromptImage } from '@chernobyl/protocol';
 import { getTransport, type Ack } from './transport';
 import { useAppStore } from '@/store/appStore';
 
@@ -35,24 +35,27 @@ export const commands = {
     revision,
     ...extra,
   }),
-  submitPrompt: (sessionId: string, text: string): ClientMessage => ({
+  /** ADR-017: `images` only for agents whose `live.composer` has 'images'. */
+  submitPrompt: (sessionId: string, text: string, images?: PromptImage[]): ClientMessage => ({
     type: 'submit_prompt',
     commandId: nextId('cmd'),
     sessionId,
     text,
+    ...(images?.length ? { images } : {}),
   }),
   interrupt: (sessionId: string): ClientMessage => ({
     type: 'interrupt',
     commandId: nextId('cmd'),
     sessionId,
   }),
-  createSession: (agentId: string, title: string, prompt: string, project?: string): ClientMessage => ({
+  createSession: (agentId: string, title: string, prompt: string, project?: string, model?: string): ClientMessage => ({
     type: 'create_session',
     commandId: nextId('cmd'),
     agentId,
     title,
     prompt,
     project,
+    ...(model ? { model } : {}),
   }),
   /* ADR-015 live-session commands (session_subscribe/unsubscribe live in data/live.ts: they never toast) */
   setPermissionMode: (sessionId: string, mode: 'default' | 'acceptEdits' | 'plan'): ClientMessage => ({
@@ -85,6 +88,19 @@ export const commands = {
     commandId: nextId('cmd'),
     sessionId,
     server,
+  }),
+  /* ADR-017 composer (Claude) */
+  setModel: (sessionId: string, model: string): ClientMessage => ({
+    type: 'set_model',
+    commandId: nextId('cmd'),
+    sessionId,
+    model,
+  }),
+  renameSession: (sessionId: string, title: string): ClientMessage => ({
+    type: 'rename_session',
+    commandId: nextId('cmd'),
+    sessionId,
+    title,
   }),
 } as const;
 

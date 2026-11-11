@@ -29,7 +29,9 @@
 
 use crate::crypto::sha256;
 use crate::json::{self, Json};
-use crate::protocol::{DecisionError, LiveWorkspace, PermissionOption, PermissionRequest};
+use crate::protocol::{
+    DecisionError, LiveWorkspace, PermissionOption, PermissionRequest, PromptImage, is_model,
+};
 use crate::runtime_io::{child_env, redact};
 use crate::transcript::{
     Field, FileDiff, Item, ItemKind, LiveState, McpAuthState, McpServer, Op, PlanStep, ToolCall,
@@ -53,6 +55,10 @@ pub const UNSUPPORTED_BY_HOST: &str = "unsupported by host";
 pub const PERMISSION_MODES: [&str; 3] = ["default", "acceptEdits", "plan"];
 /// Where claude.ai connectors are signed in (§4.7); the companion is not involved.
 pub const CLAUDE_AI_CONNECTORS: &str = "https://claude.ai/customize/connectors";
+/// ADR-017: slash commands the phone never offers. `/clear` starts a new
+/// session id the companion would lose track of (verified on 2.1.322);
+/// `/heapdump` writes to the PC's desktop; the rest are internal.
+const HIDDEN_COMMANDS: [&str; 5] = ["clear", "reset", "new", "heapdump", "workflow-launch-exec"];
 
 /// §4.2.4: an unparseable line starting with this is answered with an error.
 const CONTROL_REQUEST_PREFIX: &str = "{\"type\":\"control_request\"";
@@ -79,6 +85,7 @@ pub fn spawn_args(
     session_id: &str,
     resume: bool,
     permission_mode: Option<&str>,
+    model: Option<&str>,
 ) -> Result<Vec<String>, &'static str> {
     if !is_uuid(session_id) {
         return Err("the Claude session id must be a UUID");
@@ -106,6 +113,13 @@ pub fn spawn_args(
             return Err("permission mode must be default, acceptEdits or plan");
         }
         args.extend(["--permission-mode".into(), mode.into()]);
+    }
+    // ADR-017: "default" is the CLI's own choice, so no flag at all
+    if let Some(model) = model.filter(|m| *m != "default") {
+        if !is_model(model) {
+            return Err("model must be a Claude Code alias or a claude-… id");
+        }
+        args.extend(["--model".into(), model.into()]);
     }
     let flag = if resume { "--resume" } else { "--session-id" };
     args.extend([flag.into(), session_id.into()]);
@@ -353,7 +367,7 @@ pub struct Asked {
 struct Sent {
     subtype: &'static str,
     command_id: Option<String>,
-    /// The MCP server name, or the mode of a `set_permission_mode`.
+    /// The MCP server name, or the mode or model asked for.
     server: Option<String>,
 }
 
@@ -361,6 +375,7 @@ struct Prompt {
     uuid: String,
     command_id: String,
     text: String,
+    images: u32,
     ts: i64,
     started: bool,
     queued: bool,
@@ -392,6 +407,12 @@ pub struct Driver {
     status: &'static str,
     permission_mode: Option<String>,
     model: Option<String>,
+    /// ADR-017: `initialize`'s models (value, label) and the slash command
+    /// names (`initialize`, `system/init`, `commands_changed`).
+    models: Vec<(String, String)>,
+    commands: Vec<String>,
+    /// ADR-017: the last `get_context_usage`, (used, max) tokens.
+    context: Option<(i64, i64)>,
     /// Current streamed message and its open blocks: index → item id (None
     /// for blocks that are never shown).
     stream_msg: String,
@@ -429,6 +450,9 @@ impl Driver {
             status: "starting",
             permission_mode: None,
             model: None,
+            models: Vec::new(),
+            commands: Vec::new(),
+            context: None,
             stream_msg: String::new(),
             open: Vec::new(),
             blocks: Vec::new(),
@@ -464,6 +488,11 @@ impl Driver {
         self.permission_mode.as_deref()
     }
 
+    /// The CLI's current model (kept for a `--resume` respawn).
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
     /// The cumulative cost a `--resume` restores, for a session this driver
     /// did not start (its turns report the difference).
     pub fn restore_cost(&mut self, total: f64) {
@@ -493,22 +522,34 @@ impl Driver {
     /// A phone prompt (§4.2.5): the user frame carries a fresh v4 uuid mapped
     /// to `command_id`, so the CLI's `command_lifecycle` frames find the
     /// command. Returns the user item to push once the frame is queued.
+    /// ADR-017: `images` go first, as Messages API image blocks; the item
+    /// and everything kept here hold only their count.
     pub fn user_prompt(
         &mut self,
         command_id: &str,
         text: &str,
+        images: &[PromptImage],
         now: i64,
         send: impl FnOnce(String) -> Result<(), &'static str>,
     ) -> Result<Op, &'static str> {
         let uuid = new_uuid()?;
+        let mut content = String::new();
+        for im in images {
+            content.push_str(&format!(
+                "{{\"type\":\"image\",\"source\":{{\"type\":\"base64\",\"media_type\":{},\"data\":{}}}}},",
+                q(&im.media_type),
+                q(&im.data)
+            ));
+        }
         send(format!(
-            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":{}}}]}},\"parent_tool_use_id\":null,\"session_id\":\"\",\"uuid\":\"{uuid}\"}}",
+            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{content}{{\"type\":\"text\",\"text\":{}}}]}},\"parent_tool_use_id\":null,\"session_id\":\"\",\"uuid\":\"{uuid}\"}}",
             q(text)
         ))?;
         let prompt = Prompt {
             uuid,
             command_id: command_id.into(),
             text: text.into(),
+            images: images.len() as u32,
             ts: now,
             started: false,
             queued: false,
@@ -553,6 +594,52 @@ impl Driver {
             "set_permission_mode",
             Some(command_id),
             Some(mode),
+            send,
+        )
+    }
+
+    /// ADR-017 `set_model {model}` (verified on 2.1.322: the reply is
+    /// `{model: <resolved id>}`, an unknown one is an error).
+    pub fn set_model(
+        &mut self,
+        command_id: &str,
+        model: &str,
+        send: impl FnOnce(String) -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        if !is_model(model) {
+            return Err("model must be a Claude Code alias or a claude-… id");
+        }
+        let body = format!(r#"{{"subtype":"set_model","model":{}}}"#, q(model));
+        self.request(body, "set_model", Some(command_id), Some(model), send)
+    }
+
+    /// ADR-017 `rename_session` (the SDK's shape; verified on 2.1.322: the
+    /// CLI answers `{}` and emits `system/session_title_changed`).
+    pub fn rename(
+        &mut self,
+        command_id: &str,
+        title: &str,
+        send: impl FnOnce(String) -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        let body = format!(
+            r#"{{"subtype":"rename_session","title":{},"source":"host","session_id":{}}}"#,
+            q(title),
+            q(&self.session_id)
+        );
+        self.request(body, "rename_session", Some(command_id), None, send)
+    }
+
+    /// ADR-017 `get_context_usage` (verified live; no API call): the reply
+    /// becomes `state.context`.
+    pub fn context_usage(
+        &mut self,
+        send: impl FnOnce(String) -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        self.request(
+            r#"{"subtype":"get_context_usage"}"#.into(),
+            "get_context_usage",
+            None,
+            None,
             send,
         )
     }
@@ -743,7 +830,7 @@ impl Driver {
         }
         for (_, sent) in std::mem::take(&mut self.sent) {
             match sent.subtype {
-                "mcp_status" => {}
+                "mcp_status" | "get_context_usage" => {}
                 "mcp_authenticate" => out.push(Event::AuthStarted {
                     command_id: sent.command_id,
                     server: sent.server.unwrap_or_default(),
@@ -910,7 +997,17 @@ impl Driver {
         };
         match (sent.subtype, result) {
             ("mcp_status", Ok(())) => self.mcp_reply(body, out),
-            ("mcp_status", Err(_)) => {}
+            ("mcp_status" | "get_context_usage", Err(_)) => {}
+            ("get_context_usage", Ok(())) => {
+                let n = |k: &str| json::get(body, k).and_then(json::as_f64).map(|x| x as i64);
+                if let (Some(used), Some(max)) = (n("totalTokens"), n("maxTokens"))
+                    && max > 0
+                    && self.context != Some((used, max))
+                {
+                    self.context = Some((used, max));
+                    out.push(Event::Op(Op::State(self.live_state())));
+                }
+            }
             ("mcp_authenticate", result) => {
                 let server = sent.server.unwrap_or_default();
                 let result = result.and_then(|()| auth_start(body).map_err(String::from));
@@ -931,6 +1028,17 @@ impl Driver {
                 if let Some(mode) = json::get_str(body, "current_permission_mode") {
                     self.permission_mode = Some(mode.to_string());
                 }
+                if let Some(list) = json::get(body, "models").and_then(json::as_arr) {
+                    self.models = list
+                        .iter()
+                        .filter_map(|m| {
+                            let value = json::get_str(m, "value").filter(|v| is_model(v))?;
+                            let label = json::get_str(m, "displayName").unwrap_or(value);
+                            Some((value.to_string(), plain_text(label)))
+                        })
+                        .collect();
+                }
+                self.set_commands(json::get(body, "commands"));
                 if self.turn.is_none() && self.status != "idle" {
                     self.set_status("idle", out);
                 } else {
@@ -947,11 +1055,21 @@ impl Driver {
                 // the CLI sends no `system/status` for a mode it was told
                 if subtype == "set_permission_mode"
                     && result.is_ok()
-                    && let Some(mode) = sent.server
+                    && let Some(mode) = sent.server.clone()
                     && self.permission_mode.as_deref() != Some(&mode)
                 {
                     self.permission_mode = Some(mode);
                     out.push(Event::Op(Op::State(self.live_state())));
+                }
+                // nor for a model: its reply names the resolved id
+                if subtype == "set_model" && result.is_ok() {
+                    let model = json::get_str(body, "model")
+                        .map(String::from)
+                        .or(sent.server);
+                    if model.is_some() && self.model != model {
+                        self.model = model;
+                        out.push(Event::Op(Op::State(self.live_state())));
+                    }
                 }
                 out.push(Event::Reply {
                     command_id: sent.command_id,
@@ -1004,6 +1122,7 @@ impl Driver {
                         changed = true;
                     }
                 }
+                changed |= self.set_commands(json::get(v, "slash_commands"));
                 if changed {
                     out.push(Event::Op(Op::State(self.live_state())));
                 }
@@ -1072,7 +1191,10 @@ impl Driver {
                     out.push(Event::Title(t.to_string()));
                 }
             }
-            _ => {} // thinking_tokens, hook_*, commands_changed, task_*, …
+            "commands_changed" if self.set_commands(json::get(v, "commands")) => {
+                out.push(Event::Op(Op::State(self.live_state())));
+            }
+            _ => {} // thinking_tokens, hook_*, task_*, …
         }
     }
 
@@ -1525,7 +1647,30 @@ impl Driver {
             status: self.status,
             permission_mode: self.permission_mode.clone(),
             model: self.model.clone(),
+            models: self.models.clone(),
+            commands: self.commands.clone(),
+            context: self.context,
         }
+    }
+
+    /// Slash command names from a list of names (`system/init`) or of
+    /// `{name}` objects (`initialize`, `commands_changed`), minus the hidden
+    /// ones; true when they changed. Not a list: nothing changes.
+    fn set_commands(&mut self, list: Option<&Json>) -> bool {
+        let Some(list) = list.and_then(json::as_arr) else {
+            return false;
+        };
+        let names: Vec<String> = list
+            .iter()
+            .filter_map(|c| json::as_str(c).or_else(|| json::get_str(c, "name")))
+            .filter(|n| !n.is_empty() && !n.starts_with('_') && !HIDDEN_COMMANDS.contains(n))
+            .map(plain_text)
+            .collect();
+        if names == self.commands {
+            return false;
+        }
+        self.commands = names;
+        true
     }
 
     fn set_status(&mut self, status: &'static str, out: &mut Vec<Event>) {
@@ -1574,14 +1719,7 @@ impl Driver {
             kind,
             ts,
             turn_id: self.turn.as_ref().map(|t| t.id.clone()),
-            parent_id: None,
-            text: String::new(),
-            done: false,
-            truncated: false,
-            queued: false,
-            level: None,
-            tool: None,
-            steps: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -1721,15 +1859,11 @@ fn user_item(p: &Prompt) -> Item {
         id: p.uuid.clone(),
         kind: ItemKind::User,
         ts: p.ts,
-        turn_id: None,
-        parent_id: None,
         text: p.text.clone(),
         done: true,
-        truncated: false,
         queued: p.queued,
-        level: None,
-        tool: None,
-        steps: Vec::new(),
+        images: p.images,
+        ..Default::default()
     }
 }
 
@@ -2969,7 +3103,7 @@ mod tests {
                         };
                         prompts += 1;
                         let command = format!("cmd-{prompts}");
-                        let op = r.d.user_prompt(&command, &text, t, send).unwrap();
+                        let op = r.d.user_prompt(&command, &text, &[], t, send).unwrap();
                         r.events.push(Event::Op(op));
                         r.stdin.extend(log.into_inner());
                     }
@@ -3286,7 +3420,7 @@ mod tests {
         let mut d = Driver::new("claude-1", "ses-1", RUN1);
         let mut frame = String::new();
         let op = d
-            .user_prompt("cmd-7", "and then say ok", 5, |f| {
+            .user_prompt("cmd-7", "and then say ok", &[], 5, |f| {
                 frame = f;
                 Ok(())
             })
@@ -3326,7 +3460,7 @@ mod tests {
         );
         // a prompt the CLI cancels closes at once
         let mut prompt = |d: &mut Driver, command: &str| {
-            d.user_prompt(command, "x", 11, |f| {
+            d.user_prompt(command, "x", &[], 11, |f| {
                 frame = f;
                 Ok(())
             })
@@ -3363,7 +3497,9 @@ mod tests {
             ]
         );
         // a failed write records nothing
-        let refused = d.user_prompt("cmd-9", "y", 13, |_| Err("runtime is not reading input"));
+        let refused = d.user_prompt("cmd-9", "y", &[], 13, |_| {
+            Err("runtime is not reading input")
+        });
         assert_eq!(refused.err(), Some("runtime is not reading input"));
         assert!(
             summaries(&d.on_exit(Some(0), 14))
@@ -4102,7 +4238,7 @@ mod tests {
     fn spawn_args_match_the_sdk_set_without_shell() {
         let id = "0b6c1f5e-8f2a-4c3d-9e7b-123456789abc";
         assert_eq!(
-            spawn_args(id, false, None).unwrap(),
+            spawn_args(id, false, None, None).unwrap(),
             [
                 "-p",
                 "--output-format",
@@ -4121,13 +4257,13 @@ mod tests {
                 id,
             ]
         );
-        let resumed = spawn_args(id, true, Some("acceptEdits")).unwrap();
+        let resumed = spawn_args(id, true, Some("acceptEdits"), None).unwrap();
         assert_eq!(
             &resumed[13..],
             ["--permission-mode", "acceptEdits", "--resume", id]
         );
         for mode in ["bypassPermissions", "dontAsk", "auto", ""] {
-            assert!(spawn_args(id, false, Some(mode)).is_err(), "{mode}");
+            assert!(spawn_args(id, false, Some(mode), None).is_err(), "{mode}");
         }
         for bad in [
             "",
@@ -4135,9 +4271,9 @@ mod tests {
             "--resume",
             "0b6c1f5e-8f2a-4c3d-9e7b-123456789abc --x",
         ] {
-            assert!(spawn_args(bad, false, None).is_err(), "{bad}");
+            assert!(spawn_args(bad, false, None, None).is_err(), "{bad}");
         }
-        let all = spawn_args(id, false, Some("plan")).unwrap().join(" ");
+        let all = spawn_args(id, false, Some("plan"), None).unwrap().join(" ");
         for absent in [
             "--replay-user-messages",
             "bypass",
@@ -4435,7 +4571,7 @@ mod tests {
         let cwd = parent.join(format!("chb-live-{}", &session[..8]));
         std::fs::create_dir_all(&cwd).unwrap();
         let ws = plain(&std::fs::canonicalize(&cwd).unwrap());
-        let mut args = spawn_args(&session, false, Some("default")).unwrap();
+        let mut args = spawn_args(&session, false, Some("default"), None).unwrap();
         args.extend(["--model".to_string(), "haiku".to_string()]);
         let (io, rx) = ChildIo::spawn(&bin, &args, &cwd, &spawn_env(std::env::vars_os())).unwrap();
         let t0 = crate::protocol::now_ms();
@@ -4459,7 +4595,7 @@ mod tests {
         let mut d = Driver::new("claude-1", &session, &ws);
         d.initialize(send).unwrap();
         let prompt = "Create a.txt containing hi, then edit it to say hello";
-        d.user_prompt("cmd-1", prompt, now(), send).unwrap();
+        d.user_prompt("cmd-1", prompt, &[], now(), send).unwrap();
         let (mut events, mut code, mut edits) = (Vec::new(), None, 0);
         let mut closing = false;
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(240)) {

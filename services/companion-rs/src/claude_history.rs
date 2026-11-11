@@ -336,7 +336,14 @@ pub fn replay(path: &Path, adapter: &str, sid: &str, cwd: &str) -> io::Result<Ve
                     b.iter()
                         .any(|b| json::get_str(b, "type") == Some("tool_result"))
                 });
-                if let Some(text) = user_text(&v) {
+                // ADR-017: only how many images the prompt had, never their bytes
+                let images = content.and_then(json::as_arr).map_or(0, |b| {
+                    b.iter()
+                        .filter(|b| json::get_str(b, "type") == Some("image"))
+                        .count() as u32
+                });
+                let text = user_text(&v).or_else(|| (images > 0 && !tools).then(String::new));
+                if let Some(text) = text {
                     if !tools {
                         close(&mut d, ts, &mut ops);
                     }
@@ -346,6 +353,7 @@ pub fn replay(path: &Path, adapter: &str, sid: &str, cwd: &str) -> io::Result<Ve
                         ts,
                         text,
                         done: true,
+                        images,
                         ..Default::default()
                     }));
                 }
@@ -684,6 +692,48 @@ mod tests {
             [("a1", "completed", true), ("a4", "completed", true)]
         );
         assert!(!ops.iter().any(|o| matches!(o, Op::State(_))));
+    }
+
+    /// ADR-017: a prompt's images come back as a count, never as bytes.
+    #[test]
+    fn replay_counts_prompt_images_without_their_bytes() {
+        let f = Fake::new();
+        let work = PathBuf::from(&f.ws.path);
+        let data = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEUlEQVR4nGP4z8DwnwGMgRQAH+4D/dJQfRoAAAAASUVORK5CYII=";
+        let block = format!(
+            r#"{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{data}"}}}}"#
+        );
+        let prompt = |uuid: &str, text: &str| {
+            let mut content = format!("[{block},{block}");
+            if !text.is_empty() {
+                content.push_str(&format!(r#",{{"type":"text","text":{}}}"#, q(text)));
+            }
+            format!(
+                r#"{{"type":"user","uuid":"{uuid}","isSidechain":false,"cwd":{},"timestamp":"2026-11-12T10:00:00.000Z","message":{{"role":"user","content":{content}]}}}}"#,
+                q(&work.to_string_lossy())
+            )
+        };
+        let lines = vec![prompt("u1", "what color"), prompt("u2", "")];
+        let path = f.write(&work, ID1, &lines, 0);
+        let ops = replay(&path, "claude-1", ID1, &f.ws.path).unwrap();
+        let users: Vec<(&str, &str, u32)> = ops
+            .iter()
+            .filter_map(|o| match o {
+                Op::Item(i) if i.kind == ItemKind::User => {
+                    Some((i.id.as_str(), i.text.as_str(), i.images))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, [("u1", "what color", 2), ("u2", "", 2)]);
+        let text: String = ops
+            .iter()
+            .filter_map(|o| match o {
+                Op::Item(i) => Some(json::stringify(&i.to_json())),
+                _ => None,
+            })
+            .collect();
+        assert!(!text.contains(&data[..20]));
     }
 
     #[test]

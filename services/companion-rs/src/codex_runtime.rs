@@ -222,6 +222,17 @@ impl LiveRuntime for CodexRuntime {
 impl Inner {
     fn send(self: &Arc<Self>, msg: &ClientMsg) -> Result<ServerMsg, AdapterError> {
         match msg {
+            // ADR-017: the composer extras are Claude's
+            ClientMsg::CreateSession { images, .. } | ClientMsg::SubmitPrompt { images, .. }
+                if !images.is_empty() =>
+            {
+                Err(AdapterError::Unsupported(
+                    "Codex does not take images".into(),
+                ))
+            }
+            ClientMsg::CreateSession { model: Some(_), .. } => Err(AdapterError::Unsupported(
+                "Codex sessions use the model Codex is configured with".into(),
+            )),
             ClientMsg::CreateSession {
                 command_id,
                 title,
@@ -233,6 +244,7 @@ impl Inner {
                 command_id,
                 session_id,
                 text,
+                ..
             } => self.prompt(command_id, session_id, text),
             ClientMsg::Interrupt {
                 command_id,
@@ -784,6 +796,8 @@ pub(crate) mod tests {
             title: "Fix tests".into(),
             prompt: "hello".into(),
             project: Some("ws0123456789".into()),
+            images: vec![],
+            model: None,
         }
     }
 
@@ -1030,6 +1044,7 @@ pub(crate) mod tests {
             command_id: "p1".into(),
             session_id: "thr_1".into(),
             text: "also lint".into(),
+            images: vec![],
         };
         assert!(matches!(
             rt.send(&prompt),
@@ -1073,6 +1088,7 @@ pub(crate) mod tests {
             command_id: cid.into(),
             session_id: "thr_1".into(),
             text: "go on".into(),
+            images: vec![],
         };
         let ack = rt.send(&again("p2")).unwrap();
         assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
@@ -1314,6 +1330,7 @@ pub(crate) mod tests {
             command_id: "p1".into(),
             session_id: thread.clone(),
             text: "hello again".into(),
+            images: vec![],
         };
         let ack = rt.send(&prompt).unwrap();
         assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");

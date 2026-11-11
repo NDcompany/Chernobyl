@@ -135,6 +135,8 @@ const MUTATING: ReadonlySet<ClientMessage['type']> = new Set([
   'mcp_auth',
   'mcp_auth_callback',
   'mcp_reconnect',
+  'set_model',
+  'rename_session',
 ]);
 
 const TICK_MS = 1_000;
@@ -276,6 +278,9 @@ export class MockEngine {
       case 'mcp_auth':
       case 'mcp_auth_callback':
       case 'mcp_reconnect':
+      // ADR-017: the composer extras are the live Claude runtime's
+      case 'set_model':
+      case 'rename_session':
         reply = ackErr(msg.commandId, 'not supported by this agent');
         break;
       default:
@@ -297,6 +302,8 @@ export class MockEngine {
   /* ---------------------------------------------------------------- */
 
   private createSession(msg: Extract<ClientMessage, { type: 'create_session' }>): ServerMessage {
+    // ADR-017: images and a model are the live Claude runtime's (parity with the Rust engine)
+    if (msg.images?.length || msg.model !== undefined) return ackErr(msg.commandId, 'not supported by this agent');
     const agent = this.findAgent(msg.agentId);
     if (!agent) return ackErr(msg.commandId, 'unknown agent');
     if (!agent.acceptsNewSession) {
@@ -348,6 +355,7 @@ export class MockEngine {
   }
 
   private submitPrompt(msg: Extract<ClientMessage, { type: 'submit_prompt' }>): ServerMessage {
+    if (msg.images?.length) return ackErr(msg.commandId, 'not supported by this agent');
     const session = this.findSession(msg.sessionId);
     if (!session) return ackErr(msg.commandId, 'unknown session');
     const live = this.live.get(session.id);

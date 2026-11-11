@@ -242,6 +242,8 @@ fn live_opencode_end_to_end() {
         title: "Phase 3 e2e".into(),
         prompt: String::new(),
         project: None,
+        images: vec![],
+        model: None,
     }) {
         Some(ServerMsg::Ack {
             ok: true,
@@ -269,6 +271,7 @@ fn live_opencode_end_to_end() {
         command_id: "e2e-turn-1".into(),
         session_id: sid.clone(),
         text: "Reply with exactly: PHASE3OK".into(),
+        images: vec![],
     });
     assert!(matches!(reply, Some(ServerMsg::Ack { ok: true, .. })));
     eprintln!("E2E evidence: prompt accepted (204) — outcome follows on SSE");
@@ -498,6 +501,7 @@ fn prompt(comp: &Companion, sid: &str, cmd: &str, text: &str) {
         command_id: cmd.into(),
         session_id: sid.into(),
         text: text.into(),
+        images: vec![],
     });
     assert!(
         matches!(reply, Some(ServerMsg::Ack { ok: true, .. })),
@@ -628,6 +632,8 @@ fn live_opencode_rich_parts() {
         title: "ADR-015 step 5 live".into(),
         prompt: String::new(),
         project: None,
+        images: vec![],
+        model: None,
     }) {
         Some(ServerMsg::Ack {
             ok: true,

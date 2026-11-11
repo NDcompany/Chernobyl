@@ -1,0 +1,27 @@
+{
+  "type": "transcript",
+  "sessionId": "ses_live_1",
+  "epoch": "9f86d081884c7d65",
+  "ops": [
+    {
+      "seq": 1,
+      "op": "item",
+      "item": { "id": "u_img", "ts": 1761436800000, "kind": "user", "text": "What color is this?", "images": 2 }
+    },
+    {
+      "seq": 2,
+      "op": "state",
+      "state": {
+        "status": "idle",
+        "permissionMode": "default",
+        "model": "claude-haiku-5-5",
+        "models": [
+          { "value": "default", "label": "Default (recommended)" },
+          { "value": "haiku", "label": "Haiku 5.5" }
+        ],
+        "slashCommands": ["compact", "context", "code-review"],
+        "context": { "usedTokens": 22900, "maxTokens": 1000000 }
+      }
+    }
+  ]
+}

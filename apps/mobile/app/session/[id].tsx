@@ -38,7 +38,16 @@ import {
   SegmentedTabs,
   Timeline,
 } from '@/ui/lists';
-import { McpChip, McpSheet, ModeChip, TranscriptList, type ApprovalDecision } from '@/ui/transcript';
+import {
+  ContextChip,
+  McpChip,
+  McpSheet,
+  ModeChip,
+  ModelChip,
+  RenameChip,
+  TranscriptList,
+  type ApprovalDecision,
+} from '@/ui/transcript';
 import { Icon } from '@/ui/icons';
 
 type TabKey = 'output' | 'files' | 'activity';
@@ -314,6 +323,10 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
   const busy = turns.some((t) => t.status === 'running') || status === 'running' || status === 'waiting';
   const ended = status === 'ended';
   const canEnd = live?.end === true && !ended;
+  // ADR-017: the composer extras this runtime takes (Claude); the rest stay hidden
+  const composer = new Set(live?.composer ?? []);
+  const showModel = composer.has('model') && !ended;
+  const showRename = composer.has('rename') && !ended;
 
   const header = (
     <View style={styles.headerBlock}>
@@ -326,7 +339,7 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
           right={<StatusPill status={session.status} inverse />}
         />
       </View>
-      {view.mcp.length > 0 || live?.permissionModes || canEnd ? (
+      {view.mcp.length > 0 || live?.permissionModes || canEnd || showModel ? (
         <View style={styles.chipRow}>
           <McpChip dark servers={view.mcp} onPress={() => setMcpOpen(true)} />
           {live?.permissionModes ? (
@@ -337,7 +350,18 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
               onChange={(mode) => void send(commands.setPermissionMode(sessionId, mode))}
             />
           ) : null}
+          {showModel ? (
+            <ModelChip dark state={view.state} onChange={(model) => void send(commands.setModel(sessionId, model))} />
+          ) : null}
+          {composer.has('context') ? <ContextChip dark context={view.state.context} /> : null}
           <View style={styles.flex} />
+          {showRename ? (
+            <RenameChip
+              dark
+              title={session.title}
+              onRename={(title) => void send(commands.renameSession(sessionId, title))}
+            />
+          ) : null}
           {canEnd ? (
             <Pressable
               onPress={() => setConfirmEnd(true)}
@@ -374,8 +398,10 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
                   ? `Starting ${agentName}…`
                   : undefined
           }
-          onSubmit={(text) => void send(commands.submitPrompt(sessionId, text))}
+          onSubmit={(text, images) => void send(commands.submitPrompt(sessionId, text, images))}
           onInterrupt={live?.interrupt ? () => void send(commands.interrupt(sessionId)) : undefined}
+          slashCommands={composer.has('commands') ? view.state.slashCommands : undefined}
+          canAttach={composer.has('images')}
         />
       }
     >
@@ -455,6 +481,7 @@ const styles = StyleSheet.create({
   headerRow: { paddingBottom: spacing.sm },
   chipRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     alignItems: 'center',
     gap: spacing.sm,
     paddingHorizontal: spacing.xl,

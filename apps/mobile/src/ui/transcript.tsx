@@ -32,18 +32,22 @@ import type {
   ViewStyle,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import type {
-  AgentKind,
-  FileDiff,
-  McpServerState,
-  McpStatus,
-  PermissionDetail,
-  PermissionRequest,
-  PlanStep,
-  ToolStatus,
-  TranscriptItem,
-  TurnState,
+import {
+  SESSION_TITLE_MAX,
+  isSessionTitle,
+  type AgentKind,
+  type FileDiff,
+  type LiveState,
+  type McpServerState,
+  type McpStatus,
+  type PermissionDetail,
+  type PermissionRequest,
+  type PlanStep,
+  type ToolStatus,
+  type TranscriptItem,
+  type TurnState,
 } from '@chernobyl/protocol';
+import { contextPercent, modelChoices, modelLabel } from '@/utils/composer';
 import { colors, radii, shadow, spacing, typography } from '@/theme/tokens';
 import { Button, StatusDot, Text, type Tone } from '@/ui/primitives';
 import { ConfirmModal } from '@/ui/surface';
@@ -226,15 +230,27 @@ export interface UserBubbleProps {
   queued?: boolean;
   /** `Agent.live.promptWhileBusy`: 'merge' says the prompt joins the current turn */
   promptWhileBusy?: PromptWhileBusy;
+  /** ADR-017: how many images the prompt carried (the bytes never come back) */
+  images?: number;
 }
 
-export const UserBubble = memo(function UserBubble({ text, queued, promptWhileBusy }: UserBubbleProps) {
+export const UserBubble = memo(function UserBubble({ text, queued, promptWhileBusy, images }: UserBubbleProps) {
   const caption = queued ? (promptWhileBusy === 'merge' ? 'Joins the current turn' : 'Queued') : undefined;
   return (
     <View style={styles.user}>
-      <Text variant="body" selectable>
-        {text}
-      </Text>
+      {images ? (
+        <View style={styles.imageChip} accessible accessibilityLabel={images === 1 ? '1 image attached' : `${images} images attached`}>
+          <Icon name="camera" size={14} color={colors.text2} />
+          <Text variant="xs" color={colors.text2}>
+            {images === 1 ? '1 image' : `${images} images`}
+          </Text>
+        </View>
+      ) : null}
+      {text ? (
+        <Text variant="body" selectable>
+          {text}
+        </Text>
+      ) : null}
       {caption ? (
         <Text variant="xs" color={colors.text3}>
           {caption}
@@ -990,7 +1006,9 @@ interface ItemViewProps {
 const ItemView = memo(function ItemView({ item, ...p }: ItemViewProps) {
   switch (item.kind) {
     case 'user':
-      return <UserBubble text={item.text} queued={item.queued} promptWhileBusy={p.promptWhileBusy} />;
+      return (
+        <UserBubble text={item.text} queued={item.queued} promptWhileBusy={p.promptWhileBusy} images={item.images} />
+      );
     case 'text':
       return (
         <View style={styles.gapXs}>
@@ -1457,6 +1475,139 @@ export function ModeChip({ mode, modes, onChange, dark = false }: ModeChipProps)
 }
 
 /* ------------------------------------------------------------------ */
+/* ADR-017 composer chips: model, context, rename                      */
+/* ------------------------------------------------------------------ */
+
+export interface ModelChipProps {
+  /** `LiveState.model` (the CLI reports the resolved id) and `models` */
+  state: Pick<LiveState, 'model' | 'models'>;
+  onChange: (model: string) => void;
+  dark?: boolean;
+}
+
+/** The session's model; the sheet lists what the CLI offers, else Claude Code's aliases. */
+export function ModelChip({ state, onChange, dark = false }: ModelChipProps) {
+  const [open, setOpen] = useState(false);
+  const choices = modelChoices(state);
+  const label = modelLabel(state.model, choices);
+  return (
+    <>
+      <Pressable
+        onPress={() => setOpen(true)}
+        accessibilityRole="button"
+        accessibilityLabel={`Model: ${label}`}
+        style={({ pressed }) => [styles.chip, dark && styles.chipDark, pressed && styles.pressed]}
+      >
+        <RNText style={[typography.xs, styles.chipText, dark && styles.chipTextDark]} numberOfLines={1}>
+          {label}
+        </RNText>
+        <Icon name="chevron-down" size={12} color={dark ? colors.white : colors.text} />
+      </Pressable>
+      <Sheet visible={open} title="Model" onClose={() => setOpen(false)}>
+        <Text variant="xs" color={colors.text2}>
+          The next turn uses it. Claude Code on your PC decides which models your account may use.
+        </Text>
+        {choices.map((m) => {
+          const on = m.value === state.model || modelLabel(state.model, choices) === m.label;
+          return (
+            <Pressable
+              key={m.value}
+              onPress={() => {
+                setOpen(false);
+                if (!on) onChange(m.value);
+              }}
+              accessibilityRole="radio"
+              accessibilityState={{ checked: on }}
+              accessibilityLabel={m.label}
+              style={[styles.modeRow, on && styles.modeRowOn]}
+            >
+              <View style={styles.flex}>
+                <Text variant="bodyStrong">{m.label}</Text>
+                <Text variant="xs" color={colors.text2}>
+                  {m.value}
+                </Text>
+              </View>
+              {on ? <Icon name="check" size={18} /> : null}
+            </Pressable>
+          );
+        })}
+      </Sheet>
+    </>
+  );
+}
+
+/** "Context 12%" after the last turn; nothing while unknown. */
+export function ContextChip({ context, dark = false }: { context: LiveState['context']; dark?: boolean }) {
+  const pct = contextPercent(context);
+  if (pct === undefined || !context) return null;
+  const used = `${Math.round(context.usedTokens / 1000)}k of ${Math.round(context.maxTokens / 1000)}k tokens`;
+  return (
+    <View
+      style={[styles.chip, dark && styles.chipDark]}
+      accessible
+      accessibilityLabel={`Context ${pct} percent used, ${used}`}
+    >
+      {pct >= 80 ? <View style={styles.warnDot} /> : null}
+      <RNText style={[typography.xs, styles.chipText, dark && styles.chipTextDark]}>{`Context ${pct}%`}</RNText>
+    </View>
+  );
+}
+
+export interface RenameChipProps {
+  title: string;
+  onRename: (title: string) => void;
+  dark?: boolean;
+}
+
+/** A pencil chip whose sheet renames the session (1-80 characters, no control characters). */
+export function RenameChip({ title, onRename, dark = false }: RenameChipProps) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState(title);
+  const next = draft.trim();
+  const valid = isSessionTitle(next) && next !== title;
+  return (
+    <>
+      <Pressable
+        onPress={() => {
+          setDraft(title);
+          setOpen(true);
+        }}
+        hitSlop={6}
+        accessibilityRole="button"
+        accessibilityLabel="Rename session"
+        style={({ pressed }) => [styles.chip, dark && styles.chipDark, pressed && styles.pressed]}
+      >
+        <Icon name="pencil" size={14} color={dark ? colors.white : colors.text} />
+      </Pressable>
+      <Sheet visible={open} title="Rename session" onClose={() => setOpen(false)}>
+        <TextInput
+          value={draft}
+          onChangeText={setDraft}
+          maxLength={SESSION_TITLE_MAX}
+          autoFocus
+          placeholder="Session name"
+          placeholderTextColor={colors.text3}
+          accessibilityLabel="Session name"
+          style={styles.input}
+        />
+        <Text variant="xs" color={colors.text3}>
+          {`${next.length}/${SESSION_TITLE_MAX} · the name shows in Claude Code on your PC too`}
+        </Text>
+        <Button
+          label="Rename"
+          size="sm"
+          disabled={!valid}
+          onPress={() => {
+            setOpen(false);
+            onRename(next);
+          }}
+        />
+      </Sheet>
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Styles                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -1485,6 +1636,18 @@ const styles = StyleSheet.create({
   codeBlock: { backgroundColor: colors.black, borderRadius: radii.sm, padding: spacing.md, gap: spacing.xs },
 
   user: { backgroundColor: colors.surface2, borderRadius: radii.md, padding: spacing.md, gap: spacing.xs },
+  imageChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    gap: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
+    borderRadius: radii.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    backgroundColor: colors.white,
+  },
   thinkingRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, minHeight: 36 },
   notice: { paddingVertical: spacing.xs },
   footer: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, paddingVertical: spacing.xs },

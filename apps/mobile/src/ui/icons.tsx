@@ -44,7 +44,9 @@ export type IconName =
   | 'chevron-down'
   | 'thinking'
   | 'plug'
-  | 'diff';
+  | 'diff'
+  | 'camera'
+  | 'pencil';
 
 const PATHS: Record<IconName, readonly string[]> = {
   home: ['M4 10.6 12 4l8 6.6V19a1.5 1.5 0 0 1-1.5 1.5H15V15H9v5.5H5.5A1.5 1.5 0 0 1 4 19z'],
@@ -120,6 +122,13 @@ const PATHS: Record<IconName, readonly string[]> = {
   plug: ['M9 3.5v4', 'M15 3.5v4', 'M6.5 7.5h11v3a5.5 5.5 0 0 1-11 0z', 'M12 16v4.5'],
   /** file with + and − */
   diff: ['M7 3.5h7l4 4v13H7z', 'M10 11h5', 'M12.5 8.5v5', 'M10 16.5h5'],
+  /** ADR-017 composer: attach a photo */
+  camera: [
+    'M4 8h3.2l1.6-2.5h6.4L16.8 8H20v11H4z',
+    'M12 16.6a3.3 3.3 0 1 0 0-6.6 3.3 3.3 0 0 0 0 6.6z',
+  ],
+  /** ADR-017: rename */
+  pencil: ['M15.8 4.6l3.6 3.6L9 18.6l-4.6 1 1-4.6z', 'M13.6 6.8l3.6 3.6'],
 };
 
 export interface IconProps {

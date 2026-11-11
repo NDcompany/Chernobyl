@@ -338,6 +338,7 @@ impl Codex {
             status: "starting",
             permission_mode: None,
             model: None,
+            ..Default::default()
         };
         Ok(vec![Event::Op(thread.into(), Op::State(state))])
     }
@@ -824,6 +825,7 @@ impl Codex {
             status: "idle",
             permission_mode: None,
             model,
+            ..Default::default()
         };
         out.push(Event::Op(thread.into(), Op::State(state)));
         out.push(Event::Op(thread.into(), Op::Mcp(self.mcp_view())));
@@ -1261,6 +1263,7 @@ impl Codex {
                     status,
                     permission_mode: None,
                     model,
+                    ..Default::default()
                 };
                 out.push(Event::Op(thread, Op::State(state)));
             }
@@ -1483,6 +1486,7 @@ impl Codex {
             status,
             permission_mode: None,
             model,
+            ..Default::default()
         };
         out.push(Event::Op(thread, Op::State(state)));
     }
@@ -1598,6 +1602,7 @@ fn new_item(id: &str, kind: ItemKind, turn: Option<String>) -> Item {
         level: None,
         tool: None,
         steps: Vec::new(),
+        images: 0,
     }
 }
 
@@ -2150,6 +2155,7 @@ impl LaunchConfig {
             end: false,
             permission_modes: Vec::new(),
             workspaces: self.workspaces.clone(),
+            composer: Vec::new(),
         }
     }
 }
@@ -2546,6 +2552,7 @@ mod tests {
             status: "idle",
             permission_mode: None,
             model: Some("gpt-test".into()),
+            ..Default::default()
         };
         assert_eq!(
             events[..3],

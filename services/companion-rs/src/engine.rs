@@ -361,7 +361,9 @@ impl Engine {
             | ClientMsg::SetPermissionMode { command_id, .. }
             | ClientMsg::McpAuth { command_id, .. }
             | ClientMsg::McpAuthCallback { command_id, .. }
-            | ClientMsg::McpReconnect { command_id, .. } => Some(ServerMsg::ack_err(
+            | ClientMsg::McpReconnect { command_id, .. }
+            | ClientMsg::SetModel { command_id, .. }
+            | ClientMsg::RenameSession { command_id, .. } => Some(ServerMsg::ack_err(
                 command_id,
                 "not supported by this agent",
             )),
@@ -401,10 +403,19 @@ impl Engine {
             title,
             prompt,
             project,
+            images,
+            model,
         } = msg
         else {
             return None;
         };
+        // ADR-017: the composer extras are the live Claude runtime's
+        if !images.is_empty() || model.is_some() {
+            return Some(ServerMsg::ack_err(
+                &command_id,
+                "not supported by this agent",
+            ));
+        }
         let Some(agent) = self.find_agent(&agent_id).cloned() else {
             return Some(ServerMsg::ack_err(&command_id, "unknown agent"));
         };
@@ -467,10 +478,17 @@ impl Engine {
             command_id,
             session_id,
             text,
+            images,
         } = msg
         else {
             return None;
         };
+        if !images.is_empty() {
+            return Some(ServerMsg::ack_err(
+                &command_id,
+                "not supported by this agent",
+            ));
+        }
         let Some(session) = self.find_session(&session_id).cloned() else {
             return Some(ServerMsg::ack_err(&command_id, "unknown session"));
         };
@@ -1305,6 +1323,8 @@ mod tests {
             title: "Duplicate test".into(),
             prompt: "Say hello".into(),
             project: None,
+            images: vec![],
+            model: None,
         };
         let first = ack_of(engine.handle(cmd.clone()));
         let second = ack_of(engine.handle(cmd));
@@ -1453,6 +1473,8 @@ mod tests {
             title: "Run test".into(),
             prompt: "Do the thing".into(),
             project: None,
+            images: vec![],
+            model: None,
         }));
         assert_eq!(ack.as_ref().map(|a| a.1), Some(true));
         let session_id = ack.unwrap().2.unwrap();
@@ -1468,6 +1490,7 @@ mod tests {
             command_id: "cmd-run-2".into(),
             session_id: session_id.clone(),
             text: "again".into(),
+            images: vec![],
         }));
         assert_eq!(second.as_ref().map(|a| a.1), Some(false));
         assert!(second.unwrap().4.unwrap().contains("already running"));
@@ -1524,6 +1547,7 @@ mod tests {
             command_id: "sub-1".into(),
             session_id: "s4".into(),
             text: "go".into(),
+            images: vec![],
         }));
         assert_eq!(ack.as_ref().map(|a| a.1), Some(true));
         assert!(events.lock().unwrap().iter().any(|e| matches!(
@@ -1553,6 +1577,7 @@ mod tests {
             command_id: "sub-2".into(),
             session_id: "s4".into(),
             text: "run".into(),
+            images: vec![],
         });
         // fast-forward: plan reaches the ask at step 3 (~1.35s of steps)
         let deadline = now_ms() + 10_000;
@@ -1614,6 +1639,8 @@ mod tests {
             title: "Lifecycle".into(),
             prompt: "x".into(),
             project: None,
+            images: vec![],
+            model: None,
         });
         assert_eq!(results(&events, "cc-1"), vec!["completed"]);
     }
@@ -1733,6 +1760,8 @@ mod tests {
             title: "Full run".into(),
             prompt: "p".into(),
             project: None,
+            images: vec![],
+            model: None,
         }));
         let session_id = ack.unwrap().2.unwrap();
         // fast-forward until the ask appears

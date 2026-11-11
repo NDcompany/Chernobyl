@@ -13,7 +13,9 @@ use crate::engine::Engine;
 use crate::ffi;
 use crate::ollama::OllamaAdapter;
 use crate::opencode::OpenCodeAdapter;
-use crate::protocol::{Agent, ClientMsg, EventKind, PROTOCOL_VERSION, ServerMsg, Session, now_ms};
+use crate::protocol::{
+    Agent, ClientMsg, EventKind, PROTOCOL_VERSION, PromptImage, ServerMsg, Session, now_ms,
+};
 use crate::server::Outbound;
 use crate::storage::{CommandRecord, Storage};
 use crate::transcript::{Hub, HubHandle};
@@ -468,6 +470,8 @@ impl Companion {
                 ClientMsg::McpAuth { .. } => "mcp_auth",
                 ClientMsg::McpAuthCallback { .. } => "mcp_auth_callback",
                 ClientMsg::McpReconnect { .. } => "mcp_reconnect",
+                ClientMsg::SetModel { .. } => "set_model",
+                ClientMsg::RenameSession { .. } => "rename_session",
                 _ => unreachable!(),
             };
             let payload = json_text(&msg);
@@ -793,7 +797,9 @@ impl Companion {
             | ClientMsg::SetPermissionMode { session_id, .. }
             | ClientMsg::McpAuth { session_id, .. }
             | ClientMsg::McpAuthCallback { session_id, .. }
-            | ClientMsg::McpReconnect { session_id, .. } => (
+            | ClientMsg::McpReconnect { session_id, .. }
+            | ClientMsg::SetModel { session_id, .. }
+            | ClientMsg::RenameSession { session_id, .. } => (
                 "session",
                 session_id,
                 self.claimants(|r| r.owns_session(session_id)),
@@ -1343,6 +1349,8 @@ fn json_text(msg: &ClientMsg) -> String {
             title,
             prompt,
             project,
+            images,
+            model,
         } => {
             let mut fields = vec![
                 ("type", json::s("create_session")),
@@ -1354,18 +1362,27 @@ fn json_text(msg: &ClientMsg) -> String {
             if let Some(p) = project {
                 fields.push(("project", json::s(p)));
             }
+            if let Some(m) = model {
+                fields.push(("model", json::s(m)));
+            }
+            images_json(&mut fields, images);
             json::obj(fields)
         }
         ClientMsg::SubmitPrompt {
             command_id,
             session_id,
             text,
-        } => json::obj(vec![
-            ("type", json::s("submit_prompt")),
-            ("commandId", json::s(command_id)),
-            ("sessionId", json::s(session_id)),
-            ("text", json::s(text)),
-        ]),
+            images,
+        } => {
+            let mut fields = vec![
+                ("type", json::s("submit_prompt")),
+                ("commandId", json::s(command_id)),
+                ("sessionId", json::s(session_id)),
+                ("text", json::s(text)),
+            ];
+            images_json(&mut fields, images);
+            json::obj(fields)
+        }
         ClientMsg::Interrupt {
             command_id,
             session_id,
@@ -1503,8 +1520,44 @@ fn json_text(msg: &ClientMsg) -> String {
             ("sessionId", json::s(session_id)),
             ("server", json::s(server)),
         ]),
+        ClientMsg::SetModel {
+            command_id,
+            session_id,
+            model,
+        } => json::obj(vec![
+            ("type", json::s("set_model")),
+            ("commandId", json::s(command_id)),
+            ("sessionId", json::s(session_id)),
+            ("model", json::s(model)),
+        ]),
+        ClientMsg::RenameSession {
+            command_id,
+            session_id,
+            title,
+        } => json::obj(vec![
+            ("type", json::s("rename_session")),
+            ("commandId", json::s(command_id)),
+            ("sessionId", json::s(session_id)),
+            ("title", json::s(title)),
+        ]),
     };
     json::stringify(&v)
+}
+
+/// ADR-017 / T2: a prompt's images are journaled as their media type and
+/// `<redacted>`; only the in-memory message carries the bytes.
+fn images_json(fields: &mut Vec<(&'static str, crate::json::Json)>, images: &[PromptImage]) {
+    use crate::json::{self, Json};
+    if images.is_empty() {
+        return;
+    }
+    let list = images.iter().map(|i| {
+        json::obj(vec![
+            ("mediaType", json::s(&i.media_type)),
+            ("data", json::s("<redacted>")),
+        ])
+    });
+    fields.push(("images", Json::Arr(list.collect())));
 }
 
 #[cfg(test)]
@@ -1588,6 +1641,8 @@ mod tests {
             title: "Restart test".into(),
             prompt: "p".into(),
             project: None,
+            images: vec![],
+            model: None,
         };
         let first = comp.handle_client_msg(msg.clone());
         assert!(matches!(
@@ -1644,6 +1699,8 @@ mod tests {
             title: "Verbatim".into(),
             prompt: "p".into(),
             project: None,
+            images: vec![],
+            model: None,
         });
         let session_id = match created {
             Some(ServerMsg::Ack {
@@ -1656,6 +1713,7 @@ mod tests {
             command_id: "cmd-v2".into(),
             session_id: session_id.clone(),
             text: "again".into(),
+            images: vec![],
         });
         assert!(matches!(
             refused,
@@ -1694,6 +1752,7 @@ mod tests {
             command_id: "cmd-v2".into(),
             session_id,
             text: "again".into(),
+            images: vec![],
         });
         match replay_refused {
             Some(ServerMsg::Ack {
@@ -1756,6 +1815,8 @@ mod tests {
             title: "Seq".into(),
             prompt: "p".into(),
             project: None,
+            images: vec![],
+            model: None,
         });
         let seq1 = comp.last_seq();
         assert!(seq1 > 0);
@@ -1817,6 +1878,7 @@ mod tests {
             command_id: "cmd-oc-1".into(),
             session_id: "ses_test1".into(),
             text: "run it".into(),
+            images: vec![],
         });
         assert!(matches!(reply, Some(ServerMsg::Ack { ok: true, .. })));
         {
@@ -2008,6 +2070,8 @@ mod tests {
             title: "T".into(),
             prompt: "P".into(),
             project: None,
+            images: vec![],
+            model: None,
         };
         let reply = comp.handle_client_msg(msg);
         assert!(matches!(reply, Some(ServerMsg::Ack { ok: true, .. })));
@@ -2081,6 +2145,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
 
+    /// ADR-017 / T2: a prompt's images reach the journal as their media type
+    /// and `<redacted>`, never as base64; set_model and rename are journaled.
+    #[test]
+    fn prompt_images_are_journaled_redacted() {
+        let c = temp_config("img-redact");
+        let journal = c.data_dir.join("companion.journal");
+        let comp = Companion::boot(c.clone()).unwrap();
+        let data = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEUlEQVR4nGP4z8DwnwGMgRQAH+4D/dJQfRoAAAAASUVORK5CYII=";
+        let image = crate::protocol::PromptImage {
+            media_type: "image/png".into(),
+            data: data.into(),
+        };
+        let msgs = [
+            ClientMsg::SubmitPrompt {
+                command_id: "cmd-img".into(),
+                session_id: "s1".into(),
+                text: "what color".into(),
+                images: vec![image.clone()],
+            },
+            ClientMsg::CreateSession {
+                command_id: "cmd-img-new".into(),
+                agent_id: "a1".into(),
+                title: "t".into(),
+                prompt: "what color".into(),
+                project: None,
+                images: vec![image],
+                model: Some("haiku".into()),
+            },
+            ClientMsg::SetModel {
+                command_id: "cmd-model".into(),
+                session_id: "s1".into(),
+                model: "opus".into(),
+            },
+            ClientMsg::RenameSession {
+                command_id: "cmd-name".into(),
+                session_id: "s1".into(),
+                title: "New name".into(),
+            },
+        ];
+        for msg in msgs {
+            assert!(matches!(
+                comp.handle_client_msg(msg),
+                Some(ServerMsg::Ack { ok: false, .. })
+            ));
+        }
+        {
+            let store = comp.shared.storage.lock().unwrap();
+            for id in ["cmd-img", "cmd-img-new"] {
+                let rec = store.commands.get(id).expect("persisted");
+                let want = r#""images":[{"mediaType":"image/png","data":"<redacted>"}]"#;
+                assert!(rec.payload.contains(want), "{}", rec.payload);
+            }
+            let rec = store.commands.get("cmd-model").expect("persisted");
+            assert!(rec.payload.contains(r#""model":"opus""#), "{}", rec.payload);
+            let rec = store.commands.get("cmd-name").expect("persisted");
+            assert!(
+                rec.payload.contains(r#""title":"New name""#),
+                "{}",
+                rec.payload
+            );
+        }
+        comp.shutdown(true);
+        let on_disk = std::fs::read_to_string(&journal).unwrap();
+        assert!(
+            !on_disk.contains(&data[..24]),
+            "image bytes reached the journal"
+        );
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
     /// ADR-015 step 1: no runtime claims the live messages yet, so the engine
     /// refuses them all. Subscribe/unsubscribe are non-mutating: no journal
     /// row, and no rewrite of a persisted command that shares their id.
@@ -2146,6 +2280,8 @@ mod tests {
             title: "T".into(),
             prompt: "p".into(),
             project: None,
+            images: vec![],
+            model: None,
         });
         assert!(matches!(created, Some(ServerMsg::Ack { ok: true, .. })));
         assert!(refused(comp.handle_client_msg(subscribe("cmd-live-6"))));
@@ -2289,6 +2425,8 @@ mod tests {
             title: "T".into(),
             prompt: "p".into(),
             project: None,
+            images: vec![],
+            model: None,
         };
         assert!(ok(comp.handle_client_msg(create("cr-1", "beta"))));
         assert!(ok(comp.handle_client_msg(create("cr-2", "alpha"))));
@@ -2321,6 +2459,7 @@ mod tests {
                 command_id: cmd(1),
                 session_id: sid.clone(),
                 text: "go".into(),
+                images: vec![],
             },
             ClientMsg::Interrupt {
                 command_id: cmd(2),
@@ -2359,6 +2498,7 @@ mod tests {
             command_id: cmd(8),
             session_id: "ses-a".into(),
             text: "go".into(),
+            images: vec![],
         })));
         assert_eq!(b.got(), (1..=7).map(cmd).collect::<Vec<_>>());
         assert_eq!(a.got(), vec![cmd(8)]);
@@ -2367,6 +2507,7 @@ mod tests {
             command_id: cmd(9),
             session_id: "ses-none".into(),
             text: "go".into(),
+            images: vec![],
         }));
         assert!(!refused.is_empty());
         assert_eq!((a.got().len(), b.got().len()), (1, 7));
@@ -2579,6 +2720,7 @@ mod tests {
             command_id: "dup-1".into(),
             session_id: "ses-dup".into(),
             text: "which one?".into(),
+            images: vec![],
         }));
         assert!(refused.contains("more than one runtime"), "{refused}");
         assert!(a.got().is_empty() && b.got().is_empty());
@@ -2895,6 +3037,7 @@ mod tests {
                 command_id: cid.into(),
                 session_id: session.into(),
                 text: text.into(),
+                images: vec![],
             })
         };
 
@@ -2905,6 +3048,8 @@ mod tests {
             title: "fake".into(),
             prompt: "run edit".into(),
             project: Some(ws_id),
+            images: vec![],
+            model: None,
         };
         let thread = match comp.handle_client_msg(create) {
             Some(ServerMsg::Ack {

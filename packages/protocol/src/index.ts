@@ -144,8 +144,13 @@ export interface Agent {
     permissionModes?: string[];
     /** Spawning runtimes only. */
     workspaces?: Array<{ id: string; label: string; path: string }>;
+    /** ADR-017 composer extras this runtime takes (Claude); the phone hides the rest. */
+    composer?: ComposerFeature[];
   };
 }
+
+/** ADR-017: `Agent.live.composer` entries. */
+export type ComposerFeature = 'model' | 'images' | 'commands' | 'context' | 'rename';
 
 export interface OutputLine {
   id: string;
@@ -301,7 +306,7 @@ interface ItemBase {
 }
 
 export type TranscriptItem =
-  | (ItemBase & { kind: 'user'; text: string; queued?: true })
+  | (ItemBase & { kind: 'user'; text: string; queued?: true; /** ADR-017: how many images it carried */ images?: number })
   | (ItemBase & { kind: 'text'; text: string; done: boolean; truncated?: true })
   | (ItemBase & { kind: 'thinking'; text: string; done: boolean; truncated?: true })
   | (ItemBase & { kind: 'tool'; tool: ToolCall })
@@ -334,6 +339,12 @@ export interface LiveState {
   status: LiveStatus;
   permissionMode?: string;   // Claude: default | acceptEdits | plan | ...
   model?: string;
+  /** ADR-017 (Claude): the models the CLI offers. */
+  models?: Array<{ value: string; label: string }>;
+  /** ADR-017 (Claude): slash command names, without the slash. */
+  slashCommands?: string[];
+  /** ADR-017 (Claude): context window use after the last turn. */
+  context?: { usedTokens: number; maxTokens: number };
 }
 
 export type McpStatus = 'connected' | 'pending' | 'failed' | 'needs-auth' | 'disabled';
@@ -413,7 +424,10 @@ export type LiveClientMessage =
   | { type: 'set_permission_mode'; commandId: string; sessionId: string; mode: 'default' | 'acceptEdits' | 'plan' }
   | { type: 'mcp_auth'; commandId: string; sessionId: string; server: string; flow: 'desktop' | 'phone-callback' }
   | { type: 'mcp_auth_callback'; commandId: string; sessionId: string; server: string; callbackUrl: string }
-  | { type: 'mcp_reconnect'; commandId: string; sessionId: string; server: string }; // §4.7 "Reconnect a failed server"
+  | { type: 'mcp_reconnect'; commandId: string; sessionId: string; server: string } // §4.7 "Reconnect a failed server"
+  // ADR-017 composer (Claude): model must pass isModelName, title isSessionTitle
+  | { type: 'set_model'; commandId: string; sessionId: string; model: string }
+  | { type: 'rename_session'; commandId: string; sessionId: string; title: string };
 // ClientMessage = existing union | LiveClientMessage.
 // permission_decision gains: optionId?: string; message?: string; answers?: Record<string, string[]>
 //   (answers keyed by PermissionDetail.question.questions[].id)
@@ -450,8 +464,12 @@ export type ClientMessage =
       prompt: string;
       /** Working directory / project label for the new session. */
       project?: string;
+      /** ADR-017 (Claude): images before the prompt text. */
+      images?: PromptImage[];
+      /** ADR-017 (Claude): `--model` at spawn; must pass isModelName. */
+      model?: string;
     }
-  | { type: 'submit_prompt'; commandId: string; sessionId: string; text: string }
+  | { type: 'submit_prompt'; commandId: string; sessionId: string; text: string; images?: PromptImage[] }
   | { type: 'interrupt'; commandId: string; sessionId: string }
   | {
       type: 'permission_decision';
@@ -584,6 +602,75 @@ function isAnswers(v: unknown): boolean {
   );
 }
 
+/* ADR-017 composer bounds (Rust `protocol.rs` has the same constants). */
+
+/** Images per prompt. */
+export const PROMPT_IMAGES_MAX = 4;
+/**
+ * Base64 characters of all a prompt's images together (about 131 KiB of
+ * JPEG): the whole prompt travels in one WebSocket frame of at most
+ * 256,000 bytes, sealed as base64, so the phone also checks the frame.
+ */
+export const PROMPT_IMAGES_DATA_MAX = 180_000;
+/** Session titles (UTF-16 units). */
+export const SESSION_TITLE_MAX = 80;
+export const PROMPT_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] as const;
+export type PromptImageType = (typeof PROMPT_IMAGE_TYPES)[number];
+export interface PromptImage {
+  mediaType: PromptImageType;
+  /** Base64 (no data: prefix) that starts with the format's signature. */
+  data: string;
+}
+
+/** Each format's first bytes as base64 (PNG, JPEG, GIF, RIFF for WebP). */
+const IMAGE_MAGIC: Record<PromptImageType, string> = {
+  'image/png': 'iVBORw0KGgo',
+  'image/jpeg': '/9j/',
+  'image/gif': 'R0lGOD',
+  'image/webp': 'UklGR',
+};
+const MODEL_ALIASES: ReadonlySet<string> = new Set(['default', 'opus', 'sonnet', 'haiku', 'fable', 'opusplan']);
+
+/** ADR-017: a Claude Code alias or a full `claude-…` id (lowercase, digits, dashes; ≤ 64). */
+export function isModelName(v: unknown): v is string {
+  return (
+    typeof v === 'string' &&
+    (MODEL_ALIASES.has(v) || (v.length <= 64 && /^claude-[a-z0-9-]+$/.test(v)))
+  );
+}
+
+/** ADR-017: 1-80 UTF-16 units, not blank, no control characters. */
+export function isSessionTitle(v: unknown): v is string {
+  // eslint-disable-next-line no-control-regex
+  return fits(v, SESSION_TITLE_MAX) && v.trim().length > 0 && !/[\u0000-\u001f\u007f-\u009f]/.test(v);
+}
+
+/** ADR-017: one image: a whitelisted type and strict base64 with that format's signature. */
+export function isPromptImage(v: unknown): v is PromptImage {
+  if (!isRecord(v) || typeof v.mediaType !== 'string' || typeof v.data !== 'string') return false;
+  const magic = (IMAGE_MAGIC as Record<string, string | undefined>)[v.mediaType];
+  const data = v.data;
+  const body = data.replace(/=+$/, '');
+  return (
+    magic !== undefined &&
+    data.length <= PROMPT_IMAGES_DATA_MAX &&
+    data.length % 4 === 0 &&
+    data.length - body.length <= 2 &&
+    data.startsWith(magic) &&
+    /^[A-Za-z0-9+/]*$/.test(body)
+  );
+}
+
+/** ADR-017: at most 4 images whose data totals at most PROMPT_IMAGES_DATA_MAX characters. */
+export function isPromptImages(v: unknown): v is PromptImage[] {
+  return (
+    Array.isArray(v) &&
+    v.length <= PROMPT_IMAGES_MAX &&
+    v.every(isPromptImage) &&
+    v.reduce((n: number, im: PromptImage) => n + im.data.length, 0) <= PROMPT_IMAGES_DATA_MAX
+  );
+}
+
 const CLIENT_TYPES: ReadonlySet<string> = new Set([
   'hello',
   'ping',
@@ -599,6 +686,8 @@ const CLIENT_TYPES: ReadonlySet<string> = new Set([
   'mcp_auth',
   'mcp_auth_callback',
   'mcp_reconnect',
+  'set_model',
+  'rename_session',
 ]);
 
 const SERVER_TYPES: ReadonlySet<string> = new Set([
@@ -636,11 +725,28 @@ export function isClientMessage(v: unknown): v is ClientMessage {
     case 'hello':
       return isStr(v.clientId) && isNum(v.protocol);
     case 'create_session':
-      return hasCommandId(v) && isStr(v.agentId) && isStr(v.title) && isStr(v.prompt);
+      return (
+        hasCommandId(v) &&
+        isStr(v.agentId) &&
+        isStr(v.title) &&
+        isStr(v.prompt) &&
+        (v.images === undefined || isPromptImages(v.images)) &&
+        (v.model === undefined || isModelName(v.model))
+      );
     case 'submit_prompt':
       // ADR-015 §3.4: 32,000 characters as the phone's zod counts them (UTF-16
       // units); the Rust companion counts chars, so it is never stricter
-      return hasCommandId(v) && isStr(v.sessionId) && isStr(v.text) && fits(v.text, 32_000);
+      return (
+        hasCommandId(v) &&
+        isStr(v.sessionId) &&
+        isStr(v.text) &&
+        fits(v.text, 32_000) &&
+        (v.images === undefined || isPromptImages(v.images))
+      );
+    case 'set_model':
+      return hasCommandId(v) && isStr(v.sessionId) && isModelName(v.model);
+    case 'rename_session':
+      return hasCommandId(v) && isStr(v.sessionId) && isSessionTitle(v.title);
     case 'interrupt':
     case 'session_unsubscribe':
     case 'session_end':

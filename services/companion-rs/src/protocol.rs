@@ -119,6 +119,9 @@ pub struct AgentLive {
     pub permission_modes: Vec<String>,
     /// Spawning runtimes only. Serialized only when non-empty.
     pub workspaces: Vec<LiveWorkspace>,
+    /// ADR-017 composer features (model | images | commands | context |
+    /// rename); the phone hides what is missing. Serialized only when non-empty.
+    pub composer: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,6 +144,10 @@ impl AgentLive {
                 "permissionModes",
                 Json::Arr(self.permission_modes.iter().map(|m| json::s(m)).collect()),
             ));
+        }
+        if !self.composer.is_empty() {
+            let list = self.composer.iter().map(|c| json::s(c)).collect();
+            fields.push(("composer", Json::Arr(list)));
         }
         if !self.workspaces.is_empty() {
             fields.push((
@@ -464,6 +471,84 @@ impl Snapshot {
 /* Client messages (trust boundary)                                    */
 /* ------------------------------------------------------------------ */
 
+/// ADR-017 composer bounds (TS `PROMPT_IMAGES_MAX` etc. match). The whole
+/// prompt travels in one WebSocket frame (`ws::MAX_PAYLOAD_BYTES`, sealed
+/// as base64), so the images share about 180,000 base64 chars (about 131 KiB
+/// of JPEG); the phone checks the sealed frame size before it sends.
+pub const PROMPT_IMAGES_MAX: usize = 4;
+pub const PROMPT_IMAGES_DATA_MAX: usize = 180_000;
+pub const SESSION_TITLE_MAX: usize = 80;
+const MODEL_MAX: usize = 64;
+const MODEL_ALIASES: [&str; 6] = ["default", "opus", "sonnet", "haiku", "fable", "opusplan"];
+
+/// One prompt image: `media_type` is png | jpeg | webp | gif, `data` is
+/// base64 that starts with that format's magic bytes. Never journaled,
+/// never put in a transcript (only a count is).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptImage {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// A model the phone may pick (TS `isModelName`): a Claude Code alias or a
+/// full `claude-…` id, nothing a shell or flag parser could misread.
+pub fn is_model(s: &str) -> bool {
+    MODEL_ALIASES.contains(&s)
+        || s.strip_prefix("claude-").is_some_and(|rest| {
+            !rest.is_empty()
+                && s.len() <= MODEL_MAX
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+/// TS `isPromptImage`: a whitelisted media type, strict base64 whose first
+/// bytes are that format's signature.
+fn image_ok(media_type: &str, data: &str) -> bool {
+    let magic = match media_type {
+        "image/png" => "iVBORw0KGgo",
+        "image/jpeg" => "/9j/",
+        "image/gif" => "R0lGOD",
+        "image/webp" => "UklGR",
+        _ => return false,
+    };
+    let body = data.trim_end_matches('=');
+    data.len() <= PROMPT_IMAGES_DATA_MAX
+        && data.len().is_multiple_of(4)
+        && data.len() - body.len() <= 2
+        && data.starts_with(magic)
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
+/// ADR-017 `images`: absent → empty; otherwise ≤ 4 valid images whose data
+/// totals ≤ 180,000 chars.
+fn opt_images(obj: &Json) -> Option<Vec<PromptImage>> {
+    let Some(v) = json::get(obj, "images") else {
+        return Some(Vec::new());
+    };
+    let list = json::as_arr(v).filter(|l| l.len() <= PROMPT_IMAGES_MAX)?;
+    let images = list
+        .iter()
+        .map(|im| {
+            let media_type = json::get_str(im, "mediaType")?;
+            let data = json::get_str(im, "data")?;
+            image_ok(media_type, data).then(|| PromptImage {
+                media_type: media_type.to_string(),
+                data: data.to_string(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (images.iter().map(|i| i.data.len()).sum::<usize>() <= PROMPT_IMAGES_DATA_MAX).then_some(images)
+}
+
+/// TS `isSessionTitle`: 1-80 UTF-16 units, not blank, no control characters.
+fn title_ok(t: &str) -> bool {
+    fits(t, SESSION_TITLE_MAX) && !t.trim().is_empty() && !t.chars().any(char::is_control)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientMsg {
     Hello {
@@ -479,11 +564,17 @@ pub enum ClientMsg {
         title: String,
         prompt: String,
         project: Option<String>,
+        /// ADR-017: Claude only; other runtimes refuse a non-empty list.
+        images: Vec<PromptImage>,
+        /// ADR-017: `--model` at spawn (`is_model`), Claude only.
+        model: Option<String>,
     },
     SubmitPrompt {
         command_id: String,
         session_id: String,
         text: String,
+        /// ADR-017: Claude only; other runtimes refuse a non-empty list.
+        images: Vec<PromptImage>,
     },
     Interrupt {
         command_id: String,
@@ -547,6 +638,18 @@ pub enum ClientMsg {
         session_id: String,
         server: String,
     },
+    /// ADR-017: Claude `set_model`; `model` passed `is_model`.
+    SetModel {
+        command_id: String,
+        session_id: String,
+        model: String,
+    },
+    /// ADR-017: Claude `rename_session`; `title` passed `title_ok`.
+    RenameSession {
+        command_id: String,
+        session_id: String,
+        title: String,
+    },
     /// E2E handshake, step 1 (ADR-011): request to connect as `device_id`.
     /// Plaintext; the server answers with a fresh nonce+salt to bind the proof.
     /// `cnonce` is the client's fresh 16-byte nonce (base64), bound into both
@@ -579,7 +682,9 @@ impl ClientMsg {
             | ClientMsg::SetPermissionMode { command_id, .. }
             | ClientMsg::McpAuth { command_id, .. }
             | ClientMsg::McpAuthCallback { command_id, .. }
-            | ClientMsg::McpReconnect { command_id, .. } => Some(command_id),
+            | ClientMsg::McpReconnect { command_id, .. }
+            | ClientMsg::SetModel { command_id, .. }
+            | ClientMsg::RenameSession { command_id, .. } => Some(command_id),
         }
     }
 
@@ -595,6 +700,8 @@ impl ClientMsg {
                 | ClientMsg::McpAuth { .. }
                 | ClientMsg::McpAuthCallback { .. }
                 | ClientMsg::McpReconnect { .. }
+                | ClientMsg::SetModel { .. }
+                | ClientMsg::RenameSession { .. }
         )
     }
 }
@@ -699,6 +806,11 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
             project: json::get(obj, "project")
                 .and_then(json::as_str)
                 .map(str::to_string),
+            images: opt_images(obj)?,
+            model: match opt_str(obj, "model", MODEL_MAX)? {
+                Some(m) if !is_model(&m) => return None,
+                m => m,
+            },
         }),
         "submit_prompt" => Some(ClientMsg::SubmitPrompt {
             command_id: req("commandId")?,
@@ -707,6 +819,17 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
             // companion never stricter than the phone, whose zod counts UTF-16
             // units (an emoji is 2 there, 1 here); bytes ≥ chars, hence the fast path.
             text: req("text").filter(|t| t.len() <= 32_000 || t.chars().count() <= 32_000)?,
+            images: opt_images(obj)?,
+        }),
+        "set_model" => Some(ClientMsg::SetModel {
+            command_id: req("commandId")?,
+            session_id: req("sessionId")?,
+            model: req("model").filter(|m| is_model(m))?,
+        }),
+        "rename_session" => Some(ClientMsg::RenameSession {
+            command_id: req("commandId")?,
+            session_id: req("sessionId")?,
+            title: req("title").filter(|t| title_ok(t))?,
         }),
         "interrupt" => Some(ClientMsg::Interrupt {
             command_id: req("commandId")?,
@@ -2139,6 +2262,7 @@ mod tests {
                 label: "demo".into(),
                 path: "C:\\work\\demo".into(),
             }],
+            composer: vec![],
         });
         assert_eq!(
             json::stringify(json::get(&agent.to_json(), "live").unwrap()),
@@ -2166,5 +2290,82 @@ mod tests {
             json::get(&session.to_json(), "transcript"),
             Some(&Json::Bool(true))
         );
+    }
+    /// ADR-017: the composer messages, from the fixtures the TS suite reads,
+    /// plus the size bounds at their edges.
+    #[test]
+    fn parses_composer_messages_and_rejects_bad_fields() {
+        for case in json::as_arr(&fixture!("composer-valid.json")).unwrap() {
+            let text = json::stringify(case);
+            assert!(parse_client_message(&text).is_some(), "rejected {text}");
+        }
+        for case in json::as_arr(&fixture!("composer-invalid.json")).unwrap() {
+            let text = json::stringify(json::get(case, "msg").unwrap());
+            let why = json::get_str(case, "why").unwrap();
+            assert!(parse_client_message(&text).is_none(), "{why}: {text}");
+        }
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEUlEQVR4nGP4z8DwnwGMgRQAH+4D/dJQfRoAAAAASUVORK5CYII=";
+        assert_eq!(
+            parse_client_message(&format!(
+                r#"{{"type":"submit_prompt","commandId":"c","sessionId":"s","text":"t","images":[{{"mediaType":"image/png","data":"{png}"}}]}}"#
+            )),
+            Some(ClientMsg::SubmitPrompt {
+                command_id: "c".into(),
+                session_id: "s".into(),
+                text: "t".into(),
+                images: vec![PromptImage {
+                    media_type: "image/png".into(),
+                    data: png.into(),
+                }],
+            })
+        );
+        // the data cap is on all images together: 180,000 chars pass, one
+        // more quad fails (also when split across images)
+        let image = |len: usize| {
+            format!(
+                r#"{{"mediaType":"image/gif","data":"R0lGOD{}"}}"#,
+                "A".repeat(len - 6)
+            )
+        };
+        let prompt = |images: &[String]| {
+            format!(
+                r#"{{"type":"submit_prompt","commandId":"c","sessionId":"s","text":"t","images":[{}]}}"#,
+                images.join(",")
+            )
+        };
+        let max = PROMPT_IMAGES_DATA_MAX;
+        assert!(parse_client_message(&prompt(&[image(max)])).is_some());
+        assert!(parse_client_message(&prompt(&[image(max + 4)])).is_none());
+        assert!(parse_client_message(&prompt(&[image(max / 2), image(max / 2)])).is_some());
+        assert!(parse_client_message(&prompt(&[image(max / 2), image(max / 2 + 4)])).is_none());
+        // titles count UTF-16 units like the phone: 40 emoji = 80 units
+        let rename = |t: &str| {
+            parse_client_message(&format!(
+                r#"{{"type":"rename_session","commandId":"c","sessionId":"s","title":{}}}"#,
+                json::stringify(&json::s(t))
+            ))
+        };
+        assert!(rename(&"\u{1F600}".repeat(40)).is_some());
+        assert!(rename(&format!("{}x", "\u{1F600}".repeat(40))).is_none());
+        assert!(rename(&"t".repeat(80)).is_some());
+        // models: the aliases and claude- ids only, 64 chars at most
+        for good in [
+            "default", "sonnet", "opus", "haiku", "fable", "opusplan", "claude-x",
+        ] {
+            assert!(is_model(good), "{good}");
+        }
+        let long = format!("claude-{}", "a".repeat(57));
+        assert!(is_model(&long) && !is_model(&format!("{long}a")));
+        for bad in [
+            "",
+            "claude-",
+            "claude-A",
+            "claude-a b",
+            "gpt-5",
+            "-model",
+            "claude-a/b",
+        ] {
+            assert!(!is_model(bad), "{bad}");
+        }
     }
 }
