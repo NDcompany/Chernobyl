@@ -31,8 +31,18 @@ node scripts/build-android.mjs --abi x86_64    # emulator only
 ```
 
 It compiles the shared packages, runs `expo prebuild` if `apps/mobile/android` is missing,
-then builds the release APK into `release/`, where `package-release` hashes it. The APK is signed with the debug keystore from Expo's template. It installs on any
-device (`adb install -r …`), but it is not a Play Store identity.
+then builds the release APK into `release/`, where `package-release` hashes it. Gradle signs with the debug keystore from Expo's template; set `CHB_KEYSTORE` and the script
+re-signs the APK with your own release key (free; `apksigner` from the SDK build-tools):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\make-signing-key.ps1   # once: <dir>\chernobyl-release.jks + .pass (random, never printed)
+$env:CHB_KEYSTORE = 'G:\Secrets\Android\chernobyl-release.jks'
+node scripts/build-android.mjs                                        # or: --sign-only <apk>
+```
+
+Back up the `.jks` and `.pass`: updates must be signed with the same key, and a phone with the
+app installed refuses an APK signed with a different one (uninstall and re-pair to switch keys).
+It is not a Play Store identity (Play needs a developer account).
 
 To test on an emulator, `scripts/device/validate.mjs` runs the phone checklist against the
 APK and a real companion. It pairs, connects, restarts things, revokes the device and saves

@@ -344,8 +344,8 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
       (os error 10054, connection reset); not reproducible on demand.
 - [ ] One physical-phone run of the checklist (S4), incl. a real camera QR scan.
 - [ ] A human third-party security audit (S9).
-- [ ] Release signing: a release keystore for the APK; Windows code signing stays an ADR-007
-      decision.
+- [x] APK release signing (2026-11-12): `scripts/make-signing-key.ps1` + `CHB_KEYSTORE` in
+      `scripts/build-android.mjs` (apksigner, v3). Windows code signing stays an ADR-007 decision.
 
 ## Explicitly not done (honesty)
 

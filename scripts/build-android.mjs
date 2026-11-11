@@ -14,7 +14,7 @@
 // Play Store identity (same disclosure stance as ADR-007).
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,6 +26,13 @@ const abis = abiArg > 0 ? process.argv[abiArg + 1] : 'arm64-v8a,x86_64';
 
 const sdk = process.env.ANDROID_HOME ?? process.env.ANDROID_SDK_ROOT;
 if (!sdk || !existsSync(sdk)) fail('set ANDROID_HOME to the Android SDK');
+
+// `--sign-only <apk>`: re-sign an already built APK with the release key and stop
+const signOnly = process.argv.indexOf('--sign-only');
+if (signOnly > 0) {
+  signRelease(process.argv[signOnly + 1]);
+  process.exit(0);
+}
 if (!process.env.JAVA_HOME) fail('set JAVA_HOME to a JDK 17');
 
 const cmakeVersions = existsSync(join(sdk, 'cmake'))
@@ -70,6 +77,8 @@ const outDir = join(root, 'release');
 mkdirSync(outDir, { recursive: true });
 const out = join(outDir, `chernobyl-${version}-${abis.replace(/,/g, '+')}.apk`);
 copyFileSync(apk, out);
+if (process.env.CHB_KEYSTORE) signRelease(out);
+else console.log('(debug-signed: set CHB_KEYSTORE to sign with your release key, see scripts/make-signing-key.ps1)');
 console.log(`APK: ${out}`);
 
 /** sha256 over everything prebuild reads: app.json, the assets it names and
@@ -103,6 +112,29 @@ function cmp(a, b) {
   }
   return 0;
 }
+/**
+ * Re-signs `apk` in place with the release key at CHB_KEYSTORE (made by
+ * scripts/make-signing-key.ps1). apksigner reads the password from the .pass
+ * file next to it, so the password never touches argv, env or this process.
+ */
+function signRelease(apk) {
+  const ks = process.env.CHB_KEYSTORE;
+  if (!ks || !existsSync(ks)) fail('set CHB_KEYSTORE to your release .jks (scripts/make-signing-key.ps1 makes one)');
+  const passFile = ks.replace(/\.jks$/i, '.pass');
+  if (!existsSync(passFile)) fail(`missing ${passFile} next to the keystore`);
+  if (!apk || !existsSync(apk)) fail(`no APK at ${apk}`);
+  const tools = readdirSync(join(sdk, 'build-tools')).filter((v) => existsSync(join(sdk, 'build-tools', v, 'apksigner.bat')) || existsSync(join(sdk, 'build-tools', v, 'apksigner')));
+  if (!tools.length) fail('no apksigner in the Android SDK build-tools');
+  const latest = tools.sort(cmp).pop();
+  const apksigner = join(sdk, 'build-tools', latest, process.platform === 'win32' ? 'apksigner.bat' : 'apksigner');
+  const signed = `${apk}.signed`;
+  const q = (x) => `"${x}"`;
+  run(q(apksigner), ['sign', '--ks', q(ks), '--ks-pass', q(`file:${passFile}`), '--ks-key-alias', 'chernobyl', '--out', q(signed), q(apk)], root);
+  renameSync(signed, apk);
+  run(q(apksigner), ['verify', '--print-certs', q(apk)], root);
+  console.log(`signed with the release key: ${apk}`);
+}
+
 function fail(msg) {
   console.error(`build-android: ${msg}`);
   process.exit(1);

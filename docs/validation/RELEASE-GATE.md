@@ -8,8 +8,8 @@ with evidence, ⛔ when an external condition blocks it, and ⚠️ when it is p
 
 **Ready for private use; a public release still needs three external things:** one run of
 the checklist on a physical Android phone (real camera, radio and OEM battery policy), a human
-third-party security audit, and the signing decisions (debug-signed APK, unsigned Windows exe
-with published checksums, ADR-007).
+third-party security audit, and the Windows signing decision (unsigned exe with published checksums,
+ADR-007). The APK is signed with the owner's release key since 2026-11-12.
 
 Everything a machine without a phone can prove has been proven. The release APK runs on an
 Android 15 emulator against the real companion: 30 of the 31 checklist rows in sections 1-8
@@ -56,8 +56,9 @@ never journaled (`docs/PRIVACY.md`).
 2. A human third-party review of the E2E layer (`e2e.rs`, `crypto.rs`, `server.rs` handshake,
    `packages/e2e`). Hand over `docs/security/INDEPENDENT-REVIEW-2026-10-25.md`, the threat
    model, ADR-011 to ADR-014 and the golden vectors.
-3. Signing: a release keystore for the APK (and a Play `specialUse` foreground-service
-   declaration if it ever ships on Play); Windows code signing stays an ADR-007 decision.
+3. Signing: done for the APK (release key, `scripts/make-signing-key.ps1`, 2026-11-12); a Play
+   `specialUse` foreground-service declaration if it ever ships on Play; Windows code signing
+   stays an ADR-007 decision.
 4. Run the live-session rows on the physical phone (9.9 sign-in included).
 5. A live Codex run before Codex is described as anything but `limited`.
 
