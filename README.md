@@ -131,6 +131,22 @@ contains the CHERNOBYL data directory are refused. Bypass-permissions modes are 
 from the phone. Per-runtime limits: `docs/INTEGRATIONS.md`; threats and controls:
 `docs/decisions/PHASE5-THREAT-MODEL.md` §3.12.
 
+**Claude Code sessions running on the PC (ADR-018).** A session you started in a terminal or
+VS Code (in an allow-listed folder) shows "Live on PC" on the phone and streams as it runs.
+Sending from the phone forks it into a new session (`claude --resume <id> --fork-session`); the
+PC session is not touched. To approve its permission prompts from the phone too, install the
+hook once (it edits `%USERPROFILE%\.claude\settings.json` after a backup to
+`settings.json.chernobyl-backup`):
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\CHERNOBYL\chernobyl-companion.exe" --install-hooks   # or setup-windows.ps1 -PhoneApprovals
+& "$env:LOCALAPPDATA\Programs\CHERNOBYL\chernobyl-companion.exe" --uninstall-hooks # undo
+```
+
+The phone then gets Allow / Deny for those prompts while it is connected; if it does not answer
+in 120 s (`--install-hooks --timeout <s>` changes that), or no phone is connected, the PC asks as
+usual.
+
 **Files and Changes (ADR-016).** From an agent's workspace (agent screen, or the Files and
 Changes chips on a live conversation) the phone browses the allow-listed folder read-only
 (secrets masked, `.env*` values hidden) and reviews git: status, diffs, stage and unstage,

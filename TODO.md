@@ -341,6 +341,12 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
 - [x] Claude composer (ADR-017): model chip and `set_model`, a model for new tasks, camera
       photos in prompts (4 at most, 180,000 base64 chars together: one WebSocket frame), the
       slash-command menu, the context meter and rename; live Haiku run $0.0061.
+- [x] PC sessions live on the phone (ADR-018): sessions a terminal or VS Code is writing are
+      mirrored ("Live on PC", 750 ms tail), forked from the phone (`--resume --fork-session`),
+      and with `--install-hooks` their permission prompts reach the phone through a
+      `PermissionRequest` command hook; live Haiku run of the hook (`tests/live_hook.rs`) $0.0062.
+- [ ] ADR-018 on the real phone: an interactive terminal session's prompt answered on the PC
+      first (does Claude Code cancel the hook, as assumed?), and a fork from an emulator run.
 - [ ] Composer: gallery attachments need `expo-image-picker` (not shipped); one camera run on a
       device; chunked uploads if bigger photos are wanted.
 - [ ] A live Codex run, when someone has Codex installed and signed in; capabilities stay

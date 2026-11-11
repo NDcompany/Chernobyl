@@ -9,7 +9,7 @@ page records **which versions were verified** and the limits that matter in prac
 |---|---|---|---|---|
 | OpenCode | agent runtime (live sessions) | `opencode` **1.19.4** (rich parts live run PASS 2026-11-04 on local Ollama; live e2e PASS 2026-10-24), 1.17.7 (Phase 3) | `services/companion-rs/src/opencode.rs` | attach-only HTTP + SSE to a running `opencode serve`; never spawns a second server |
 | Ollama | model runtime | Ollama **0.40.9** | `services/companion-rs/src/ollama.rs` | attach-only HTTP (`/api/version`, `/api/tags`, `/api/ps`) |
-| Claude Code | hook ingress + driven sessions | Claude Code **2.1.309** (`SessionStart` captured live); driven sessions **2.1.310** (live Haiku run through the companion server) | `services/companion-rs/src/claude.rs`, `claude_live.rs`, `claude_runtime.rs` | hooks POST to the loopback diagnostics listener (install the snippet from `chernobyl-companion --claude-hooks` yourself, never auto-written); with `workspaces`, the phone also starts `claude.exe` sessions (stream-json on stdio) in allow-listed folders, and lists, replays and continues (`--resume`) the 50 newest Claude sessions on disk in those folders, refusing one written in the last 2 minutes (ADR-015 §10); the phone also picks the model, attaches camera photos, runs slash commands, shows context use and renames (ADR-017) |
+| Claude Code | hook ingress + driven sessions | Claude Code **2.1.309** (`SessionStart` captured live); driven sessions **2.1.310** (live Haiku run through the companion server) | `services/companion-rs/src/claude.rs`, `claude_live.rs`, `claude_runtime.rs` | hooks POST to the loopback diagnostics listener (install the snippet from `chernobyl-companion --claude-hooks` yourself, never auto-written); with `workspaces`, the phone also starts `claude.exe` sessions (stream-json on stdio) in allow-listed folders, and lists, replays and continues (`--resume`) the 50 newest Claude sessions on disk in those folders, refusing one written in the last 2 minutes (ADR-015 §10); the phone also picks the model, attaches camera photos, runs slash commands, shows context use and renames (ADR-017); a session running in a terminal or VS Code streams live to the phone ("Live on PC"), can be forked to continue on the phone (`--resume --fork-session`), and with `--install-hooks` its permission prompts reach the phone (allow once or deny; the PC asks as usual after 120 s, or at once when no phone is connected); the hook round trip is verified live with `claude -p` 2.1.322 (ADR-018) |
 | Codex | agent runtime (live sessions) | **no live run**: openai/codex `970111f` schema, fake app-server processes only | `services/companion-rs/src/codex.rs`, `codex_runtime.rs` | spawns one `codex app-server` (stdio JSON-RPC) per adapter on the first session, in an allow-listed workspace; each phone session is a thread |
 | Hermes | — | not installed, deferred | ADR-008 | not offered; unsupported adapters stay invisible rather than half-working |
 | Mock | simulation | — | `services/companion-rs/src/seed.rs` | offline demo data; the phone labels it **Simulation** (ADR-009) |
@@ -37,7 +37,12 @@ page records **which versions were verified** and the limits that matter in prac
   `workspaces` the phone drives its own sessions: create, prompt (follow-ups join the
   running turn), interrupt, inline approvals with Claude's options, permission mode
   (default, accept edits, plan), end, a streaming transcript, and MCP status, sign-in and
-  reconnect. History of sessions it did not start is `unavailable`; desktop MCP sign-in
+  reconnect. Sessions running elsewhere on the PC are mirrored, forkable and, with the
+  explicitly installed `PermissionRequest` hook (`chernobyl-companion --install-hooks`, undo
+  with `--uninstall-hooks`, or `setup-windows.ps1 -PhoneApprovals`), approvable from the
+  phone (ADR-018). Assumed, not verifiable headless: an interactive Claude Code shows its own
+  dialog while the hook waits and cancels the hook when you answer on the PC. Questions and
+  plan approvals of PC sessions stay on the PC. Desktop MCP sign-in
   is `limited` (whether the CLI's own listener reconnects by itself is unverified, so the
   companion polls and reconnects). **Adding a folder to `workspaces` is trusting it:** the
   CLI runs in print mode, which skips Claude's folder-trust dialog, so the folder's

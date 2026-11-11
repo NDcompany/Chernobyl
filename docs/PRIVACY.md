@@ -1,7 +1,7 @@
 # CHERNOBYL — privacy and data retention
 
 **Applies to:** the desktop companion (`chernobyl-companion.exe`) and the CHERNOBYL phone app.
-**Last reviewed:** 2026-11-12 against ADR-017 (Claude composer: photos, model, rename on the phone).
+**Last reviewed:** 2026-11-12 against ADR-018 (Claude Code sessions running on the PC: live mirror, phone approvals through a hook, fork).
 
 ## The short version
 
@@ -40,7 +40,18 @@ started in a terminal or VS Code. The companion reads them from Claude Code's ow
 (`%USERPROFILE%\.claude\projects`) on your PC, only the last 4 MiB of one session at a time and
 only when your phone opens it, and redacts and caps them before they leave the PC, the same as
 live transcripts. Each listed session's title (at most 80 characters, redacted) is part of the
-session events the journal keeps. OpenCode conversation text used to be republished as journaled activity events;
+session events the journal keeps. A session that a terminal or VS Code is writing right now
+(ADR-018) is followed while your phone has it open: the companion reads only what Claude Code
+appends to that file (at most 256 KiB every 750 ms), redacts and caps it like a live transcript,
+keeps it in memory only, and stops reading when the phone closes the conversation or the session
+goes quiet. If you install the approval hook (`--install-hooks`), Claude Code hands each
+permission request of a session in an allow-listed workspace (tool name and input, the folder,
+the session id) to the companion on loopback, and it becomes an ordinary permission request on
+your phone: journaled like every request, redacted and capped. `--install-hooks` changes your
+`%USERPROFILE%\.claude\settings.json` (one hook entry; a copy of the old file is kept as
+`settings.json.chernobyl-backup`); `--uninstall-hooks` takes it out again. Forking a PC session
+from the phone makes Claude Code write a new session file next to the old one, which stays
+unchanged. OpenCode conversation text used to be republished as journaled activity events;
 since ADR-015 step 5 it is not. What you type on the phone is different: a prompt
 (`create_session`, `submit_prompt`) and a deny reason (`permission_decision.message`) are part
 of the command record, journaled as sent and kept with the newest 5 000 commands. Permission
