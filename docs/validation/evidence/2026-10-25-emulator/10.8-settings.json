@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"G:/Chernobyl/services/companion-rs/target/release/chernobyl-companion.exe\" --hook permission-request --timeout 120 --config \"C:/Users/you/AppData/Local/Temp/chernobyl-device-run-live/companion.json\"",
+            "timeout": 150
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,8 +1,8 @@
 {
   "1.1": {
     "pass": true,
-    "observed": "home: 2 hosts online; companion clients=1; device 5976f4635664f87d registered=true",
-    "at": "2026-11-04T20:44:19.503Z"
+    "observed": "home: 2 hosts online; companion clients=1; device 35dbb92bdaa3be38 registered=true",
+    "at": "2026-11-11T23:20:13.350Z"
   },
   "6.2": {
     "pass": true,
@@ -53,7 +53,7 @@
   "4.1": {
     "pass": true,
     "observed": "sessions 5 -> 6; live output on the session screen=true",
-    "at": "2026-11-04T20:44:53.368Z"
+    "at": "2026-11-11T23:20:50.127Z"
   },
   "8.5n": {
     "pass": true,
@@ -122,8 +122,8 @@
   },
   "9.1": {
     "pass": true,
-    "observed": "\"Starting Claude Code…\" shown=true; phone frames while streaming at companion text lengths 459 -> 859 -> 1259 -> 1659 -> 2059 -> 2459 -> 2763 -> 3163 -> 3403 -> 3803 -> 4083 -> 4283 -> 4549 -> 4803 -> 5003 -> 5269 -> 5537 (stream-1/stream-2 differ=true); final phone text is 1..1500=true; \"Jump to latest\" shown at turn end=false; footer \"Done · 12.9 s · 46.2k tokens · <$0.01\"; model=claude-haiku-5-5; cost so far $0.0069",
-    "at": "2026-11-11T19:25:14.605Z"
+    "observed": "\"Starting Claude Code…\" shown=true; phone frames while streaming at companion text lengths 391 -> 839 -> 1335 -> 1911 -> 2535 -> 3095 -> 3655 -> 4039 -> 4493 -> 4893 -> 5359 -> 5893 (stream-1/stream-2 differ=true); final phone text is 1..1500=true; \"Jump to latest\" shown at turn end=false; footer \"Done · 13.1 s · 49.2k tokens · <$0.01\"; model=claude-haiku-5-5; cost so far $0.0070",
+    "at": "2026-11-11T23:22:35.515Z"
   },
   "9.3": {
     "pass": true,
@@ -143,7 +143,7 @@
   "9.5": {
     "pass": true,
     "observed": "9.5a (sent while text streamed, no tool): sent while the turn ran=true; companion marked it queued=true; turns: 2 (completed, completed); PINEAPPLE answered=true (merged into the first turn=false); all turns settled=true. 9.5b (sent before a Bash call): sent while the turn ran=true; companion marked it queued=true; turns: 2 (completed, completed); MANGO answered=true (merged into the first turn=false); all turns settled=true. While sending, the phone shows \"Queued\" (9.5a-joins.png, 9.5b-joins.png); 9.5a-answered.png, 9.5b-answered.png show the word under its own turn footer",
-    "at": "2026-11-11T19:26:12.341Z"
+    "at": "2026-11-11T23:23:40.215Z"
   },
   "9.6": {
     "pass": true,
@@ -189,5 +189,45 @@
     "pass": true,
     "observed": "QR endpoints=[wss://example-tunnel-for-testing.ngrok-free.dev] only; home: 2 hosts online; companion clients=1",
     "at": "2026-11-11T20:27:04.209Z"
+  },
+  "10.4": {
+    "pass": true,
+    "observed": "workspace chernobyl-live-ws (1136971916ff); root lists src and .env, no .git=true; src/hello.txt opened: \"hello from the device run\"; .env shows \"API_KEY=«redacted:env»\" with \"Environment file: every value is hidden. Only the keys leave your PC.\"; the key on screen=false; header back: file -> src=true, src -> root=true; the system Back on the file screen -> left the app (launcher on top)",
+    "at": "2026-11-11T22:42:35.727Z"
+  },
+  "10.5": {
+    "pass": true,
+    "observed": "\"Modified: README.md\" listed; diff \"Diff README.md: 2 added, 0 removed\"; staged=true; commit \"Edit README from the phone\" in the repo=true; push confirm \"Push main?\" -> bare remote main = local HEAD=true; then \"Nothing to commit\"=true; a second clone pushed dcefd9a -> Pull confirm \"Pull into main?\" -> local HEAD dcefd9a fast-forwarded=true (one parent, no merge commit=true)",
+    "at": "2026-11-11T22:31:11.324Z"
+  },
+  "10.6": {
+    "pass": true,
+    "observed": "banner \"Runs on your PC without approval prompts\"; echo hello -> output \"hello\"=true, \"Exit code 0\"; git log --oneline -1 -> \"dcefd9a Commit from a second clone\" shown=true, \"Exit code 0\"; ping -n 30 -> Stop -> \"Stopped\" after 8 s",
+    "at": "2026-11-11T22:37:26.168Z"
+  },
+  "10.1": {
+    "pass": false,
+    "observed": "header subtitle \"Claude Code · DESKTOP-EXAMPLE\" (mark before it, 10.1-waiting.png); reply head \"none\"; a working-row frame before the tool call (10.1-working-verb.png)=true; while the Bash request was pending: \"Waiting for you\", a11y \"Claude Code is waiting for you\", elapsed \"43s\"; after Allow: \"Running Bash…\" (companion tool status running=true; the turn's items after the tool then: []); the working row gone at turn end=true; Agents row \"Claude Code, Online, 13 total\" (10.1-agents.png); Sessions row \"Live 10.1 7304, idle, Claude Code\" (10.1-sessions.png)",
+    "at": "2026-11-11T23:26:50.901Z"
+  },
+  "10.2": {
+    "pass": true,
+    "observed": "chip \"Model: Haiku 5.5\"; sheet lists 14 models; picked \"Sonnet 5.5\" -> state.model claude-sonnet-5-5, then \"Haiku 5.5\" -> state.model claude-haiku-5-5, chip \"Model: Haiku 5.5\"; \"/\" opened the menu (first \"Insert /agent-reach\"), picked /agent-reach -> field \"/agent-reach \" (inserted=true); context chip \"Context 7 percent used, 66k of 1000k tokens\"; rename -> companion title \"Renamed 10.2 8222\"=true, Sessions row \"Renamed 10.2 8222, idle, Claude Code\"",
+    "at": "2026-11-11T22:55:30.123Z"
+  },
+  "10.3": {
+    "pass": false,
+    "observed": "the photo the app captured was black (preview showed the room; 10.3-attached.png thumbnail is black); photo taken in the app's camera (10.3-camera.png), thumbnail in the composer (10.3-attached.png); user bubble \"1 image attached\", companion user item images=1; Claude answered \"Black\"",
+    "at": "2026-11-11T23:28:01.726Z"
+  },
+  "10.7": {
+    "pass": false,
+    "observed": "claude -p (exit 0, $0.0061) listed as \"count from 1 to 40 slowly, one per line, idle, Claude Code, live on PC\" (10.7-sessions-live.png); conversation tag \"Live on PC\"=true; phone frames at 0 ms (mirror 0 chars) and 5010 ms (110 chars) differ=false; the mirror reached 40=true; fork composer \"Continue on phone (fork)…\" with hint=true; new session 9ffe9146 \"count from 1 to 40 slowly, one per line\" forkedFrom \"count from 1 to 40 slowly, one per line\"; the phone replaced the screen with it=true, note \"Forked from “count from 1 to 40 slowly, one per line”; the PC session is unchanged.\"; FORKED answered=true",
+    "at": "2026-11-11T23:29:13.925Z"
+  },
+  "10.8": {
+    "pass": true,
+    "observed": "temp settings from --install-hooks (CLAUDE_CONFIG_DIR=C:\\Users\\you\\AppData\\Local\\Temp\\chernobyl-hook-settings-1794439760369, 10.8-settings.json); request \"Claude wants to use Write: C:\\Users\\you\\AppData\\Local\\Temp\\chernobyl-live-ws\\hook.txt\" (options Allow / Deny) on the Approvals tab (10.8-approvals.png; the dump had 0 nodes, \"from a PC session\" in the card label and text=false); tapping the card title at (360, 450) opened a screen offering [] (10.8-request.png); tapped \"Approve Once (at 360, 1351)\" -> request approved; claude -p exit 0 ($0.0091); hook.txt=\"hi\"; no hook entry or backup in the user's settings.json=true",
+    "at": "2026-11-11T23:31:37.718Z"
   }
 }

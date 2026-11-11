@@ -6,9 +6,11 @@ import { execFileSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 
 const ADB = process.env.ADB ?? 'G:/Android/sdk/platform-tools/adb.exe';
+// with several devices attached, every call names one (ANDROID_SERIAL=emulator-5554)
+const SERIAL = process.env.ANDROID_SERIAL ? ['-s', process.env.ANDROID_SERIAL] : [];
 
 export function adb(args, opts = {}) {
-  return execFileSync(ADB, args, { encoding: opts.binary ? 'buffer' : 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: opts.timeout ?? 60_000 });
+  return execFileSync(ADB, [...SERIAL, ...args], { encoding: opts.binary ? 'buffer' : 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: opts.timeout ?? 60_000 });
 }
 export const shell = (cmd) => adb(['shell', cmd]);
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -18,8 +20,9 @@ export function dump() {
   let xml = '';
   for (let i = 0; i < 3 && !xml.includes('<hierarchy'); i++) {
     try {
-      shell('uiautomator dump /sdcard/ui.xml >/dev/null 2>&1');
-      xml = shell('cat /sdcard/ui.xml');
+      // a failed dump (no idle UI) leaves the previous file: never read a stale tree
+      shell('rm -f /sdcard/ui.xml; uiautomator dump /sdcard/ui.xml >/dev/null 2>&1');
+      xml = shell('cat /sdcard/ui.xml 2>/dev/null');
     } catch {
       /* the dump fails while the screen animates; retry */
     }

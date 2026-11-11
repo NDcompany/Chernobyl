@@ -578,7 +578,8 @@ async function newTask(title, message, { doubleTap = false, expectNavigate = tru
   if (verified) await a.typeVerified(message);
   else a.type(message);
   a.key('KEYCODE_BACK');
-  const btn = await a.waitFor('Start a new agent session', 10_000);
+  // below the fold since the new-task screen got its Model row
+  const btn = await scrollTo('Start a new agent session');
   a.shell(`input tap ${btn.x} ${btn.y}`);
   if (doubleTap) a.shell(`input tap ${btn.x} ${btn.y}`);
   if (afterTap) afterTap();
@@ -596,18 +597,48 @@ const LIVE_MODEL = process.env.LIVE_MODEL ?? 'haiku';
 const FAKE_KEY = 'sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKEFAKE';
 const live = { sid: null, sids: [], obs: null, costs: new Map(), model: null, echoTurns: null, queued: new Set() };
 
+/** Section 10: the workspace is a git repo whose upstream is a local bare
+ *  remote next to it (pull and push work offline), with a folder and a `.env`. */
+const REMOTE = `${LIVE_WS}-remote.git`;
+const git = (args, cwd = LIVE_WS) => spawnSync('git', args, { cwd, encoding: 'utf8' });
+function ensureRepo() {
+  if (existsSync(join(LIVE_WS, '.git'))) return;
+  mkdirSync(join(LIVE_WS, 'src'), { recursive: true });
+  writeFileSync(join(LIVE_WS, 'README.md'), '# Device run workspace\n');
+  writeFileSync(join(LIVE_WS, 'src', 'hello.txt'), 'hello from the device run\n');
+  writeFileSync(join(LIVE_WS, '.env'), `API_KEY=${FAKE_KEY}\n`);
+  rmSync(REMOTE, { recursive: true, force: true });
+  git(['init', '-q', '--bare', '-b', 'main', REMOTE], process.env.TEMP);
+  for (const args of [
+    ['init', '-q', '-b', 'main'],
+    ['config', 'user.name', 'CHERNOBYL device run'],
+    ['config', 'user.email', 'device-run@localhost'],
+    ['add', '-A'],
+    ['commit', '-q', '-m', 'Initial commit'],
+    ['remote', 'add', 'origin', REMOTE],
+    ['push', '-q', '-u', 'origin', 'main'],
+  ]) {
+    const r = git(args);
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+  }
+}
+
 async function startLive(extraAdapters = []) {
   mkdirSync(LIVE_WS, { recursive: true });
   mkdirSync(LIVE_HOME, { recursive: true });
+  ensureRepo();
   const cfg = {
     version: 1,
     name: 'CHERNOBYL host',
     dataDir: LIVE_HOME,
     adapters: [{ id: 'claude-1', type: 'claude', enabled: true, workspaces: [LIVE_WS], maxSessions: 3 }, ...extraAdapters],
     retention: { events: 5000, commands: 5000, eventsMaxAgeMs: 604800000 },
-    diagnostics: { port: 9487 },
-    probeIntervalMs: 15000,
+    // the port the companion really listens on: the ADR-018 hook reads it from here
+    diagnostics: { port: 19487 },
+    // discovery of PC sessions (ADR-018) runs on this cadence
+    probeIntervalMs: 3000,
     server: { port: 8787, bind: '127.0.0.1', requireE2e: false },
+    terminal: { enabled: true },
   };
   writeFileSync(join(LIVE_HOME, 'companion.json'), JSON.stringify(cfg, null, 2));
   // the runner may itself run inside Claude Code: none of its session
@@ -1232,13 +1263,529 @@ Object.assign(ROWS, {
   },
 });
 
+/* ---- section 10: phone features of 2026-11-12 (ADR-016/017/018/020, agent identity) ---- */
+
+const cap = () => a.adb(['exec-out', 'screencap', '-p'], { binary: true });
+const CLAUDE_BIN = process.env.CLAUDE_BIN ?? join(process.env.USERPROFILE ?? '', '.local/bin/claude.exe');
+live.extCost = 0;
+/** A REAL Claude Code run outside the companion (as a terminal would start
+ *  it) in the workspace, with the runner's env scrubbed like the companion's. */
+function runClaude(args) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(CLAUDE|ANTHROPIC_)/i.test(k)));
+  env.ANTHROPIC_MODEL = LIVE_MODEL;
+  const child = spawn(CLAUDE_BIN, args, { cwd: LIVE_WS, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (d) => (out += d));
+  child.stderr.on('data', (d) => (err += d));
+  const run = { child, exited: false, exitedAt: 0 };
+  run.done = new Promise((res) =>
+    child.on('close', (code) => {
+      run.exited = true;
+      run.exitedAt = Date.now();
+      let cost = null;
+      try {
+        cost = JSON.parse(out.trim()).total_cost_usd ?? null;
+      } catch {
+        /* not JSON: the run failed */
+      }
+      if (cost) live.extCost += cost;
+      res({ code, out, err, cost });
+    }),
+  );
+  return run;
+}
+const sessions = async () => (await snapshotNow())?.sessions ?? [];
+/** The allow-listed workspace and its agent, from the companion's snapshot. */
+async function liveWorkspace() {
+  const agent = (await snapshotNow())?.agents?.find((x) => x.live?.workspaces?.length);
+  if (!agent) throw new Error('no agent lists a workspace');
+  return { agentId: agent.id, agentName: agent.name, ...agent.live.workspaces[0] };
+}
+/** The agent screen the way a user opens it: Agents tab, then its row. */
+async function openAgent(name) {
+  await goHome();
+  await tab('Agents');
+  await tapApp(new RegExp(`^${name}, `));
+  await waitApp(/^Browse the files of /, 20_000);
+}
+/** Waits for `re`, then scrolls down for it (output can push it below the fold). */
+const seek = async (re, ms) => (await waitApp(re, ms)) ?? (await reveal(re));
+const toTop = async () => {
+  for (let i = 0; i < 3; i++) a.shell('input swipe 360 450 360 1250 200');
+  await a.sleep(600);
+};
+const clearField = () => {
+  a.shell('input keycombination KEYCODE_CTRL_LEFT KEYCODE_A');
+  a.key('KEYCODE_DEL');
+};
+/** A bottom tab (the lowest node with that exact text: a screen may have a section of that name). */
+const tab = (name) => a.tap(a.dump().filter((n) => n.pkg === PKG && n.text === name).sort((p, q) => q.y - p.y)[0] ?? name);
+/** A text input by its label (a TextField's label Text above it says the same). */
+async function tapField(re) {
+  const n = await until(() => a.dump().find((x) => x.pkg === PKG && x.cls.includes('EditText') && (re.test(x.desc) || re.test(x.text))), 10_000);
+  if (!n) throw new Error(`no input ${re}`);
+  return a.tap(n);
+}
+/** The last match: with a modal open its button follows the screen's own. */
+const lastApp = (re) => a.dump().filter((n) => n.pkg === PKG && (re.test(n.text) || re.test(n.desc))).at(-1) ?? null;
+const textAfter = (v, item) => [...v.items.values()].filter((i) => i.kind === 'text' && i.ts >= item.ts).map((i) => i.text).join(' ');
+
+Object.assign(ROWS, {
+  // 10.1: the Claude mark + name on the header and each reply head; the working
+  // row's mark, status verb and elapsed time, "Running <Tool>…", "Waiting for you";
+  // the Agents and Sessions lists carry marks (decorative: screenshots)
+  async '10.1'() {
+    await ensureLive('10.1');
+    const { agentName } = await liveWorkspace();
+    await tab('Agents');
+    await a.sleep(1500);
+    shot('10.1', 'agents');
+    const agentRow = appNode(new RegExp(`^${agentName}, `));
+    await goHome();
+    const title = `Live 10.1 ${Date.now() % 10000}`; // earlier runs' sessions stay listed
+    await newTask(title, 'Run in bash: ping -n 8 127.0.0.1 then reply DONE.', { verified: true, expectNavigate: false });
+    const sid = await until(async () => (await sessions()).find((s) => s.title === title)?.id, 30_000, 300);
+    if (!sid) throw new Error('no session');
+    live.sid = sid;
+    live.sids.push(sid);
+    live.obs.send({ type: 'session_subscribe', commandId: `obs-${Date.now()}`, sessionId: sid });
+    const running = () => [...view().turns.values()].some((t) => t.status === 'running');
+    const tool = () => [...view().items.values()].find((i) => i.kind === 'tool');
+    // before the tool call the row shows a verb; dumps stall while text streams, so screencaps
+    await until(() => running(), 60_000, 100);
+    let verbFrame = null;
+    await until(() => {
+      if (tool()) return true;
+      verbFrame = cap();
+      return false;
+    }, 15_000, 700);
+    if (verbFrame) writeFileSync(join(OUT, '10.1-working-verb.png'), verbFrame);
+    const perm = await waitPerm(90_000);
+    if (!perm) return record('10.1', false, 'no Bash approval request within 90 s');
+    await jumpLatest();
+    const head = await waitApp(new RegExp(`^${agentName}$`), 8000);
+    const subtitle = appNode(new RegExp(`^${agentName} · `));
+    // the working row is the list footer, under the open approval card
+    const waiting = await seek(/^Waiting for you$/, 8000);
+    const waitingA11y = appNode(new RegExp(`^${agentName} is waiting for you$`));
+    const elapsed = appNode(/^\d+s( · .*)?$/);
+    shot('10.1', 'waiting');
+    await tapApp(/^Allow$/);
+    const ran = await until(() => tool()?.tool.status === 'running', 30_000, 200);
+    const runFrame = cap();
+    const runningNode = ran ? await waitApp(/^Running Bash…$/, 5000) : null;
+    // the working row reads the turn's LAST item: a notice after the tool hides it
+    const turnItems = [...view().items.values()].filter((i) => i.turnId === tool()?.turnId);
+    const afterTool = turnItems.slice(turnItems.indexOf(tool()) + 1).map((i) => i.kind);
+    if (runningNode) shot('10.1', 'running-tool');
+    else writeFileSync(join(OUT, '10.1-running-tool.png'), runFrame);
+    await waitTurnEnd(0, 120_000);
+    await jumpLatest();
+    const gone = !appNode(/^Waiting for you$|^Running Bash…$/);
+    shot('10.1', 'done');
+    await goHome();
+    await tab('Sessions');
+    await a.sleep(1500);
+    const listed = appNode(new RegExp(`^${title}, .*${agentName}`));
+    shot('10.1', 'sessions');
+    record(
+      '10.1',
+      !!verbFrame && !!waiting && !!runningNode && !!head && !!subtitle && gone && !!agentRow && !!listed,
+      `header subtitle "${subtitle?.text ?? 'none'}" (mark before it, 10.1-waiting.png); reply head "${head?.text ?? 'none'}"; a working-row frame before the tool call (10.1-working-verb.png)=${!!verbFrame}; while the Bash request was pending: "${waiting?.text ?? 'no "Waiting for you"'}", a11y "${waitingA11y?.desc ?? 'none'}", elapsed "${elapsed?.text ?? 'none'}"; after Allow: "${runningNode?.text ?? 'no "Running Bash…"'}" (companion tool status running=${!!ran}; the turn's items after the tool then: [${afterTool.join(', ')}]); the working row gone at turn end=${gone}; Agents row "${agentRow?.desc ?? 'none'}" (10.1-agents.png); Sessions row "${listed?.desc ?? 'none'}" (10.1-sessions.png)`,
+    );
+  },
+  // 10.2: model chip + sheet (to another model and back to haiku, resolved in the
+  // state), the slash menu inserts a command, the context chip, rename
+  async '10.2'() {
+    await ensureLiveSession('10.2');
+    const st = () => view().state ?? {};
+    const chip = await waitApp(/^Model: /, 20_000);
+    if (!chip) return record('10.2', false, 'no model chip');
+    const models = st().models ?? [];
+    const pick = (re) => models.find((m) => re.test(m.value)) ?? models.find((m) => re.test(m.label));
+    const other = pick(/^sonnet$/i) ?? pick(/sonnet/i) ?? { value: 'sonnet', label: 'Sonnet' };
+    const haiku = pick(/^haiku$/i) ?? pick(/haiku/i) ?? { value: 'haiku', label: 'Haiku' };
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const choose = async (m, re) => {
+      await tapApp(/^Model: /);
+      await waitApp(/^The next turn uses it/, 10_000);
+      await tapApp(new RegExp(`^${esc(m.label)}$`));
+      return until(() => re.test(st().model ?? ''), 20_000, 500);
+    };
+    await a.tap(chip);
+    await waitApp(/^The next turn uses it/, 10_000);
+    shot('10.2', 'model-sheet');
+    a.key('KEYCODE_BACK');
+    await a.sleep(800);
+    const toOther = await choose(other, /sonnet/i);
+    const otherModel = st().model;
+    const toHaiku = await choose(haiku, /haiku/i);
+    const chipAfter = await waitApp(/^Model: /, 5000);
+    shot('10.2', 'model-haiku');
+    // slash commands
+    await tapApp(/^Message .+…$/);
+    a.type('/');
+    const menu = await waitApp(/^Insert \//, 10_000);
+    shot('10.2', 'slash-menu');
+    const item = appNode(/^Insert \/context$/) ?? menu;
+    const name = item?.desc.slice('Insert '.length) ?? null;
+    if (item) await a.tap(item);
+    await a.sleep(800);
+    const field = a.dump().find((n) => n.pkg === PKG && n.cls.includes('EditText'));
+    const inserted = !!name && field?.text.trimEnd() === name;
+    shot('10.2', 'slash-inserted');
+    clearField();
+    await hideKeyboard();
+    const ctx = appNode(/^Context \d+ percent used/);
+    // rename through the pencil
+    const newTitle = `Renamed 10.2 ${Date.now() % 10000}`;
+    await tapApp(/^Rename session$/);
+    // no Back here: it can close the sheet instead of the keyboard
+    await tapField(/^Session name$/);
+    clearField();
+    a.type(newTitle);
+    await a.sleep(800);
+    shot('10.2', 'rename-sheet');
+    await tapApp(/^Rename$/);
+    const renamed = await until(async () => (await sessions()).find((s) => s.id === live.sid)?.title === newTitle, 20_000, 1000);
+    await goHome();
+    await tab('Sessions');
+    await a.sleep(1500);
+    const row = appNode(new RegExp(`^${newTitle}, `));
+    shot('10.2', 'sessions-renamed');
+    record(
+      '10.2',
+      !!toOther && !!toHaiku && /haiku/i.test(chipAfter?.desc ?? '') && !!menu && inserted && !!ctx && !!renamed && !!row,
+      `chip "${chip.desc}"; sheet lists ${models.length || 'the fallback'} models; picked "${other.label}" -> state.model ${otherModel}, then "${haiku.label}" -> state.model ${st().model}, chip "${chipAfter?.desc}"; "/" opened the menu (first "${menu?.desc ?? 'none'}"), picked ${name} -> field "${field?.text ?? ''}" (inserted=${inserted}); context chip "${ctx?.desc ?? 'none'}"; rename -> companion title "${newTitle}"=${!!renamed}, Sessions row "${row?.desc ?? 'none'}"`,
+    );
+    await openSession(live.sid);
+  },
+  // 10.3: one photo from the emulator's virtual camera, answered by Claude
+  async '10.3'() {
+    await ensureLiveSession('10.3');
+    a.shell(`pm grant ${PKG} android.permission.CAMERA`);
+    const n0 = endedTurns().length;
+    await tapApp(/^Attach a photo$/);
+    // the app's own camera-permission step, then the system prompt if it shows
+    const allowCam = await waitApp(/^Allow camera$|^Take photo$/, 15_000);
+    if (allowCam && /Allow camera/.test(allowCam.text + allowCam.desc)) {
+      await a.tap(allowCam);
+      const sys = await until(() => a.dump().find((n) => n.pkg !== PKG && /^While using the app$|^Allow$/i.test(n.text)), 6000);
+      if (sys) await a.tap(sys);
+    }
+    const take = await waitApp(/^Take photo$/, 15_000);
+    await a.sleep(8000); // the preview reconfigures to the picked picture size once ready
+    shot('10.3', 'camera');
+    if (!take) {
+      const screen = a.screenText().slice(0, 300);
+      a.key('KEYCODE_BACK');
+      return record('10.3', null, `NOT RUN: the camera screen did not offer "Take photo" (screen: ${screen})`);
+    }
+    await a.tap(take);
+    const thumb = await waitApp(/^Remove photo 1$/, 20_000);
+    if (!thumb) {
+      const screen = a.screenText().slice(0, 300);
+      shot('10.3', 'no-photo');
+      a.key('KEYCODE_BACK');
+      return record('10.3', null, `NOT RUN: the virtual camera gave no photo (screen: ${screen})`);
+    }
+    await typePrompt('what colour dominates this image? one word');
+    await hideKeyboard();
+    shot('10.3', 'attached');
+    await sendTyped();
+    await waitTurnEnd(n0, 120_000);
+    await jumpLatest();
+    const chip = await waitApp(/^1 image attached$/, 10_000);
+    shot('10.3', 'answered');
+    const user = [...view().items.values()].filter((i) => i.kind === 'user').at(-1);
+    const answer = user ? textAfter(view(), user) : '';
+    // the virtual scene is a beige room: "Black" means the app sent a black frame
+    const black = /^black\W*$/i.test(answer.trim());
+    record('10.3', !!chip && user?.images === 1 && answer.trim().length > 0 && !black, `${black ? 'the photo the app captured was black (preview showed the room; 10.3-attached.png thumbnail is black); ' : ''}photo taken in the app's camera (10.3-camera.png), thumbnail in the composer (10.3-attached.png); user bubble "${chip?.desc ?? 'no image chip'}", companion user item images=${user?.images}; Claude answered ${JSON.stringify(answer.trim().slice(0, 60))}`);
+  },
+  // 10.4: Files: a folder, a text file, and a `.env` whose value is masked
+  async '10.4'() {
+    await ensureLive('10.4');
+    const ws = await liveWorkspace();
+    await openAgent(ws.agentName);
+    await tapApp(/^Browse the files of /);
+    const src = await waitApp(/^Folder src$/, 20_000);
+    const env = appNode(/^File \.env$/);
+    const noGit = !appNode(/^Folder \.git$/);
+    shot('10.4', 'root');
+    if (!src) return record('10.4', false, `no "src" folder listed: ${a.screenText().slice(0, 300)}`);
+    await a.tap(src);
+    const hello = await waitApp(/^File hello\.txt$/, 20_000);
+    shot('10.4', 'folder');
+    if (hello) await a.tap(hello);
+    const content = await waitApp(/hello from the device run/, 20_000);
+    shot('10.4', 'text-file');
+    // the system Back first (app-wide: it left the app on every pushed screen)
+    a.key('KEYCODE_BACK');
+    const hwBack = (await waitApp(/^File hello\.txt$/, 4000)) ? 'src' : /launcher/.test(a.shell('dumpsys activity activities | grep topResumedActivity')) ? 'left the app (launcher on top)' : 'somewhere else';
+    shot('10.4', 'system-back');
+    if (hwBack !== 'src') {
+      await openAgent(ws.agentName);
+      await tapApp(/^Browse the files of /);
+      await tapApp(/^Folder src$/);
+      await tapApp(/^File hello\.txt$/);
+      await waitApp(/hello from the device run/, 20_000);
+    }
+    // the header's back button walks up: file -> src -> workspace root
+    await tapApp(/^Go back$/);
+    const up1 = await waitApp(/^File hello\.txt$/, 5000);
+    if (up1) await tapApp(/^Go back$/);
+    const up2 = up1 && (await waitApp(/^Folder src$/, 5000));
+    const backOk = !!up2;
+    const backNote = `header back: file -> src=${!!up1}, src -> root=${!!up2}; the system Back on the file screen -> ${hwBack}`;
+    await tapApp(/^File \.env$/);
+    const masked = await waitApp(/API_KEY=«redacted:env»/, 20_000);
+    const note = appNode(/^Environment file: every value is hidden/);
+    const leaked = a.screenText().includes('FAKEFAKE');
+    shot('10.4', 'env');
+    record('10.4', backOk && !!hello && !!content && !!env && !!masked && !!note && !leaked && noGit, `workspace ${ws.label} (${ws.id}); root lists src and .env, no .git=${noGit}; src/hello.txt opened: ${JSON.stringify(content?.text.trim() ?? null)}; .env shows ${JSON.stringify(masked?.text.trim() ?? null)} with "${note?.text ?? 'no note'}"; the key on screen=${leaked}; ${backNote}`);
+  },
+  // 10.5: Changes: modified file -> diff -> Stage -> commit -> Push to the bare
+  // remote -> clean; a commit from a second clone -> Pull fast-forwards
+  async '10.5'() {
+    await ensureLive('10.5');
+    const ws = await liveWorkspace();
+    git(['reset', '-q']); // a failed earlier run may have left README.md staged
+    appendFileSync(join(LIVE_WS, 'README.md'), `Edited for row 10.5 at ${new Date().toISOString()}\n`);
+    const msg = 'Edit README from the phone';
+    await openAgent(ws.agentName);
+    await tapApp(/^Review the git changes of /);
+    const row = await waitApp(/^Modified: README\.md$/, 20_000);
+    shot('10.5', 'listed');
+    if (!row) return record('10.5', false, `README.md not listed: ${a.screenText().slice(0, 300)}`);
+    await a.tap(row);
+    const diff = await seek(/^Diff README\.md/, 15_000);
+    shot('10.5', 'diff');
+    await tapApp(/^Stage README\.md$/);
+    const staged = await waitApp(/^Unstage README\.md$/, 20_000);
+    await tapField(/^Commit message$/);
+    a.type(msg);
+    await hideKeyboard();
+    shot('10.5', 'staged');
+    await tapApp(/^Commit$/);
+    const committed = await until(() => git(['log', '-1', '--format=%s']).stdout.trim() === msg, 30_000, 1000);
+    const push = await seek(/^Push 1 commit\(s\)$/, 15_000);
+    shot('10.5', 'committed');
+    if (!push) return record('10.5', false, `committed=${!!committed}; no "Push 1 commit(s)" button`);
+    await a.tap(push);
+    const pushQ = await waitApp(/^Push main\?$/, 10_000);
+    shot('10.5', 'push-confirm');
+    await a.tap(lastApp(/^Push$/));
+    const head = () => git(['rev-parse', 'HEAD']).stdout.trim();
+    const pushed = await until(() => git(['rev-parse', 'main'], REMOTE).stdout.trim() === head(), 30_000, 1000);
+    await toTop();
+    const clean = await waitApp(/^Nothing to commit$/, 15_000);
+    shot('10.5', 'pushed-clean');
+    // someone else pushes: a second clone of the bare remote
+    const clone = join(process.env.TEMP ?? '.', `chernobyl-clone-${Date.now()}`);
+    git(['clone', '-q', REMOTE, clone], process.env.TEMP);
+    writeFileSync(join(clone, 'from-remote.txt'), 'pushed from a second clone\n');
+    for (const args of [['add', '-A'], ['-c', 'user.name=Second clone', '-c', 'user.email=clone@localhost', 'commit', '-q', '-m', 'Commit from a second clone'], ['push', '-q', 'origin', 'main']]) git(args, clone);
+    const remoteHead = git(['rev-parse', 'HEAD'], clone).stdout.trim();
+    rmSync(clone, { recursive: true, force: true, maxRetries: 3 });
+    await tapApp(/^Refresh the changes$/);
+    await a.sleep(1500);
+    await a.tap(await seek(/^Pull .+/, 10_000));
+    const pullQ = await waitApp(/^Pull into main\?$/, 10_000);
+    shot('10.5', 'pull-confirm');
+    await a.tap(lastApp(/^Pull$/));
+    const pulled = await until(() => head() === remoteHead, 30_000, 1000);
+    const parents = git(['log', '-1', '--format=%P']).stdout.trim().split(' ').length;
+    await a.sleep(1500);
+    await toTop();
+    shot('10.5', 'pulled');
+    record(
+      '10.5',
+      !!diff && !!staged && !!committed && !!pushQ && !!pushed && !!clean && !!pullQ && !!pulled && parents === 1,
+      `"Modified: README.md" listed; diff "${diff?.desc ?? 'none'}"; staged=${!!staged}; commit "${msg}" in the repo=${!!committed}; push confirm "${pushQ?.text ?? 'none'}" -> bare remote main = local HEAD=${!!pushed}; then "Nothing to commit"=${!!clean}; a second clone pushed ${remoteHead.slice(0, 7)} -> Pull confirm "${pullQ?.text ?? 'none'}" -> local HEAD ${head().slice(0, 7)} fast-forwarded=${!!pulled} (one parent, no merge commit=${parents === 1})`,
+    );
+  },
+  // 10.6: the opt-in terminal: two commands with exit 0, a long one stopped, the banner
+  async '10.6'() {
+    await ensureLive('10.6');
+    const ws = await liveWorkspace();
+    await openAgent(ws.agentName);
+    await tapApp(/^Run a command in /);
+    const banner = await waitApp(/^Runs on your PC without approval prompts$/, 20_000);
+    shot('10.6', 'screen');
+    if (!banner) return record('10.6', false, `no terminal banner: ${a.screenText().slice(0, 300)}`);
+    const runCmd = async (cmd) => {
+      await toTop();
+      await tapField(/^Command$/);
+      clearField();
+      a.type(cmd);
+      await hideKeyboard();
+      await a.sleep(2100); // one start per 2 s per companion
+      return tapApp(/^Run$/);
+    };
+    const outText = () => a.dump().filter((n) => n.pkg === PKG && n.cls.includes('TextView') && !n.text.startsWith('> ')).map((n) => n.text).join('\n');
+    await runCmd('echo hello');
+    const exit1 = await seek(/^Exit code \d+/, 30_000);
+    const hello = /^hello\s*$/m.test(outText());
+    shot('10.6', 'echo');
+    const want = git(['log', '--oneline', '-1']).stdout.trim();
+    await runCmd('git log --oneline -1');
+    await waitApp(/^Running…$|^Exit code/, 10_000);
+    const exit2 = await seek(/^Exit code \d+/, 30_000);
+    const logged = outText().includes(want);
+    shot('10.6', 'git-log');
+    // while it runs the spinner keeps uiautomator from ever idling (a dump stalls),
+    // so Stop is tapped where Run was (it takes Run's place) and the screen is a screencap
+    const run = await runCmd('ping -n 30 127.0.0.1');
+    const t0 = Date.now();
+    await a.sleep(5000);
+    writeFileSync(join(OUT, '10.6-ping-running.png'), cap());
+    const stopBtn = run;
+    a.shell(`input tap ${run.x} ${run.y}`);
+    const stopped = await seek(/^Stopped$/, 20_000);
+    const secs = Math.round((Date.now() - t0) / 1000);
+    shot('10.6', 'stopped');
+    record(
+      '10.6',
+      exit1?.text === 'Exit code 0' && hello && exit2?.text === 'Exit code 0' && logged && !!stopBtn && !!stopped && secs < 30,
+      `banner "${banner.text}"; echo hello -> output "hello"=${hello}, "${exit1?.text ?? 'no exit'}"; git log --oneline -1 -> "${want}" shown=${logged}, "${exit2?.text ?? 'no exit'}"; ping -n 30 -> Stop -> "${stopped?.text ?? 'not stopped'}" after ${secs} s`,
+    );
+  },
+  // 10.7: a REAL Claude Code run started on the PC shows "Live on PC", its
+  // conversation mirrors it, and a phone prompt forks it (or resumes it once idle)
+  async '10.7'() {
+    await ensureLive('10.7');
+    await tab('Sessions');
+    await a.sleep(1000);
+    const known = new Set((await sessions()).map((s) => s.id));
+    const pc = runClaude(['-p', 'count from 1 to 40 slowly, one per line', '--model', LIVE_MODEL, '--output-format', 'json']);
+    const s = await until(async () => (await sessions()).find((x) => !known.has(x.id) && x.livePc), 90_000, 500);
+    if (!s) {
+      const r = await pc.done;
+      return record('10.7', false, `the PC session never showed as live (exit ${r.code}, cost ${r.cost}); ${r.err.slice(0, 200)}`);
+    }
+    const listed = appNode(/, live on PC/);
+    shot('10.7', 'sessions-live');
+    live.sid = s.id;
+    live.obs.send({ type: 'session_subscribe', commandId: `obs-${Date.now()}`, sessionId: s.id });
+    a.shell(`am start -a android.intent.action.VIEW -d 'chernobyl:///session/${s.id}' ${PKG}`);
+    await waitApp(/^Continue on phone \(fork\)…$|^Message .+…$/, 15_000);
+    // the companion's mirror text length paired with each phone frame
+    const len = () => [...view().items.values()].filter((i) => i.kind === 'text').reduce((n, i) => n + i.text.length, 0);
+    const frames = [];
+    const t0 = Date.now();
+    while (Date.now() - t0 < 60_000 && !(pc.exited && Date.now() - pc.exitedAt > 5000)) {
+      frames.push({ at: Date.now() - t0, len: len(), png: cap() });
+      await a.sleep(600);
+    }
+    const r = await pc.done;
+    // the frame just before the mirror last grew, and the final one
+    const max = Math.max(...frames.map((f) => f.len));
+    const first = frames.filter((f) => f.len < max).at(-1) ?? frames[0];
+    const last = frames.at(-1);
+    writeFileSync(join(OUT, '10.7-stream-1.png'), first.png);
+    writeFileSync(join(OUT, '10.7-stream-2.png'), last.png);
+    const differ = !first.png.equals(last.png);
+    await jumpLatest();
+    const tag = appNode(/^Live on PC: this session is running on your PC right now$/);
+    shot('10.7', 'mirrored');
+    const mirrored = /\b40\b/.test([...view().items.values()].filter((i) => i.kind === 'text').map((i) => i.text).join(' '));
+    const still = (await sessions()).find((x) => x.id === s.id);
+    let fork = 'not tried';
+    let pass = !!listed && differ && first.len < last.len && mirrored;
+    if (still?.livePc) {
+      const field = await tapApp(/^Continue on phone \(fork\)…$/);
+      const hint = appNode(/^Live on PC: sending forks it/);
+      await a.typeVerified('Reply with the word FORKED.');
+      await hideKeyboard();
+      shot('10.7', 'fork-composer');
+      await tapApp(/^Send prompt to agent$/);
+      const f = await until(async () => (await sessions()).find((x) => !known.has(x.id) && x.id !== s.id && x.forkedFrom), 30_000, 1000);
+      if (f) {
+        live.sid = f.id;
+        live.sids.push(f.id);
+        live.obs.send({ type: 'session_subscribe', commandId: `obs-${Date.now()}`, sessionId: f.id });
+        const said = await until(() => /FORKED/.test([...view().items.values()].filter((i) => i.kind === 'text').map((i) => i.text).join(' ')) && ![...view().turns.values()].some((t) => t.status === 'running'), 120_000, 1000);
+        await jumpLatest();
+        const note = await waitApp(/^Forked from “/, 15_000);
+        const opened = await waitApp(/^Message .+…$/, 5000);
+        shot('10.7', 'forked');
+        fork = `fork composer "${field.text}" with hint=${!!hint}; new session ${f.id.slice(0, 8)} "${f.title}" forkedFrom "${f.forkedFrom}"; the phone replaced the screen with it=${!!opened}, note "${note?.text ?? 'none'}"; FORKED answered=${!!said}`;
+        pass &&= !!hint && !!note && !!said && !!opened;
+      } else {
+        fork = 'no forked session appeared';
+        pass = false;
+      }
+    } else {
+      fork = 'the PC session was idle again: a plain prompt resumes it in place (not exercised)';
+    }
+    record('10.7', pass, `claude -p (exit ${r.code}, $${r.cost?.toFixed(4)}) listed as "${listed?.desc ?? 'not live on the Sessions tab'}" (10.7-sessions-live.png); conversation tag "Live on PC"=${!!tag}; phone frames at ${first.at} ms (mirror ${first.len} chars) and ${last.at} ms (${last.len} chars) differ=${differ}; the mirror reached 40=${mirrored}; ${fork}`);
+  },
+  // 10.8: a PC session's approval through the PermissionRequest hook (a temp
+  // --settings file; the user's settings.json is never touched): Allow -> file written
+  async '10.8'() {
+    await ensureLive('10.8');
+    const dir = join(process.env.TEMP ?? '.', `chernobyl-hook-settings-${Date.now()}`);
+    mkdirSync(dir, { recursive: true });
+    const real = join(process.env.USERPROFILE ?? '', '.claude', 'settings.json');
+    // other Claude Code sessions on this PC rewrite the user's settings.json at any time: the
+    // check is that the hook never lands there (no CHERNOBYL entry, no backup of ours)
+    const ours = () => (existsSync(real) && readFileSync(real, 'utf8').includes('--hook permission-request')) || existsSync(`${real}.chernobyl-backup`);
+    const oursBefore = ours();
+    const inst = spawnSync(c.BIN, ['--install-hooks', '--timeout', '120', '--config', join(LIVE_HOME, 'companion.json')], { env: { ...process.env, CLAUDE_CONFIG_DIR: dir }, encoding: 'utf8' });
+    const settings = join(dir, 'settings.json');
+    if (!existsSync(settings)) return record('10.8', false, `--install-hooks made no temp settings: ${inst.stdout}${inst.stderr}`);
+    writeFileSync(join(OUT, '10.8-settings.json'), readFileSync(settings));
+    rmSync(join(LIVE_WS, 'hook.txt'), { force: true });
+    await goHome();
+    await tab('Approvals');
+    const pc = runClaude(['-p', 'create file hook.txt containing hi', '--settings', settings, '--model', LIVE_MODEL, '--output-format', 'json']);
+    const perm = await until(async () => (await snapshotNow())?.permissions?.find((p) => p.fromPc && p.status === 'pending'), 90_000, 1000);
+    if (!perm) {
+      pc.child.kill();
+      const r = await pc.done;
+      return record('10.8', false, `no fromPc request reached the companion (exit ${r.code}): ${r.out.slice(0, 200)}`);
+    }
+    await a.sleep(1500);
+    writeFileSync(join(OUT, '10.8-approvals.png'), cap());
+    // the hook's 2-minute countdown re-renders the card every second, which can
+    // keep a dump from returning: then the first card's title row is tapped where
+    // it sits on the 720 px emulator (its middle is the command block, whose
+    // selectable text takes the tap)
+    const nodes = a.dump();
+    const row = nodes.find((n) => n.pkg === PKG && n.desc.includes(perm.command));
+    const fromPc = !!row?.desc.includes('from a PC session') && nodes.some((n) => n.text.endsWith(' · from a PC session'));
+    const titleNode = nodes.find((n) => n.pkg === PKG && n.text === perm.title);
+    a.shell(`input tap ${titleNode?.x ?? 360} ${titleNode?.y ?? 450}`);
+    await a.sleep(3000);
+    writeFileSync(join(OUT, '10.8-request.png'), cap());
+    const opts = (perm.options ?? []).map((o) => o.label).join(' / ');
+    // the request screen ticks its countdown too: "Approve Once" where it sits on
+    // the 720 px emulator (10.8-request.png) when no fresh dump comes back
+    let card = await until(() => a.dump().find((n) => n.pkg === PKG && /^(Approve Once|Allow)$/.test(n.text || n.desc)), 8000, 500);
+    const screen = a.screenText();
+    const opener = titleNode ? 'the card title (found by dump)' : 'the card title at (360, 450)';
+    if (!card) card = { x: 360, y: 1351, text: 'Approve Once (at 360, 1351)', desc: '' };
+    const offered = ['Approve Once', 'Reject', 'Approve this action for the entire session', 'Allow', 'Deny'].filter((l) => screen.includes(l));
+    await a.tap(card);
+    const r = await Promise.race([pc.done, a.sleep(150_000).then(() => null)]);
+    const file = existsSync(join(LIVE_WS, 'hook.txt')) ? readFileSync(join(LIVE_WS, 'hook.txt'), 'utf8').trim() : null;
+    const after = (await snapshotNow())?.permissions?.find((p) => p.id === perm.id)?.status;
+    shot('10.8', 'after');
+    const untouched = !oursBefore && !ours();
+    rmSync(dir, { recursive: true, force: true });
+    record('10.8', file === 'hi' && untouched, `temp settings from --install-hooks (CLAUDE_CONFIG_DIR=${dir}, 10.8-settings.json); request "${perm.title}: ${perm.command}" (options ${opts}) on the Approvals tab (10.8-approvals.png; the dump had ${nodes.length} nodes, "from a PC session" in the card label and text=${fromPc}); tapping ${opener} opened a screen offering [${offered.join(", ")}] (10.8-request.png); tapped "${card.text || card.desc}" -> request ${after}; claude -p exit ${r?.code ?? 'timeout'} ($${r?.cost?.toFixed(4)}); hook.txt=${JSON.stringify(file)}; no hook entry or backup in the user's settings.json=${untouched}`);
+  },
+});
+
 /** Ends every live session (the CLI exits on stdin EOF) and reports the spend. */
 async function endLive() {
   if (!live.obs) return;
   for (const sid of live.sids) live.obs.send({ type: 'session_end', commandId: `end-${Date.now()}-${sid}`, sessionId: sid });
   await a.sleep(8000);
-  console.log(`live model ${live.model}; Claude cost this run $${totalCost().toFixed(4)} over ${live.costs.size} turns; extra "Jump to latest" taps needed: ${live.extraJumps ?? 0}`);
-  appendFileSync(join(OUT, '9-cost.txt'), `${new Date().toISOString()} rows ${pick.join(' ')}: model ${live.model}, ${live.costs.size} turns, total_cost_usd ${totalCost().toFixed(4)}\n`);
+  console.log(`live model ${live.model}; Claude cost this run $${totalCost().toFixed(4)} over ${live.costs.size} turns (+ $${live.extCost.toFixed(4)} for claude -p runs on the PC); extra "Jump to latest" taps needed: ${live.extraJumps ?? 0}`);
+  appendFileSync(join(OUT, '9-cost.txt'), `${new Date().toISOString()} rows ${pick.join(' ')}: model ${live.model}, ${live.costs.size} turns, total_cost_usd ${totalCost().toFixed(4)}, claude -p on the PC ${live.extCost.toFixed(4)}\n`);
   live.obs.close();
 }
 
@@ -1251,11 +1798,12 @@ const netOn = () => {
 
 const pick = process.argv.slice(2);
 // section 9 drives the real Claude CLI (it costs money): named rows or LIVE=1 only
-const order = pick.length ? pick : Object.keys(ROWS).filter((r) => (!r.startsWith('9.') || process.env.LIVE === '1') && !r.startsWith('T.'));
+const order = pick.length ? pick : Object.keys(ROWS).filter((r) => (!/^(9|10)\./.test(r) || process.env.LIVE === '1') && !r.startsWith('T.'));
 try {
   netOn();
   await dismissSystemDialogs();
   for (const row of order) {
+    const spent = totalCost() + live.extCost;
     try {
       await ROWS[row]();
     } catch (e) {
@@ -1263,6 +1811,8 @@ try {
       record(row, false, `error: ${e.message.split('\n')[0]}`);
     } finally {
       netOn();
+      // turn costs land at turn end: a row's spend is what arrived while it ran
+      if (/^(9|10)\./.test(row)) appendFileSync(join(OUT, '10-cost.txt'), `${new Date().toISOString()} ${row}: $${(totalCost() + live.extCost - spent).toFixed(4)}\n`);
     }
   }
 } finally {
