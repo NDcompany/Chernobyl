@@ -110,8 +110,8 @@
     }
   },
   {
-    "why": "create_session model gpt-5",
-    "msg": { "type": "create_session", "commandId": "c", "agentId": "a", "title": "t", "prompt": "p", "model": "gpt-5" }
+    "why": "create_session model ending in a dot",
+    "msg": { "type": "create_session", "commandId": "c", "agentId": "a", "title": "t", "prompt": "p", "model": "gpt-5." }
   },
   {
     "why": "create_session model empty",
@@ -131,7 +131,7 @@
   { "why": "set_model without model", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s" } },
   { "why": "set_model without sessionId", "msg": { "type": "set_model", "commandId": "c", "model": "opus" } },
   { "why": "set_model empty", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "" } },
-  { "why": "set_model unknown alias", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "best" } },
+  { "why": "set_model starting with a dot", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": ".best" } },
   { "why": "set_model alias in the wrong case", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "Opus" } },
   { "why": "set_model bare prefix", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "claude-" } },
   { "why": "set_model uppercase id", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "claude-Opus-5" } },

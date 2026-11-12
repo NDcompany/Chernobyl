@@ -235,7 +235,7 @@ carry a `SimulatedTag`. Derived from the keystore pairing and store transport st
 ## Routes (`app/`)
 
 Tabs: `(tabs)/index` Home · `agents` → `agent/[id]` · `sessions` → `session/[id]` · `approvals` →
-`permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field; agents with `live.composer` `model` get a Model chip row, Default sending no `model`).
+`permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field; Claude Code agents with `live.composer` `model` get a Model chip row, Default sending no `model`; Codex picks its own models in the session).
 Full-screen (no gesture back): `onboarding`, `sign-in`.
 Workspace (ADR-016): `files/[workspace]?path=` (one screen per folder, so Back walks up),
 `file/[workspace]?path=` (text viewer), `changes/[workspace]` (git), `terminal/[workspace]`

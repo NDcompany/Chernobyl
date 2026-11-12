@@ -17,19 +17,33 @@
 use crate::adapters::Capability;
 use crate::crypto;
 use crate::json::{self, Json};
-use crate::protocol::{AgentLive, LiveWorkspace, PermissionOption, PermissionRequest, now_ms};
+use crate::protocol::{
+    AgentLive, LiveWorkspace, PermissionOption, PermissionRequest, PromptImage, now_ms,
+};
 use crate::runtime_io::{AUTH_TTL_MS, ChildEvent, ChildIo, redact};
 use crate::transcript::{
     Field, FileDiff, Item, ItemKind, LiveState, McpAuthState, McpServer, Op, PlanStep, ToolCall,
     ToolStatus, TurnState, Usage,
 };
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Every Codex capability stays `limited` until a live run (`INTEGRATIONS.md` rule).
-const HONESTY: &str = "implemented from openai/codex@970111f schema; verified against fake \
-                       app-server processes only; no live run";
+/// The codex build the wire was checked against (`generate-ts` + live runs).
+pub const VERIFIED: &str = "codex-cli 0.167.0-alpha.4.1";
+/// Thread policy. Verified live on Windows: `untrusted` asks the phone
+/// before every file change and every command codex does not know as
+/// read-only (`git status`, `ls`, … run unasked). The Windows sandbox is not
+/// used: with `workspace-write` a command in a fresh workspace ran in `C:\`
+/// after a 3-minute stall, so commands run like Claude Code's, unsandboxed
+/// and approved. codex records each workspace as trusted in its config.toml.
+const APPROVAL_POLICY: &str = "untrusted";
+const SANDBOX: &str = "danger-full-access";
+/// History replay (`thread/items/list`): the newest this many items.
+const HISTORY_ITEMS: i64 = 300;
+/// `thread/list`: the newest this many threads in the workspaces.
+const THREADS_MAX: i64 = 50;
 /// §3.5 tool output: forwarding stops here; completion keeps head + tail.
 const OUTPUT_CAP: usize = 32 << 10;
 /// A partial output line longer than this is forwarded without its newline.
@@ -67,8 +81,13 @@ pub enum Event {
     /// Answered elsewhere, ended with its turn, or codex exited: the engine
     /// resolves it `stale`. It is never answered afterwards.
     Withdrawn(String),
-    /// `thread/start` succeeded for command `tag`: the session exists.
+    /// `thread/start` (or `thread/fork`) succeeded for command `tag`: the
+    /// session exists. A fork's history ops follow this event.
     SessionStarted { tag: String, thread: String },
+    /// `thread/name/set` succeeded: the session's title.
+    Renamed { thread: String, title: String },
+    /// A `thread/list` page: codex's threads in the workspaces, newest first.
+    Threads(Vec<FoundThread>),
     /// G1 progress for command `tag`: `running` (prompt) or `accepted` (interrupt).
     Progress { tag: String, status: &'static str },
     /// G1 result for command `tag`: completed | cancelled | failed | unknown.
@@ -82,30 +101,72 @@ pub enum Event {
     OpenUrl { tag: String, url: String },
 }
 
-/// The Codex capability declaration (PRD §7.3): honest, so all `limited`.
+/// The Codex capability declaration (PRD §7.3): `available` = run live
+/// against [`VERIFIED`] (`tests` `live_codex_*`); the rest says what is not.
 pub fn capabilities() -> Vec<Capability> {
-    [
-        "session.create",
-        "session.prompt",
-        "session.interrupt",
-        "session.activity.stream",
-        "permission.review",
-        "diff.read",
-        "mcp.status",
-        "mcp.auth",
+    let ok = |id| Capability::new(id, "available", None);
+    let limited = |id, why| Capability::new(id, "limited", Some(why));
+    vec![
+        ok("session.create"),
+        ok("session.prompt"),
+        ok("session.interrupt"),
+        ok("session.activity.stream"),
+        ok("permission.review"),
+        ok("diff.read"),
+        limited(
+            "session.list",
+            "the 50 most recent Codex threads whose folder is an allow-listed workspace, from the \
+             phone or the Codex app; one the Codex app wrote in the last 2 minutes is not resumed \
+             (fork it to continue on the phone)",
+        ),
+        limited(
+            "session.history.read",
+            "the newest 300 items of a thread, redacted; a thread running in the Codex app is \
+             re-read at the probe cadence, not streamed",
+        ),
+        limited(
+            "server.spawn",
+            "codex app-server is started only in workspaces the operator allow-listed",
+        ),
+        limited(
+            "mcp.status",
+            "server status verified live; per-thread status is not reported",
+        ),
+        limited(
+            "mcp.auth",
+            "desktop sign-in (codex opens the browser on the PC) verified against a fake \
+             app-server only",
+        ),
     ]
-    .into_iter()
-    .map(|id| Capability::new(id, "limited", Some(HONESTY)))
-    .collect()
+}
+
+/// One thread of `thread/list`, as the session list shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoundThread {
+    pub id: String,
+    /// The thread's name, else its first prompt (one line, redacted).
+    pub title: String,
+    pub cwd: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// A prompt on its way to a thread (ADR-017 images ride along).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Prompt {
+    pub text: String,
+    pub images: Vec<PromptImage>,
 }
 
 /// A request we sent, by id, with what its reply means.
 enum Pending {
     Init,
+    Models,
+    Threads,
     ThreadStart {
         tag: String,
         cwd: String,
-        prompt: String,
+        prompt: Prompt,
     },
     /// `submit_prompt` to a thread whose app-server exited: the prompt
     /// follows once codex has loaded the thread again.
@@ -113,7 +174,25 @@ enum Pending {
         tag: String,
         thread: String,
         cwd: String,
-        prompt: String,
+        prompt: Prompt,
+    },
+    /// ADR-018 fork: the new thread's history, then the prompt.
+    Fork {
+        tag: String,
+        cwd: String,
+        prompt: Prompt,
+    },
+    /// `thread/items/list`: the history of `thread`; `then` = a fork's
+    /// first prompt, sent once the history is in place.
+    History {
+        thread: String,
+        cwd: String,
+        then: Option<(String, Prompt)>,
+    },
+    Rename {
+        tag: String,
+        thread: String,
+        title: String,
     },
     TurnStart {
         tag: String,
@@ -122,7 +201,7 @@ enum Pending {
     Steer {
         tag: String,
         thread: String,
-        text: String,
+        prompt: Prompt,
     },
     Interrupt {
         tag: String,
@@ -145,10 +224,13 @@ impl Pending {
     /// The phone command riding on this request, and whether it is an interrupt.
     fn tag(&self) -> Option<(&str, bool)> {
         match self {
-            Pending::Init | Pending::McpList(_) => None,
+            Pending::Init | Pending::Models | Pending::Threads | Pending::McpList(_) => None,
+            Pending::History { then, .. } => then.as_ref().map(|(tag, _)| (tag.as_str(), false)),
             Pending::Interrupt { tag, .. } => Some((tag, true)),
             Pending::ThreadStart { tag, .. }
             | Pending::ThreadResume { tag, .. }
+            | Pending::Fork { tag, .. }
+            | Pending::Rename { tag, .. }
             | Pending::TurnStart { tag, .. }
             | Pending::Steer { tag, .. }
             | Pending::McpLogin { tag, .. }
@@ -167,14 +249,27 @@ struct Ask {
 }
 
 enum AskKind {
-    Command { amendment: Option<Json> },
+    /// `available`: codex's `availableDecisions` names, when it sent them
+    /// (live: `["accept", {acceptWithExecpolicyAmendment}, "cancel"]`).
+    Command {
+        amendment: Option<Json>,
+        available: Option<Vec<String>>,
+    },
     FileChange,
-    Question { ids: Vec<String> },
+    Question {
+        ids: Vec<String>,
+    },
 }
 
 struct Thread {
     cwd: String,
     model: Option<String>,
+    /// ADR-017 `set_model`: sent with every turn/start and resume.
+    model_override: Option<String>,
+    /// The last `thread/status/changed`, for the state ops in between.
+    status: &'static str,
+    /// (used, max) tokens from `thread/tokenUsage/updated`.
+    context: Option<(i64, i64)>,
     /// The turn in progress, as far as we know.
     turn: Option<String>,
     /// The last ended turn: a reply that raced its turn/completed binds here.
@@ -200,6 +295,9 @@ struct Live {
     forwarded: usize,
     /// reasoning: which stream feeds the text (true = summary).
     summary: Option<bool>,
+    /// False for a reasoning item until it has text: codex sends many
+    /// empty ones (live), which the phone never sees.
+    shown: bool,
 }
 
 /// One `codex app-server` process: its JSON-RPC state and every session
@@ -209,6 +307,8 @@ pub struct Codex {
     io: ChildIo,
     adapter: String,
     next_id: i64,
+    /// Ids of [`Codex::background`] requests.
+    next_bg: i64,
     /// `initialized` sent; until then requests wait in `queued`.
     ready: bool,
     queued: Vec<String>,
@@ -218,6 +318,8 @@ pub struct Codex {
     turns: HashMap<String, Turn>,
     items: HashMap<String, Live>,
     mcp: Vec<McpServer>,
+    /// `model/list` (value, label), visible models only.
+    models: Vec<(String, String)>,
     /// One `mcpServerStatus/list` at a time; a trigger meanwhile re-lists once after.
     listing: bool,
     relist: bool,
@@ -246,6 +348,7 @@ impl Codex {
             io,
             adapter: adapter_id.into(),
             next_id: 1,
+            next_bg: 1 << 40,
             ready: false,
             queued: Vec::new(),
             pending: HashMap::new(),
@@ -254,6 +357,7 @@ impl Codex {
             turns: HashMap::new(),
             items: HashMap::new(),
             mcp: Vec::new(),
+            models: Vec::new(),
             listing: false,
             relist: false,
             logins: HashMap::new(),
@@ -283,6 +387,8 @@ impl Codex {
         let id = codex.alloc(Pending::Init);
         // a child that is already gone reports Exit next
         let _ = codex.io.try_send(request(id, "initialize", Some(params)));
+        // queued until `initialized`; the picker shows what this lists
+        codex.background("model/list", json::obj(vec![]), Pending::Models);
         codex
     }
 
@@ -291,20 +397,115 @@ impl Codex {
     pub fn start_session(
         &mut self,
         cwd: &str,
-        prompt: &str,
+        prompt: Prompt,
         tag: &str,
     ) -> Result<(), &'static str> {
-        let params = json::obj(vec![
-            ("cwd", json::s(cwd)),
-            ("approvalPolicy", json::s("on-request")),
-            ("sandbox", json::s("workspace-write")),
-        ]);
         let pending = Pending::ThreadStart {
             tag: tag.into(),
             cwd: cwd.into(),
-            prompt: prompt.into(),
+            prompt,
         };
-        self.call("thread/start", Some(params), pending)
+        self.call("thread/start", Some(policy(None, cwd, None)), pending)
+    }
+
+    /// ADR-018 fork of a thread on disk (`thread/fork`): a new thread with
+    /// the old one's history, then `prompt` as its first turn. The original
+    /// thread is not touched.
+    pub fn fork(
+        &mut self,
+        thread: &str,
+        cwd: &str,
+        prompt: Prompt,
+        tag: &str,
+    ) -> Result<(), &'static str> {
+        let pending = Pending::Fork {
+            tag: tag.into(),
+            cwd: cwd.into(),
+            prompt,
+        };
+        let mut params = policy(Some(thread), cwd, None);
+        if let Json::Obj(f) = &mut params {
+            // the history comes from thread/items/list (full hydration is deprecated)
+            f.push(("excludeTurns".into(), Json::Bool(true)));
+        }
+        self.call("thread/fork", Some(params), pending)
+    }
+
+    /// `thread/list` for the workspaces: answered as [`Event::Threads`].
+    pub fn list_threads(&mut self, cwds: &[String]) -> Result<(), &'static str> {
+        let params = json::obj(vec![
+            ("limit", Json::Int(THREADS_MAX)),
+            ("sortKey", json::s("updated_at")),
+            ("cwd", Json::Arr(cwds.iter().map(|c| json::s(c)).collect())),
+        ]);
+        self.call("thread/list", Some(params), Pending::Threads)
+    }
+
+    /// A thread's history (`thread/items/list`, newest [`HISTORY_ITEMS`]) as
+    /// transcript ops for `thread`, whether codex has it loaded or not.
+    pub fn history(&mut self, thread: &str, cwd: &str) -> Result<(), &'static str> {
+        self.items_list(thread, cwd, None)
+    }
+
+    fn items_list(
+        &mut self,
+        thread: &str,
+        cwd: &str,
+        then: Option<(String, Prompt)>,
+    ) -> Result<(), &'static str> {
+        let params = json::obj(vec![
+            ("threadId", json::s(thread)),
+            ("limit", Json::Int(HISTORY_ITEMS)),
+            ("sortDirection", json::s("desc")),
+        ]);
+        let pending = Pending::History {
+            thread: thread.into(),
+            cwd: cwd.into(),
+            then,
+        };
+        self.call("thread/items/list", Some(params), pending)
+    }
+
+    /// ADR-017 `set_model`: one of codex's listed models, used from the next
+    /// turn on (codex takes `model` per turn and keeps it).
+    pub fn set_model(&mut self, thread: &str, model: &str) -> Result<Vec<Event>, &'static str> {
+        // only a model codex listed (the phone's fallback list is Claude's)
+        if !self.models.iter().any(|(m, _)| m == model) {
+            return Err("Codex does not offer this model");
+        }
+        let t = self.threads.get_mut(thread).ok_or("unknown session")?;
+        t.model = Some(model.into());
+        t.model_override = Some(model.into());
+        let status = t.status;
+        Ok(vec![self.state_op(thread, status)])
+    }
+
+    /// ADR-017 `rename_session`: `thread/name/set` (codex keeps the name).
+    pub fn rename(&mut self, thread: &str, title: &str, tag: &str) -> Result<(), &'static str> {
+        let params = json::obj(vec![
+            ("threadId", json::s(thread)),
+            ("name", json::s(title)),
+        ]);
+        let pending = Pending::Rename {
+            tag: tag.into(),
+            thread: thread.into(),
+            title: title.into(),
+        };
+        self.call("thread/name/set", Some(params), pending)
+    }
+
+    /// The thread's [`LiveState`]: status plus model, models and context.
+    fn state_op(&self, thread: &str, status: &'static str) -> Event {
+        let t = self.threads.get(thread);
+        let state = LiveState {
+            status,
+            permission_mode: None,
+            model: t.and_then(|t| t.model.clone()),
+            models: self.models.clone(),
+            commands: Vec::new(),
+            context: t.and_then(|t| t.context),
+        };
+        Event::Op(thread.into(), Op::State(state))
     }
 
     /// `submit_prompt` to a session whose app-server exited (ADR-015 §10):
@@ -314,33 +515,38 @@ impl Codex {
         &mut self,
         thread: &str,
         cwd: &str,
-        prompt: &str,
+        model: Option<&str>,
+        prompt: Prompt,
         tag: &str,
     ) -> Result<Vec<Event>, &'static str> {
         if self.resuming.contains(thread) {
             return Err("Codex is still resuming this session; send again in a moment");
         }
-        let params = json::obj(vec![
-            ("threadId", json::s(thread)),
-            ("cwd", json::s(cwd)),
-            ("approvalPolicy", json::s("on-request")),
-            ("sandbox", json::s("workspace-write")),
-        ]);
         let pending = Pending::ThreadResume {
             tag: tag.into(),
             thread: thread.into(),
             cwd: cwd.into(),
-            prompt: prompt.into(),
+            prompt,
         };
+        let mut params = policy(Some(thread), cwd, model);
+        if let Json::Obj(f) = &mut params {
+            // the phone has the history already
+            f.push(("excludeTurns".into(), Json::Bool(true)));
+        }
         self.call("thread/resume", Some(params), pending)?;
         self.resuming.insert(thread.into());
         let state = LiveState {
             status: "starting",
-            permission_mode: None,
-            model: None,
+            model: model.map(str::to_string),
+            models: self.models.clone(),
             ..Default::default()
         };
         Ok(vec![Event::Op(thread.into(), Op::State(state))])
+    }
+
+    /// The model `set_model` chose for a live thread (kept across a respawn).
+    pub fn model_override(&self, thread: &str) -> Option<String> {
+        self.threads.get(thread)?.model_override.clone()
     }
 
     /// `submit_prompt`: steers the running turn, or starts one when idle. The
@@ -348,11 +554,11 @@ impl Codex {
     pub fn prompt(
         &mut self,
         thread: &str,
-        text: &str,
+        prompt: Prompt,
         tag: &str,
     ) -> Result<Vec<Event>, &'static str> {
         let mut out = Vec::new();
-        self.send_prompt(thread, text, tag, &mut out)?;
+        self.send_prompt(thread, prompt, tag, &mut out)?;
         Ok(out)
     }
 
@@ -549,43 +755,61 @@ impl Codex {
         if self.exited {
             return Err("Codex has exited");
         }
-        let frame = request(self.next_id, method, params);
-        if self.ready {
-            self.io.try_send(frame)?;
-        } else {
-            self.queued.push(frame);
-        }
+        let id = self.next_id;
+        self.write(request(id, method, params))?;
         self.alloc(pending);
         Ok(())
+    }
+
+    /// A request of the companion's own (`model/list`): numbered apart from
+    /// the commands' requests, so neither shifts the other.
+    fn background(&mut self, method: &str, params: Json, pending: Pending) {
+        if self.exited {
+            return;
+        }
+        let id = self.next_bg;
+        if self.write(request(id, method, Some(params))).is_ok() {
+            self.next_bg += 1;
+            self.pending.insert(id, pending);
+        }
+    }
+
+    fn write(&mut self, frame: String) -> Result<(), &'static str> {
+        if self.ready {
+            self.io.try_send(frame)
+        } else {
+            self.queued.push(frame);
+            Ok(())
+        }
     }
 
     fn send_prompt(
         &mut self,
         thread: &str,
-        text: &str,
+        prompt: Prompt,
         tag: &str,
         out: &mut Vec<Event>,
     ) -> Result<(), &'static str> {
-        let active = self
-            .threads
-            .get(thread)
-            .ok_or("unknown session")?
-            .turn
-            .clone();
-        let mut params = vec![("threadId", json::s(thread)), ("input", input(text))];
+        let t = self.threads.get(thread).ok_or("unknown session")?;
+        let (active, model) = (t.turn.clone(), t.model_override.clone());
+        let mut params = vec![("threadId", json::s(thread)), ("input", input(&prompt))];
+        let (text, images) = (redact(&prompt.text), prompt.images.len());
         match active {
             Some(turn) => {
                 params.push(("expectedTurnId", json::s(&turn)));
                 let pending = Pending::Steer {
                     tag: tag.into(),
                     thread: thread.into(),
-                    text: text.into(),
+                    prompt,
                 };
                 self.call("turn/steer", Some(json::obj(params)), pending)?;
             }
             // codex steers a turn/start on a busy thread as well, so a turn we
             // have not heard of yet is fine
             None => {
+                if let Some(m) = model {
+                    params.push(("model", json::s(&m)));
+                }
                 let pending = Pending::TurnStart {
                     tag: tag.into(),
                     thread: thread.into(),
@@ -595,7 +819,8 @@ impl Codex {
         }
         self.seq += 1;
         let mut user = new_item(&format!("user:{}", self.seq), ItemKind::User, None);
-        user.text = redact(text);
+        user.text = text;
+        user.images = images as u32;
         out.push(Event::Op(thread.into(), Op::Item(user)));
         Ok(())
     }
@@ -684,8 +909,70 @@ impl Codex {
                     self.list();
                 }
             }
+            (Pending::Models, Ok(r)) => {
+                let data = json::get(&r, "data").and_then(json::as_arr).unwrap_or(&[]);
+                self.models = data
+                    .iter()
+                    .filter(|m| json::get_bool(m, "hidden") != Some(true))
+                    .filter_map(|m| {
+                        let id = json::get_str(m, "model").or(json::get_str(m, "id"))?;
+                        let label = json::get_str(m, "displayName").unwrap_or(id);
+                        Some((id.to_string(), label.to_string()))
+                    })
+                    .collect();
+                let threads: Vec<(String, &'static str)> = self
+                    .threads
+                    .iter()
+                    .map(|(id, t)| (id.clone(), t.status))
+                    .collect();
+                for (thread, status) in threads {
+                    out.push(self.state_op(&thread, status));
+                }
+            }
+            (Pending::Threads, Ok(r)) => {
+                let data = json::get(&r, "data").and_then(json::as_arr).unwrap_or(&[]);
+                out.push(Event::Threads(
+                    data.iter().filter_map(found_thread).collect(),
+                ));
+            }
             (Pending::ThreadStart { tag, cwd, prompt }, Ok(r)) => {
-                self.thread_started(&r, tag, cwd, &prompt, out)
+                self.thread_started(&r, tag, cwd, prompt, out)
+            }
+            (Pending::Fork { tag, cwd, prompt }, Ok(r)) => {
+                let Some(thread) = json::get(&r, "thread").and_then(|t| json::get_str(t, "id"))
+                else {
+                    return out.push(failed(tag, "thread/fork returned no thread".into()));
+                };
+                let thread = thread.to_string();
+                out.push(Event::SessionStarted {
+                    tag: tag.clone(),
+                    thread: thread.clone(),
+                });
+                if let Err(e) = self.items_list(&thread, &cwd, Some((tag.clone(), prompt))) {
+                    out.push(failed(tag, e.into()));
+                }
+            }
+            (Pending::History { thread, cwd, then }, res) => {
+                match &res {
+                    Ok(r) => {
+                        let data = json::get(r, "data").and_then(json::as_arr).unwrap_or(&[]);
+                        let ops = history_ops(data.iter().rev(), &cwd);
+                        out.extend(ops.into_iter().map(|op| Event::Op(thread.clone(), op)));
+                    }
+                    Err(e) => {
+                        let text = format!("The history of this session could not be read: {e}");
+                        out.push(self.notice(&thread, "warning", &text, None));
+                    }
+                }
+                if let Some((tag, prompt)) = then {
+                    let text = "Forked from a Codex thread; the original thread is unchanged";
+                    out.push(self.notice(&thread, "info", text, None));
+                    self.open_thread(&thread, cwd, None, tag, prompt, out);
+                }
+            }
+            (Pending::Rename { tag, thread, title }, Ok(_)) => {
+                out.push(Event::Renamed { thread, title });
+                out.push(done(tag, "completed", None));
             }
             (
                 Pending::ThreadResume {
@@ -700,7 +987,7 @@ impl Codex {
                 match res {
                     Ok(r) => {
                         let model = json::get_str(&r, "model").map(str::to_string);
-                        self.open_thread(&thread, cwd, model, tag, &prompt, out);
+                        self.open_thread(&thread, cwd, model, tag, prompt, out);
                     }
                     // the thread is gone for good: the session ends
                     Err(e) => {
@@ -720,14 +1007,21 @@ impl Codex {
                 Some(turn) => self.bind(tag, &thread, turn, false, out),
                 None => out.push(failed(tag, "turn/steer returned no turn".into())),
             },
-            (Pending::Steer { tag, thread, text }, Err(e)) if e.contains("no active turn") => {
+            (
+                Pending::Steer {
+                    tag,
+                    thread,
+                    prompt,
+                },
+                Err(e),
+            ) if e.contains("no active turn") => {
                 // the turn ended before the steer landed: start one with the same input
                 if let Some(t) = self.threads.get_mut(&thread) {
                     t.turn = None;
                 }
                 let params = json::obj(vec![
                     ("threadId", json::s(&thread)),
-                    ("input", input(&text)),
+                    ("input", input(&prompt)),
                 ]);
                 let pending = Pending::TurnStart {
                     tag: tag.clone(),
@@ -785,7 +1079,7 @@ impl Codex {
         r: &Json,
         tag: String,
         cwd: String,
-        prompt: &str,
+        prompt: Prompt,
         out: &mut Vec<Event>,
     ) {
         let Some(thread) = json::get(r, "thread").and_then(|t| json::get_str(t, "id")) else {
@@ -811,23 +1105,20 @@ impl Codex {
         cwd: String,
         model: Option<String>,
         tag: String,
-        prompt: &str,
+        prompt: Prompt,
         out: &mut Vec<Event>,
     ) {
         let state = Thread {
             cwd,
-            model: model.clone(),
+            model_override: None,
+            model,
+            status: "idle",
+            context: None,
             turn: None,
             last: None,
         };
         self.threads.insert(thread.into(), state);
-        let state = LiveState {
-            status: "idle",
-            permission_mode: None,
-            model,
-            ..Default::default()
-        };
-        out.push(Event::Op(thread.into(), Op::State(state)));
+        out.push(self.state_op(thread, "idle"));
         out.push(Event::Op(thread.into(), Op::Mcp(self.mcp_view())));
         if let Err(e) = self.send_prompt(thread, prompt, &tag, out) {
             out.push(done(tag, "failed", Some(e.into())));
@@ -999,7 +1290,10 @@ impl Codex {
                     "Codex wants to run a command"
                 }
                 .into();
-                pr.command = clip(&command, COMMAND_CAP).0;
+                // the headline is what codex parsed out of its shell wrapper;
+                // the detail keeps the full command line that runs
+                let title = command_title(p).unwrap_or_else(|| first_line(&command));
+                pr.command = clip(&title, COMMAND_CAP).0;
                 pr.detail = Some(detail_shell(&command, json::get_str(p, "cwd"), &reason));
                 // an empty prefix would allow every command: never offered
                 let amendment = json::get(p, "proposedExecpolicyAmendment")
@@ -1009,10 +1303,20 @@ impl Codex {
                         })
                     })
                     .cloned();
+                // a decision codex did not list is never offered
+                let available = json::get(p, "availableDecisions")
+                    .and_then(json::as_arr)
+                    .map(|list| list.iter().filter_map(decision_name).collect());
                 let mut card = new_tool("shell", ToolStatus::Running);
-                card.title = Some(first_line(&command));
+                card.title = Some(title);
                 card.input = command;
-                (AskKind::Command { amendment }, card)
+                (
+                    AskKind::Command {
+                        amendment,
+                        available,
+                    },
+                    card,
+                )
             }
             "item/fileChange/requestApproval" => {
                 // the diff came with item/started (codex starts the item, then asks)
@@ -1170,7 +1474,16 @@ impl Codex {
                     out.push(Event::Op(live.thread.clone(), Op::Item(live.item.clone())));
                 }
                 live.summary = Some(summary);
-                out.push(append_text(live, delta, THINKING_CAP));
+                if live.shown {
+                    out.push(append_text(live, delta, THINKING_CAP));
+                } else {
+                    // the first words of an item the phone has not seen yet
+                    live.shown = true;
+                    (live.item.text, live.item.truncated) = clip(delta, THINKING_CAP);
+                    let mut it = live.item.clone();
+                    it.text = redact(&it.text);
+                    out.push(Event::Op(live.thread.clone(), Op::Item(it)));
+                }
             }
             "item/reasoning/summaryPartAdded" => {
                 if let Some(live) = self.live(p)
@@ -1213,10 +1526,20 @@ impl Codex {
                 }
             }
             "thread/tokenUsage/updated" => {
-                let Some(last) = json::get(p, "tokenUsage").and_then(|u| json::get(u, "last"))
-                else {
+                let usage = json::get(p, "tokenUsage");
+                let Some(last) = usage.and_then(|u| json::get(u, "last")) else {
                     return;
                 };
+                // ADR-017 context meter: what the last request put in the window
+                let window = usage.and_then(|u| json::get_i64(u, "modelContextWindow"));
+                if let (Some(max), Some(used)) = (window, json::get_i64(last, "totalTokens"))
+                    && let Some(t) = self.threads.get_mut(&thread)
+                    && max > 0
+                {
+                    t.context = Some((used, max));
+                    let status = t.status;
+                    out.push(self.state_op(&thread, status));
+                }
                 let usage = Usage {
                     input: json::get_i64(last, "inputTokens").unwrap_or(0),
                     output: json::get_i64(last, "outputTokens").unwrap_or(0),
@@ -1259,14 +1582,16 @@ impl Codex {
                     }
                     _ => return,
                 };
-                let model = self.threads.get(&thread).and_then(|t| t.model.clone());
-                let state = LiveState {
-                    status,
-                    permission_mode: None,
-                    model,
-                    ..Default::default()
-                };
-                out.push(Event::Op(thread, Op::State(state)));
+                if let Some(t) = self.threads.get_mut(&thread) {
+                    t.status = status;
+                }
+                out.push(self.state_op(&thread, status));
+            }
+            "thread/name/updated" => {
+                if let Some(title) = json::get_str(p, "threadName") {
+                    let title = clip(&redact(title), TITLE_CAP).0;
+                    out.push(Event::Renamed { thread, title });
+                }
             }
             "error" => {
                 let message = json::get(p, "error").and_then(|e| json::get_str(e, "message"));
@@ -1300,44 +1625,25 @@ impl Codex {
             return;
         }
         let prev = self.items.remove(id);
-        let mut it = new_item(
-            id,
-            ItemKind::Tool,
-            json::get_str(p, "turnId").map(str::to_string),
-        );
-        if let Some(prev) = &prev {
-            it.ts = prev.item.ts;
+        let cwd = self.threads.get(&thread).map_or("", |t| t.cwd.as_str());
+        let turn = json::get_str(p, "turnId");
+        let Some(it) = decode(item, turn, completed, prev.as_ref().map(|l| &l.item), cwd) else {
+            return;
+        };
+        if it.kind == ItemKind::Notice {
+            return out.push(Event::Op(thread, Op::Item(it)));
         }
-        match kind {
-            "contextCompaction" => {
-                it.kind = ItemKind::Notice;
-                it.level = Some("info");
-                it.text = "Context compacted".into();
-                return out.push(Event::Op(thread, Op::Item(it)));
-            }
-            "agentMessage" | "plan" => {
-                it.kind = ItemKind::Text;
-                let text = json::get_str(item, "text").unwrap_or("");
-                (it.text, it.truncated) = clip(&redact(text), TEXT_CAP);
-                it.done = completed;
-            }
-            "reasoning" => {
-                it.kind = ItemKind::Thinking;
-                let mut text = strings(json::get(item, "summary")).join("\n\n");
-                if text.is_empty() {
-                    text = strings(json::get(item, "content")).join("\n\n");
-                }
-                (it.text, it.truncated) = clip(&redact(&text), THINKING_CAP);
-                it.done = completed;
-            }
-            _ => {
-                let prev_tool = prev.as_ref().and_then(|l| l.item.tool.as_ref());
-                it.tool = Some(tool_call(kind, item, completed, prev_tool));
-            }
+        // an empty reasoning item waits for its first words (codex sends many)
+        let shown = it.kind != ItemKind::Thinking
+            || !it.text.is_empty()
+            || prev.as_ref().is_some_and(|l| l.shown);
+        if shown {
+            out.push(Event::Op(thread.clone(), Op::Item(it.clone())));
         }
-        out.push(Event::Op(thread.clone(), Op::Item(it.clone())));
         if !completed {
-            self.items.insert(id.into(), Live::new(&thread, it));
+            let mut live = Live::new(&thread, it);
+            live.shown = shown;
+            self.items.insert(id.into(), live);
         }
     }
 
@@ -1389,7 +1695,7 @@ impl Codex {
         let ended = self
             .items
             .extract_if(|_, l| turn.is_none() || l.item.turn_id.as_deref() == turn);
-        for (_, mut l) in ended {
+        for (_, mut l) in ended.filter(|(_, l)| l.shown) {
             match l.item.tool.as_mut() {
                 Some(t) => t.status = ToolStatus::Cancelled,
                 None => {
@@ -1581,6 +1887,7 @@ impl Live {
             line: String::new(),
             forwarded: 0,
             summary: None,
+            shown: true,
         }
     }
 }
@@ -1695,7 +2002,13 @@ fn output_delta(live: &mut Live, delta: &str) -> Option<Event> {
 
 /// A codex ThreadItem as a tool card (§3.6). `prev` is the card the phone
 /// has already: its approval link and the output streamed so far.
-fn tool_call(kind: &str, item: &Json, completed: bool, prev: Option<&ToolCall>) -> ToolCall {
+fn tool_call(
+    kind: &str,
+    item: &Json,
+    completed: bool,
+    prev: Option<&ToolCall>,
+    cwd: &str,
+) -> ToolCall {
     let status = match json::get_str(item, "status") {
         Some("completed") => ToolStatus::Completed,
         Some("failed") => ToolStatus::Failed,
@@ -1714,7 +2027,7 @@ fn tool_call(kind: &str, item: &Json, completed: bool, prev: Option<&ToolCall>) 
         "commandExecution" => {
             let command = redact(json::get_str(item, "command").unwrap_or(""));
             t.name = "shell".into();
-            t.title = Some(first_line(&command));
+            t.title = Some(command_title(item).unwrap_or_else(|| first_line(&command)));
             if let Some(all) = json::get_str(item, "aggregatedOutput") {
                 (t.output, t.output_truncated) = head_tail(&redact(all), OUTPUT_CAP);
             }
@@ -1728,7 +2041,7 @@ fn tool_call(kind: &str, item: &Json, completed: bool, prev: Option<&ToolCall>) 
             let changes = json::get(item, "changes")
                 .and_then(json::as_arr)
                 .unwrap_or(&[]);
-            t.diffs = changes.iter().filter_map(change_diff).collect();
+            t.diffs = changes.iter().filter_map(|c| change_diff(c, cwd)).collect();
             t.title = Some(paths_title(&t.diffs));
         }
         "mcpToolCall" => {
@@ -1778,6 +2091,157 @@ fn first_line(s: &str) -> String {
     }
 }
 
+/// A codex `ThreadItem` as a transcript item, for live items and history
+/// alike. `prev` is what the phone already has of it. `None`: nothing to show.
+fn decode(
+    item: &Json,
+    turn: Option<&str>,
+    completed: bool,
+    prev: Option<&Item>,
+    cwd: &str,
+) -> Option<Item> {
+    let (id, kind) = (json::get_str(item, "id")?, json::get_str(item, "type")?);
+    let mut it = new_item(id, ItemKind::Tool, turn.map(str::to_string));
+    if let Some(ts) = prev
+        .map(|p| p.ts)
+        .or_else(|| json::get_i64(item, "startedAtMs"))
+    {
+        it.ts = ts;
+    }
+    match kind {
+        "userMessage" => {
+            let parts = json::get(item, "content")
+                .and_then(json::as_arr)
+                .unwrap_or(&[]);
+            let text: Vec<&str> = parts
+                .iter()
+                .filter_map(|p| json::get_str(p, "text"))
+                .collect();
+            it.kind = ItemKind::User;
+            (it.text, it.truncated) = clip(&redact(&text.join("\n")), TEXT_CAP);
+            it.images = parts
+                .iter()
+                .filter(|p| matches!(json::get_str(p, "type"), Some("image" | "localImage")))
+                .count() as u32;
+        }
+        "contextCompaction" => {
+            it.kind = ItemKind::Notice;
+            it.level = Some("info");
+            it.text = "Context compacted".into();
+        }
+        "agentMessage" | "plan" => {
+            it.kind = ItemKind::Text;
+            let text = json::get_str(item, "text").unwrap_or("");
+            (it.text, it.truncated) = clip(&redact(text), TEXT_CAP);
+            it.done = completed;
+        }
+        "reasoning" => {
+            it.kind = ItemKind::Thinking;
+            let mut text = strings(json::get(item, "summary")).join("\n\n");
+            if text.is_empty() {
+                text = strings(json::get(item, "content")).join("\n\n");
+            }
+            (it.text, it.truncated) = clip(&redact(&text), THINKING_CAP);
+            it.done = completed;
+        }
+        _ => {
+            let prev_tool = prev.and_then(|p| p.tool.as_ref());
+            it.tool = Some(tool_call(kind, item, completed, prev_tool, cwd));
+        }
+    }
+    Some(it)
+}
+
+/// `thread/items/list` entries (oldest first) as a finished transcript:
+/// tools still `inProgress` on disk were cut off, so they are cancelled.
+fn history_ops<'a>(entries: impl Iterator<Item = &'a Json>, cwd: &str) -> Vec<Op> {
+    let mut ops = Vec::new();
+    for e in entries {
+        let Some(item) = json::get(e, "item") else {
+            continue;
+        };
+        let turn = json::get_str(e, "turnId");
+        let Some(mut it) = decode(item, turn, true, None, cwd) else {
+            continue;
+        };
+        if it.kind == ItemKind::Thinking && it.text.is_empty() {
+            continue;
+        }
+        if let Some(t) = it.tool.as_mut().filter(|t| t.status == ToolStatus::Running) {
+            t.status = ToolStatus::Cancelled;
+        }
+        it.done = true;
+        ops.push(Op::Item(it));
+    }
+    ops.push(Op::State(LiveState::default()));
+    ops
+}
+
+/// The phone's session title: at most this many bytes.
+const TITLE_CAP: usize = 200;
+
+/// One `thread/list` entry; subagent and ephemeral threads are not listed.
+fn found_thread(t: &Json) -> Option<FoundThread> {
+    if json::get_bool(t, "ephemeral") == Some(true) || json::get_str(t, "parentThreadId").is_some()
+    {
+        return None;
+    }
+    let named = json::get_str(t, "name").filter(|n| !n.trim().is_empty());
+    let title = named
+        .or_else(|| json::get_str(t, "preview"))
+        .map(|s| {
+            s.lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Codex thread");
+    let secs = |k| json::get_i64(t, k).unwrap_or(0) * 1000;
+    Some(FoundThread {
+        id: json::get_str(t, "id")?.into(),
+        title: clip(&redact(title), TITLE_CAP).0,
+        cwd: json::get_str(t, "cwd")?.into(),
+        created_at: secs("createdAt"),
+        updated_at: secs("updatedAt"),
+    })
+}
+
+/// What a command does, as codex parsed it out of its shell wrapper (live:
+/// `"…\powershell.exe" -Command 'git add x'` → `git add x`).
+fn command_title(v: &Json) -> Option<String> {
+    let actions = json::get(v, "commandActions").and_then(json::as_arr)?;
+    let parts: Vec<String> = actions
+        .iter()
+        .filter_map(|a| json::get_str(a, "command"))
+        .map(|c| redact(&first_line(c)))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" && "))
+}
+
+/// The variant name of a `CommandExecutionApprovalDecision`.
+fn decision_name(d: &Json) -> Option<String> {
+    match d {
+        Json::Str(s) => Some(s.clone()),
+        Json::Obj(f) => f.first().map(|(k, _)| k.clone()),
+        _ => None,
+    }
+}
+
+/// A file codex names by absolute path (live), shown relative to the
+/// thread's folder with forward slashes, as `turn/diff/updated` names it.
+fn relative(path: &str, cwd: &str) -> String {
+    // same byte lengths as the originals, so `c.len()` indexes `path`
+    let norm = |s: &str| s.to_ascii_lowercase().replace('\\', "/");
+    let (p, c) = (norm(path), norm(cwd.trim_end_matches(['\\', '/'])));
+    if !c.is_empty() && p.len() > c.len() + 1 && p.starts_with(&c) && p.as_bytes()[c.len()] == b'/'
+    {
+        path[c.len() + 1..].replace('\\', "/")
+    } else {
+        path.into()
+    }
+}
+
 fn paths_title(diffs: &[FileDiff]) -> String {
     match diffs {
         [] => String::new(),
@@ -1789,8 +2253,8 @@ fn paths_title(diffs: &[FileDiff]) -> String {
 /// One FileUpdateChange as a FileDiff. Codex sends a unified diff for
 /// `update` (plus "\n\nMoved to: <path>" when renamed) and the whole file for
 /// `add` and `delete` (item_builders.rs `format_file_change_diff`).
-fn change_diff(change: &Json) -> Option<FileDiff> {
-    let path = json::get_str(change, "path")?;
+fn change_diff(change: &Json, cwd: &str) -> Option<FileDiff> {
+    let path = &relative(json::get_str(change, "path")?, cwd);
     let kind = json::get(change, "kind");
     let raw = json::get_str(change, "diff").unwrap_or("");
     let moved = kind.and_then(|k| json::get_str(k, "move_path"));
@@ -1800,7 +2264,8 @@ fn change_diff(change: &Json) -> Option<FileDiff> {
         _ => match moved {
             Some(to) => {
                 let trailer = format!("\n\nMoved to: {to}");
-                file_diff(to, "renamed", raw.strip_suffix(&trailer).unwrap_or(raw))
+                let patch = raw.strip_suffix(&trailer).unwrap_or(raw);
+                file_diff(&relative(to, cwd), "renamed", patch)
             }
             None => file_diff(path, "modified", raw),
         },
@@ -1933,7 +2398,10 @@ fn options(kind: &AskKind) -> Vec<PermissionOption> {
             "session",
         ),
     ];
-    if let AskKind::Command { amendment: Some(a) } = kind {
+    if let AskKind::Command {
+        amendment: Some(a), ..
+    } = kind
+    {
         let rule = redact(&strings(Some(a)).join(" "));
         let label = format!("Always allow commands starting with `{rule}`");
         offered.push(PermissionOption {
@@ -1951,6 +2419,13 @@ fn options(kind: &AskKind) -> Vec<PermissionOption> {
         stops_turn: true,
         ..option("cancel", "reject", "Deny and stop", "once")
     });
+    if let AskKind::Command {
+        available: Some(names),
+        ..
+    } = kind
+    {
+        offered.retain(|o| names.contains(&o.id));
+    }
     offered
 }
 
@@ -1971,6 +2446,7 @@ fn answer(kind: &AskKind, option: &str, answers: &[(String, Vec<String>)]) -> Js
         }
         AskKind::Command {
             amendment: Some(amendment),
+            ..
         } if option == "acceptWithExecpolicyAmendment" => {
             let inner = json::obj(vec![("execpolicy_amendment", amendment.clone())]);
             json::obj(vec![(
@@ -2101,11 +2577,38 @@ fn reply_error(id: &Json, message: &str) -> String {
     json::stringify(&json::obj(vec![("id", id.clone()), ("error", error)]))
 }
 
-fn input(text: &str) -> Json {
-    Json::Arr(vec![json::obj(vec![
+/// `UserInput[]`: ADR-017 images first, as `data:` URLs (`{type: "image",
+/// url}`, accepted live), then the text.
+fn input(prompt: &Prompt) -> Json {
+    let mut list: Vec<Json> = prompt
+        .images
+        .iter()
+        .map(|im| {
+            let url = format!("data:{};base64,{}", im.media_type, im.data);
+            json::obj(vec![("type", json::s("image")), ("url", json::s(&url))])
+        })
+        .collect();
+    list.push(json::obj(vec![
         ("type", json::s("text")),
-        ("text", json::s(text)),
-    ])])
+        ("text", json::s(&prompt.text)),
+    ]));
+    Json::Arr(list)
+}
+
+/// `thread/start` | `thread/resume` | `thread/fork` params: the thread, its
+/// folder, the model and the policy ([`APPROVAL_POLICY`], [`SANDBOX`]).
+fn policy(thread: Option<&str>, cwd: &str, model: Option<&str>) -> Json {
+    let mut f = Vec::new();
+    if let Some(t) = thread {
+        f.push(("threadId", json::s(t)));
+    }
+    f.push(("cwd", json::s(cwd)));
+    if let Some(m) = model {
+        f.push(("model", json::s(m)));
+    }
+    f.push(("approvalPolicy", json::s(APPROVAL_POLICY)));
+    f.push(("sandbox", json::s(SANDBOX)));
+    json::obj(f)
 }
 
 /// The id of a line json.rs refused (nesting past 32): codex writes `id`
@@ -2133,13 +2636,28 @@ fn salvage(line: &str) -> Option<(i64, bool)> {
 /// "binary": null, "args": []}`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchConfig {
-    pub binary: PathBuf,
+    /// `None`: found by [`find_codex`] at every spawn, so an update of the
+    /// Codex app (a new `bin\<hash>` folder) never breaks a configured agent.
+    pub binary: Option<PathBuf>,
     /// Before `app-server`; lets tests run `node fake-codex-app-server.mjs`.
     pub args: Vec<String>,
     pub workspaces: Vec<LiveWorkspace>,
 }
 
 impl LaunchConfig {
+    /// The binary to spawn now: the configured one, else [`find_codex`].
+    pub fn resolve_binary(&self) -> Result<PathBuf, String> {
+        match &self.binary {
+            Some(b) => Ok(b.clone()),
+            None => find_codex(
+                std::env::var_os("PATH").as_deref(),
+                std::env::var_os("LOCALAPPDATA")
+                    .map(PathBuf::from)
+                    .as_deref(),
+            ),
+        }
+    }
+
     /// `<binary> <args…> app-server` for `ChildIo::spawn` (no shell; prompts
     /// go on stdin, never argv).
     pub fn argv(&self) -> Vec<String> {
@@ -2166,8 +2684,8 @@ impl LaunchConfig {
 /// user profile or a folder containing the CHERNOBYL data directory.
 pub fn launch_config(entry: &Json, data_dir: &Path) -> Result<LaunchConfig, String> {
     let binary = match json::get(entry, "binary") {
-        None | Some(Json::Null) => PathBuf::from("codex.exe"),
-        Some(Json::Str(b)) if !b.is_empty() => PathBuf::from(b),
+        None | Some(Json::Null) => None,
+        Some(Json::Str(b)) if !b.is_empty() => Some(PathBuf::from(b)),
         _ => return Err("codex 'binary' must be a non-empty string or null".into()),
     };
     let args = match json::get(entry, "args") {
@@ -2201,6 +2719,45 @@ pub fn launch_config(entry: &Json, data_dir: &Path) -> Result<LaunchConfig, Stri
         binary,
         args,
         workspaces,
+    })
+}
+
+/// `codex.exe` when the config names none: the first real one on `path`,
+/// else the newest the Codex desktop app installed
+/// (`<local_app_data>\OpenAI\Codex\bin\<hash>\codex.exe`; the hash folder
+/// changes with app updates, and some hold no codex.exe). The Store's 0-byte
+/// app-execution aliases (anything under a `WindowsApps` folder) are never
+/// taken: they are not the CLI and cannot be spawned with piped stdio.
+pub fn find_codex(path: Option<&OsStr>, local_app_data: Option<&Path>) -> Result<PathBuf, String> {
+    let real = |p: &Path| {
+        p.metadata().is_ok_and(|m| m.is_file() && m.len() > 0)
+            && !p
+                .components()
+                .any(|c| c.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+    };
+    let on_path = path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join("codex.exe"))
+        .find(|p| real(p));
+    if let Some(p) = on_path {
+        return Ok(p);
+    }
+    let bin = local_app_data.map(|d| d.join("OpenAI").join("Codex").join("bin"));
+    let newest = bin
+        .and_then(|b| std::fs::read_dir(b).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let exe = e.ok()?.path().join("codex.exe");
+            let modified = exe.metadata().ok()?.modified().ok()?;
+            real(&exe).then_some((modified, exe))
+        })
+        .max_by_key(|(modified, _)| *modified);
+    newest.map(|(_, exe)| exe).ok_or_else(|| {
+        "Codex was not found: install the Codex app (or put codex.exe on PATH), or set \
+         \"binary\" in companion.json"
+            .into()
     })
 }
 
@@ -2250,7 +2807,7 @@ fn canonical(p: &Path) -> io::Result<PathBuf> {
 }
 
 /// `inner` is `outer` or inside it; Windows paths compare without case.
-fn within(inner: &Path, outer: &Path) -> bool {
+pub(crate) fn within(inner: &Path, outer: &Path) -> bool {
     let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
     lower(inner).starts_with(lower(outer))
 }
@@ -2262,6 +2819,13 @@ fn within(inner: &Path, outer: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn p(text: &str) -> Prompt {
+        Prompt {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
     use std::io::{BufRead, BufReader, Write};
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
@@ -2284,7 +2848,9 @@ mod tests {
         let (child, events) = ChildIo::from_pipes(core_stdout, core_stdin).unwrap();
         let (tx, frames) = mpsc::channel();
         thread::spawn(move || {
-            for line in BufReader::new(from_core).lines().map_while(Result::ok) {
+            // the core's own model/list (a background id) is not under test here
+            let lines = BufReader::new(from_core).lines().map_while(Result::ok);
+            for line in lines.filter(|l| !l.contains(r#""method":"model/list""#)) {
                 if tx.send(line).is_err() {
                     return;
                 }
@@ -2347,7 +2913,7 @@ mod tests {
         peer.recv();
         peer.send(&mut codex, INIT_OK);
         peer.recv();
-        codex.start_session(r"C:\work", "hello", "c1").unwrap();
+        codex.start_session(r"C:\work", p("hello"), "c1").unwrap();
         peer.recv();
         peer.send(
             &mut codex,
@@ -2418,6 +2984,17 @@ mod tests {
                     assert_eq!(thread, "thr_1");
                     Some(op)
                 }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The items of `events`, on any thread.
+    fn any_items(events: &[Event]) -> Vec<&Item> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Op(_, Op::Item(i)) => Some(i),
                 _ => None,
             })
             .collect()
@@ -2532,13 +3109,13 @@ mod tests {
             r#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"chernobyl","title":"CHERNOBYL","version":"9.9.9"},"capabilities":{"experimentalApi":false}}}"#
         );
         // a session asked for during the handshake waits for `initialized`
-        codex.start_session(r"C:\work", "hello", "c1").unwrap();
+        codex.start_session(r"C:\work", p("hello"), "c1").unwrap();
         peer.quiet();
         assert!(peer.send(&mut codex, INIT_OK).is_empty());
         assert_eq!(peer.recv(), r#"{"method":"initialized"}"#);
         assert_eq!(
             peer.recv(),
-            r#"{"id":2,"method":"thread/start","params":{"cwd":"C:\\work","approvalPolicy":"on-request","sandbox":"workspace-write"}}"#
+            r#"{"id":2,"method":"thread/start","params":{"cwd":"C:\\work","approvalPolicy":"untrusted","sandbox":"danger-full-access"}}"#
         );
         // the reply's `sandbox` is a policy object, not the mode string we sent
         let events = peer.send(
@@ -2770,7 +3347,7 @@ mod tests {
             (card.name.as_str(), card.title.as_deref(), card.status),
             (
                 "apply_patch",
-                Some(r"C:\work\src\greeting.txt (+3 more)"),
+                Some("src/greeting.txt (+3 more)"),
                 ToolStatus::Running
             )
         );
@@ -2791,27 +3368,21 @@ mod tests {
             shape,
             [
                 (
-                    r"C:\work\src\greeting.txt",
+                    "src/greeting.txt",
                     "modified",
                     1,
                     1,
                     "@@ -1,3 +1,3 @@\n line one\n-hello world\n+hello codex\n line three\n"
                 ),
                 (
-                    r"C:\work\src\notes.md",
+                    "src/notes.md",
                     "added",
                     3,
                     0,
                     "@@ -0,0 +1,3 @@\n+# Notes\n+\n+Created by the fake app-server.\n"
                 ),
-                (
-                    r"C:\work\old.txt",
-                    "deleted",
-                    0,
-                    1,
-                    "@@ -1,1 +0,0 @@\n-bye\n"
-                ),
-                (r"C:\work\b.txt", "renamed", 1, 1, "@@ -1 +1 @@\n-a\n+b\n"),
+                ("old.txt", "deleted", 0, 1, "@@ -1,1 +0,0 @@\n-bye\n"),
+                ("b.txt", "renamed", 1, 1, "@@ -1 +1 @@\n-a\n+b\n"),
             ]
         );
         // codex starts the item, then asks: the approval points at the card and carries its diff
@@ -2890,6 +3461,202 @@ mod tests {
         // the turn footer keeps them
         let events = peer.note(&mut codex, "turn/completed", &turn_completed("completed"));
         assert_eq!(turn_op(&events).diffs.len(), 3);
+    }
+
+    /// Live shapes (codex-cli 0.167.0-alpha.4.1): `availableDecisions`, the
+    /// PowerShell wrapper, absolute fileChange paths.
+    #[test]
+    fn live_shapes_offer_only_listed_decisions_and_readable_titles() {
+        let (mut codex, mut peer) = session();
+        let ask = r#"{"id":1,"method":"item/commandExecution/requestApproval","params":{"kind":"command","threadId":"thr_1","turnId":"turn_1","itemId":"exec-1","startedAtMs":1,"environmentId":"local","command":"\"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\" -Command 'git add probe.txt'","cwd":"C:\\work","commandActions":[{"type":"unknown","command":"git add probe.txt"}],"proposedExecpolicyAmendment":["git","add","probe.txt"],"availableDecisions":["accept",{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","add","probe.txt"]}},"cancel"]}}"#;
+        let events = peer.send(&mut codex, ask);
+        let pr = permission(&events).clone();
+        let ids: Vec<&str> = pr.options.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, ["accept", "acceptWithExecpolicyAmendment", "cancel"]);
+        assert_eq!(pr.supported_decisions, ["approve-once", "reject"]);
+        assert_eq!(pr.command, "git add probe.txt");
+        let detail = json::stringify(pr.detail.as_ref().unwrap());
+        assert!(
+            detail.contains("powershell.exe"),
+            "the detail keeps the real command: {detail}"
+        );
+        assert_eq!(
+            tools(&events)[0].title.as_deref(),
+            Some("git add probe.txt")
+        );
+        // a legacy reject is the one listed: cancel
+        assert!(codex.decide(&pr.id, "reject", None, &[]).is_ok());
+        assert_eq!(peer.recv(), r#"{"id":1,"result":{"decision":"cancel"}}"#);
+        // fileChange paths come absolute; the card shows them relative
+        let item = r#"{"threadId":"thr_1","turnId":"turn_1","item":{"type":"fileChange","id":"exec-2","changes":[{"path":"c:\\WORK\\sub\\probe.txt","kind":{"type":"add"},"diff":"ok\n"}],"status":"inProgress"}}"#;
+        let events = peer.note(&mut codex, "item/started", item);
+        assert_eq!(tools(&events)[0].diffs[0].path, "sub/probe.txt");
+        assert_eq!(
+            relative(r"D:\elsewhere\x.txt", r"C:\work"),
+            r"D:\elsewhere\x.txt"
+        );
+        assert_eq!(
+            relative(r"C:\workshop\x.txt", r"C:\work"),
+            r"C:\workshop\x.txt"
+        );
+    }
+
+    #[test]
+    fn models_context_rename_and_history() {
+        let (mut codex, mut peer) = session();
+        // no model/list yet: nothing to pick
+        assert_eq!(
+            codex.set_model("thr_1", "gpt-5.6-luna"),
+            Err("Codex does not offer this model")
+        );
+        let models = r#"{"id":1099511627776,"result":{"data":[{"id":"gpt-6-luna","model":"gpt-6-luna","displayName":"GPT-6-Luna","hidden":false},{"id":"x","model":"secret-x","displayName":"X","hidden":true},{"id":"gpt-5.6-luna","model":"gpt-5.6-luna","displayName":"GPT-5.6-Luna","hidden":false}],"nextCursor":null}}"#;
+        let events = peer.send(&mut codex, models);
+        let state = |events: &[Event]| -> LiveState {
+            ops(events)
+                .into_iter()
+                .find_map(|op| match op {
+                    Op::State(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .expect("a state op")
+        };
+        assert_eq!(
+            state(&events).models,
+            [
+                ("gpt-6-luna".to_string(), "GPT-6-Luna".to_string()),
+                ("gpt-5.6-luna".to_string(), "GPT-5.6-Luna".to_string())
+            ]
+        );
+        let events = codex.set_model("thr_1", "gpt-5.6-luna").unwrap();
+        assert_eq!(state(&events).model.as_deref(), Some("gpt-5.6-luna"));
+        assert!(codex.set_model("thr_1", "secret-x").is_err());
+        // context: the last request's tokens against the window
+        let usage = r#"{"threadId":"thr_1","turnId":"turn_1","tokenUsage":{"total":{"totalTokens":43732,"inputTokens":43588,"cachedInputTokens":24576,"cacheWriteInputTokens":0,"outputTokens":144,"reasoningOutputTokens":0},"last":{"totalTokens":22259,"inputTokens":22228,"cachedInputTokens":22016,"cacheWriteInputTokens":0,"outputTokens":31,"reasoningOutputTokens":0},"modelContextWindow":258400}}"#;
+        let events = peer.note(&mut codex, "thread/tokenUsage/updated", usage);
+        assert_eq!(state(&events).context, Some((22259, 258400)));
+        peer.note(&mut codex, "turn/completed", &turn_completed("completed"));
+        // the next turn carries the chosen model
+        codex.prompt("thr_1", p("next"), "c2").unwrap();
+        let frame = peer.recv();
+        assert!(frame.contains(r#""model":"gpt-5.6-luna""#), "{frame}");
+        // rename: thread/name/set, then the title
+        codex.rename("thr_1", "Probe", "r1").unwrap();
+        let frame = peer.recv();
+        assert!(
+            frame.contains(
+                r#""method":"thread/name/set","params":{"threadId":"thr_1","name":"Probe"}"#
+            ),
+            "{frame}"
+        );
+        let id = json::get_i64(&json::parse(&frame).unwrap(), "id").unwrap();
+        let events = peer.send(&mut codex, &format!(r#"{{"id":{id},"result":{{}}}}"#));
+        assert_eq!(
+            events,
+            [
+                Event::Renamed {
+                    thread: "thr_1".into(),
+                    title: "Probe".into()
+                },
+                done("r1".into(), "completed", None)
+            ]
+        );
+        // history of a thread codex has not loaded: items newest first, replayed oldest first
+        codex.history("thr_old", r"C:\work").unwrap();
+        let frame = peer.recv();
+        assert!(frame.contains(r#""method":"thread/items/list","params":{"threadId":"thr_old","limit":300,"sortDirection":"desc"}"#), "{frame}");
+        let id = json::get_i64(&json::parse(&frame).unwrap(), "id").unwrap();
+        let data = r#"[{"turnId":"t2","item":{"type":"commandExecution","id":"e1","command":"x","commandActions":[{"type":"unknown","command":"git add a"}],"status":"inProgress","aggregatedOutput":null,"exitCode":null,"startedAtMs":5}},{"turnId":"t1","item":{"type":"reasoning","id":"r1","summary":[],"content":[]}},{"turnId":"t1","item":{"type":"agentMessage","id":"m1","text":"pong","phase":"final_answer"}},{"turnId":"t1","item":{"type":"userMessage","id":"u1","clientId":null,"content":[{"type":"image","url":"data:image/png;base64,iVBORw0KGgo="},{"type":"text","text":"Reply pong","text_elements":[]}]}}]"#;
+        let events = peer.send(
+            &mut codex,
+            &format!(r#"{{"id":{id},"result":{{"data":{data},"nextCursor":null}}}}"#),
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e, Event::Op(t, _) if t == "thr_old"))
+        );
+        let replay = any_items(&events);
+        let shape: Vec<_> = replay
+            .iter()
+            .map(|i| (i.id.as_str(), i.kind, i.text.as_str(), i.images))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("u1", ItemKind::User, "Reply pong", 1),
+                ("m1", ItemKind::Text, "pong", 0),
+                ("e1", ItemKind::Tool, "", 0)
+            ]
+        );
+        assert_eq!(
+            replay[2].tool.as_ref().unwrap().status,
+            ToolStatus::Cancelled
+        );
+        assert!(matches!(events.last(), Some(Event::Op(_, Op::State(s))) if s.status == "idle"));
+    }
+
+    #[test]
+    fn thread_list_and_fork() {
+        let (mut codex, mut peer) = session();
+        codex.list_threads(&[r"C:\work".to_string()]).unwrap();
+        let frame = peer.recv();
+        assert!(frame.contains(r#""method":"thread/list","params":{"limit":50,"sortKey":"updated_at","cwd":["C:\\work"]}"#), "{frame}");
+        let id = json::get_i64(&json::parse(&frame).unwrap(), "id").unwrap();
+        let data = r#"[{"id":"a","name":null,"preview":"\nFix the login bug\nmore","cwd":"C:\\work","ephemeral":false,"parentThreadId":null,"createdAt":10,"updatedAt":20},{"id":"b","name":"Named","preview":"x","cwd":"C:\\work","ephemeral":false,"parentThreadId":null,"createdAt":1,"updatedAt":2},{"id":"sub","name":null,"preview":"x","cwd":"C:\\work","ephemeral":false,"parentThreadId":"a","createdAt":1,"updatedAt":2},{"id":"eph","name":null,"preview":"x","cwd":"C:\\work","ephemeral":true,"parentThreadId":null,"createdAt":1,"updatedAt":2}]"#;
+        let events = peer.send(
+            &mut codex,
+            &format!(r#"{{"id":{id},"result":{{"data":{data},"nextCursor":null}}}}"#),
+        );
+        let Some(Event::Threads(list)) = events.first() else {
+            panic!("{events:?}");
+        };
+        let shape: Vec<_> = list
+            .iter()
+            .map(|t| (t.id.as_str(), t.title.as_str(), t.updated_at))
+            .collect();
+        assert_eq!(
+            shape,
+            [("a", "Fix the login bug", 20_000), ("b", "Named", 2_000)]
+        );
+        // fork: a new thread, its history, a notice, then the prompt
+        codex.fork("a", r"C:\work", p("go on"), "f1").unwrap();
+        let frame = peer.recv();
+        assert!(frame.contains(r#""method":"thread/fork","params":{"threadId":"a","cwd":"C:\\work","approvalPolicy":"untrusted","sandbox":"danger-full-access","excludeTurns":true}"#), "{frame}");
+        let id = json::get_i64(&json::parse(&frame).unwrap(), "id").unwrap();
+        let events = peer.send(&mut codex, &format!(r#"{{"id":{id},"result":{{"thread":{{"id":"thr_f","forkedFromId":"a"}},"model":"gpt-6-luna"}}}}"#));
+        assert_eq!(
+            events,
+            [Event::SessionStarted {
+                tag: "f1".into(),
+                thread: "thr_f".into()
+            }]
+        );
+        let frame = peer.recv();
+        assert!(
+            frame.contains(r#""threadId":"thr_f""#) && frame.contains("thread/items/list"),
+            "{frame}"
+        );
+        let id = json::get_i64(&json::parse(&frame).unwrap(), "id").unwrap();
+        let data =
+            r#"[{"turnId":"t1","item":{"type":"agentMessage","id":"m1","text":"old answer"}}]"#;
+        let events = peer.send(
+            &mut codex,
+            &format!(r#"{{"id":{id},"result":{{"data":{data},"nextCursor":null}}}}"#),
+        );
+        let texts: Vec<&str> = any_items(&events).iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "old answer",
+                "Forked from a Codex thread; the original thread is unchanged",
+                "go on"
+            ]
+        );
+        assert!(
+            peer.recv()
+                .contains(r#""method":"turn/start","params":{"threadId":"thr_f""#)
+        );
+        assert!(codex.owns_session("thr_f"));
     }
 
     #[test]
@@ -3189,7 +3956,7 @@ mod tests {
     fn steer_when_busy_start_when_idle() {
         let (mut codex, mut peer) = session();
         // busy: the follow-up steers turn_1
-        let events = codex.prompt("thr_1", "focus on tests", "c2").unwrap();
+        let events = codex.prompt("thr_1", p("focus on tests"), "c2").unwrap();
         assert_eq!(items(&events)[0].text, "focus on tests");
         assert_eq!(
             peer.recv(),
@@ -3210,7 +3977,7 @@ mod tests {
             [("c1", "completed", None), ("c2", "completed", None)]
         );
         // idle: a new turn
-        codex.prompt("thr_1", "next", "c3").unwrap();
+        codex.prompt("thr_1", p("next"), "c3").unwrap();
         assert_eq!(
             peer.recv(),
             r#"{"id":5,"method":"turn/start","params":{"threadId":"thr_1","input":[{"type":"text","text":"next"}]}}"#
@@ -3222,7 +3989,7 @@ mod tests {
         // a steer that loses the race with the turn's end falls back to
         // turn/start, without a second bubble
         assert_eq!(
-            items(&codex.prompt("thr_1", "late", "c4").unwrap()).len(),
+            items(&codex.prompt("thr_1", p("late"), "c4").unwrap()).len(),
             1
         );
         assert!(peer.recv().contains(r#""method":"turn/steer""#));
@@ -3243,7 +4010,7 @@ mod tests {
             [running("c4")]
         );
         // a steer accepted just before its turn ended completes at once
-        codex.prompt("thr_1", "also", "c5").unwrap();
+        codex.prompt("thr_1", p("also"), "c5").unwrap();
         peer.recv();
         let ended =
             r#"{"threadId":"thr_1","turn":{"id":"turn_3","status":"completed","error":null}}"#;
@@ -3253,7 +4020,7 @@ mod tests {
         );
         let late = peer.send(&mut codex, r#"{"id":8,"result":{"turnId":"turn_3"}}"#);
         assert_eq!(dones(&late), [("c5", "completed", None)]);
-        assert_eq!(codex.prompt("nope", "x", "c6"), Err("unknown session"));
+        assert_eq!(codex.prompt("nope", p("x"), "c6"), Err("unknown session"));
     }
 
     #[test]
@@ -3532,7 +4299,7 @@ mod tests {
             })
             .collect();
         assert_eq!(states, ["idle"]);
-        assert_eq!(codex.prompt("thr_1", "x", "c2"), Err("Codex has exited"));
+        assert_eq!(codex.prompt("thr_1", p("x"), "c2"), Err("Codex has exited"));
     }
 
     #[test]
@@ -3593,19 +4360,19 @@ mod tests {
         peer.send(&mut codex, INIT_OK);
         peer.recv();
         let events = codex
-            .resume_session("thr_1", r"C:\work", "again", "p1")
+            .resume_session("thr_1", r"C:\work", None, p("again"), "p1")
             .unwrap();
         assert!(
             matches!(&events[..], [Event::Op(t, Op::State(s))] if t == "thr_1" && s.status == "starting")
         );
         assert_eq!(
             peer.recv(),
-            r#"{"id":2,"method":"thread/resume","params":{"threadId":"thr_1","cwd":"C:\\work","approvalPolicy":"on-request","sandbox":"workspace-write"}}"#
+            r#"{"id":2,"method":"thread/resume","params":{"threadId":"thr_1","cwd":"C:\\work","approvalPolicy":"untrusted","sandbox":"danger-full-access","excludeTurns":true}}"#
         );
         // one resume at a time
         assert!(
             codex
-                .resume_session("thr_1", r"C:\work", "x", "p2")
+                .resume_session("thr_1", r"C:\work", None, p("x"), "p2")
                 .is_err()
         );
         assert!(!codex.owns_session("thr_1"));
@@ -3626,7 +4393,7 @@ mod tests {
         );
         // a thread codex no longer has: the command fails and the session ends
         let events = codex
-            .resume_session("thr_9", r"C:\work", "hi", "p3")
+            .resume_session("thr_9", r"C:\work", None, p("hi"), "p3")
             .unwrap();
         assert_eq!(events.len(), 1);
         peer.recv();
@@ -3655,11 +4422,23 @@ mod tests {
             ]);
             on_turn(vec![("item", item)])
         };
+        // an empty reasoning item stays off the phone until its first words
+        let events = peer.note(&mut codex, "item/started", &reasoning("rs_1", &[], &[]));
+        assert!(events.is_empty(), "{events:?}");
+        let first = peer.delta(
+            &mut codex,
+            "item/reasoning/summaryTextDelta",
+            "rs_1",
+            "**Reading**",
+        );
+        let it = items(&first)[0];
+        assert_eq!(
+            (it.kind, it.text.as_str()),
+            (ItemKind::Thinking, "**Reading**")
+        );
         // summaries win over raw reasoning text
-        peer.note(&mut codex, "item/started", &reasoning("rs_1", &[], &[]));
         let mut text = Vec::new();
         for (method, delta) in [
-            ("item/reasoning/summaryTextDelta", "**Reading**"),
             ("item/reasoning/summaryPartAdded", ""),
             ("item/reasoning/summaryTextDelta", "Plan"),
             ("item/reasoning/textDelta", "raw words"),
@@ -3669,7 +4448,16 @@ mod tests {
                 Field::Text,
             ));
         }
-        assert_eq!(text, ["**Reading**", "\n\n", "Plan"]);
+        assert_eq!(text, ["\n\n", "Plan"]);
+        // one that never gets words is never shown
+        assert!(
+            peer.note(&mut codex, "item/started", &reasoning("rs_0", &[], &[]))
+                .is_empty()
+        );
+        assert!(
+            peer.note(&mut codex, "item/completed", &reasoning("rs_0", &[], &[]))
+                .is_empty()
+        );
         let done = reasoning("rs_1", &["**Reading**", "Plan"], &["raw words"]);
         let events = peer.note(&mut codex, "item/completed", &done);
         let it = items(&events)[0];
@@ -3680,7 +4468,7 @@ mod tests {
         // raw text shown first is replaced once a summary arrives
         peer.note(&mut codex, "item/started", &reasoning("rs_2", &[], &[]));
         let events = peer.delta(&mut codex, "item/reasoning/textDelta", "rs_2", "raw ");
-        assert_eq!(appended(&events, Field::Text), ["raw "]);
+        assert_eq!(items(&events)[0].text, "raw ");
         let events = peer.delta(&mut codex, "item/reasoning/summaryTextDelta", "rs_2", "sum");
         assert_eq!(items(&events)[0].text, "");
         assert_eq!(appended(&events, Field::Text), ["sum"]);
@@ -3800,7 +4588,7 @@ mod tests {
             &data,
         )
         .unwrap();
-        assert_eq!(cfg.binary, PathBuf::from("codex.exe"));
+        assert_eq!(cfg.binary, None, "found at every spawn");
         assert_eq!(cfg.argv(), ["fake.mjs", "app-server"]);
         assert_eq!(cfg.workspaces, std::slice::from_ref(&w));
         let live = cfg.agent_live();
@@ -3811,7 +4599,11 @@ mod tests {
         assert_eq!(live.workspaces, [w]);
         let custom =
             launch_config(&entry(&[&ws], r#","binary":"C:\\tools\\codex.exe""#), &data).unwrap();
-        assert_eq!(custom.binary, PathBuf::from(r"C:\tools\codex.exe"));
+        assert_eq!(custom.binary, Some(PathBuf::from(r"C:\tools\codex.exe")));
+        assert_eq!(
+            custom.resolve_binary().unwrap(),
+            PathBuf::from(r"C:\tools\codex.exe")
+        );
         let again = ws.join("..").join("ws");
         for (bad, why) in [
             (entry(&[&ws, &again], ""), "repeats an earlier folder"),
@@ -3826,16 +4618,65 @@ mod tests {
             let err = launch_config(&bad, &data).unwrap_err();
             assert!(err.contains(why), "{err}");
         }
-        // honesty: every capability limited, with the same detail
+        // honesty: a limited capability says why
         let caps = capabilities();
         assert!(
             caps.iter()
-                .all(|c| c.status == "limited" && c.detail.as_deref() == Some(HONESTY))
+                .all(|c| (c.status == "limited") == c.detail.is_some())
+        );
+        assert!(
+            caps.iter()
+                .any(|c| c.id == "session.list" && c.status == "limited")
         );
         let mut ids: Vec<&str> = caps.iter().map(|c| c.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), caps.len());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_codex_takes_path_then_the_newest_app_install_never_a_stub() {
+        let root = std::env::temp_dir().join(format!("chb-find-codex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (on_path, stubs, lad) = (
+            root.join("path"),
+            root.join("WindowsApps"),
+            root.join("lad"),
+        );
+        let bin = lad.join("OpenAI").join("Codex").join("bin");
+        for d in [
+            &on_path,
+            &stubs,
+            &bin.join("aaa"),
+            &bin.join("bbb"),
+            &bin.join("rg"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let write = |p: &Path, body: &str, secs: u64| {
+            std::fs::write(p, body).unwrap();
+            let at = std::time::UNIX_EPOCH + Duration::from_secs(secs);
+            let f = std::fs::File::options().write(true).open(p).unwrap();
+            f.set_modified(at).unwrap();
+        };
+        // an app-execution alias (WindowsApps) and a 0-byte file are not codex
+        write(&stubs.join("codex.exe"), "alias", 3_000_000_000);
+        write(&on_path.join("codex.exe"), "", 3_000_000_000);
+        write(&bin.join("rg").join("rg.exe"), "rg", 3_000_000_000);
+        let paths = std::env::join_paths([&stubs, &on_path]).unwrap();
+        let find = || find_codex(Some(&paths), Some(&lad));
+        assert!(find().unwrap_err().contains("not found"), "{:?}", find());
+        assert!(find_codex(None, None).is_err());
+        // the newest install wins: an app update adds a folder
+        write(&bin.join("aaa").join("codex.exe"), "old", 2_000_000_000);
+        write(&bin.join("bbb").join("codex.exe"), "new", 2_100_000_000);
+        assert_eq!(find().unwrap(), bin.join("bbb").join("codex.exe"));
+        write(&bin.join("aaa").join("codex.exe"), "newer", 2_200_000_000);
+        assert_eq!(find().unwrap(), bin.join("aaa").join("codex.exe"));
+        // a real codex.exe on PATH comes first
+        write(&on_path.join("codex.exe"), "cli", 1_000_000_000);
+        assert_eq!(find().unwrap(), on_path.join("codex.exe"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3860,7 +4701,7 @@ mod tests {
         };
         let mut codex = Codex::new(child, "codex-1", "9.9.9");
         codex
-            .start_session(&cwd.to_string_lossy(), "hello run edit", "c1")
+            .start_session(&cwd.to_string_lossy(), p("hello run edit"), "c1")
             .unwrap();
         let (mut seen, mut asked) = (Vec::new(), 0);
         let deadline = Instant::now() + Duration::from_secs(60);

@@ -30,7 +30,7 @@
 use crate::crypto::sha256;
 use crate::json::{self, Json};
 use crate::protocol::{
-    DecisionError, LiveWorkspace, PermissionOption, PermissionRequest, PromptImage, is_model,
+    DecisionError, LiveWorkspace, PermissionOption, PermissionRequest, PromptImage, is_claude_model,
 };
 use crate::runtime_io::{child_env, redact};
 use crate::transcript::{
@@ -116,7 +116,7 @@ pub fn spawn_args(
     }
     // ADR-017: "default" is the CLI's own choice, so no flag at all
     if let Some(model) = model.filter(|m| *m != "default") {
-        if !is_model(model) {
+        if !is_claude_model(model) {
             return Err("model must be a Claude Code alias or a claude-… id");
         }
         args.extend(["--model".into(), model.into()]);
@@ -606,7 +606,7 @@ impl Driver {
         model: &str,
         send: impl FnOnce(String) -> Result<(), &'static str>,
     ) -> Result<(), &'static str> {
-        if !is_model(model) {
+        if !is_claude_model(model) {
             return Err("model must be a Claude Code alias or a claude-… id");
         }
         let body = format!(r#"{{"subtype":"set_model","model":{}}}"#, q(model));
@@ -1032,7 +1032,7 @@ impl Driver {
                     self.models = list
                         .iter()
                         .filter_map(|m| {
-                            let value = json::get_str(m, "value").filter(|v| is_model(v))?;
+                            let value = json::get_str(m, "value").filter(|v| is_claude_model(v))?;
                             let label = json::get_str(m, "displayName").unwrap_or(value);
                             Some((value.to_string(), plain_text(label)))
                         })

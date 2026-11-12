@@ -435,7 +435,7 @@ export type LiveClientMessage =
   | { type: 'mcp_auth'; commandId: string; sessionId: string; server: string; flow: 'desktop' | 'phone-callback' }
   | { type: 'mcp_auth_callback'; commandId: string; sessionId: string; server: string; callbackUrl: string }
   | { type: 'mcp_reconnect'; commandId: string; sessionId: string; server: string } // §4.7 "Reconnect a failed server"
-  // ADR-017 composer (Claude): model must pass isModelName, title isSessionTitle
+  // ADR-017 composer: model must pass isModelName (Claude: isClaudeModelName; Codex: its model/list), title isSessionTitle
   | { type: 'set_model'; commandId: string; sessionId: string; model: string }
   | { type: 'rename_session'; commandId: string; sessionId: string; title: string };
 // ClientMessage = existing union | LiveClientMessage.
@@ -580,7 +580,7 @@ export type ClientMessage =
       project?: string;
       /** ADR-017 (Claude): images before the prompt text. */
       images?: PromptImage[];
-      /** ADR-017 (Claude): `--model` at spawn; must pass isModelName. */
+      /** ADR-017 (Claude): `--model` at spawn; must pass isModelName (the runtime checks isClaudeModelName). */
       model?: string;
     }
   | {
@@ -759,8 +759,17 @@ const IMAGE_MAGIC: Record<PromptImageType, string> = {
 };
 const MODEL_ALIASES: ReadonlySet<string> = new Set(['default', 'opus', 'sonnet', 'haiku', 'fable', 'opusplan']);
 
-/** ADR-017: a Claude Code alias or a full `claude-…` id (lowercase, digits, dashes; ≤ 64). */
+/**
+ * ADR-017 wire check, any runtime's model name: lowercase letters, digits, `.`, `_`, `-`, ≤ 64,
+ * starting and ending with a letter or digit (nothing a shell or flag parser could misread).
+ * Which names a runtime takes is its own check (`isClaudeModelName`, Codex's `model/list`).
+ */
 export function isModelName(v: unknown): v is string {
+  return typeof v === 'string' && v.length <= 64 && /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/.test(v);
+}
+
+/** ADR-017 Claude Code: an alias or a full `claude-…` id (lowercase, digits, dashes; ≤ 64). */
+export function isClaudeModelName(v: unknown): v is string {
   return (
     typeof v === 'string' &&
     (MODEL_ALIASES.has(v) || (v.length <= 64 && /^claude-[a-z0-9-]+$/.test(v)))

@@ -515,9 +515,21 @@ pub struct PromptImage {
     pub data: String,
 }
 
-/// A model the phone may pick (TS `isModelName`): a Claude Code alias or a
-/// full `claude-…` id, nothing a shell or flag parser could misread.
+/// A model name the phone may send (TS `isModelName`): lowercase letters,
+/// digits, `.`, `_`, `-`, at most 64, starting and ending with a letter or
+/// digit, so nothing a shell or flag parser could misread. Which names a
+/// runtime takes is its own check: [`is_claude_model`], Codex's `model/list`.
 pub fn is_model(s: &str) -> bool {
+    let edge = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    s.len() <= MODEL_MAX
+        && edge(s.as_bytes().first())
+        && edge(s.as_bytes().last())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+}
+
+/// ADR-017 Claude Code: an alias or a full `claude-…` id.
+pub fn is_claude_model(s: &str) -> bool {
     MODEL_ALIASES.contains(&s)
         || s.strip_prefix("claude-").is_some_and(|rest| {
             !rest.is_empty()
@@ -2959,22 +2971,38 @@ mod tests {
         assert!(rename(&"\u{1F600}".repeat(40)).is_some());
         assert!(rename(&format!("{}x", "\u{1F600}".repeat(40))).is_none());
         assert!(rename(&"t".repeat(80)).is_some());
-        // models: the aliases and claude- ids only, 64 chars at most
+        // Claude: the aliases and claude- ids only, 64 chars at most
         for good in [
             "default", "sonnet", "opus", "haiku", "fable", "opusplan", "claude-x",
         ] {
-            assert!(is_model(good), "{good}");
+            assert!(is_claude_model(good) && is_model(good), "{good}");
         }
         let long = format!("claude-{}", "a".repeat(57));
+        assert!(is_claude_model(&long) && !is_claude_model(&format!("{long}a")));
         assert!(is_model(&long) && !is_model(&format!("{long}a")));
+        for bad in ["claude-", "claude-A", "gpt-5", "best"] {
+            assert!(!is_claude_model(bad), "{bad}");
+        }
+        // the wire: any runtime's model name (Codex lists gpt-6-luna, gpt-5.6-terra)
+        for good in [
+            "gpt-6-luna",
+            "gpt-5.6-terra",
+            "o4-mini",
+            "codex_mini",
+            "best",
+        ] {
+            assert!(is_model(good), "{good}");
+        }
         for bad in [
             "",
             "claude-",
             "claude-A",
             "claude-a b",
-            "gpt-5",
             "-model",
             "claude-a/b",
+            ".hidden",
+            "gpt-5.",
+            "sonnet[1m]",
         ] {
             assert!(!is_model(bad), "{bad}");
         }

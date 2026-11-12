@@ -13,6 +13,7 @@ import {
   applyTranscript,
   emptyTranscriptView,
   isClientMessage,
+  isClaudeModelName,
   isModelName,
   isServerMessage,
   type LiveServerMessage,
@@ -43,10 +44,16 @@ test('image data is capped across all images; titles count UTF-16 units', () => 
   assert.ok(isClientMessage(rename('\u{1F600}'.repeat(40))));
   assert.ok(!isClientMessage(rename(`${'\u{1F600}'.repeat(40)}x`)));
   assert.ok(isClientMessage(rename('t'.repeat(80))));
-  for (const good of ['default', 'sonnet', 'opus', 'haiku', 'fable', 'opusplan', 'claude-x']) assert.ok(isModelName(good), good);
+  for (const good of ['default', 'sonnet', 'opus', 'haiku', 'fable', 'opusplan', 'claude-x']) {
+    assert.ok(isClaudeModelName(good) && isModelName(good), good);
+  }
   const long = `claude-${'a'.repeat(57)}`;
   assert.ok(isModelName(long) && !isModelName(`${long}a`));
-  for (const bad of ['', 'claude-', 'claude-A', 'claude-a b', 'gpt-5', '-model', 'claude-a/b', 7]) {
+  assert.ok(isClaudeModelName(long) && !isClaudeModelName(`${long}a`));
+  for (const bad of ['claude-', 'claude-A', 'gpt-5', 'best']) assert.ok(!isClaudeModelName(bad), bad);
+  // the wire takes any runtime's names (Codex lists gpt-6-luna, gpt-5.6-terra)
+  for (const good of ['gpt-6-luna', 'gpt-5.6-terra', 'o4-mini', 'codex_mini', 'best']) assert.ok(isModelName(good), good);
+  for (const bad of ['', 'claude-', 'claude-A', 'claude-a b', '-model', 'claude-a/b', '.hidden', 'gpt-5.', 'sonnet[1m]', 7]) {
     assert.ok(!isModelName(bad), String(bad));
   }
 });

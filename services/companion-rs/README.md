@@ -193,19 +193,28 @@ An adapter entry in `companion.json` with `"type": "codex"` drives `codex app-se
   the CHERNOBYL data directory are refused. The phone sees them as
   `Agent.live.workspaces` (`id` = first 12 hex chars of sha256 of the canonical path) and
   `create_session.project` must be one of those ids. **Listing a folder trusts it**: Codex
-  runs there with `approvalPolicy: on-request`, `sandbox: workspace-write`.
-- `binary`: `null` = `codex.exe` on `PATH`. It is spawned directly, never through a shell,
-  so npm's `codex.cmd` shim is refused: point `binary` at the real `codex.exe` (inside the
-  npm package's `vendor` folder). Health (`/adapters`) is whether the binary resolves.
+  runs there with `approvalPolicy: untrusted` (it asks the phone before every file change
+  and every command it does not know as read-only) and `sandbox: danger-full-access` (the
+  Windows sandbox misbehaved in the live run, ADR-015 §10); codex also marks the folder
+  trusted in its own `config.toml`.
+- `binary`: `null` (recommended) = found at every spawn: the first real `codex.exe` on `PATH`,
+  else the newest `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe` of the Codex desktop
+  app; `WindowsApps` aliases and 0-byte files are skipped (`codex::find_codex`). It is spawned
+  directly, never through a shell, so npm's `codex.cmd` shim is refused. Health (`/adapters`)
+  is whether the binary resolves.
 - `args`: put before `app-server`. Tests use `"binary": "node"` (or node's full path) with
   `"args": ["<repo>/services/companion-rs/tools/fake-codex-app-server.mjs"]`.
 
-One app-server child per adapter, spawned on the first `create_session` (acked once Codex
-names the thread, which is the session id) with the companion's environment minus
-`HOST_TOKEN`, `CHERNOBYL_*` and `NODE_OPTIONS`. Prompts travel on stdin only. If the child
-exits, open approvals turn `stale`, running prompts fail, a pending interrupt is `unknown`
-and its sessions end; the next `create_session` respawns it. Capabilities are all `limited`
-(no live run; see `docs/INTEGRATIONS.md`).
+One app-server child per adapter, spawned by the first probe (it lists codex's threads in the
+workspaces, `thread/list`) or command, with the companion's environment minus `HOST_TOKEN`,
+`CHERNOBYL_*` and `NODE_OPTIONS`; `create_session` is acked once Codex names the thread, which
+is the session id. Prompts (and photos, as `data:` URLs) travel on stdin only. If the child
+exits, open approvals turn `stale`, running prompts fail, a pending interrupt is `unknown` and
+its sessions idle; the next prompt respawns it and resumes the thread. Threads found on disk
+are idle sessions (replayed on subscribe, resumed by a prompt, forked when the Codex app wrote
+them in the last 2 minutes). Live-verified on codex-cli 0.167.0-alpha.4.1: `CHERNOBYL_LIVE_CODEX=1
+cargo test --lib live_codex -- --ignored --nocapture` (uses the owner's ChatGPT plan; about 7
+short turns).
 
 ## Verify
 

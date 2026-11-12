@@ -72,7 +72,8 @@ export default function NewTaskScreen() {
   // ADR-015: a spawning runtime starts only in a workspace allow-listed on the PC;
   // create_session.project then carries the workspace id
   const workspaces = selectedAgent?.live?.workspaces ?? [];
-  const pickModel = selectedAgent?.live?.composer?.includes('model') ?? false;
+  // the start-time chips are Claude Code's aliases; Codex picks its models in the session
+  const pickModel = selectedAgent?.kind === 'claude-code' && (selectedAgent.live?.composer?.includes('model') ?? false);
 
   // Auto-navigate when reconciled on reconnect
   useEffect(() => {

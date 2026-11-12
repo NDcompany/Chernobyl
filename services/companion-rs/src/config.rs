@@ -385,7 +385,9 @@ pub fn config_to_json(c: &CompanionConfig) -> Json {
                         if let Some(cx) = &a.codex {
                             let paths = cx.workspaces.iter().map(|w| json::s(&w.path));
                             fields.push(("workspaces", Json::Arr(paths.collect())));
-                            fields.push(("binary", json::s(&cx.binary.to_string_lossy())));
+                            if let Some(b) = &cx.binary {
+                                fields.push(("binary", json::s(&b.to_string_lossy())));
+                            }
                             let args = cx.args.iter().map(|a| json::s(a));
                             fields.push(("args", Json::Arr(args.collect())));
                         }

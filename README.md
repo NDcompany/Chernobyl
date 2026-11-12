@@ -119,7 +119,7 @@ on both sides, and are never journaled (`docs/PRIVACY.md`).
 | --- | --- | --- |
 | Claude Code | **driven**: the companion starts `claude.exe` (stream-json on stdio) in an allow-listed folder; also permission mode and end session | live round trip passed against Haiku, CLI 2.1.310 (about $0.01 per run) |
 | OpenCode | **attach** to a running `opencode serve` (HTTP + SSE), as before | live tests passed on 1.19.4 with local Ollama (`qwen3.5:4b`, 24k context) |
-| Codex | **driven**: one `codex app-server` per adapter, each session a thread | every capability `limited`: tested only against a fake app-server, no live run |
+| Codex | **driven**: one `codex app-server` per adapter, each session a thread; its threads in the workspaces (the Codex app's too) listed, replayed, resumed, forked | live runs passed 2026-11-12 on codex-cli 0.167.0-alpha.4.1 (ChatGPT plan, 11 short turns) |
 
 To enable them, add to `companion.json` (keys documented in `services/companion-rs/README.md`):
 
@@ -127,7 +127,8 @@ To enable them, add to `companion.json` (keys documented in `services/companion-
   (optional `binary`, `maxSessions` 1-16, default 3, and `permissionMode`: `default`,
   `acceptEdits` or `plan`). Without `workspaces` the entry stays a hook ingress only.
 - Codex: a new entry `{ "id": "codex-1", "type": "codex", "enabled": true, "workspaces": [...] }`
-  with `binary` pointing at the real `codex.exe` (the npm `.cmd` shim is refused).
+  (or `setup-windows.ps1 -Codex`); `codex.exe` is found on PATH or in the Codex app's install at
+  every start (`binary` overrides it; the npm `.cmd` shim is refused).
 
 **Allow-listing a folder means trusting it.** The phone can start an agent in it, and Claude
 runs in print mode, which skips its folder-trust dialog, so that folder's project hooks and MCP
@@ -198,7 +199,7 @@ protocol-v2 the mobile app already emits:
 - **Adapters** — an attach-only OpenCode adapter (HTTP/SSE to an existing
   `opencode serve`), an Ollama model-runtime adapter (attach-only, explicit endpoint),
   Claude Code as a hook ingress (loopback diagnostics POST only) plus driven sessions in
-  allow-listed workspaces, a Codex app-server runtime (`limited`), and the in-process
+  allow-listed workspaces, a Codex app-server runtime (live-verified), and the in-process
   `mock` engine. Hermes is deferred by ADR-008 (not installed on this machine —
   not stubbed). Phase 7 complete.
 
@@ -216,8 +217,7 @@ production backend — use the companion for real connections.
   persistent **"Simulation"** badge while the mock is active so demo data is never
   mistaken for a real agent.
 - **Real agent integration**: OpenCode (attach-only HTTP/SSE, no spawned server) and
-  Claude Code driven sessions are live-verified; Codex is implemented from its schema and
-  tested only against a fake app-server; Ollama is a model runtime; Hermes is deferred
+  Claude Code and Codex driven sessions are live-verified; Ollama is a model runtime; Hermes is deferred
   (ADR-008 — not installed here, deliberately not stubbed). The live-session emulator rows
   (checklist 9.1-9.13) are not run yet. When no healthy real runtime is
   attached, sessions/agents fall back to the mock seed — the UI must not present that
@@ -280,8 +280,9 @@ packaging, windowless autostart, terminal TUI) are implemented and tested
 1. **Physical-device validation** — `docs/validation/PHONE-VALIDATION-CHECKLIST.md`:
    30 of 31 rows in sections 1-8 pass on the emulator; no physical phone yet.
 2. **Live-session emulator rows** — checklist section 9 (rows 9.1-9.13), NOT RUN.
-3. **Codex live run** — Codex stays `limited` until someone runs it against a real
-   `codex app-server`; session resume and the interrupt and sign-in timeouts are not built.
+3. **Codex on the phone** — live-verified at the runtime and companion level (2026-11-12);
+   the emulator rows for Codex are not run yet, and a thread running in the Codex app cannot
+   be mirrored live (its app-server is a private child process).
 4. **Independent security assessment** (S9) — automated tests + review are not a
    substitute for it.
 5. **Release signing** — the APK is debug-signed; Windows code signing is an ADR-007

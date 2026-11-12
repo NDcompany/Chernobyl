@@ -35,6 +35,14 @@ try {
   $c = Run-Setup @()
   if ($c.terminal.enabled -ne $false) { throw 'terminal must default to off' }
   if (@($c.adapters | Where-Object type -eq 'opencode').Count) { throw 'no opencode without -OpenCode' }
+  if (@($c.adapters | Where-Object type -eq 'codex').Count) { throw 'no codex without -Codex' }
+
+  $c = Run-Setup @('-Codex')
+  $cx = @($c.adapters | Where-Object type -eq 'codex')
+  if ($cx.Count -ne 1 -or $cx[0].id -ne 'codex-1' -or -not $cx[0].enabled -or @($cx[0].workspaces)[0] -ne (Resolve-Path $ws).Path) { throw "bad codex entry: $($cx | ConvertTo-Json)" }
+  if ($cx[0].PSObject.Properties.Name -contains 'binary') { throw 'codex.exe is found at start, never written' }
+  & $Exe --config (Join-Path $tmp 'roaming\CHERNOBYL\companion.json') --devices | Out-Host
+  if ($LASTEXITCODE) { throw 'the companion refused the generated codex config' }
 
   $c = Run-Setup @('-OpenCode', '-EnableTerminal')
   $oc = @($c.adapters | Where-Object type -eq 'opencode')

@@ -24,9 +24,20 @@
  * the same turn.
  *
  * Resume: thread/resume {threadId, cwd?, approvalPolicy?, sandbox?} returns a loaded thread as is,
- * or one a previous process started when --state-dir <dir> is given (thread/start saves
- * <dir>/<threadId>.json, as codex keeps rollouts on disk); otherwise -32600 "no rollout found for
+ * or one a previous process started when --state-dir <dir> is given (thread/start and every turn end
+ * save <dir>/<threadId>.json, as codex keeps rollouts on disk); otherwise -32600 "no rollout found for
  * thread id <id>". The resumed thread comes back with `turns: []` (history is not replayed).
+ *
+ * Verified live on codex-cli 0.167.0-alpha.4.1 (2026-11-12) and mirrored here: model/list (three
+ * visible models), thread/list {cwd: string | string[], limit, sortKey} (newest first, also threads
+ * no process has loaded), thread/items/list {threadId, limit, sortDirection} ({turnId, item} entries;
+ * works on unloaded threads), thread/name/set (then thread/name/updated {threadId, threadName}),
+ * thread/fork {threadId, excludeTurns} (a new thread with the old one's items, forkedFromId set),
+ * turn/start {model} (kept by the thread) and image inputs ({type: "image", url: "data:..."}).
+ * With approvalPolicy "untrusted" a command approval carries availableDecisions ["accept",
+ * {acceptWithExecpolicyAmendment} when proposed, "cancel"] and any other decision is a violation; on
+ * Windows the command is wrapped as codex does ("...powershell.exe" -Command '<cmd>') while
+ * commandActions[].command keeps the plain command. Agent messages carry phase "final_answer".
  *
  * MCP: fake-docs (stdio, connected) and fake-linear (HTTP, authenticationRequired). One
  * mcpServer/startupStatus/updated per server follows the initialize response. A
@@ -51,7 +62,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -67,6 +78,13 @@ const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 const SANDBOX_POLICY_TYPES = ['dangerFullAccess', 'readOnly', 'externalSandbox', 'workspaceWrite'];
 const USER_INPUT_TYPES = ['text', 'image', 'localImage', 'audio', 'localAudio', 'skill', 'mention'];
+const MODELS = [
+  ['gpt-6-luna', 'GPT-6-Luna', true],
+  ['gpt-5.6-terra', 'GPT-5.6-Terra', false],
+  ['gpt-5.6-luna', 'GPT-5.6-Luna', false],
+];
+const POWERSHELL = 'C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+const shellCommand = (cmd) => (process.platform === 'win32' ? `"${POWERSHELL}" -Command '${cmd}'` : cmd);
 const FILE_DECISIONS = new Map([['accept', 'apply'], ['acceptForSession', 'apply'], ['decline', 'declined'], ['cancel', 'cancel']]);
 const STATUS_FLAGS = {
   'item/commandExecution/requestApproval': 'waitingOnApproval',
@@ -145,6 +163,7 @@ function userInput(list) {
   return list.map((item) => {
     if (!isObj(item)) throw invalid('Invalid request: invalid type for `input` item, expected struct UserInput');
     variant(field(item, 'type', isStr, 'a string'), USER_INPUT_TYPES);
+    if (item.type === 'image' && !(isStr(item.url) || isStr(item.fileId))) throw invalid('Invalid request: image input needs `url` or `fileId`');
     if (item.type !== 'text') return item;
     field(item, 'text', isStr, 'a string');
     // text_elements is required in the TS type but #[serde(default)] in Rust.
@@ -306,7 +325,11 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
 
   // ---- turn building blocks -----------------------------------------------------------------
   const itemStarted = (t, item) => notify('item/started', { item, ...t.ids, startedAtMs: nowMs() });
-  const itemCompleted = (t, item) => notify('item/completed', { item, ...t.ids, completedAtMs: nowMs() });
+  function itemCompleted(t, item) {
+    const at = nowMs();
+    if (item.type !== 'reasoning') t.thread.items.push({ turnId: t.id, item, startedAtMs: at, completedAtMs: at });
+    notify('item/completed', { item, ...t.ids, completedAtMs: at });
+  }
   function userMessage(t, input, clientId) {
     if (!input.length) return;
     const item = { type: 'userMessage', id: newItemId('user'), clientId: isStr(clientId) ? clientId : null, content: input };
@@ -315,7 +338,7 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
   }
   async function say(t, text, delayMs = TICK_MS) {
     const chunks = Array.isArray(text) ? text : text.match(/\S+\s*/g);
-    const item = { type: 'agentMessage', id: newItemId('msg'), text: '', phase: null, memoryCitation: null, delivery: null, questions: null };
+    const item = { type: 'agentMessage', id: newItemId('msg'), text: '', phase: 'final_answer', memoryCitation: null, delivery: null, questions: null };
     itemStarted(t, item);
     for (const delta of chunks) {
       await t.sleep(delayMs);
@@ -333,6 +356,10 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
   function commandOutcome(answer, params) {
     if (answer.error) return 'failed'; // codex: "approval request failed", item failed, turn goes on
     const d = answer.result?.decision;
+    const name = isObj(d) ? Object.keys(d)[0] : d;
+    if (params.availableDecisions && !params.availableDecisions.some((a) => (isObj(a) ? Object.keys(a)[0] : a) === name)) {
+      violation(`decision ${JSON.stringify(d)} for request ${answer.id} is not one of availableDecisions ${JSON.stringify(params.availableDecisions)}`);
+    }
     if (d === 'accept' || d === 'acceptForSession') return 'run';
     if (d === 'decline') return 'declined';
     if (d === 'cancel') return 'cancel';
@@ -349,12 +376,15 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
 
   async function command(t, cmd, { amend = false, withdraw = false } = {}) {
     const { cwd } = t.thread;
-    const item = { type: 'commandExecution', id: newItemId('call'), pluginId: null, scriptPath: null, command: cmd, cwd, processId: null, source: 'agent', status: 'inProgress', commandActions: [{ type: 'unknown', command: cmd }], aggregatedOutput: null, exitCode: null, durationMs: null };
+    const item = { type: 'commandExecution', id: newItemId('call'), pluginId: null, scriptPath: null, command: shellCommand(cmd), cwd, processId: null, source: 'agent', status: 'inProgress', commandActions: [{ type: 'unknown', command: cmd }], aggregatedOutput: null, exitCode: null, durationMs: null };
     itemStarted(t, item); // codex starts the item, then asks
     let outcome = 'run';
     if (withdraw || t.thread.approvalPolicy !== 'never') {
-      const params = { kind: 'command', ...t.ids, itemId: item.id, startedAtMs: nowMs(), environmentId: null, reason: `Run \`${cmd}\` in the workspace`, command: cmd, cwd, commandActions: item.commandActions };
+      const params = { kind: 'command', ...t.ids, itemId: item.id, startedAtMs: nowMs(), environmentId: null, reason: `Run \`${cmd}\` in the workspace`, command: item.command, cwd, commandActions: item.commandActions };
       if (amend) params.proposedExecpolicyAmendment = cmd.split(' ');
+      if (t.thread.approvalPolicy === 'untrusted') {
+        params.availableDecisions = ['accept', ...(amend ? [{ acceptWithExecpolicyAmendment: { execpolicy_amendment: params.proposedExecpolicyAmendment } }] : []), 'cancel'];
+      }
       // withdraw: another client answers (accept) before this one can.
       if (withdraw) settle(sendRequest(t, 'item/commandExecution/requestApproval', params), 'withdrawn');
       else outcome = commandOutcome(await request(t, 'item/commandExecution/requestApproval', params), params);
@@ -523,6 +553,8 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
   function endTurn(t, status, error) {
     const { thread } = t;
     if (thread.turn === t) thread.turn = null;
+    thread.updatedAt = nowSecs();
+    save(thread);
     for (const req of requests.values()) {
       if (req.turn !== t || req.state !== 'pending') continue;
       // An interrupt resolves open requests server-side; on a normal end nothing may be open.
@@ -566,12 +598,10 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
     const sandbox = sandboxPolicy(p.sandbox == null ? 'read-only' : variant(p.sandbox, SANDBOX_MODES));
     if (p.cwd != null && !isStr(p.cwd)) throw invalid('Invalid request: invalid type for `cwd`, expected a string');
     const cwd = p.cwd ?? process.cwd();
-    const model = isStr(p.model) ? p.model : 'gpt-fake';
+    const model = isStr(p.model) ? p.model : MODELS[0][0];
     const t = newThread(uuidv7(), cwd, model, approval, sandbox);
-    if (stateDir && p.ephemeral !== true) {
-      mkdirSync(stateDir, { recursive: true });
-      writeFileSync(join(stateDir, `${t.id}.json`), JSON.stringify({ cwd, model }));
-    }
+    t.ephemeral = p.ephemeral === true;
+    save(t);
     const thread = threadShape(t, p.ephemeral === true, isStr(p.threadSource) ? p.threadSource : null);
     respond(id, threadResult(t, thread));
     notify('thread/started', { thread });
@@ -584,13 +614,10 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
     if (p.cwd != null && !isStr(p.cwd)) throw invalid('Invalid request: invalid type for `cwd`, expected a string');
     let t = threads.get(tid);
     if (!t) {
-      let saved = null;
-      try {
-        if (stateDir && /^[\w-]+$/.test(tid)) saved = JSON.parse(readFileSync(join(stateDir, `${tid}.json`), 'utf8'));
-      } catch {}
-      if (!saved) throw invalid(`no rollout found for thread id ${tid}`);
-      t = newThread(tid, saved.cwd, saved.model, 'on-request', sandboxPolicy('read-only'));
+      t = loadSaved(tid);
+      if (!t) throw invalid(`no rollout found for thread id ${tid}`);
     }
+    if (isStr(p.model)) t.model = p.model;
     if (approval) t.approvalPolicy = approval;
     if (sandbox) t.sandbox = sandbox;
     if (isStr(p.cwd)) t.cwd = p.cwd;
@@ -601,17 +628,46 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
     const t = {
       id: tid, cwd, model, approvalPolicy: approval, sandbox, turn: null, statusKey: '{"type":"idle"}', createdAt: nowSecs(),
       usage: { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 },
+      items: [], name: null, forkedFromId: null, ephemeral: false,
     };
+    t.updatedAt = t.createdAt;
     threads.set(tid, t);
     return t;
   }
+  // codex keeps rollouts on disk: --state-dir stands in for ~/.codex/sessions
+  function save(t) {
+    if (!stateDir || t.ephemeral) return;
+    mkdirSync(stateDir, { recursive: true });
+    const { id, cwd, model, name, items, createdAt, updatedAt, forkedFromId } = t;
+    writeFileSync(join(stateDir, `${id}.json`), JSON.stringify({ id, cwd, model, name, items, createdAt, updatedAt, forkedFromId }));
+  }
+  function loadSaved(tid) {
+    let saved = null;
+    try {
+      if (stateDir && /^[\w-]+$/.test(tid)) saved = JSON.parse(readFileSync(join(stateDir, `${tid}.json`), 'utf8'));
+    } catch {}
+    if (!saved) return null;
+    const t = newThread(tid, saved.cwd, saved.model, 'on-request', sandboxPolicy('read-only'));
+    Object.assign(t, { items: saved.items ?? [], name: saved.name ?? null, createdAt: saved.createdAt ?? t.createdAt, updatedAt: saved.updatedAt ?? t.updatedAt, forkedFromId: saved.forkedFromId ?? null });
+    return t;
+  }
+  // reading a thread does not load it
+  function known(tid) {
+    if (threads.has(tid)) return threads.get(tid);
+    const t = loadSaved(tid);
+    if (t) threads.delete(tid);
+    return t;
+  }
+  function preview(t) {
+    const first = t.items.find((e) => e.item.type === 'userMessage');
+    return first ? textOf(first.item.content) : '';
+  }
   function threadShape(t, ephemeral, threadSource) {
-    const t0 = t.createdAt;
     return {
-      id: t.id, sessionId: t.id, forkedFromId: null, parentThreadId: null, preview: '', ephemeral, section: null, sectionEnteredAt: null,
-      projectId: null, historyMode: 'legacy', modelProvider: 'openai', model: t.model, reasoningEffort: null, createdAt: t0, updatedAt: t0, recencyAt: t0,
-      status: { type: 'idle' }, path: null, cwd: t.cwd, cliVersion: '0.0.0-fake', originator: clientName, source: 'appServer',
-      threadSource, agentNickname: null, agentRole: null, gitInfo: null, name: null, turns: [],
+      id: t.id, sessionId: t.id, forkedFromId: t.forkedFromId, parentThreadId: null, preview: preview(t), ephemeral, section: null, sectionEnteredAt: null,
+      projectId: null, historyMode: 'paginated', modelProvider: 'openai', model: t.model, reasoningEffort: null, createdAt: t.createdAt, updatedAt: t.updatedAt, recencyAt: t.updatedAt,
+      status: t.turn ? { type: 'active', activeFlags: [] } : threads.has(t.id) ? { type: 'idle' } : { type: 'notLoaded' }, path: null, cwd: t.cwd, cliVersion: '0.0.0-fake', originator: clientName, source: 'vscode',
+      threadSource, agentNickname: null, agentRole: null, gitInfo: null, name: t.name, turns: [],
     };
   }
   const threadResult = (t, thread) => ({ thread, model: t.model, modelProvider: 'openai', serviceTier: null, disabledPluginIds: [], cwd: t.cwd, instructionSources: [], approvalPolicy: t.approvalPolicy, approvalsReviewer: 'user', sandbox: t.sandbox, reasoningEffort: null });
@@ -624,6 +680,7 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
     thread.approvalPolicy = approval;
     if (p.sandboxPolicy != null) thread.sandbox = p.sandboxPolicy;
     if (isStr(p.cwd)) thread.cwd = p.cwd;
+    if (p.model != null) thread.model = variant(p.model, MODELS.map((m) => m[0])); // codex: "model not found"
     if (thread.turn) {
       // codex start_or_steer_turn: input joins the active turn, whose id is returned.
       respond(id, { turn: thread.turn.shape('inProgress') });
@@ -631,6 +688,7 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
     }
     const t = new Turn(thread, textOf(input), p.rootTurnId);
     thread.turn = t;
+    thread.lastInput = input;
     respond(id, { turn: t.shape('inProgress') });
     refreshStatus(thread);
     notify('turn/started', { threadId: thread.id, turn: t.shape('inProgress', { startedAt: t.startedAt }) });
@@ -703,6 +761,60 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
     timers.add(timer);
     logins.set(name, timer);
   }
+  function modelList(id) {
+    respond(id, {
+      data: MODELS.map(([model, displayName, isDefault]) => ({ id: model, model, upgrade: null, upgradeInfo: null, availabilityNux: null, displayName, description: `${displayName} (fake)`, modelSpecialty: null, hidden: false, supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }], defaultReasoningEffort: 'medium', inputModalities: ['text', 'image'], supportsPersonality: false, multiAgentVersion: null, additionalSpeedTiers: [], serviceTiers: [], defaultServiceTier: null, availableAccessPrograms: null, isDefault })),
+      nextCursor: null,
+    });
+  }
+  function threadList(id, p) {
+    const cwds = p.cwd == null ? null : Array.isArray(p.cwd) ? p.cwd : [p.cwd];
+    if (cwds && !cwds.every(isStr)) throw invalid('Invalid request: invalid type for `cwd`, expected a string or a sequence of strings');
+    if (p.sortKey != null) variant(p.sortKey, ['created_at', 'updated_at', 'recency_at', 'section_position']);
+    const all = new Map(threads);
+    if (stateDir) {
+      let names = [];
+      try {
+        names = readdirSync(stateDir).filter((n) => n.endsWith('.json'));
+      } catch {}
+      for (const n of names) if (!all.has(n.slice(0, -5))) {
+        const t = loadSaved(n.slice(0, -5));
+        threads.delete(t.id); // listed, not loaded
+        all.set(t.id, t);
+      }
+    }
+    const list = [...all.values()].filter((t) => !t.ephemeral && (!cwds || cwds.includes(t.cwd))).sort((a, b) => b.updatedAt - a.updatedAt);
+    respond(id, { data: list.slice(0, p.limit ?? 25).map((t) => threadShape(t, false, null)), nextCursor: null, backwardsCursor: null });
+  }
+  function itemsList(id, p) {
+    const tid = field(p, 'threadId', isStr, 'a string');
+    const t = known(tid);
+    if (!t) throw invalid(`no rollout found for thread id ${tid}`);
+    if (p.sortDirection != null) variant(p.sortDirection, ['asc', 'desc']);
+    const ordered = p.sortDirection === 'desc' ? [...t.items].reverse() : t.items;
+    respond(id, { data: ordered.slice(0, p.limit ?? 100), nextCursor: null, backwardsCursor: null });
+  }
+  function setName(id, p) {
+    const t = known(field(p, 'threadId', isStr, 'a string'));
+    const name = field(p, 'name', isStr, 'a string');
+    if (!t) throw invalid('thread not found');
+    t.name = name;
+    save(t);
+    respond(id, {});
+    notify('thread/name/updated', { threadId: t.id, threadName: name });
+  }
+  function threadFork(id, p) {
+    const from = known(field(p, 'threadId', isStr, 'a string'));
+    if (!from) throw invalid(`no rollout found for thread id ${p.threadId}`);
+    const approval = p.approvalPolicy == null ? 'on-request' : approvalPolicy(p.approvalPolicy, experimentalApi);
+    const sandbox = sandboxPolicy(p.sandbox == null ? 'read-only' : variant(p.sandbox, SANDBOX_MODES));
+    const t = newThread(uuidv7(), isStr(p.cwd) ? p.cwd : from.cwd, from.model, approval, sandbox);
+    Object.assign(t, { items: [...from.items], forkedFromId: from.id });
+    save(t);
+    const thread = threadShape(t, false, null);
+    respond(id, threadResult(t, thread));
+    notify('thread/started', { thread });
+  }
   function mcpReload(id) {
     respond(id, {});
     for (const name of Object.keys(mcp)) notify('mcpServer/startupStatus/updated', startupStatus(name));
@@ -713,6 +825,11 @@ function createServer({ write, log, transcript = null, oauthDelayMs = 500, answe
     'thread/start': threadStart,
     'thread/resume': threadResume,
     'turn/start': turnStart,
+    'model/list': modelList,
+    'thread/list': threadList,
+    'thread/items/list': itemsList,
+    'thread/name/set': setName,
+    'thread/fork': threadFork,
     'turn/steer': turnSteer,
     'turn/interrupt': turnInterrupt,
     'mcpServerStatus/list': mcpList,
@@ -1018,7 +1135,9 @@ async function selfTest() {
     const t = await turn(c, threadId, 'Run the tests', accept);
     const req = t.seq.find((m) => m.method === 'item/commandExecution/requestApproval');
     assert.equal(req.params.kind, 'command');
-    assert.equal(req.params.command, 'npm test');
+    assert.equal(req.params.commandActions[0].command, 'npm test');
+    assert.equal(req.params.command, process.platform === 'win32' ? `"${POWERSHELL}" -Command 'npm test'` : 'npm test');
+    assert.ok(!('availableDecisions' in req.params), 'on-request lists no decisions');
     assert.equal(req.params.environmentId, null);
     assert.ok(!('proposedExecpolicyAmendment' in req.params));
     const at = t.seq.indexOf(req);
@@ -1167,6 +1286,52 @@ async function selfTest() {
     assert.ok(!t.methods.includes('item/commandExecution/requestApproval'));
     assert.match((await c.call('turn/start', { threadId, input: [], approvalPolicy: 'on-request', sandboxPolicy: 'workspace-write' })).error.message, /invalid type for `sandboxPolicy`/);
     await turn(c, threadId, 'hello', null, { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite', writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false } });
+  });
+
+  await check('untrusted (the companion policy): availableDecisions, an unlisted decision is a violation', async () => {
+    const { c: u } = await ready();
+    const tid = (await u.call('thread/start', { cwd: process.cwd(), approvalPolicy: 'untrusted', sandbox: 'danger-full-access' })).result.thread.id;
+    let t = await turn(u, tid, 'run amend', (req) => ({ result: { decision: req.params.availableDecisions[1] } }));
+    const req = t.seq.find((m) => m.method === 'item/commandExecution/requestApproval');
+    assert.deepEqual(req.params.availableDecisions, ['accept', { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['npm', 'test'] } }, 'cancel']);
+    assert.equal(commandItem(t).status, 'completed');
+    assert.equal(u.logs.length, 0);
+    t = await turn(u, tid, 'run', () => ({ result: { decision: 'decline' } }));
+    assert.match(u.logs.at(-1), /is not one of availableDecisions/);
+    assert.equal(u.server.end(), 3);
+  });
+
+  await check('models, thread list (cwd filter), items, name, fork, model override, image input', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fake-codex-state-'));
+    try {
+      const { c: a, threadId: tid } = await ready({ stateDir: dir });
+      const models = (await a.call('model/list', {})).result.data;
+      assert.deepEqual(models.map((m) => [m.model, m.isDefault]), [['gpt-6-luna', true], ['gpt-5.6-terra', false], ['gpt-5.6-luna', false]]);
+      const image = { type: 'image', url: 'data:image/png;base64,iVBORw0KGgo=' };
+      const res = await a.call('turn/start', { threadId: tid, input: [image, { type: 'text', text: 'hello' }], model: 'gpt-5.6-luna' });
+      await a.waitFor((m) => m.method === 'turn/completed' && m.params.turn.id === res.result.turn.id);
+      assert.match((await a.call('turn/start', { threadId: tid, input: [], model: 'gpt-9' })).error.message, /unknown variant `gpt-9`/);
+      assert.match((await a.call('turn/start', { threadId: tid, input: [{ type: 'image' }] })).error.message, /needs `url`/);
+      assert.deepEqual((await a.call('thread/name/set', { threadId: tid, name: 'Greeting' })).result, {});
+      assert.equal((await a.waitFor((m) => m.method === 'thread/name/updated')).params.threadName, 'Greeting');
+      assert.equal(a.server.end(), 0);
+      // a new process: listed and readable without loading it
+      const { c: b } = await ready({ stateDir: dir });
+      const listed = (await b.call('thread/list', { limit: 50, sortKey: 'updated_at', cwd: [process.cwd(), 'C:\\nope'] })).result.data;
+      const mine = listed.find((t) => t.id === tid);
+      assert.deepEqual([mine.name, mine.preview, mine.status.type, mine.model], ['Greeting', 'hello', 'notLoaded', 'gpt-5.6-luna']);
+      assert.deepEqual((await b.call('thread/list', { cwd: 'C:\\nope' })).result.data, []);
+      const items = (await b.call('thread/items/list', { threadId: tid, limit: 300, sortDirection: 'desc' })).result.data;
+      assert.deepEqual(items.map((e) => e.item.type), ['agentMessage', 'userMessage']);
+      assert.deepEqual(items[1].item.content[0], image);
+      const fork = await b.call('thread/fork', { threadId: tid, cwd: process.cwd(), approvalPolicy: 'untrusted', sandbox: 'danger-full-access', excludeTurns: true });
+      assert.equal(fork.result.thread.forkedFromId, tid);
+      assert.notEqual(fork.result.thread.id, tid);
+      assert.equal((await b.call('thread/items/list', { threadId: fork.result.thread.id })).result.data.length, 2);
+      assert.equal(b.server.end(), 0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   await check('mcp: status list, oauth login, completion marks the server connected, reload', async () => {
