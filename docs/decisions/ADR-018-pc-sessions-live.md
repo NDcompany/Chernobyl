@@ -33,7 +33,7 @@ Three facts make that possible without attaching to another process:
 
 ### 2.3 Continue on the phone: fork
 
-- `submit_prompt` takes an optional `fork: boolean` (TS and Rust validators share `composer-*.json`; anything but a boolean is refused). Codex, OpenCode and both mock engines refuse `fork: true`.
+- `submit_prompt` takes an optional `fork: boolean` (TS and Rust validators share `composer-*.json`; anything but a boolean is refused). Codex and both mock engines refuse `fork: true` (OpenCode forks natively since ADR-021).
 - For a session listed from disk (in use or not), the Claude runtime picks a new UUID and spawns `--session-id <new> --resume <old> --fork-session` in the recorded cwd (re-checked against the allow-list), under the same rate limit and `maxSessions` slot as `create_session`. The new session (`forkedFrom: <old title>`, new optional field) first gets the old session's history in its own transcript, then a notice "Forked from “…”; the PC session is unchanged", then the prompt. The ack's `sessionId` names the new session; a later respawn of the fork resumes the fork itself. A session the companion drives is not forked ("send a normal prompt").
 - A plain prompt to a session in use is still refused (T10, text now "…continue it there, or fork it to continue on the phone"). Idle sessions still resume in place.
 

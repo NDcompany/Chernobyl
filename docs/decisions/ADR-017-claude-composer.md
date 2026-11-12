@@ -20,7 +20,7 @@ ADR-015 gave the phone a Claude Code conversation: prompts, Stop, inline approva
 
 | Where | Addition |
 |---|---|
-| `Agent.live.composer` | `Array<'model' \| 'images' \| 'commands' \| 'context' \| 'rename'>`: what this runtime takes. Claude sends all five; Codex, OpenCode and the mock send none, so the phone hides the controls. |
+| `Agent.live.composer` | `Array<'model' \| 'images' \| 'commands' \| 'context' \| 'rename'>`: what this runtime takes. Claude sends all five; Codex and the mock send none, so the phone hides the controls (OpenCode sends what its server offers since ADR-021). |
 | `submit_prompt`, `create_session` | optional `images: [{mediaType, data}]` |
 | `create_session` | optional `model` (passed as `--model` at spawn; `default` passes nothing) |
 | client messages | `set_model {commandId, sessionId, model}`, `rename_session {commandId, sessionId, title}` (mutating: journaled, deduplicated, G1 lifecycle like `set_permission_mode`) |

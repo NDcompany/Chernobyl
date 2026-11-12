@@ -32,13 +32,24 @@
 //! SSE reconnect (deltas are not replayable), and `GET /mcp` is polled while
 //! anyone watches. Verified against 1.19.4 captures
 //! (`tests/fixtures/opencode/`).
+//!
+//! ADR-021 (parity with Claude Code): the serve's project folder (`GET
+//! /path`) is the agent's one workspace when it passes the same rules as a
+//! configured Claude workspace, so Files, Changes and Terminal work. The
+//! composer takes a model (`GET /config/providers`, sent with each prompt),
+//! photos (`file` parts with `data:` URLs), slash commands (`GET /command`,
+//! run through `POST /session/{id}/command`), the context meter (the last
+//! assistant message's tokens against the model's limit) and rename (`PATCH
+//! /session/{id}`); `submit_prompt {fork}` forks natively.
 
 use crate::adapters::{Capability, LiveRuntime};
+use crate::claude_live::validate_workspace;
 use crate::client::{HttpResponse, http_request, http_request_waiting, split_url};
 use crate::json::{self, Json};
 use crate::protocol::{
     ActivityEvent, Agent, AgentLive, ClientMsg, EventKind, FileChange, LIVE_PERMISSION_TTL_MS,
-    PermissionOption, PermissionRequest, ServerMsg, Session, next_id, now_ms,
+    LiveWorkspace, PermissionOption, PermissionRequest, PromptImage, ServerMsg, Session,
+    is_provider_model, next_id, now_ms,
 };
 use crate::runtime_io::{AUTH_TTL_MS, PendingAuth, check_callback_url, form_decode, redact};
 use crate::transcript::{
@@ -48,6 +59,7 @@ use crate::transcript::{
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -104,6 +116,34 @@ struct OcState {
     mcp: Vec<McpServer>,
     /// server → the sign-in URL OpenCode could not open on the desktop.
     open_failed: HashMap<String, String>,
+    /// ADR-021: the serve's project folder, once it passed
+    /// `validate_workspace`.
+    workspace: Option<LiveWorkspace>,
+    /// ADR-021: models, the configured model and the slash commands.
+    catalog: Catalog,
+    /// sessionID → the `provider/model` the phone chose (sent with every
+    /// prompt of that session).
+    chosen: HashMap<String, String>,
+    /// sessionID → the model its last assistant message ran on.
+    last_model: HashMap<String, String>,
+    /// sessionID → (used, max) context tokens of its last assistant message.
+    context: HashMap<String, (i64, i64)>,
+    /// user messageID → its image part ids (the user item shows a count).
+    images: HashMap<String, Vec<String>>,
+    /// sessionID → the title of the session it was forked from.
+    forks: HashMap<String, String>,
+}
+
+/// ADR-021: what `GET /config/providers`, `GET /config` and `GET /command`
+/// answered on the last probe.
+#[derive(Default, Clone)]
+struct Catalog {
+    /// (`provider/model`, label, context limit), the configured model first.
+    models: Vec<(String, String, i64)>,
+    /// `GET /config` `model`.
+    default_model: Option<String>,
+    /// Slash command names, without the slash.
+    commands: Vec<String>,
 }
 
 #[derive(Default)]
@@ -136,6 +176,11 @@ const SESSIONS_KEPT: usize = 64;
 const MCP_POLL: Duration = Duration::from_secs(30);
 /// §4.6: an interrupt with no turn end in this long ends `unknown`.
 const INTERRUPT_WAIT: Duration = Duration::from_secs(30);
+/// A slash command's `POST /session/{id}/command` answers when its turn
+/// ends; the turn's outcome comes from the event stream before that.
+const COMMAND_WAIT: Duration = Duration::from_secs(3600);
+/// Models offered to the phone (the transcript hub keeps as many).
+const MODELS_MAX: usize = 32;
 /// Permission records are journaled: legacy command and detail stay small.
 const COMMAND_CAP: usize = 2 << 10;
 const DETAIL_CAP: usize = 64 << 10;
@@ -160,6 +205,9 @@ struct Inner {
     hub: HubHandle,
     /// Asks the MCP poller for a poll now (auth calls, MCP toasts).
     poke: AtomicBool,
+    /// ADR-021: the companion's data directory, which a workspace must not
+    /// contain; `None` (probes) advertises no workspace.
+    data_dir: Option<PathBuf>,
 }
 
 pub struct OpenCodeAdapter {
@@ -174,15 +222,17 @@ pub struct OpenCodeAdapter {
 impl OpenCodeAdapter {
     /// An adapter streaming into a detached hub (probes, tests).
     pub fn new(id: &str, endpoint: &str, basic_auth: Option<&str>) -> OpenCodeAdapter {
-        OpenCodeAdapter::with_hub(id, endpoint, basic_auth, HubHandle::default())
+        OpenCodeAdapter::with_hub(id, endpoint, basic_auth, HubHandle::default(), None)
     }
 
-    /// The companion's adapter: transcripts go to `hub` (`Companion::hub`).
+    /// The companion's adapter: transcripts go to `hub` (`Companion::hub`);
+    /// `data_dir` is the companion's (ADR-021 workspace rule).
     pub fn with_hub(
         id: &str,
         endpoint: &str,
         basic_auth: Option<&str>,
         hub: HubHandle,
+        data_dir: Option<&Path>,
     ) -> OpenCodeAdapter {
         let ep = endpoint.trim();
         let ep = if ep.starts_with("http://") || ep.starts_with("https://") {
@@ -206,6 +256,7 @@ impl OpenCodeAdapter {
                 malformed_events: AtomicU64::new(0),
                 hub,
                 poke: AtomicBool::new(false),
+                data_dir: data_dir.map(Path::to_path_buf),
             }),
         }
     }
@@ -238,6 +289,25 @@ impl OpenCodeAdapter {
             Capability::new("permission.reply", "available", None),
             Capability::new("session.output", "available", None),
             Capability::new("mcp.status", "available", None),
+            // ADR-021, live-verified on 1.19.4 (`live_opencode_parity`)
+            Capability::new("session.model", "available", None),
+            Capability::new("session.rename", "available", None),
+            Capability::new("session.commands", "available", None),
+            Capability::new("session.fork", "available", None),
+            Capability::new(
+                "session.images",
+                "limited",
+                Some(
+                    "sent as data: file parts; whether the model sees them depends on the model OpenCode runs",
+                ),
+            ),
+            Capability::new(
+                "workspace.files",
+                "dependent-config",
+                Some(
+                    "the folder opencode serve runs in, when it is not a drive root, the profile folder or a folder holding the CHERNOBYL data directory",
+                ),
+            ),
             Capability::new(
                 "session.diff",
                 "limited",
@@ -299,40 +369,51 @@ impl OpenCodeAdapter {
     /// validation fault for the caller to surface.
     pub fn send(&self, msg: &ClientMsg) -> Result<ServerMsg, AdapterError> {
         match msg {
-            // ADR-018: forking is Claude's
-            ClientMsg::SubmitPrompt { fork: true, .. } => Err(AdapterError::Unsupported(
-                "OpenCode sessions cannot be forked from the phone".into(),
-            )),
-            // ADR-017: the composer extras are Claude's
-            ClientMsg::CreateSession { images, .. } | ClientMsg::SubmitPrompt { images, .. }
-                if !images.is_empty() =>
-            {
-                Err(AdapterError::Unsupported(
-                    "OpenCode does not take images yet".into(),
-                ))
-            }
-            ClientMsg::CreateSession { model: Some(_), .. } => Err(AdapterError::Unsupported(
-                "OpenCode sessions use the agent's configured model".into(),
-            )),
             ClientMsg::CreateSession {
                 command_id,
                 title,
                 prompt,
                 project,
+                images,
+                model,
                 ..
-            } => self
-                .inner
-                .create_session(command_id, title, prompt, project.as_deref()),
+            } => self.inner.create_session(
+                command_id,
+                title,
+                prompt,
+                project.as_deref(),
+                images,
+                model.as_deref(),
+            ),
+            // ADR-021: a native fork (`POST /session/{id}/fork`), then the
+            // prompt in the fork
             ClientMsg::SubmitPrompt {
                 command_id,
                 session_id,
                 text,
+                images,
+                fork: true,
+            } => self.inner.fork(command_id, session_id, text, images),
+            ClientMsg::SubmitPrompt {
+                command_id,
+                session_id,
+                text,
+                images,
                 ..
             } => {
-                self.inner.prompt_accept(session_id, text)?;
-                self.inner.track_prompt(session_id, command_id);
+                self.inner.prompt(command_id, session_id, text, images)?;
                 Ok(ack(command_id, true, None, Some(session_id), None))
             }
+            ClientMsg::SetModel {
+                command_id,
+                session_id,
+                model,
+            } => Ok(self.inner.set_model(command_id, session_id, model)),
+            ClientMsg::RenameSession {
+                command_id,
+                session_id,
+                title,
+            } => self.inner.rename(command_id, session_id, title),
             ClientMsg::Interrupt {
                 command_id,
                 session_id,
@@ -391,9 +472,7 @@ impl OpenCodeAdapter {
             ClientMsg::SessionSubscribe { .. }
             | ClientMsg::SessionUnsubscribe { .. }
             | ClientMsg::SessionEnd { .. }
-            | ClientMsg::SetPermissionMode { .. }
-            | ClientMsg::SetModel { .. }
-            | ClientMsg::RenameSession { .. } => Err(AdapterError::Unsupported(
+            | ClientMsg::SetPermissionMode { .. } => Err(AdapterError::Unsupported(
                 "not supported by this agent".into(),
             )),
         }
@@ -668,6 +747,9 @@ impl Inner {
                 st.detail = None;
                 st.version = version;
             }
+            // ADR-021 extras first: sessions are placed in the workspace and
+            // agents advertise it and the composer
+            self.fetch_extras();
             let mut sessions = self.fetch_sessions()?;
             let agents = self.fetch_agents()?;
             let mut st = self.state.lock().unwrap();
@@ -704,8 +786,52 @@ impl Inner {
         let st = self.state.lock().unwrap();
         Ok(arr
             .iter()
-            .filter_map(|info| Self::map_session(info, &self.id, &st.statuses))
+            .filter_map(|info| Self::map_session(info, &self.id, &st))
             .collect())
+    }
+
+    /// ADR-021: `GET /path` (the workspace), `GET /config/providers` and
+    /// `GET /config` (models), `GET /command` (slash commands). Best effort:
+    /// what a server does not answer stays as it was, and never fails the
+    /// probe.
+    fn fetch_extras(&self) {
+        let get = |path: &str| -> Option<Json> {
+            let resp = self
+                .req("GET", &format!("{}{path}", self.endpoint), None)
+                .ok()?;
+            if resp.status != 200 {
+                return None;
+            }
+            validate_json(&resp).ok()
+        };
+        let workspace = get("/path").map(|p| {
+            let dir = json::get_str(&p, "directory")?;
+            let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+            validate_workspace(dir, self.data_dir.as_deref()?, profile.as_deref()).ok()
+        });
+        let providers = get("/config/providers");
+        let config = get("/config");
+        let commands = get("/command");
+        let mut st = self.state.lock().unwrap();
+        if let Some(ws) = workspace {
+            st.workspace = ws;
+        }
+        if let Some(c) = &config {
+            st.catalog.default_model = json::get_str(c, "model")
+                .filter(|m| is_provider_model(m))
+                .map(str::to_string);
+        }
+        if let Some(p) = &providers {
+            st.catalog.models = catalog_models(p, st.catalog.default_model.as_deref());
+        }
+        if let Some(list) = commands.as_ref().and_then(json::as_arr) {
+            st.catalog.commands = list
+                .iter()
+                .filter_map(|c| json::get_str(c, "name"))
+                .filter(|n| !n.is_empty() && !n.contains(char::is_whitespace))
+                .map(str::to_string)
+                .collect();
+        }
     }
 
     fn fetch_agents(&self) -> Result<Vec<Agent>, AdapterError> {
@@ -720,22 +846,28 @@ impl Inner {
         let arr = json::as_arr(&v).ok_or_else(|| {
             AdapterError::InvalidResponse("`GET /agent` did not answer an array".into())
         })?;
-        let healthy = self.state.lock().unwrap().healthy;
+        let st = self.state.lock().unwrap();
         Ok(arr
             .iter()
-            .filter_map(|a| Self::map_agent(a, &self.id, healthy))
+            .filter_map(|a| Self::map_agent(a, &self.id, &st))
             .collect())
     }
 
     /// Maps a native session info object onto the protocol `Session`.
     /// `agent_id` is always `build`: OpenCode binds the agent per message,
-    /// not per session (probe evidence has no agent field on sessions).
-    fn map_session(
-        info: &Json,
-        host_id: &str,
-        statuses: &HashMap<String, String>,
-    ) -> Option<Session> {
+    /// not per session (probe evidence has no agent field on sessions). A
+    /// session in the workspace folder carries the workspace's own path, so
+    /// the phone finds its Files and Changes.
+    fn map_session(info: &Json, host_id: &str, st: &OcState) -> Option<Session> {
         let id = json::get_str(info, "id")?.to_string();
+        let directory = json::get_str(info, "directory");
+        let project = match (directory, &st.workspace) {
+            (Some(d), Some(ws)) if same_dir(d, &ws.path) => ws.path.clone(),
+            _ => directory
+                .or_else(|| json::get_str(info, "projectID"))
+                .unwrap_or("")
+                .to_string(),
+        };
         let (created, updated) = match json::get(info, "time") {
             Some(t) => (
                 json::get_i64(t, "created").unwrap_or(0),
@@ -743,10 +875,12 @@ impl Inner {
             ),
             None => (0, 0),
         };
-        let status = statuses
+        let status = st
+            .statuses
             .get(&id)
             .cloned()
             .unwrap_or_else(|| "completed".to_string());
+        let forked_from = st.forks.get(&id).cloned();
         Some(Session {
             id,
             agent_id: "build".to_string(),
@@ -755,10 +889,7 @@ impl Inner {
                 .or_else(|| json::get_str(info, "slug"))
                 .unwrap_or("(untitled)")
                 .to_string(),
-            project: json::get_str(info, "directory")
-                .or_else(|| json::get_str(info, "projectID"))
-                .unwrap_or("")
-                .to_string(),
+            project,
             status,
             progress: 0,
             created_at: created,
@@ -771,11 +902,13 @@ impl Inner {
             // subscriber hydrates it), so the phone opens the conversation
             transcript: true,
             live_pc: false,
-            forked_from: None,
+            forked_from,
         })
     }
 
-    fn map_agent(v: &Json, host_id: &str, healthy: bool) -> Option<Agent> {
+    fn map_agent(v: &Json, host_id: &str, st: &OcState) -> Option<Agent> {
+        let healthy = st.healthy;
+        let cat = &st.catalog;
         let name = json::get_str(v, "name")?.to_string();
         let mode = json::get_str(v, "mode").unwrap_or("primary");
         let mut caps = vec![mode.to_string()];
@@ -792,14 +925,29 @@ impl Inner {
             accepts_new_session: mode == "primary" && healthy,
             simulated: false,
             // §4.4/§4.6: a mid-turn prompt runs as its own turn afterwards;
-            // abort works; no end-session or permission-mode equivalent
+            // abort works; no end-session or permission-mode equivalent.
+            // ADR-021: the serve's folder and the composer extras OpenCode has
             live: Some(AgentLive {
                 prompt_while_busy: "queue",
                 interrupt: true,
                 end: false,
                 permission_modes: Vec::new(),
-                workspaces: Vec::new(),
-                composer: Vec::new(),
+                workspaces: st.workspace.iter().cloned().collect(),
+                composer: [
+                    ("model", !cat.models.is_empty()),
+                    ("images", true),
+                    ("commands", !cat.commands.is_empty()),
+                    ("context", true),
+                    ("rename", true),
+                ]
+                .into_iter()
+                .filter_map(|(f, on)| on.then_some(f))
+                .collect(),
+                models: cat
+                    .models
+                    .iter()
+                    .map(|(v, l, _)| (v.clone(), l.clone()))
+                    .collect(),
             }),
         })
     }
@@ -816,24 +964,57 @@ impl Inner {
         }
     }
 
+    /// ADR-017/021 `state` op for a session: its model (chosen, else the one
+    /// its last answer ran on, else OpenCode's configured one), the models
+    /// and commands on offer, and its context use.
+    fn live_state(st: &OcState, sid: &str, status: &'static str) -> LiveState {
+        LiveState {
+            status,
+            model: st
+                .chosen
+                .get(sid)
+                .or_else(|| st.last_model.get(sid))
+                .or(st.catalog.default_model.as_ref())
+                .cloned(),
+            models: st
+                .catalog
+                .models
+                .iter()
+                .map(|(v, l, _)| (v.clone(), l.clone()))
+                .collect(),
+            commands: st.catalog.commands.clone(),
+            context: st.context.get(sid).copied(),
+            ..Default::default()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn create_session(
-        &self,
+        self: &Arc<Self>,
         command_id: &str,
         title: &str,
         prompt: &str,
         project: Option<&str>,
+        images: &[PromptImage],
+        model: Option<&str>,
     ) -> Result<ServerMsg, AdapterError> {
-        // ADR-015 §4.2.3: a phone never picks a folder. OpenCode has no
-        // workspace allow-list, so its sessions start where `opencode serve`
-        // runs, and a `project` (once passed as `?directory=`) is refused.
-        if project.is_some_and(|p| !p.is_empty()) {
-            return Ok(ack(
-                command_id,
-                false,
-                Some("OpenCode sessions start in the folder opencode serve runs in".into()),
-                None,
-                None,
-            ));
+        // ADR-015 §4.2.3: a phone never picks a folder. OpenCode sessions
+        // start where `opencode serve` runs; its id is the only `project`
+        // taken (ADR-021), anything else is refused.
+        let refusal = {
+            let st = self.state.lock().unwrap();
+            let ws = st.workspace.as_ref().map(|w| w.id.as_str());
+            let model = model.filter(|m| *m != "default");
+            if project.is_some_and(|p| !p.is_empty() && Some(p) != ws) {
+                Some("OpenCode sessions start in the folder opencode serve runs in".to_string())
+            } else {
+                model
+                    .filter(|m| !st.catalog.models.iter().any(|c| c.0 == *m))
+                    .map(|m| format!("OpenCode does not offer the model {m}"))
+            }
+        };
+        if let Some(error) = refusal {
+            return Ok(ack(command_id, false, Some(error), None, None));
         }
         let url = format!("{}/session", self.endpoint);
         let body = json::stringify(&json::obj(vec![("title", json::s(title))]));
@@ -852,12 +1033,23 @@ impl Inner {
             .to_string();
         // Optimistic cache insert so the snapshot sees the session even if
         // the SSE stream is down; `session.created` upserts the same id.
-        if let Some(mapped) = Self::map_session(&v, &self.id, &HashMap::new()) {
+        let state = {
             let mut st = self.state.lock().unwrap();
-            Self::upsert_session(&mut st.sessions, mapped);
-        }
-        if !prompt.trim().is_empty()
-            && let Err(e) = self.prompt_accept(&session_id, prompt)
+            match model.filter(|m| *m != "default") {
+                Some(m) => st.chosen.insert(session_id.clone(), m.to_string()),
+                None => st.chosen.remove(&session_id),
+            };
+            trim(&mut st.chosen);
+            if let Some(mapped) = Self::map_session(&v, &self.id, &st) {
+                Self::upsert_session(&mut st.sessions, mapped);
+            }
+            Self::live_state(&st, &session_id, "idle")
+        };
+        // the phone opens this session next: stream it from the first event
+        self.hub.push(&session_id, Op::State(state));
+        // §4.6: create_session ends with its first turn
+        if (!prompt.trim().is_empty() || !images.is_empty())
+            && let Err(e) = self.prompt(command_id, &session_id, prompt, images)
         {
             // The create DID happen — surface it as a domain refusal with
             // the session id, not as a transport error hiding success.
@@ -869,26 +1061,255 @@ impl Inner {
                 None,
             ));
         }
-        // the phone opens this session next: stream it from the first event
-        self.hub.push(&session_id, Op::State(LiveState::default()));
-        if !prompt.trim().is_empty() {
-            // §4.6: create_session ends with its first turn
-            self.track_prompt(&session_id, command_id);
-        }
         Ok(ack(command_id, true, None, Some(&session_id), None))
+    }
+
+    /// A prompt, tracked until its turn ends (G1): a known slash command
+    /// (`/name args`) goes to `POST /session/:id/command`, anything else to
+    /// `prompt_async`, with the session's chosen model and the images.
+    fn prompt(
+        self: &Arc<Self>,
+        command_id: &str,
+        session_id: &str,
+        text: &str,
+        images: &[PromptImage],
+    ) -> Result<(), AdapterError> {
+        let (model, command) = {
+            let st = self.state.lock().unwrap();
+            (
+                st.chosen.get(session_id).cloned(),
+                slash(text, &st.catalog.commands).map(|(n, a)| (n.to_string(), a.to_string())),
+            )
+        };
+        match command {
+            Some((name, args)) => {
+                self.track_prompt(session_id, command_id);
+                self.run_command(command_id, session_id, &name, &args, images, model)
+            }
+            None => {
+                self.prompt_accept(session_id, text, images, model.as_deref())?;
+                self.track_prompt(session_id, command_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// ADR-021: `POST /session/:id/command {command, arguments, model?,
+    /// parts?}` answers only when the command's turn ends, so it runs on a
+    /// thread; the turn's outcome closes the prompt from the event stream.
+    /// A refusal before the turn started fails the prompt.
+    fn run_command(
+        self: &Arc<Self>,
+        command_id: &str,
+        session_id: &str,
+        name: &str,
+        args: &str,
+        images: &[PromptImage],
+        model: Option<String>,
+    ) {
+        let mut fields = vec![("command", json::s(name)), ("arguments", json::s(args))];
+        fields.extend(model.map(|m| ("model", json::s(&m))));
+        if !images.is_empty() {
+            fields.push(("parts", Json::Arr(image_parts(images))));
+        }
+        let body = json::stringify(&json::obj(fields));
+        let url = format!("{}/session/{session_id}/command", self.endpoint);
+        let (inner, cmd, sid, name) = (
+            self.clone(),
+            command_id.to_string(),
+            session_id.to_string(),
+            name.to_string(),
+        );
+        let _ = std::thread::Builder::new()
+            .name("opencode-command".into())
+            .spawn(move || {
+                let outcome = http_request_waiting(
+                    "POST",
+                    &url,
+                    inner.auth.as_deref(),
+                    Some(&body),
+                    COMMAND_WAIT,
+                );
+                let error = match outcome {
+                    Ok(r) if (200..300).contains(&r.status) => return,
+                    Ok(r) => format!("OpenCode refused /{name}: HTTP {}", r.status),
+                    Err(e) => format!("/{name} did not reach OpenCode: {e}"),
+                };
+                // still waiting for its turn to start = it never ran
+                let never_ran = {
+                    let mut st = inner.state.lock().unwrap();
+                    let at = st.pending.iter().position(|p| p.1 == cmd && !p.2);
+                    at.map(|i| st.pending.remove(i)).is_some()
+                };
+                if never_ran {
+                    inner.emit(vec![result(&cmd, "failed", Some(clip(error)), Some(sid))]);
+                }
+            });
+    }
+
+    /// ADR-021: a native fork (`POST /session/:id/fork`, all messages), then
+    /// the prompt in the fork; the ack names the fork. The original session
+    /// is never written.
+    fn fork(
+        self: &Arc<Self>,
+        command_id: &str,
+        session_id: &str,
+        text: &str,
+        images: &[PromptImage],
+    ) -> Result<ServerMsg, AdapterError> {
+        let resp = self.req(
+            "POST",
+            &format!("{}/session/{session_id}/fork", self.endpoint),
+            Some("{}"),
+        )?;
+        if !(200..300).contains(&resp.status) {
+            return Err(AdapterError::InvalidResponse(format!(
+                "fork answered HTTP {}",
+                resp.status
+            )));
+        }
+        let v = validate_json(&resp)?;
+        let fork = json::get_str(&v, "id")
+            .ok_or_else(|| AdapterError::InvalidResponse("fork response has no id".into()))?
+            .to_string();
+        let (state, created) = {
+            let mut st = self.state.lock().unwrap();
+            let from = st
+                .sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .map_or_else(|| "a session".to_string(), |s| s.title.clone());
+            st.forks.insert(fork.clone(), from);
+            trim(&mut st.forks);
+            if let Some(m) = st.chosen.get(session_id).cloned() {
+                st.chosen.insert(fork.clone(), m);
+            }
+            let mapped = Self::map_session(&v, &self.id, &st);
+            if let Some(s) = mapped.clone() {
+                Self::upsert_session(&mut st.sessions, s);
+            }
+            (Self::live_state(&st, &fork, "idle"), mapped)
+        };
+        self.emit(created.into_iter().map(EventKind::SessionCreated).collect());
+        self.hub.push(&fork, Op::State(state));
+        if let Err(e) = self.prompt(command_id, &fork, text, images) {
+            return Ok(ack(
+                command_id,
+                false,
+                Some(format!("forked, prompt not accepted: {e}")),
+                Some(&fork),
+                None,
+            ));
+        }
+        Ok(ack(command_id, true, None, Some(&fork), None))
+    }
+
+    /// ADR-021 `set_model`: OpenCode takes the model with each prompt, so
+    /// the choice is kept here and sent from the next prompt on. Only a
+    /// model `GET /config/providers` listed is taken.
+    fn set_model(&self, command_id: &str, session_id: &str, model: &str) -> ServerMsg {
+        let state = {
+            let mut st = self.state.lock().unwrap();
+            if !st.catalog.models.iter().any(|m| m.0 == model) {
+                return ack(
+                    command_id,
+                    false,
+                    Some(format!("OpenCode does not offer the model {model}")),
+                    Some(session_id),
+                    None,
+                );
+            }
+            st.chosen.insert(session_id.to_string(), model.to_string());
+            trim(&mut st.chosen);
+            let status = st.live.get(session_id).map_or("idle", |l| l.state);
+            Self::live_state(
+                &st,
+                session_id,
+                if status.is_empty() { "idle" } else { status },
+            )
+        };
+        self.push(session_id, Op::State(state));
+        self.emit(vec![result(
+            command_id,
+            "completed",
+            None,
+            Some(session_id.to_string()),
+        )]);
+        ack(command_id, true, None, Some(session_id), None)
+    }
+
+    /// ADR-021 `rename_session`: `PATCH /session/:id {title}` answers the
+    /// renamed session.
+    fn rename(
+        &self,
+        command_id: &str,
+        session_id: &str,
+        title: &str,
+    ) -> Result<ServerMsg, AdapterError> {
+        let body = json::stringify(&json::obj(vec![("title", json::s(title))]));
+        let resp = self.req(
+            "PATCH",
+            &format!("{}/session/{session_id}", self.endpoint),
+            Some(&body),
+        )?;
+        if !(200..300).contains(&resp.status) {
+            return Err(AdapterError::InvalidResponse(format!(
+                "rename answered HTTP {}",
+                resp.status
+            )));
+        }
+        let v = validate_json(&resp)?;
+        let mut out = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap();
+            if let Some(s) = Self::map_session(&v, &self.id, &st) {
+                Self::upsert_session(&mut st.sessions, s);
+            }
+            out.extend(
+                st.sessions
+                    .iter()
+                    .find(|s| s.id == session_id)
+                    .cloned()
+                    .map(EventKind::SessionUpdated),
+            );
+        }
+        out.push(result(
+            command_id,
+            "completed",
+            None,
+            Some(session_id.to_string()),
+        ));
+        self.emit(out);
+        Ok(ack(command_id, true, None, Some(session_id), None))
     }
 
     /// `POST /session/:id/prompt_async` — acceptance is 204-with-empty-body
     /// or 200+JSON; anything else (the HTML-200 fallback above all) is a
-    /// validation failure, never success (G4.2).
-    fn prompt_accept(&self, session_id: &str, text: &str) -> Result<(), AdapterError> {
-        let body = json::stringify(&json::obj(vec![(
-            "parts",
-            Json::Arr(vec![json::obj(vec![
-                ("type", json::s("text")),
-                ("text", json::s(text)),
-            ])]),
-        )]));
+    /// validation failure, never success (G4.2). ADR-021: the images follow
+    /// the text as `file` parts, and a chosen model rides along.
+    fn prompt_accept(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: &[PromptImage],
+        model: Option<&str>,
+    ) -> Result<(), AdapterError> {
+        let mut parts = vec![json::obj(vec![
+            ("type", json::s("text")),
+            ("text", json::s(text)),
+        ])];
+        parts.extend(image_parts(images));
+        let mut fields = vec![("parts", Json::Arr(parts))];
+        if let Some((provider, id)) = model.and_then(|m| m.split_once('/')) {
+            fields.push((
+                "model",
+                json::obj(vec![
+                    ("providerID", json::s(provider)),
+                    ("modelID", json::s(id)),
+                ]),
+            ));
+        }
+        let body = json::stringify(&json::obj(fields));
         let resp = self.req(
             "POST",
             &format!("{}/session/{session_id}/prompt_async", self.endpoint),
@@ -2011,7 +2432,7 @@ impl Inner {
                     return;
                 };
                 let mut st = self.state.lock().unwrap();
-                let Some(session) = Self::map_session(info, &self.id, &st.statuses) else {
+                let Some(session) = Self::map_session(info, &self.id, &st) else {
                     return;
                 };
                 Self::upsert_session(&mut st.sessions, session.clone());
@@ -2224,13 +2645,9 @@ impl Inner {
                 });
             }
             let live = st.live.entry(sid.to_string()).or_default();
-            (live.state != "running").then(|| {
-                live.state = "running";
-                Op::State(LiveState {
-                    status: "running",
-                    ..Default::default()
-                })
-            })
+            let changed = live.state != "running";
+            live.state = "running";
+            changed.then(|| Op::State(Self::live_state(&st, sid, "running")))
         };
         if let Some(op) = op {
             self.push(sid, op);
@@ -2290,7 +2707,7 @@ impl Inner {
         }
         if live.state != "idle" {
             live.state = "idle";
-            ops.push(Op::State(LiveState::default()));
+            ops.push(Op::State(Self::live_state(&st, sid, "idle")));
         }
         drop(st);
         for op in ops {
@@ -2351,6 +2768,17 @@ impl Inner {
             false => json::get_str(info, "parentID").unwrap_or(id),
         };
         let mut st = self.state.lock().unwrap();
+        // ADR-021: the model it ran on and the context it filled
+        if !user && note_usage(&mut st, sid, info) {
+            let status = match st.live.get(sid).map_or("", |l| l.state) {
+                "" => "idle",
+                s => s,
+            };
+            let state = Self::live_state(&st, sid, status);
+            drop(st);
+            self.push(sid, Op::State(state));
+            st = self.state.lock().unwrap();
+        }
         st.roles.insert(id.to_string(), (user, turn_id.to_string()));
         trim(&mut st.roles);
         if st.live.len() > SESSIONS_KEPT {
@@ -2438,6 +2866,20 @@ impl Inner {
         let Some((user, turn)) = st.roles.get(msg).cloned() else {
             return;
         };
+        // ADR-021: a photo of the prompt counts on its user item
+        if user && is_image(part) {
+            let list = st.images.entry(msg.to_string()).or_default();
+            if !list.iter().any(|p| p == id) {
+                list.push(id.to_string());
+            }
+            let n = list.len() as u32;
+            trim(&mut st.images);
+            drop(st);
+            if self.hub.streams(sid) {
+                self.hub.update(sid, msg, |item| item.images = n);
+            }
+            return;
+        }
         let op = match json::get_str(part, "type") {
             Some("step-finish") => {
                 let Some(turn) = st
@@ -2507,6 +2949,18 @@ impl Inner {
                 false => json::get_str(info, "parentID").unwrap_or(id),
             };
             st.roles.insert(id.to_string(), (user, turn_id.to_string()));
+            if user {
+                let photos: Vec<String> = parts
+                    .iter()
+                    .filter(|p| is_image(p))
+                    .filter_map(|p| json::get_str(p, "id").map(str::to_string))
+                    .collect();
+                if !photos.is_empty() {
+                    st.images.insert(id.to_string(), photos);
+                }
+            } else {
+                note_usage(&mut st, sid, info);
+            }
             let time = json::get(info, "time");
             let at = |k| time.and_then(|t| json::get_i64(t, k));
             if user {
@@ -2574,6 +3028,11 @@ impl Inner {
         }
         let keep = live.turns.len().saturating_sub(TURNS_KEPT);
         live.turns.drain(..keep);
+        // the composer's view (model, models, commands, context)
+        let status = if busy { "running" } else { "idle" };
+        live.state = status;
+        ops.push(Op::State(Self::live_state(&st, sid, status)));
+        trim(&mut st.images);
         drop(st);
         for op in ops {
             self.hub.push(sid, op);
@@ -2623,6 +3082,7 @@ fn part_item(
                 id: msg.to_string(),
                 kind: ItemKind::User,
                 text: text(),
+                images: st.images.get(msg).map_or(0, |p| p.len() as u32),
                 ..base
             })
         }
@@ -2729,6 +3189,120 @@ fn tool_call(
         duration_ms: at("end").zip(at("start")).map(|(e, s)| e - s),
         ..Default::default()
     }
+}
+
+/// ADR-021: a `file` part holding a picture.
+fn is_image(part: &Json) -> bool {
+    json::get_str(part, "type") == Some("file")
+        && json::get_str(part, "mime").is_some_and(|m| m.starts_with("image/"))
+}
+
+/// ADR-021: prompt images as OpenCode `file` parts with `data:` URLs.
+fn image_parts(images: &[PromptImage]) -> Vec<Json> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(i, im)| {
+            let ext = im.media_type.trim_start_matches("image/");
+            json::obj(vec![
+                ("type", json::s("file")),
+                ("mime", json::s(&im.media_type)),
+                ("filename", json::s(&format!("photo-{}.{ext}", i + 1))),
+                (
+                    "url",
+                    json::s(&format!("data:{};base64,{}", im.media_type, im.data)),
+                ),
+            ])
+        })
+        .collect()
+}
+
+/// ADR-021: `/name args` when `name` is one of OpenCode's commands.
+fn slash<'a>(text: &'a str, commands: &[String]) -> Option<(&'a str, &'a str)> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    commands
+        .iter()
+        .any(|c| c == name)
+        .then(|| (name, args.trim()))
+}
+
+/// Whether OpenCode's `directory` is the workspace folder (Windows paths
+/// compare without case; either slash).
+fn same_dir(dir: &str, workspace: &str) -> bool {
+    let norm = |p: &str| p.trim_end_matches(['\\', '/']).replace('/', "\\");
+    norm(dir).eq_ignore_ascii_case(&norm(workspace))
+}
+
+/// ADR-021 `GET /config/providers` (`{providers: [{id, name, models: {id:
+/// {id, name, limit: {context}, status}}}]}`) → (`provider/model`, label,
+/// context limit), the configured model first, deprecated ones left out,
+/// at most `MODELS_MAX`.
+fn catalog_models(v: &Json, default: Option<&str>) -> Vec<(String, String, i64)> {
+    let mut out = Vec::new();
+    for p in json::get(v, "providers")
+        .and_then(json::as_arr)
+        .unwrap_or(&[])
+    {
+        let (Some(provider), Some(Json::Obj(models))) =
+            (json::get_str(p, "id"), json::get(p, "models"))
+        else {
+            continue;
+        };
+        for (key, m) in models {
+            if json::get_str(m, "status") == Some("deprecated") {
+                continue;
+            }
+            let id = json::get_str(m, "id").unwrap_or(key);
+            let value = format!("{provider}/{id}");
+            if !is_provider_model(&value) {
+                continue;
+            }
+            let limit = json::get(m, "limit")
+                .and_then(|l| json::get_i64(l, "context"))
+                .unwrap_or(0);
+            let label = json::get_str(m, "name").unwrap_or(id).to_string();
+            out.push((value, label, limit));
+        }
+    }
+    out.sort_by_key(|m| Some(m.0.as_str()) != default);
+    out.truncate(MODELS_MAX);
+    out
+}
+
+/// ADR-021: an assistant message's model (`providerID/modelID`) and its
+/// context use (every token of the message: input, output, reasoning and
+/// cache) against that model's limit. True when the context changed.
+fn note_usage(st: &mut OcState, sid: &str, info: &Json) -> bool {
+    if let (Some(p), Some(m)) = (
+        json::get_str(info, "providerID"),
+        json::get_str(info, "modelID"),
+    ) {
+        st.last_model.insert(sid.to_string(), format!("{p}/{m}"));
+        trim(&mut st.last_model);
+    }
+    let Some(tokens) = json::get(info, "tokens") else {
+        return false;
+    };
+    let n = |v: &Json, k| json::get_i64(v, k).unwrap_or(0);
+    let cache = json::get(tokens, "cache");
+    let used = n(tokens, "input")
+        + n(tokens, "output")
+        + n(tokens, "reasoning")
+        + cache.map_or(0, |c| n(c, "read") + n(c, "write"));
+    let model = st.last_model.get(sid);
+    let max = st
+        .catalog
+        .models
+        .iter()
+        .find(|c| Some(&c.0) == model)
+        .map_or(0, |c| c.2);
+    if used <= 0 || max <= 0 || st.context.get(sid) == Some(&(used, max)) {
+        return false;
+    }
+    st.context.insert(sid.to_string(), (used, max));
+    trim(&mut st.context);
+    true
 }
 
 /// A unified diff for one file, its +/- lines counted (headers excluded).
@@ -3310,6 +3884,20 @@ pub(crate) mod tests {
                         }
                         ("POST", p) if p.ends_with("/abort") => {
                             respond(&mut stream, "200 OK", "application/json", "true")
+                        }
+                        // ADR-021: a slash command answers its assistant
+                        // message once the turn ends; "broken" is refused
+                        ("POST", p) if p.ends_with("/command") => {
+                            if body.contains(r#""command":"broken""#) {
+                                respond(
+                                    &mut stream,
+                                    "400 Bad Request",
+                                    "application/json",
+                                    r#"{"error":"unknown command"}"#,
+                                )
+                            } else {
+                                respond(&mut stream, "200 OK", "application/json", "{}")
+                            }
                         }
                         ("POST", p) if p.starts_with("/question/") => {
                             respond(&mut stream, "200 OK", "application/json", "true")
@@ -4101,6 +4689,11 @@ pub(crate) mod tests {
     }
 
     fn rig(opts: Opts, sid: &str) -> Rig {
+        rig_in(opts, sid, None)
+    }
+
+    /// `rig` with the companion's data directory (ADR-021 workspace rule).
+    fn rig_in(opts: Opts, sid: &str, data_dir: Option<&Path>) -> Rig {
         let f = start(opts);
         let shared = Arc::new(Mutex::new(Hub::default()));
         let (out, rx_out) =
@@ -4111,7 +4704,7 @@ pub(crate) mod tests {
             hub.subscribe(1, out, sid, None).unwrap();
         }
         let hub = HubHandle::new(shared);
-        let ad = OpenCodeAdapter::with_hub("oc-1", &f.addr, None, hub.clone());
+        let ad = OpenCodeAdapter::with_hub("oc-1", &f.addr, None, hub.clone(), data_dir);
         let (tx, rx) = mpsc::channel();
         ad.subscribe(move |k| {
             let _ = tx.send(k);
@@ -4798,5 +5391,481 @@ pub(crate) mod tests {
             r.requests(&path).len() >= 3
         });
         r.ad.dispose();
+    }
+
+    /* ------------------------ ADR-021 parity ------------------------ */
+
+    /// Shaped like 1.19.4's `GET /config/providers` (trimmed): a hosted
+    /// provider, Ollama with the configured model, a deprecated model and an
+    /// id the phone could not send.
+    const PROVIDERS: &str = r#"{"providers":[
+{"id":"opencode","name":"OpenCode","models":{
+ "big-pickle":{"id":"big-pickle","providerID":"opencode","name":"Big Pickle","limit":{"context":200000,"output":32000},"status":"active"},
+ "old-one":{"id":"old-one","name":"Old","limit":{"context":1000},"status":"deprecated"},
+ "bad id":{"id":"bad id","name":"Bad","limit":{"context":1000}}}},
+{"id":"ollama","name":"Ollama","models":{
+ "qwen3.5:4b":{"id":"qwen3.5:4b","name":"qwen3.5 4b","limit":{"context":8192,"output":2048},"status":"active"},
+ "chernobyl-qwen35-24k":{"id":"chernobyl-qwen35-24k","name":"qwen3.5 4b 24k","limit":{"context":24576,"output":4096},"status":"active"}}}],
+"default":{"opencode":"big-pickle","ollama":"qwen3.5:4b"}}"#;
+    const COMMANDS: &str = r#"[{"name":"init","source":"command","template":"t","hints":["$ARGUMENTS"]},{"name":"review","source":"command","template":"t","hints":[]},{"name":"broken","template":"t","hints":[]},{"name":"has space","template":"t","hints":[]}]"#;
+    const QWEN24: &str = "ollama/chernobyl-qwen35-24k";
+
+    /// A workspace folder (the serve's cwd) and a data dir outside it.
+    struct Dirs {
+        root: PathBuf,
+        work: PathBuf,
+        data: PathBuf,
+    }
+
+    impl Drop for Dirs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn dirs() -> Dirs {
+        let root = std::env::temp_dir().join(format!("chb-oc-parity-{}", next_id("t")));
+        let (work, data) = (root.join("Work"), root.join("data"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let canon = |p: &Path| crate::claude_live::plain(&std::fs::canonicalize(p).unwrap());
+        Dirs {
+            work: PathBuf::from(canon(&work)),
+            data: PathBuf::from(canon(&data)),
+            root,
+        }
+    }
+
+    /// The parity routes: `/path` names `dir`, the session lists in it
+    /// (spelled in lower case with forward slashes, as a client may).
+    fn parity_opts(dir: &str) -> Opts {
+        let q = |s: &str| json::stringify(&json::s(s));
+        let session_dir = dir.to_lowercase().replace('\\', "/");
+        Opts {
+            routes: vec![
+                (
+                    "GET /path".into(),
+                    format!(r#"{{"home":"h","state":"s","config":"c","worktree":{0},"directory":{0}}}"#, q(dir)),
+                ),
+                ("GET /config/providers".into(), PROVIDERS.into()),
+                ("GET /config".into(), format!(r#"{{"model":"{QWEN24}"}}"#)),
+                ("GET /command".into(), COMMANDS.into()),
+                (
+                    "GET /session".into(),
+                    format!(
+                        r#"[{{"id":"ses_test1","directory":{},"title":"Demo session","time":{{"created":1,"updated":2}}}}]"#,
+                        q(&session_dir)
+                    ),
+                ),
+                (
+                    "PATCH /session/ses_test1".into(),
+                    r#"{"id":"ses_test1","title":"Renamed","time":{"created":1,"updated":3}}"#.into(),
+                ),
+                (
+                    "POST /session/ses_test1/fork".into(),
+                    r#"{"id":"ses_fork1","title":"Demo session (fork #1)","time":{"created":4,"updated":4}}"#.into(),
+                ),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn last_state(ops: &[Json]) -> Json {
+        ops.iter()
+            .rev()
+            .find(|o| json::get_str(o, "op") == Some("state"))
+            .and_then(|o| json::get(o, "state"))
+            .cloned()
+            .expect("a state op")
+    }
+
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEUlEQVR4nGP4z8DwnwGMgRQAH+4D/dJQfRoAAAAASUVORK5CYII=";
+
+    fn png() -> Vec<PromptImage> {
+        vec![PromptImage {
+            media_type: "image/png".into(),
+            data: PNG.into(),
+        }]
+    }
+
+    #[test]
+    fn serve_folder_is_the_workspace_and_the_composer_is_advertised() {
+        let d = dirs();
+        let r = rig_in(
+            parity_opts(&d.work.to_string_lossy()),
+            "ses_test1",
+            Some(&d.data),
+        );
+        r.ad.refresh().unwrap();
+        let build = r.ad.agents().into_iter().find(|a| a.id == "build").unwrap();
+        let live = build.live.unwrap();
+        assert_eq!(live.workspaces.len(), 1);
+        let ws = &live.workspaces[0];
+        assert_eq!(ws.path, d.work.to_string_lossy());
+        assert_eq!(ws.label, "Work");
+        assert_eq!(ws.id, crate::claude_live::workspace_id(&ws.path));
+        assert_eq!(
+            live.composer,
+            ["model", "images", "commands", "context", "rename"]
+        );
+        // the configured model first; deprecated and unsendable ids left out
+        let values: Vec<&str> = live.models.iter().map(|m| m.0.as_str()).collect();
+        assert_eq!(values, [QWEN24, "opencode/big-pickle", "ollama/qwen3.5:4b"]);
+        assert_eq!(live.models[0].1, "qwen3.5 4b 24k");
+        // a session in that folder carries the workspace's own spelling
+        assert_eq!(r.ad.sessions()[0].project, ws.path);
+        // the serve in a folder that holds the data dir: no workspace
+        let r = rig_in(parity_opts(&d.root.to_string_lossy()), "s", Some(&d.data));
+        r.ad.refresh().unwrap();
+        assert!(
+            r.ad.agents()[0]
+                .live
+                .as_ref()
+                .unwrap()
+                .workspaces
+                .is_empty()
+        );
+        // a drive root, and a probe without a data dir: none either
+        let root = d
+            .work
+            .ancestors()
+            .last()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let r = rig_in(parity_opts(&root), "s", Some(&d.data));
+        r.ad.refresh().unwrap();
+        assert!(
+            r.ad.agents()[0]
+                .live
+                .as_ref()
+                .unwrap()
+                .workspaces
+                .is_empty()
+        );
+        let r = rig(parity_opts(&d.work.to_string_lossy()), "s");
+        r.ad.refresh().unwrap();
+        assert!(
+            r.ad.agents()[0]
+                .live
+                .as_ref()
+                .unwrap()
+                .workspaces
+                .is_empty()
+        );
+        // a server without the extras still probes, with no composer extras
+        // beyond the ones that need no list
+        let r = rig(Opts::default(), "s");
+        r.ad.refresh().unwrap();
+        let live = r.ad.agents()[0].live.clone().unwrap();
+        assert_eq!(live.composer, ["images", "context", "rename"]);
+        assert!(live.models.is_empty() && live.workspaces.is_empty());
+    }
+
+    #[test]
+    fn create_takes_the_workspace_a_listed_model_and_photos() {
+        let d = dirs();
+        let r = rig_in(
+            parity_opts(&d.work.to_string_lossy()),
+            "ses_created1",
+            Some(&d.data),
+        );
+        r.ad.refresh().unwrap();
+        let ws = r.ad.agents()[0].live.clone().unwrap().workspaces[0]
+            .id
+            .clone();
+        let create = |project: Option<&str>, model: Option<&str>, cmd: &str| {
+            r.ad.send(&ClientMsg::CreateSession {
+                command_id: cmd.into(),
+                agent_id: "build".into(),
+                title: "Fresh".into(),
+                prompt: "what is this?".into(),
+                project: project.map(str::to_string),
+                images: png(),
+                model: model.map(str::to_string),
+            })
+            .unwrap()
+        };
+        let refused = |m: ServerMsg| match m {
+            ServerMsg::Ack {
+                ok: false, error, ..
+            } => error.unwrap(),
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(refused(create(Some("0123456789ab"), None, "c1")).contains("folder"));
+        assert!(refused(create(Some(&ws), Some("ollama/nope"), "c2")).contains("does not offer"));
+        assert!(r.requests("POST /session ").is_empty(), "nothing created");
+        let ok = create(Some(&ws), Some(QWEN24), "c3");
+        assert!(matches!(ok, ServerMsg::Ack { ok: true, .. }), "{ok:?}");
+        let sent = r.requests("prompt_async").pop().unwrap();
+        assert!(
+            sent.contains(r#""model":{"providerID":"ollama","modelID":"chernobyl-qwen35-24k"}"#),
+            "{sent}"
+        );
+        assert!(sent.contains(&format!(
+            r#"{{"type":"file","mime":"image/png","filename":"photo-1.png","url":"data:image/png;base64,{PNG}"}}"#
+        )));
+        // text first, then the photo
+        assert!(sent.find("what is this?").unwrap() < sent.find("data:image/png").unwrap());
+        let state = last_state(&r.ops("ses_created1"));
+        assert_eq!(json::get_str(&state, "model"), Some(QWEN24));
+        assert_eq!(
+            json::get(&state, "slashCommands")
+                .and_then(json::as_arr)
+                .map(<[Json]>::len),
+            Some(3)
+        );
+        // "default" means OpenCode's own choice: no model is sent
+        assert!(matches!(
+            create(None, Some("default"), "c4"),
+            ServerMsg::Ack { ok: true, .. }
+        ));
+        assert!(
+            !r.requests("prompt_async")
+                .pop()
+                .unwrap()
+                .contains("providerID")
+        );
+    }
+
+    #[test]
+    fn set_model_rename_and_slash_commands() {
+        let d = dirs();
+        let r = rig_in(
+            parity_opts(&d.work.to_string_lossy()),
+            "ses_test1",
+            Some(&d.data),
+        );
+        r.ad.refresh().unwrap();
+        let send = |m: ClientMsg| r.ad.send(&m).unwrap();
+        let model = |cmd: &str, m: &str| {
+            send(ClientMsg::SetModel {
+                command_id: cmd.into(),
+                session_id: "ses_test1".into(),
+                model: m.into(),
+            })
+        };
+        assert!(matches!(
+            model("m1", "ollama/nope"),
+            ServerMsg::Ack { ok: false, .. }
+        ));
+        assert!(matches!(
+            model("m2", "opencode/big-pickle"),
+            ServerMsg::Ack { ok: true, .. }
+        ));
+        assert_eq!(
+            json::get_str(&last_state(&r.ops("ses_test1")), "model"),
+            Some("opencode/big-pickle")
+        );
+        submit_to(&r.ad, "ses_test1", "p1");
+        assert!(
+            r.requests("prompt_async")
+                .pop()
+                .unwrap()
+                .contains(r#""modelID":"big-pickle""#)
+        );
+        // rename: PATCH with the title, the session updated, the command done
+        let ack = send(ClientMsg::RenameSession {
+            command_id: "r1".into(),
+            session_id: "ses_test1".into(),
+            title: "Renamed".into(),
+        });
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }));
+        assert!(
+            r.requests("PATCH /session/ses_test1")
+                .pop()
+                .unwrap()
+                .contains(r#"{"title":"Renamed"}"#)
+        );
+        assert_eq!(r.ad.sessions()[0].title, "Renamed");
+        let events = r.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EventKind::SessionUpdated(s) if s.title == "Renamed"))
+        );
+        let done = results(&events);
+        assert!(done.contains(&("m2".into(), "completed".into())));
+        assert!(done.contains(&("r1".into(), "completed".into())));
+        // a known command runs through /command with its arguments and the
+        // chosen model; an unknown one is plain prompt text
+        let slash = |cmd: &str, text: &str| {
+            let ack = send(ClientMsg::SubmitPrompt {
+                command_id: cmd.into(),
+                session_id: "ses_test1".into(),
+                text: text.into(),
+                images: vec![],
+                fork: false,
+            });
+            assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        };
+        slash("s1", "/init keep it short");
+        wait_for("the command call", || {
+            !r.requests("ses_test1/command").is_empty()
+        });
+        let call = r.requests("POST /session/ses_test1/command").pop().unwrap();
+        assert!(
+            call.contains(
+                r#""command":"init","arguments":"keep it short","model":"opencode/big-pickle""#
+            ),
+            "{call}"
+        );
+        slash("s2", "/nosuch thing");
+        assert!(
+            r.requests("prompt_async")
+                .pop()
+                .unwrap()
+                .contains("/nosuch thing")
+        );
+        // the turn closes a command like any prompt
+        r.feed(&format!(
+            "data: {}\n",
+            r#"{"payload":{"type":"session.idle","properties":{"sessionID":"ses_test1"}}}"#
+        ));
+        let done = results(&r.events());
+        assert!(
+            done.contains(&("s1".into(), "completed".into())),
+            "{done:?}"
+        );
+        // a command OpenCode refuses before its turn started fails at once
+        slash("s3", "/broken");
+        wait_for("the refusal", || {
+            r.rx.try_iter().any(|e| {
+                matches!(&e, EventKind::CommandResult { command_id, status, error, .. }
+                    if command_id == "s3" && status == "failed"
+                        && error.as_deref().is_some_and(|m| m.contains("HTTP 400")))
+            })
+        });
+    }
+
+    #[test]
+    fn fork_creates_the_fork_and_prompts_it() {
+        let d = dirs();
+        let r = rig_in(
+            parity_opts(&d.work.to_string_lossy()),
+            "ses_fork1",
+            Some(&d.data),
+        );
+        r.ad.refresh().unwrap();
+        let ack =
+            r.ad.send(&ClientMsg::SubmitPrompt {
+                command_id: "f1".into(),
+                session_id: "ses_test1".into(),
+                text: "carry on".into(),
+                images: vec![],
+                fork: true,
+            })
+            .unwrap();
+        match ack {
+            ServerMsg::Ack {
+                ok: true,
+                session_id,
+                ..
+            } => assert_eq!(session_id.as_deref(), Some("ses_fork1")),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(r.requests("POST /session/ses_test1/fork").len(), 1);
+        assert!(
+            r.requests("/session/ses_fork1/prompt_async")
+                .pop()
+                .unwrap()
+                .contains("carry on")
+        );
+        assert!(
+            r.requests("/session/ses_test1/prompt_async").is_empty(),
+            "the original is untouched"
+        );
+        let forked =
+            r.ad.sessions()
+                .into_iter()
+                .find(|s| s.id == "ses_fork1")
+                .unwrap();
+        assert_eq!(forked.forked_from.as_deref(), Some("Demo session"));
+        assert!(
+            r.events()
+                .iter()
+                .any(|e| matches!(e, EventKind::SessionCreated(s) if s.id == "ses_fork1"))
+        );
+        // the marker survives OpenCode's own updates of the fork
+        r.feed(r#"data: {"payload":{"type":"session.updated","properties":{"sessionID":"ses_fork1","info":{"id":"ses_fork1","title":"Fork title","time":{"created":4,"updated":5}}}}}"#);
+        let forked =
+            r.ad.sessions()
+                .into_iter()
+                .find(|s| s.id == "ses_fork1")
+                .unwrap();
+        assert_eq!(forked.title, "Fork title");
+        assert_eq!(forked.forked_from.as_deref(), Some("Demo session"));
+    }
+
+    #[test]
+    fn photos_count_on_the_user_item_and_the_context_meter_fills() {
+        let d = dirs();
+        let r = rig_in(
+            parity_opts(&d.work.to_string_lossy()),
+            "ses_test1",
+            Some(&d.data),
+        );
+        r.ad.refresh().unwrap();
+        let ev = |t: &str, props: &str| {
+            format!(r#"data: {{"payload":{{"type":"{t}","properties":{props}}}}}"#)
+        };
+        let script = [
+            ev("message.updated", r#"{"info":{"id":"msg_u1","sessionID":"ses_test1","role":"user","time":{"created":1}}}"#),
+            ev("message.part.updated", r#"{"part":{"id":"prt_t1","messageID":"msg_u1","sessionID":"ses_test1","type":"text","text":"what is this?"}}"#),
+            ev("message.part.updated", r#"{"part":{"id":"prt_f1","messageID":"msg_u1","sessionID":"ses_test1","type":"file","mime":"image/png","url":"data:image/png;base64,x"}}"#),
+            ev("message.part.updated", r#"{"part":{"id":"prt_f1","messageID":"msg_u1","sessionID":"ses_test1","type":"file","mime":"image/png","url":"data:image/png;base64,x"}}"#),
+            ev("message.updated", r#"{"info":{"id":"msg_a1","sessionID":"ses_test1","role":"assistant","parentID":"msg_u1","providerID":"ollama","modelID":"chernobyl-qwen35-24k","time":{"created":2},"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}"#),
+            ev("message.updated", r#"{"info":{"id":"msg_a1","sessionID":"ses_test1","role":"assistant","parentID":"msg_u1","providerID":"ollama","modelID":"chernobyl-qwen35-24k","time":{"created":2,"completed":3},"tokens":{"input":12000,"output":200,"reasoning":50,"cache":{"read":40,"write":0}}}}"#),
+        ]
+        .join("\n");
+        r.feed(&script);
+        let ops = r.ops("ses_test1");
+        let user = items(&ops, "msg_u1").pop().unwrap().clone();
+        assert_eq!(json::get_i64(&user, "images"), Some(1), "counted once");
+        let state = last_state(&ops);
+        let context = json::get(&state, "context").expect("context");
+        assert_eq!(json::get_i64(context, "usedTokens"), Some(12_290));
+        assert_eq!(json::get_i64(context, "maxTokens"), Some(24_576));
+        assert_eq!(json::get_str(&state, "model"), Some(QWEN24));
+        // hydration counts the photos too and rebuilds the meter
+        let messages = r#"[
+{"info":{"id":"msg_u2","sessionID":"ses_h","role":"user","time":{"created":1}},"parts":[
+ {"id":"prt_t2","messageID":"msg_u2","sessionID":"ses_h","type":"text","text":"two photos"},
+ {"id":"prt_f2","messageID":"msg_u2","sessionID":"ses_h","type":"file","mime":"image/jpeg","url":"data:"},
+ {"id":"prt_f3","messageID":"msg_u2","sessionID":"ses_h","type":"file","mime":"image/png","url":"data:"}]},
+{"info":{"id":"msg_a2","sessionID":"ses_h","role":"assistant","parentID":"msg_u2","providerID":"opencode","modelID":"big-pickle","time":{"created":2,"completed":3},"tokens":{"input":1000,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}},"parts":[]}]"#;
+        let mut opts = parity_opts(&d.work.to_string_lossy());
+        opts.routes
+            .push(("GET /session/ses_h/message".into(), messages.into()));
+        let r = rig_in(opts, "ses_h", Some(&d.data));
+        r.ad.refresh().unwrap();
+        r.ad.on_subscribe("ses_h");
+        wait_for("hydrated", || !items(&r.ops("ses_h"), "msg_u2").is_empty());
+        let ops = r.ops("ses_h");
+        assert_eq!(json::get_i64(items(&ops, "msg_u2")[0], "images"), Some(2));
+        wait_for("state", || {
+            r.ops("ses_h")
+                .iter()
+                .any(|o| json::get_str(o, "op") == Some("state"))
+        });
+        let state = last_state(&r.ops("ses_h"));
+        assert_eq!(json::get_str(&state, "model"), Some("opencode/big-pickle"));
+        let context = json::get(&state, "context").unwrap();
+        assert_eq!(json::get_i64(context, "maxTokens"), Some(200_000));
+        r.ad.dispose();
+    }
+
+    #[test]
+    fn slash_and_model_helpers() {
+        let cmds = vec!["init".to_string(), "review".to_string()];
+        assert_eq!(slash("/init", &cmds), Some(("init", "")));
+        assert_eq!(slash("/review  HEAD~1 ", &cmds), Some(("review", "HEAD~1")));
+        assert_eq!(slash("/initx", &cmds), None);
+        assert_eq!(slash("init", &cmds), None);
+        assert!(same_dir(r"C:\Proj\Demo\", "c:/proj/demo"));
+        assert!(!same_dir(r"C:\Proj\Demo2", r"C:\Proj\Demo"));
+        let models = catalog_models(&json::parse(PROVIDERS).unwrap(), None);
+        assert_eq!(models[0].0, "opencode/big-pickle");
+        assert_eq!(models.len(), 3);
     }
 }

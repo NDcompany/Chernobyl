@@ -11,6 +11,7 @@ import {
   imageBudgetLeft,
   modelChoices,
   modelLabel,
+  newTaskModels,
   pickPictureSize,
   sealedFrameBytes,
   slashQuery,
@@ -76,4 +77,16 @@ test('context meter and model labels', () => {
   assert.equal(modelLabel('haiku', listed), 'Haiku 5.5');
   assert.equal(modelLabel(undefined, listed), 'Model');
   assert.equal(modelLabel('something-else', listed), 'something-else');
+});
+
+test('ADR-021 models: OpenCode sends its own list, Default stays first', () => {
+  const oc = [
+    { value: 'ollama/qwen3.5:4b', label: 'qwen3.5 4b' },
+    { value: 'opencode/big-pickle', label: 'Big Pickle' },
+  ];
+  assert.deepEqual(newTaskModels(oc).map((m) => m.value), ['default', 'ollama/qwen3.5:4b', 'opencode/big-pickle']);
+  assert.deepEqual(newTaskModels(undefined).map((m) => m.value), ['default', 'sonnet', 'opus', 'haiku']);
+  assert.deepEqual(newTaskModels([]).map((m) => m.value), ['default', 'sonnet', 'opus', 'haiku']);
+  assert.equal(modelLabel('ollama/qwen3.5:4b', modelChoices({ models: oc })), 'qwen3.5 4b');
+  assert.equal(modelLabel('ollama/other', oc), 'ollama/other');
 });

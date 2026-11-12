@@ -29,6 +29,15 @@ page records **which versions were verified** and the limits that matter in prac
   after a reconnect, state is re-listed and watched transcripts are rebuilt from
   `GET /session/{id}/message`. OpenCode's conversation text is not journaled (prompts sent
   from the phone are, as part of their command records: `PRIVACY.md`).
+  Since ADR-021 (2026-11-12) OpenCode is at Claude's level on the phone: the folder `opencode
+  serve` runs in (`GET /path`, checked like a Claude workspace) is the agent's workspace, so
+  Files, Changes, Pull and the opt-in Terminal work and New task picks it; the model picker
+  lists `GET /config/providers` and sends the chosen `provider/model` with each prompt
+  (OpenCode has no per-session model setting); photos go as `data:` file parts; slash commands
+  come from `GET /command` and run through `POST /session/{id}/command`; the context meter
+  uses the last answer's tokens against the model's limit; rename is `PATCH /session/{id}`;
+  `submit_prompt {fork}` forks natively. A session `opencode run` created in the same project
+  (its own process on the same data) lists on the next probe and replays its history.
 - **Ollama.** It is a model provider, not an agent. Session operations report
   `unavailable` (PRD §7.7).
 - **Claude Code.** Without `workspaces` it is ingress only: the companion observes hook

@@ -148,8 +148,10 @@ export interface Agent {
     permissionModes?: string[];
     /** Spawning runtimes only. */
     workspaces?: Array<{ id: string; label: string; path: string }>;
-    /** ADR-017 composer extras this runtime takes (Claude); the phone hides the rest. */
+    /** ADR-017 composer extras this runtime takes (Claude, OpenCode); the phone hides the rest. */
     composer?: ComposerFeature[];
+    /** ADR-021: models a new session may start with, when they are not Claude Code's aliases (OpenCode). */
+    models?: Array<{ value: string; label: string }>;
   };
 }
 
@@ -759,11 +761,18 @@ const IMAGE_MAGIC: Record<PromptImageType, string> = {
 };
 const MODEL_ALIASES: ReadonlySet<string> = new Set(['default', 'opus', 'sonnet', 'haiku', 'fable', 'opusplan']);
 
-/** ADR-017: a Claude Code alias or a full `claude-…` id (lowercase, digits, dashes; ≤ 64). */
+/**
+ * ADR-017: a Claude Code alias or a full `claude-…` id (lowercase, digits, dashes; ≤ 64), or
+ * (ADR-021) an OpenCode `provider/model` id (`ollama/qwen3.5:4b`; ≤ 64, nothing that starts with
+ * `-` or `/`). Each runtime checks its own form again (Rust `is_claude_model`, the OpenCode list).
+ */
 export function isModelName(v: unknown): v is string {
   return (
     typeof v === 'string' &&
-    (MODEL_ALIASES.has(v) || (v.length <= 64 && /^claude-[a-z0-9-]+$/.test(v)))
+    v.length <= 64 &&
+    (MODEL_ALIASES.has(v) ||
+      /^claude-[a-z0-9-]+$/.test(v) ||
+      /^[A-Za-z0-9._][A-Za-z0-9._-]*\/[A-Za-z0-9._:@+][A-Za-z0-9._:/@+-]*$/.test(v))
   );
 }
 

@@ -92,9 +92,10 @@ gets the same label via `announceForAccessibility`), `McpChip` ("MCP 4/5" + warn
 actions), `ModeChip` (Claude permission mode picker; `dark` variant for the black header).
 ADR-017: `UserBubble` shows an outlined "1 image" / "N images" chip (camera icon) above the text
 when the prompt carried photos (only the count comes back); `ModelChip` (current model, sheet of the
-CLI's models or the `default`/`sonnet`/`opus`/`haiku` aliases), `ContextChip` ("Context N%",
+runtime's models or the `default`/`sonnet`/`opus`/`haiku` aliases), `ContextChip` ("Context N%",
 warning dot from 80%, hidden while unknown) and `RenameChip` (pencil; sheet with a text field,
-80 characters) share the chip style and its `dark` variant.
+80 characters) share the chip style and its `dark` variant. ADR-021: `ModelChip` and `RenameChip`
+take `agentName` ("Claude Code" by default, "OpenCode") for their sheet notes.
 
 **`workspace.tsx`** — ADR-016 Files / Changes pieces, presentational only (pure logic in
 `src/utils/workspace.ts`, unit-tested): `WorkspaceUnavailable` ("Connect a PC" without
@@ -235,7 +236,7 @@ carry a `SimulatedTag`. Derived from the keystore pairing and store transport st
 ## Routes (`app/`)
 
 Tabs: `(tabs)/index` Home · `agents` → `agent/[id]` · `sessions` → `session/[id]` · `approvals` →
-`permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field; agents with `live.composer` `model` get a Model chip row, Default sending no `model`).
+`permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field; agents with `live.composer` `model` get a Model chip row, Default sending no `model`; the row lists `live.models` when the agent sends them (OpenCode's `provider/model` ids, `newTaskModels`), else Claude Code's aliases, and switching agents resets it to Default).
 Full-screen (no gesture back): `onboarding`, `sign-in`.
 Workspace (ADR-016): `files/[workspace]?path=` (one screen per folder, so Back walks up),
 `file/[workspace]?path=` (text viewer), `changes/[workspace]` (git), `terminal/[workspace]`
@@ -246,7 +247,7 @@ Changes, and Terminal when enabled) and the Files / Changes chips in the live co
 `session/[id]` is the live conversation (see Live sessions) or the classic workspace; its black
 header's chip row wraps: MCP, permission mode, model, context, then rename and End session on the
 right (model, context, rename, slash commands and the camera only for agents whose
-`live.composer` lists them, i.e. Claude). ADR-018: a `livePc` session (a terminal or VS Code is
+`live.composer` lists them: Claude, and OpenCode since ADR-021). ADR-018: a `livePc` session (a terminal or VS Code is
 writing it) shows `LivePcTag` first in the chip row and hides mode, model, rename, End and Stop;
 the transcript is the companion's live mirror. Its composer reads "Continue on phone (fork)…"
 with the one-line hint "Live on PC: sending forks it into a new session here; the PC session is

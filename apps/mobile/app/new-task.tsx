@@ -13,7 +13,7 @@ import { useSnapshot } from '@/data/state';
 import { useCommands, commands } from '@/data/commands';
 import { transportKind } from '@/data/transport';
 import { agentKindLabel } from '@/utils/format';
-import { FALLBACK_MODELS } from '@/utils/composer';
+import { newTaskModels } from '@/utils/composer';
 import { zodHandler } from '@/forms/zodBridge';
 import { Button, Chip, SimulatedTag, StatusDot, Text, TextField } from '@/ui/primitives';
 import { Screen, PageHeader, Card, EmptyState } from '@/ui/surface';
@@ -73,6 +73,8 @@ export default function NewTaskScreen() {
   // create_session.project then carries the workspace id
   const workspaces = selectedAgent?.live?.workspaces ?? [];
   const pickModel = selectedAgent?.live?.composer?.includes('model') ?? false;
+  // ADR-021: OpenCode sends its own list; Claude Code takes the aliases
+  const modelList = newTaskModels(selectedAgent?.live?.models);
 
   // Auto-navigate when reconciled on reconnect
   useEffect(() => {
@@ -129,6 +131,8 @@ export default function NewTaskScreen() {
                     form.setValue('agentId', a.id, { shouldDirty: true });
                     // a workspace id means nothing to another agent, and vice versa
                     form.setValue('project', a.live?.workspaces?.[0]?.id ?? '');
+                    // and a model name means nothing to another runtime
+                    setModel('default');
                   }}
                 />
               ))}
@@ -197,12 +201,12 @@ export default function NewTaskScreen() {
                 showsHorizontalScrollIndicator={false}
                 contentContainerStyle={{ gap: spacing.sm, paddingRight: spacing.xl }}
               >
-                {FALLBACK_MODELS.map((m) => (
+                {modelList.map((m) => (
                   <Chip key={m.value} label={m.label} active={model === m.value} onPress={() => setModel(m.value)} />
                 ))}
               </ScrollView>
               <Text variant="xs" color={colors.text3}>
-                Default is the model Claude Code uses on your PC. You can switch later in the session.
+                {`Default is the model ${agentKindLabel(selectedAgent?.kind ?? '')} uses on your PC. You can switch later in the session.`}
               </Text>
             </View>
           ) : null}

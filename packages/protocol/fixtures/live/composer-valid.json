@@ -48,6 +48,17 @@
   { "type": "set_model", "commandId": "c-model-2", "sessionId": "ses_live_1", "model": "opus" },
   { "type": "set_model", "commandId": "c-model-3", "sessionId": "ses_live_1", "model": "haiku" },
   { "type": "set_model", "commandId": "c-model-4", "sessionId": "ses_live_1", "model": "claude-sonnet-5-5" },
+  { "type": "set_model", "commandId": "c-model-5", "sessionId": "ses_oc_1", "model": "ollama/qwen3.5:4b" },
+  { "type": "set_model", "commandId": "c-model-6", "sessionId": "ses_oc_1", "model": "openrouter/anthropic/claude-3.5-sonnet" },
+  {
+    "type": "create_session",
+    "commandId": "c-new-3",
+    "agentId": "build",
+    "title": "t",
+    "prompt": "p",
+    "project": "3f2a9c1d0e4b",
+    "model": "opencode/big-pickle"
+  },
   { "type": "rename_session", "commandId": "c-name-1", "sessionId": "ses_live_1", "title": "Fix the login bug" },
   { "type": "rename_session", "commandId": "c-name-2", "sessionId": "ses_live_1", "title": "Ünïcode ✓ title" }
 ]
