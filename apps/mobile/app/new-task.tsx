@@ -13,7 +13,7 @@ import { useSnapshot } from '@/data/state';
 import { useCommands, commands } from '@/data/commands';
 import { transportKind } from '@/data/transport';
 import { agentKindLabel } from '@/utils/format';
-import { FALLBACK_MODELS } from '@/utils/composer';
+import { newSessionModels } from '@/utils/composer';
 import { zodHandler } from '@/forms/zodBridge';
 import { Button, Chip, SimulatedTag, StatusDot, Text, TextField } from '@/ui/primitives';
 import { Screen, PageHeader, Card, EmptyState } from '@/ui/surface';
@@ -46,7 +46,7 @@ export default function NewTaskScreen() {
   const params = useLocalSearchParams<{ agent?: string }>();
   const [busy, setBusy] = useState(false);
   const [submittedCommandId, setSubmittedCommandId] = useState<string | null>(null);
-  // ADR-017: Claude starts on this model (`--model`); 'default' sends none
+  // ADR-017/022: the session starts on this model; 'default' sends none
   const [model, setModel] = useState('default');
   const commandStates = useAppStore((s) => s.commandStates);
 
@@ -73,6 +73,8 @@ export default function NewTaskScreen() {
   // create_session.project then carries the workspace id
   const workspaces = selectedAgent?.live?.workspaces ?? [];
   const pickModel = selectedAgent?.live?.composer?.includes('model') ?? false;
+  // ADR-022: Antigravity lists its own models; Claude Code takes its aliases
+  const modelOptions = newSessionModels(selectedAgent?.live?.models);
 
   // Auto-navigate when reconciled on reconnect
   useEffect(() => {
@@ -89,7 +91,8 @@ export default function NewTaskScreen() {
   const submit = zodHandler(taskSchema, form, (data) => {
     setBusy(true);
     void (async () => {
-      const chosen = pickModel && model !== 'default' ? model : undefined;
+      const offered = modelOptions.some((m) => m.value === model);
+      const chosen = pickModel && offered && model !== 'default' ? model : undefined;
       const msg = commands.createSession(data.agentId, data.title, data.prompt, data.project || undefined, chosen);
       setSubmittedCommandId('commandId' in msg ? msg.commandId : null);
       const ack = await send(msg);
@@ -197,12 +200,13 @@ export default function NewTaskScreen() {
                 showsHorizontalScrollIndicator={false}
                 contentContainerStyle={{ gap: spacing.sm, paddingRight: spacing.xl }}
               >
-                {FALLBACK_MODELS.map((m) => (
+                {modelOptions.map((m) => (
                   <Chip key={m.value} label={m.label} active={model === m.value} onPress={() => setModel(m.value)} />
                 ))}
               </ScrollView>
               <Text variant="xs" color={colors.text3}>
-                Default is the model Claude Code uses on your PC. You can switch later in the session.
+                Default is the model {selectedAgent?.name ?? 'the agent'} uses on your PC. You can switch later in the
+                session.
               </Text>
             </View>
           ) : null}

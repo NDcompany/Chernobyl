@@ -113,6 +113,7 @@ test('agentKindLabel: recognized kinds and custom fallback', () => {
   assert.equal(agentKindLabel('claude-code'), 'Claude Code');
   assert.equal(agentKindLabel('opencode'), 'OpenCode');
   assert.equal(agentKindLabel('codex'), 'Codex');
+  assert.equal(agentKindLabel('antigravity'), 'Antigravity');
   assert.equal(agentKindLabel('browser'), 'Browser automation');
   assert.equal(agentKindLabel('local'), 'Local agent');
   assert.equal(agentKindLabel('unknown-custom'), 'Custom agent');

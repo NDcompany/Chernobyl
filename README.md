@@ -19,7 +19,7 @@ packages/protocol   Shared TypeScript protocol: types, message envelopes,
 services/companion-rs
                     The real backend (Rust, std-only, one binary): protocol-v2
                     WebSocket server + pairing/QR + E2E session layer +
-                    OpenCode, Claude Code and Codex live runtimes + loopback
+                    OpenCode, Claude Code, Codex and Antigravity live runtimes + loopback
                     diagnostics. This is the production runtime the phone
                     talks to.
 services/host       TypeScript reference host (Node + ws): MockEngine + the
@@ -120,6 +120,7 @@ on both sides, and are never journaled (`docs/PRIVACY.md`).
 | Claude Code | **driven**: the companion starts `claude.exe` (stream-json on stdio) in an allow-listed folder; also permission mode and end session | live round trip passed against Haiku, CLI 2.1.310 (about $0.01 per run) |
 | OpenCode | **attach** to a running `opencode serve` (HTTP + SSE), as before | live tests passed on 1.19.4 with local Ollama (`qwen3.5:4b`, 24k context) |
 | Codex | **driven**: one `codex app-server` per adapter, each session a thread | every capability `limited`: tested only against a fake app-server, no live run |
+| Antigravity | **driven**: one `agy acp` (Agent Client Protocol) per adapter, each session an agy session (ADR-022) | inline approvals (allow once or deny), steering follow-ups, interrupt, model, images, slash commands, permission mode, history from agy's own list; no MCP status; live run against agy 1.5.6 |
 
 To enable them, add to `companion.json` (keys documented in `services/companion-rs/README.md`):
 
@@ -128,6 +129,11 @@ To enable them, add to `companion.json` (keys documented in `services/companion-
   `acceptEdits` or `plan`). Without `workspaces` the entry stays a hook ingress only.
 - Codex: a new entry `{ "id": "codex-1", "type": "codex", "enabled": true, "workspaces": [...] }`
   with `binary` pointing at the real `codex.exe` (the npm `.cmd` shim is refused).
+- Antigravity: `{ "id": "agy-1", "type": "antigravity", "enabled": true, "workspaces": [...] }`
+  (optional `binary`, default `%LOCALAPPDATA%\agy\bin\agy.exe` then `agy.exe` on PATH; `model`
+  for new sessions, such as `gemini-3.8-flash-low`; `maxSessions` 1-16, default 3), or
+  `setup-windows.ps1 -Antigravity`. Sign in to agy once in a terminal first. The phone answers
+  agy's own permission prompts once at a time; the companion never writes agy's settings.
 
 **Allow-listing a folder means trusting it.** The phone can start an agent in it, and Claude
 runs in print mode, which skips its folder-trust dialog, so that folder's project hooks and MCP
@@ -198,7 +204,8 @@ protocol-v2 the mobile app already emits:
 - **Adapters** — an attach-only OpenCode adapter (HTTP/SSE to an existing
   `opencode serve`), an Ollama model-runtime adapter (attach-only, explicit endpoint),
   Claude Code as a hook ingress (loopback diagnostics POST only) plus driven sessions in
-  allow-listed workspaces, a Codex app-server runtime (`limited`), and the in-process
+  allow-listed workspaces, a Codex app-server runtime (`limited`), a Google Antigravity
+  `agy acp` runtime (ADR-022), and the in-process
   `mock` engine. Hermes is deferred by ADR-008 (not installed on this machine —
   not stubbed). Phase 7 complete.
 
@@ -215,8 +222,9 @@ production backend — use the companion for real connections.
   ADR-009: mock mode is a permanent, first-class dev/test mode; the mobile app shows a
   persistent **"Simulation"** badge while the mock is active so demo data is never
   mistaken for a real agent.
-- **Real agent integration**: OpenCode (attach-only HTTP/SSE, no spawned server) and
-  Claude Code driven sessions are live-verified; Codex is implemented from its schema and
+- **Real agent integration**: OpenCode (attach-only HTTP/SSE, no spawned server), Claude
+  Code and Antigravity driven sessions are live-verified (Antigravity: no emulator run
+  yet); Codex is implemented from its schema and
   tested only against a fake app-server; Ollama is a model runtime; Hermes is deferred
   (ADR-008 — not installed here, deliberately not stubbed). The live-session emulator rows
   (checklist 9.1-9.13) are not run yet. When no healthy real runtime is

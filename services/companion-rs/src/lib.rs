@@ -20,8 +20,13 @@
 //! claude_history: Claude Code sessions on disk (discovery and replay).
 //! workspace: ADR-016 read-only files and git for allow-listed workspaces.
 //! terminal: ADR-020 opt-in one-shot command runner (off by default).
+//! agy: ADR-022 Google Antigravity `agy acp` client core (Agent Client
+//! Protocol, inline approvals); agy_runtime: its LiveRuntime (one agy child
+//! per adapter, sessions inside it).
 
 pub mod adapters;
+pub mod agy;
+pub mod agy_runtime;
 pub mod backup;
 pub mod base64;
 pub mod claude;

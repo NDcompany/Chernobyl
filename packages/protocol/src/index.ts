@@ -42,6 +42,7 @@ export type AgentKind =
   | 'claude-code'
   | 'opencode'
   | 'codex'
+  | 'antigravity'
   | 'browser'
   | 'local'
   | 'custom';
@@ -150,6 +151,8 @@ export interface Agent {
     workspaces?: Array<{ id: string; label: string; path: string }>;
     /** ADR-017 composer extras this runtime takes (Claude); the phone hides the rest. */
     composer?: ComposerFeature[];
+    /** ADR-022: the models a new session may start on, for runtimes whose ids are not Claude's. */
+    models?: Array<{ value: string; label: string }>;
   };
 }
 
@@ -759,11 +762,15 @@ const IMAGE_MAGIC: Record<PromptImageType, string> = {
 };
 const MODEL_ALIASES: ReadonlySet<string> = new Set(['default', 'opus', 'sonnet', 'haiku', 'fable', 'opusplan']);
 
-/** ADR-017: a Claude Code alias or a full `claude-…` id (lowercase, digits, dashes; ≤ 64). */
+/**
+ * ADR-017/022: a Claude Code alias, or a runtime's model id (`claude-sonnet-4-6`,
+ * `gemini-3.8-flash-low`): lowercase letters and digits in `-`/`.`-separated parts, at least
+ * two, starting with a letter, ≤ 64. Each runtime then checks the id against its own models.
+ */
 export function isModelName(v: unknown): v is string {
   return (
     typeof v === 'string' &&
-    (MODEL_ALIASES.has(v) || (v.length <= 64 && /^claude-[a-z0-9-]+$/.test(v)))
+    (MODEL_ALIASES.has(v) || (v.length <= 64 && /^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)+$/.test(v)))
   );
 }
 

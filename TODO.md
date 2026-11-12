@@ -374,6 +374,14 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
       plain-framework Java, pure-Java ChaCha20-Poly1305 proven by RFC 8439 + the golden frames,
       TLS 1.2 + bundled ISRG roots for ngrok; emulator API 19 run passes (live Haiku $0.018).
       Open: a physical 4.4 tablet run incl. camera QR; photos, slash commands and session chips.
+- [x] Google Antigravity runtime (ADR-022, branch `feat/antigravity`, 2026-11-12): `agy acp`
+      (Agent Client Protocol) instead of the stream-json approve-then-retry plan, because agy
+      1.5.x asks for permissions inline there; inline once-only approvals, steering, interrupt,
+      model/images/slash commands/mode/rename/end, history via `session/list`/`load`/`resume`,
+      `setup-windows.ps1 -Antigravity`, the saucer mark (app and KitKat). Fake `agy acp` tests
+      plus one live run on agy 1.5.6 (`gemini-3.8-flash-low`, about 75k tokens).
+- [ ] Antigravity on the emulator: create, approve, stop, history and the model picker on
+      screen; one `session_end` against real agy (only the fake answered `session/close`).
 - [ ] One physical-phone run of the checklist (S4), incl. a real camera QR scan.
 - [ ] A human third-party security audit (S9).
 - [x] APK release signing (2026-11-12): `scripts/make-signing-key.ps1` + `CHB_KEYSTORE` in

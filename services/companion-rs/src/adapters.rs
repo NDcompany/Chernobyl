@@ -232,7 +232,7 @@ impl AdapterManager {
                 // whether a bridge is actually delivering is a runtime signal
                 // the adapter reports, not a discovery-time claim.
                 (true, true, None, Vec::new())
-            } else if entry.kind == "codex" {
+            } else if entry.kind == "codex" || entry.kind == "antigravity" {
                 // ADR-015 §4.3: spawned on the first session; health comes
                 // from the boot binary probe, never from discovery alone.
                 (

@@ -800,6 +800,7 @@ impl Inner {
                 permission_modes: Vec::new(),
                 workspaces: Vec::new(),
                 composer: Vec::new(),
+                models: Vec::new(),
             }),
         })
     }

@@ -130,6 +130,9 @@ pub struct AgentLive {
     /// ADR-017 composer features (model | images | commands | context |
     /// rename); the phone hides what is missing. Serialized only when non-empty.
     pub composer: Vec<&'static str>,
+    /// ADR-022: the models a new session may start on, (value, label), for
+    /// runtimes whose ids are not Claude's. Serialized only when non-empty.
+    pub models: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,6 +159,12 @@ impl AgentLive {
         if !self.composer.is_empty() {
             let list = self.composer.iter().map(|c| json::s(c)).collect();
             fields.push(("composer", Json::Arr(list)));
+        }
+        if !self.models.is_empty() {
+            let list = self.models.iter().map(|(value, label)| {
+                json::obj(vec![("value", json::s(value)), ("label", json::s(label))])
+            });
+            fields.push(("models", Json::Arr(list.collect())));
         }
         if !self.workspaces.is_empty() {
             fields.push((
@@ -515,8 +524,26 @@ pub struct PromptImage {
     pub data: String,
 }
 
-/// A model the phone may pick (TS `isModelName`): a Claude Code alias or a
-/// full `claude-…` id, nothing a shell or flag parser could misread.
+/// A model the phone may pick (TS `isModelName`): a Claude Code alias, or a
+/// runtime's model id (ADR-022: `gemini-3.8-flash-low`, `gpt-oss-120b-medium`):
+/// lowercase letters and digits in `-`/`.`-separated parts, at least two,
+/// starting with a letter, at most 64 chars. Nothing a shell or flag parser
+/// could misread. Each runtime then checks the id against its own models.
+pub fn is_model_name(s: &str) -> bool {
+    let part = |p: &str| {
+        !p.is_empty()
+            && p.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    };
+    MODEL_ALIASES.contains(&s)
+        || (s.len() <= MODEL_MAX
+            && s.starts_with(|c: char| c.is_ascii_lowercase())
+            && s.split(['-', '.']).count() >= 2
+            && s.split(['-', '.']).all(part))
+}
+
+/// A model the Claude runtime takes: a Claude Code alias or a full
+/// `claude-…` id.
 pub fn is_model(s: &str) -> bool {
     MODEL_ALIASES.contains(&s)
         || s.strip_prefix("claude-").is_some_and(|rest| {
@@ -1024,7 +1051,7 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
                 .map(str::to_string),
             images: opt_images(obj)?,
             model: match opt_str(obj, "model", MODEL_MAX)? {
-                Some(m) if !is_model(&m) => return None,
+                Some(m) if !is_model_name(&m) => return None,
                 m => m,
             },
         }),
@@ -1046,7 +1073,7 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
         "set_model" => Some(ClientMsg::SetModel {
             command_id: req("commandId")?,
             session_id: req("sessionId")?,
-            model: req("model").filter(|m| is_model(m))?,
+            model: req("model").filter(|m| is_model_name(m))?,
         }),
         "rename_session" => Some(ClientMsg::RenameSession {
             command_id: req("commandId")?,
@@ -2843,6 +2870,7 @@ mod tests {
                 path: "C:\\work\\demo".into(),
             }],
             composer: vec![],
+            models: Vec::new(),
         });
         assert_eq!(
             json::stringify(json::get(&agent.to_json(), "live").unwrap()),
@@ -2978,5 +3006,50 @@ mod tests {
         ] {
             assert!(!is_model(bad), "{bad}");
         }
+        // ADR-022: on the wire, any runtime's model id; Claude's still pass
+        for good in [
+            "default",
+            "claude-sonnet-4-6",
+            "gemini-3.8-flash-low",
+            "gpt-oss-120b-medium",
+            "gpt-5",
+        ] {
+            assert!(is_model_name(good), "{good}");
+        }
+        for bad in [
+            "",
+            "best",
+            "Opus",
+            "claude-",
+            "-model",
+            "--dangerously-skip-permissions",
+            "gemini..x",
+            "9-model",
+            "gemini-3.8 flash",
+            "gpt_5",
+            "a/b-c",
+            "claude-opus;calc",
+        ] {
+            assert!(!is_model_name(bad), "{bad}");
+        }
+        assert!(!is_model_name(&format!("claude-{}", "a".repeat(58))));
+        // `models` on Agent.live only when there are some
+        let mut live = AgentLive {
+            prompt_while_busy: "merge",
+            interrupt: true,
+            end: true,
+            permission_modes: vec![],
+            workspaces: vec![],
+            composer: vec![],
+            models: vec![],
+        };
+        assert!(!json::stringify(&live.to_json()).contains("models"));
+        live.models = vec![(
+            "gemini-3.8-flash-low".into(),
+            "Gemini 3.8 Flash (Low)".into(),
+        )];
+        assert!(json::stringify(&live.to_json()).contains(
+            r#""models":[{"value":"gemini-3.8-flash-low","label":"Gemini 3.8 Flash (Low)"}]"#
+        ));
     }
 }

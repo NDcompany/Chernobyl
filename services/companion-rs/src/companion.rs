@@ -5,6 +5,7 @@
 //! continuity (C2).
 
 use crate::adapters::{AdapterManager, LiveRuntime};
+use crate::agy_runtime::AgyRuntime;
 use crate::claude::ClaudeAdapter;
 use crate::claude_runtime::{ClaudeRuntime, LiveConfig};
 use crate::codex_runtime::{CodexRuntime, Sink};
@@ -313,6 +314,31 @@ impl Companion {
                 companion.hub(),
                 companion.engine_sink(),
                 opener,
+            ));
+            let probe = rt.refresh();
+            let mut mgr = companion.shared.adapters.lock().unwrap();
+            mgr.attach(&id, rt.capabilities());
+            mgr.probe_result(&id, probe.err().map(|e| e.to_string()));
+            drop(mgr);
+            companion.runtimes.push(rt);
+        }
+
+        // ADR-022: Antigravity (`agy acp`) runtimes. The boot refresh lists
+        // agy's past conversations in the workspaces (spawning agy once).
+        let agy_cfgs: Vec<_> = companion
+            .shared
+            .config
+            .adapters
+            .iter()
+            .filter(|e| e.enabled && e.kind == "antigravity")
+            .filter_map(|e| Some((e.id.clone(), e.agy.clone()?)))
+            .collect();
+        for (id, cfg) in agy_cfgs {
+            let rt = Arc::new(AgyRuntime::new(
+                &id,
+                cfg,
+                companion.hub(),
+                companion.engine_sink(),
             ));
             let probe = rt.refresh();
             let mut mgr = companion.shared.adapters.lock().unwrap();
@@ -2719,6 +2745,7 @@ mod tests {
                             permission_modes: vec![],
                             workspaces: vec![w],
                             composer: Vec::new(),
+                            models: Vec::new(),
                         }
                     }),
                 };
@@ -3223,6 +3250,99 @@ mod tests {
         );
         comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
+    }
+
+    // ---- ADR-022: Antigravity behind the router, through the real boot path ----
+
+    #[test]
+    fn antigravity_boots_routes_approvals_and_serves_its_workspace() {
+        let mut c = temp_config("agy-boot");
+        let ws = c.data_dir.parent().unwrap().join("agy-ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("hello.txt"), "hi\n").unwrap();
+        let Some(fake) = crate::agy_runtime::tests::fake_agy(&ws, &[]) else {
+            return;
+        };
+        let entry = crate::json::obj(vec![
+            ("type", crate::json::s("antigravity")),
+            (
+                "workspaces",
+                crate::json::Json::Arr(vec![crate::json::s(&ws.to_string_lossy())]),
+            ),
+        ]);
+        let mut launch = crate::agy::launch_config(&entry, &c.data_dir).unwrap();
+        (launch.binary, launch.args) = (fake.binary, fake.args);
+        c.adapters.push(crate::config::AdapterEntryConfig {
+            id: "agy-1".into(),
+            kind: "antigravity".into(),
+            enabled: true,
+            agy: Some(launch),
+            ..Default::default()
+        });
+        let comp = Companion::boot(c.clone()).unwrap();
+        let status = crate::json::stringify(&comp.adapters_json());
+        assert!(
+            status.contains(r#""id":"agy-1","type":"antigravity","supported":true,"healthy":true"#),
+            "{status}"
+        );
+        let agent = comp
+            .snapshot()
+            .agents
+            .into_iter()
+            .find(|a| a.id == "agy-1")
+            .unwrap();
+        assert_eq!(agent.kind, "antigravity");
+        let ws_id = agent.live.unwrap().workspaces[0].id.clone();
+        // Files works for an Antigravity workspace (ADR-016)
+        let (result, ack) = comp.workspace_query(
+            "r1",
+            &ws_id,
+            &WorkspaceOp::FsList {
+                path: String::new(),
+            },
+        );
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        assert!(result.unwrap().to_text().contains("hello.txt"));
+        // create → an approval decided through the engine (G2)
+        let create = ClientMsg::CreateSession {
+            command_id: "c1".into(),
+            agent_id: "agy-1".into(),
+            title: "fake".into(),
+            prompt: "run hostname".into(),
+            project: Some(ws_id),
+            images: vec![],
+            model: None,
+        };
+        let session = match comp.handle_client_msg(create) {
+            Some(ServerMsg::Ack {
+                ok: true,
+                session_id: Some(s),
+                ..
+            }) => s,
+            other => panic!("{other:?}"),
+        };
+        cx::wait_until("the engine record", || {
+            comp.snapshot()
+                .permissions
+                .iter()
+                .any(|p| p.session_id == session && p.status == "pending")
+        });
+        let p = comp
+            .snapshot()
+            .permissions
+            .into_iter()
+            .find(|p| p.session_id == session)
+            .unwrap();
+        assert_eq!(p.title, "Antigravity wants to run a command");
+        assert_eq!(p.supported_decisions, ["approve-once", "reject"]);
+        let stale = decision("d0", &p.id, "approve-once", Some("allow"), 0.0);
+        refusal(comp.handle_client_msg(stale));
+        let allow = decision("d1", &p.id, "approve-once", Some("allow"), 1.0);
+        assert!(ok(comp.handle_client_msg(allow)));
+        cx::wait_until("the turn", || command_status(&comp, "c1") == "completed");
+        let p = permission(&comp, &p.id).unwrap();
+        assert_eq!(p.status, "approved");
+        comp.shutdown(true);
     }
 
     // ---- ADR-015 step 7: the Codex runtime behind the router ----

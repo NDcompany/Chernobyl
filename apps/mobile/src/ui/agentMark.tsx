@@ -19,7 +19,7 @@ import { markFor, type MarkId, type MarkState } from '@/utils/agentIdentity';
 
 export type { MarkState } from '@/utils/agentIdentity';
 
-/** '#' = filled cell. Original characters: ember, bot, braces, blob. */
+/** '#' = filled cell. Original characters: ember, bot, braces, saucer, blob. */
 const SPRITES: Record<MarkId, readonly string[]> = {
   // Claude Code: a diamond-shaped ember with two eyes
   claude: ['...##...', '..####..', '.######.', '##.##.##', '########', '.######.', '..####..', '...##...'],
@@ -27,6 +27,8 @@ const SPRITES: Record<MarkId, readonly string[]> = {
   codex: ['...##...', '.######.', '.#.##.#.', '.######.', '.##..##.', '.######.', '..#..#..', '.##..##.'],
   // OpenCode: curly braces around a dot
   opencode: ['.##..##.', '.#....#.', '.#....#.', '#..##..#', '#..##..#', '.#....#.', '.#....#.', '.##..##.'],
+  // Antigravity: a little flying saucer with two eyes, hovering on its beam
+  antigravity: ['..####..', '.#.##.#.', '########', '#.#..#.#', '########', '..#..#..', '.#....#.', '#......#'],
   // anything else: a round blob
   generic: ['..####..', '.######.', '##.##.##', '########', '########', '########', '.######.', '.#.##.#.'],
 };
@@ -50,6 +52,7 @@ const PATHS: Record<MarkId, string> = {
   claude: spritePath(SPRITES.claude),
   codex: spritePath(SPRITES.codex),
   opencode: spritePath(SPRITES.opencode),
+  antigravity: spritePath(SPRITES.antigravity),
   generic: spritePath(SPRITES.generic),
 };
 

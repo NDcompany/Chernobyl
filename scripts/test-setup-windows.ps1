@@ -35,6 +35,16 @@ try {
   $c = Run-Setup @()
   if ($c.terminal.enabled -ne $false) { throw 'terminal must default to off' }
   if (@($c.adapters | Where-Object type -eq 'opencode').Count) { throw 'no opencode without -OpenCode' }
+  if (@($c.adapters | Where-Object type -eq 'antigravity').Count) { throw 'no antigravity without -Antigravity' }
+
+  $c = Run-Setup @('-Antigravity')
+  $ag = @($c.adapters | Where-Object type -eq 'antigravity')
+  if ($ag.Count -ne 1 -or $ag[0].id -ne 'agy-1' -or -not $ag[0].enabled -or @($ag[0].workspaces)[0] -ne (Resolve-Path $ws).Path) { throw "bad antigravity entry: $($ag | ConvertTo-Json)" }
+  if ($ag[0].PSObject.Properties.Name -contains 'model' -or $ag[0].PSObject.Properties.Name -contains 'args') { throw 'no model unless asked, never args' }
+  $c = Run-Setup @('-AntigravityModel', 'gemini-3.8-flash-low')
+  if (@($c.adapters | Where-Object type -eq 'antigravity')[0].model -ne 'gemini-3.8-flash-low') { throw '-AntigravityModel must set the model' }
+  & $Exe --config (Join-Path $tmp 'roaming\CHERNOBYL\companion.json') --devices | Out-Host
+  if ($LASTEXITCODE) { throw 'the companion refused the antigravity config' }
 
   $c = Run-Setup @('-OpenCode', '-EnableTerminal')
   $oc = @($c.adapters | Where-Object type -eq 'opencode')
@@ -57,6 +67,8 @@ try {
   if (-not $LASTEXITCODE -or ($bad | Out-String) -notmatch 'serves on this PC only') { throw 'a remote -StartOpenCode must be refused' }
   $bad = & powershell -NoProfile -ExecutionPolicy Bypass -File $script -Workspaces $ws -ConfigOnly -OpenCode -OpenCodeUrl 'https://x/y' 2>&1
   if (-not $LASTEXITCODE -or ($bad | Out-String) -notmatch 'must look like') { throw 'a bad -OpenCodeUrl must be refused' }
+  $bad = & powershell -NoProfile -ExecutionPolicy Bypass -File $script -Workspaces $ws -ConfigOnly -AntigravityModel '--dangerously-skip-permissions' 2>&1
+  if (-not $LASTEXITCODE -or ($bad | Out-String) -notmatch 'must be a model id') { throw 'a flag as -AntigravityModel must be refused' }
   $ErrorActionPreference = 'Stop'
 } finally {
   $env:APPDATA = $saved.APPDATA; $env:LOCALAPPDATA = $saved.LOCALAPPDATA

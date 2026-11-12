@@ -8,7 +8,7 @@
 import type { PermissionRequest, TranscriptItem, TurnState } from '@chernobyl/protocol';
 
 /** One original mark per runtime family; everything else shares the generic one. */
-export type MarkId = 'claude' | 'codex' | 'opencode' | 'generic';
+export type MarkId = 'claude' | 'codex' | 'opencode' | 'antigravity' | 'generic';
 
 export type MarkState = 'idle' | 'thinking' | 'working' | 'waiting' | 'done' | 'error';
 
@@ -21,6 +21,8 @@ export function markFor(kind?: string): MarkId {
       return 'codex';
     case 'opencode':
       return 'opencode';
+    case 'antigravity':
+      return 'antigravity';
     default:
       return 'generic';
   }

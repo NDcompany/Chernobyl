@@ -207,6 +207,28 @@ exits, open approvals turn `stale`, running prompts fail, a pending interrupt is
 and its sessions end; the next `create_session` respawns it. Capabilities are all `limited`
 (no live run; see `docs/INTEGRATIONS.md`).
 
+### Antigravity adapter (ADR-022)
+
+An adapter entry with `"type": "antigravity"` drives Google Antigravity's `agy acp` (Agent
+Client Protocol over stdio):
+
+```json
+{ "id": "agy-1", "type": "antigravity", "enabled": true,
+  "workspaces": ["G:\\Chernobyl"], "model": "gemini-3.8-flash-low", "maxSessions": 3 }
+```
+
+- `workspaces` (required): the Codex/Claude policy above, checked at config load.
+- `binary`: default `%LOCALAPPDATA%\agy\bin\agy.exe`, else `agy.exe` on `PATH`; never a
+  `.cmd`/`.bat`. There is no `args` key: the command line is always `<binary> acp`.
+- `model` (optional): what a new session starts on when the phone picks none (an id from
+  `agy models`). `maxSessions` (1-16, default 3) caps running or waiting sessions.
+
+One `agy acp` child per adapter, spawned at boot to list history (`session/list` per
+workspace) and again whenever needed; it closes after 10 idle minutes with no phone watching.
+Approvals arrive inline (`session/request_permission`) and are offered once-only. A prompt to a
+session agy does not have open respawns agy if needed and `session/resume`s it. Tests drive
+`tools/fake-agy-acp.mjs` through the real spawn path (`agy_runtime::tests::fake_agy`).
+
 ## Verify
 
 ```powershell
@@ -311,6 +333,7 @@ matrix covers those).
 | `transcript` | ADR-015 transcript hub: per-session op ring + compacted items, coalesced deltas, subscriptions, half-bulk backpressure, snapshots, redaction and caps; `HubHandle` is what live runtimes push through |
 | `claude_live` / `claude_runtime` | ADR-015 Claude Code: stream-json driver core (decoder, permission options, encoders, workspace policy) and its `LiveRuntime` (a process per session, reaper and `--resume`, G1 lifecycles, MCP sign-in) |
 | `codex` / `codex_runtime` | ADR-015 Codex app-server: JSON-RPC core (decoder, approvals, MCP) and its `LiveRuntime` (spawn, sessions as threads, hub/engine wiring) |
+| `agy` / `agy_runtime` | ADR-022 Google Antigravity `agy acp`: Agent Client Protocol core (`session/update` decoder, inline approvals, launch config) and its `LiveRuntime` (one child per adapter, resume, history via `session/list`/`load`, idle close) |
 | `runtime_io` | ADR-015 child process IO, env scrub, secret redaction, desktop URL opener, OAuth callback check |
 | `client` | test WS client + loopback `http_get` (used by `--self-test`) |
 | `crypto` | std-only SHA-256, HMAC, HKDF, ChaCha20, Poly1305, AEAD (official RFC/NIST KATs) |

@@ -1589,7 +1589,7 @@ impl Live {
 /* Decoding helpers                                                    */
 /* ------------------------------------------------------------------ */
 
-fn new_item(id: &str, kind: ItemKind, turn: Option<String>) -> Item {
+pub(crate) fn new_item(id: &str, kind: ItemKind, turn: Option<String>) -> Item {
     Item {
         id: id.into(),
         kind,
@@ -1607,7 +1607,7 @@ fn new_item(id: &str, kind: ItemKind, turn: Option<String>) -> Item {
     }
 }
 
-fn new_tool(name: &str, status: ToolStatus) -> ToolCall {
+pub(crate) fn new_tool(name: &str, status: ToolStatus) -> ToolCall {
     ToolCall {
         name: name.into(),
         title: None,
@@ -1769,7 +1769,7 @@ fn strings(v: Option<&Json>) -> Vec<&str> {
         .collect()
 }
 
-fn first_line(s: &str) -> String {
+pub(crate) fn first_line(s: &str) -> String {
     let line = s.lines().next().unwrap_or("");
     if line.len() < s.trim_end().len() {
         format!("{line} …")
@@ -1778,7 +1778,7 @@ fn first_line(s: &str) -> String {
     }
 }
 
-fn paths_title(diffs: &[FileDiff]) -> String {
+pub(crate) fn paths_title(diffs: &[FileDiff]) -> String {
     match diffs {
         [] => String::new(),
         [one] => one.path.clone(),
@@ -1827,7 +1827,7 @@ fn whole(content: &str, sign: char) -> String {
     out
 }
 
-fn file_diff(path: &str, status: &'static str, patch: &str) -> FileDiff {
+pub(crate) fn file_diff(path: &str, status: &'static str, patch: &str) -> FileDiff {
     let patch = redact(hunks(patch));
     let count = |sign: char| patch.lines().filter(|l| l.starts_with(sign)).count() as i64;
     FileDiff {
@@ -1883,7 +1883,7 @@ fn split_turn_diff(diff: &str) -> Vec<FileDiff> {
 }
 
 /// At most `max` bytes, cut at a char boundary; true when something was cut.
-fn clip(s: &str, max: usize) -> (String, bool) {
+pub(crate) fn clip(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
         return (s.into(), false);
     }
@@ -1891,7 +1891,7 @@ fn clip(s: &str, max: usize) -> (String, bool) {
 }
 
 /// Head and tail of `s` within `max` bytes (§3.5 tool output).
-fn head_tail(s: &str, max: usize) -> (String, bool) {
+pub(crate) fn head_tail(s: &str, max: usize) -> (String, bool) {
     const CUT: &str = "\n…\n";
     if s.len() <= max {
         return (s.into(), false);
@@ -1984,7 +1984,7 @@ fn answer(kind: &AskKind, option: &str, answers: &[(String, Vec<String>)]) -> Js
 
 // PermissionDetail builders (ADR §3.2); only codex uses them so far.
 
-fn detail_shell(command: &str, cwd: Option<&str>, reason: &str) -> Json {
+pub(crate) fn detail_shell(command: &str, cwd: Option<&str>, reason: &str) -> Json {
     let mut fields = vec![
         ("kind", json::s("shell")),
         ("command", json::s(&clip(command, DETAIL_CAP).0)),
@@ -1998,7 +1998,7 @@ fn detail_shell(command: &str, cwd: Option<&str>, reason: &str) -> Json {
     json::obj(fields)
 }
 
-fn detail_edit(diffs: &[FileDiff]) -> Json {
+pub(crate) fn detail_edit(diffs: &[FileDiff]) -> Json {
     let patch: String = diffs
         .iter()
         .map(|d| format!("diff --git a/{0} b/{0}\n{1}", d.path, d.patch))
@@ -2157,6 +2157,7 @@ impl LaunchConfig {
             permission_modes: Vec::new(),
             workspaces: self.workspaces.clone(),
             composer: Vec::new(),
+            models: Vec::new(),
         }
     }
 }

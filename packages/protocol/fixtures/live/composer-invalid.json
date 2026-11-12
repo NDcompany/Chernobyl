@@ -110,8 +110,8 @@
     }
   },
   {
-    "why": "create_session model gpt-5",
-    "msg": { "type": "create_session", "commandId": "c", "agentId": "a", "title": "t", "prompt": "p", "model": "gpt-5" }
+    "why": "create_session model with an underscore",
+    "msg": { "type": "create_session", "commandId": "c", "agentId": "a", "title": "t", "prompt": "p", "model": "gpt_5" }
   },
   {
     "why": "create_session model empty",

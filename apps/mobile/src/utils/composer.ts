@@ -91,6 +91,14 @@ export const FALLBACK_MODELS: readonly { value: string; label: string }[] = [
   { value: 'haiku', label: 'Haiku' },
 ];
 
+/**
+ * ADR-022: the models a new session may start on. A runtime with its own model ids lists them
+ * on `Agent.live.models` (Default first); Claude Code takes its aliases.
+ */
+export function newSessionModels(models?: readonly { value: string; label: string }[]): readonly { value: string; label: string }[] {
+  return models?.length ? [FALLBACK_MODELS[0], ...models.filter((m) => m.value !== 'default')] : FALLBACK_MODELS;
+}
+
 /** The models to offer: the CLI's list when it sent one. */
 export function modelChoices(state: Pick<LiveState, 'models'>): readonly { value: string; label: string }[] {
   return state.models?.length ? state.models : FALLBACK_MODELS;

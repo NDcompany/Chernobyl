@@ -557,6 +557,7 @@ impl LiveRuntime for ClaudeRuntime {
                 permission_modes: PERMISSION_MODES.iter().map(|m| m.to_string()).collect(),
                 workspaces: self.inner.cfg.workspaces.clone(),
                 composer: vec!["model", "images", "commands", "context", "rename"],
+                models: Vec::new(),
             }),
         }]
     }

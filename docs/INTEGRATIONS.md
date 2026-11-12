@@ -11,6 +11,7 @@ page records **which versions were verified** and the limits that matter in prac
 | Ollama | model runtime | Ollama **0.40.9** | `services/companion-rs/src/ollama.rs` | attach-only HTTP (`/api/version`, `/api/tags`, `/api/ps`) |
 | Claude Code | hook ingress + driven sessions | Claude Code **2.1.309** (`SessionStart` captured live); driven sessions **2.1.310** (live Haiku run through the companion server) | `services/companion-rs/src/claude.rs`, `claude_live.rs`, `claude_runtime.rs` | hooks POST to the loopback diagnostics listener (install the snippet from `chernobyl-companion --claude-hooks` yourself, never auto-written); with `workspaces`, the phone also starts `claude.exe` sessions (stream-json on stdio) in allow-listed folders, and lists, replays and continues (`--resume`) the 50 newest Claude sessions on disk in those folders, refusing one written in the last 2 minutes (ADR-015 §10); the phone also picks the model, attaches camera photos, runs slash commands, shows context use and renames (ADR-017); a session running in a terminal or VS Code streams live to the phone ("Live on PC"), can be forked to continue on the phone (`--resume --fork-session`), and with `--install-hooks` its permission prompts reach the phone (allow once or deny; the PC asks as usual after 120 s, or at once when no phone is connected); the hook round trip is verified live with `claude -p` 2.1.322 (ADR-018) |
 | Codex | agent runtime (live sessions) | **no live run**: openai/codex `970111f` schema, fake app-server processes only | `services/companion-rs/src/codex.rs`, `codex_runtime.rs` | spawns one `codex app-server` (stdio JSON-RPC) per adapter on the first session, in an allow-listed workspace; each phone session is a thread |
+| Antigravity | agent runtime (live sessions) | `agy` **1.5.6** (`agy acp` live run through the runtime 2026-11-12, `gemini-3.8-flash-low`: create, approve a command, follow-up, interrupt, resume in a new process; about 75k tokens) | `services/companion-rs/src/agy.rs`, `agy_runtime.rs` | spawns one `agy acp` (Agent Client Protocol, JSON-RPC on stdio) per adapter; each phone session is an agy session in an allow-listed workspace; history from agy's own `session/list` (ADR-022) |
 | Hermes | — | not installed, deferred | ADR-008 | not offered; unsupported adapters stay invisible rather than half-working |
 | Mock | simulation | — | `services/companion-rs/src/seed.rs` | offline demo data; the phone labels it **Simulation** (ADR-009) |
 
@@ -67,7 +68,27 @@ page records **which versions were verified** and the limits that matter in prac
   `sandbox: workspace-write` there. Workspaces are checked when the config loads, and a bad
   folder stops the companion from starting. Set `binary` to the real `codex.exe`; npm's
   `codex.cmd` shim is refused (no shell is ever used).
-- **Workspace files and git (ADR-016, `workspace.v1`).** Any Claude or Codex workspace on the
+- **Antigravity (ADR-022).** Driven through `agy acp`, not the headless `-p` stream-json mode,
+  which cannot ask for permissions. Sessions stream a live transcript: text as it is generated
+  (agy streams no thinking text), tool cards with the command, its output and edit diffs, a
+  plan, and a turn footer with duration and tokens. Approvals are inline on the card with agy's
+  own labels, **once only**: agy's "always" options are never offered, and the companion never
+  writes agy's settings. Follow-ups steer the running turn. Stop is `session/cancel` (the turn
+  ends interrupted; `unknown` after 30 s). The phone also picks the model (agy's own list),
+  attaches photos, runs agy's slash commands (its built-ins and your skills), sets the mode
+  (default, accept edits, plan), renames (the companion's title) and ends (`session/close`).
+  Not offered: MCP status (agy reports none, so the chip is hidden), a context meter (agy
+  reports no window size), forks, and sessions running on the PC. History: the conversations agy
+  lists for each workspace (`session/list`, once at boot, then once a minute while agy runs),
+  replayed by `session/load` when the phone opens one and continued by `session/resume`. When
+  agy exits or closes after 10 idle minutes with no phone watching, the next prompt respawns it
+  and resumes. Sessions are capped by `maxSessions` (1-16, default 3, running or waiting) and
+  one new session per 5 s; workspaces are checked when the config loads (Claude's policy). agy
+  runs commands through PowerShell found on PATH: a companion started with a PATH that lacks
+  `WindowsPowerShell\v1.0` makes every approved command fail (seen in the live run with a
+  trimmed PATH). agy's own rules still apply: what your agy allow-list or `default` mode
+  auto-allows (writes inside the workspace) runs without a phone prompt.
+- **Workspace files and git (ADR-016, `workspace.v1`).** Any Claude, Codex or Antigravity workspace on the
   allow-list can be browsed read-only from the phone and committed and pushed from it. Git is
   the desktop's own `git.exe` (found on PATH, else `C:\Program Files\Git\cmd\git.exe`; any
   version with `git restore`, 2.23+), run with no shell and no prompts: a push that needs a

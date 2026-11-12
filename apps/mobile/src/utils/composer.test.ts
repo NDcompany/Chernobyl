@@ -11,6 +11,7 @@ import {
   imageBudgetLeft,
   modelChoices,
   modelLabel,
+  newSessionModels,
   pickPictureSize,
   sealedFrameBytes,
   slashQuery,
@@ -76,4 +77,14 @@ test('context meter and model labels', () => {
   assert.equal(modelLabel('haiku', listed), 'Haiku 5.5');
   assert.equal(modelLabel(undefined, listed), 'Model');
   assert.equal(modelLabel('something-else', listed), 'something-else');
+});
+
+test('new-session models: the agent list after Default, else the Claude aliases', () => {
+  assert.deepEqual(newSessionModels(undefined).map((m) => m.value), ['default', 'sonnet', 'opus', 'haiku']);
+  assert.deepEqual(newSessionModels([]).map((m) => m.value), ['default', 'sonnet', 'opus', 'haiku']);
+  const agy = [
+    { value: 'gemini-3.8-flash-low', label: 'Gemini 3.8 Flash (Low)' },
+    { value: 'default', label: 'Default' },
+  ];
+  assert.deepEqual(newSessionModels(agy).map((m) => m.value), ['default', 'gemini-3.8-flash-low']);
 });
