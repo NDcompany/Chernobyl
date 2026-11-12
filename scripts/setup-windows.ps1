@@ -128,6 +128,7 @@ if ($StartOpenCode) {
   [IO.File]::WriteAllText($ocVbs, "Set sh = CreateObject(""WScript.Shell"")`r`nsh.CurrentDirectory = ""$ocDir""`r`nsh.Run ""$ocLine"", 0, False`r`n", (New-Object Text.UTF8Encoding $false))
   Write-Host "Wrote $ocVbs"
 }
+if ($OpenCode) { Write-Host "OpenCode: run terminal tasks as 'opencode run --attach $OpenCodeUrl ""...""' so they stream live on the phone (a plain 'opencode run' shows up there only after it ends)." }
 if ($ConfigOnly) { Write-Host 'Config only: nothing installed, started or registered.'; return }
 if ($StartOpenCode) {
   if (-not $NoAutostart) {

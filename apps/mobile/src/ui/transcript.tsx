@@ -1521,6 +1521,13 @@ const MODE_HINT: Record<PermissionModeChoice, string> = {
   plan: 'Reads and plans only; nothing changes until you approve the plan.',
 };
 
+/** ADR-021: OpenCode's modes are its built-in agents; acceptEdits is never offered. */
+const OPENCODE_MODE_HINT: Record<PermissionModeChoice, string> = {
+  default: 'OpenCode’s build agent: asks as its rules on your PC say.',
+  acceptEdits: '',
+  plan: 'OpenCode’s plan agent: reads and plans; by default it does not edit files.',
+};
+
 export interface ModeChipProps {
   /** `LiveState.permissionMode` */
   mode?: string;
@@ -1529,13 +1536,16 @@ export interface ModeChipProps {
   onChange: (mode: PermissionModeChoice) => void;
   /** on the black session header */
   dark?: boolean;
+  /** `Agent.kind`: OpenCode's modes are its agents (ADR-021) */
+  agentKind?: string;
 }
 
-/** Claude's permission mode with a picker; read-only when the agent offers no modes. */
-export function ModeChip({ mode, modes, onChange, dark = false }: ModeChipProps) {
+/** The permission mode with a picker; read-only when the agent offers no modes. */
+export function ModeChip({ mode, modes, onChange, dark = false, agentKind }: ModeChipProps) {
   const [open, setOpen] = useState(false);
   const choices = (modes ?? []).filter(isModeChoice);
-  const label = modeLabel(mode);
+  const label = modeLabel(mode, agentKind);
+  const hints = agentKind === 'opencode' ? OPENCODE_MODE_HINT : MODE_HINT;
   return (
     <>
       <Pressable
@@ -1561,13 +1571,13 @@ export function ModeChip({ mode, modes, onChange, dark = false }: ModeChipProps)
               }}
               accessibilityRole="radio"
               accessibilityState={{ checked: on }}
-              accessibilityLabel={modeLabel(m)}
+              accessibilityLabel={modeLabel(m, agentKind)}
               style={[styles.modeRow, on && styles.modeRowOn]}
             >
               <View style={styles.flex}>
-                <Text variant="bodyStrong">{modeLabel(m)}</Text>
+                <Text variant="bodyStrong">{modeLabel(m, agentKind)}</Text>
                 <Text variant="xs" color={colors.text2}>
-                  {MODE_HINT[m]}
+                  {hints[m]}
                 </Text>
               </View>
               {on ? <Icon name="check" size={18} /> : null}

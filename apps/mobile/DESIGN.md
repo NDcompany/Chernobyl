@@ -89,7 +89,8 @@ pending, elapsed seconds and live tokens/cost when the turn reports them; gone w
 footer stays. It ticks on its own `useNow(1000)`, so rows never re-render for it. One polite live
 region whose label only flips between "<agent> is working" and "<agent> is waiting for you"; iOS
 gets the same label via `announceForAccessibility`), `McpChip` ("MCP 4/5" + warning dot), `McpSheet` (status + §4.7 sign-in
-actions), `ModeChip` (Claude permission mode picker; `dark` variant for the black header).
+actions), `ModeChip` (permission mode picker; `dark` variant for the black header; ADR-021: with
+`agentKind` `opencode` the modes read "Build" / "Plan", OpenCode's built-in agents, with their own hints).
 ADR-017: `UserBubble` shows an outlined "1 image" / "N images" chip (camera icon) above the text
 when the prompt carried photos (only the count comes back); `ModelChip` (current model, sheet of the
 runtime's models or the `default`/`sonnet`/`opus`/`haiku` aliases), `ContextChip` ("Context N%",

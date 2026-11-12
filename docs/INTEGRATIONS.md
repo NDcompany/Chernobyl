@@ -25,7 +25,7 @@ page records **which versions were verified** and the limits that matter in prac
   phone watches; sign-in works on the desktop or by pasting the dead callback page from the
   phone browser, and failed servers can be reconnected. `limited`: diff (summary diffs are
   mapped, but no populated capture yet), MCP sign-in (completing a real OAuth login is not
-  verified live). Not offered: ending a session, permission modes. There is no SSE replay:
+  verified live). End and permission modes are ADR-021's (below). There is no SSE replay:
   after a reconnect, state is re-listed and watched transcripts are rebuilt from
   `GET /session/{id}/message`. OpenCode's conversation text is not journaled (prompts sent
   from the phone are, as part of their command records: `PRIVACY.md`).
@@ -36,8 +36,14 @@ page records **which versions were verified** and the limits that matter in prac
   (OpenCode has no per-session model setting); photos go as `data:` file parts; slash commands
   come from `GET /command` and run through `POST /session/{id}/command`; the context meter
   uses the last answer's tokens against the model's limit; rename is `PATCH /session/{id}`;
-  `submit_prompt {fork}` forks natively. A session `opencode run` created in the same project
-  (its own process on the same data) lists on the next probe and replays its history.
+  `submit_prompt {fork}` forks natively. End aborts a running turn and ends the session on
+  the companion's side (OpenCode has no end route; `DELETE /session` would destroy the history,
+  so it is never called); later prompts are refused until the companion restarts. The
+  permission-mode chip picks OpenCode's built-in agents: Build (`default`) and Plan (`plan`),
+  sent as `agent` with every prompt; user-defined agents are not offered, since one may allow
+  what Build asks for. Terminal runs: `opencode run --attach http://127.0.0.1:4096 "..."` goes
+  through the watched server and streams live; a plain `opencode run` uses its own private
+  server, so its session lists on the next probe (with its history) but does not stream.
 - **Ollama.** It is a model provider, not an agent. Session operations report
   `unavailable` (PRD §7.7).
 - **Claude Code.** Without `workspaces` it is ingress only: the companion observes hook

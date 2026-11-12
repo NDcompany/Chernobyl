@@ -392,6 +392,7 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
               dark
               mode={view.state.permissionMode}
               modes={live.permissionModes}
+              agentKind={agent?.kind}
               onChange={(mode) => void send(commands.setPermissionMode(sessionId, mode))}
             />
           ) : null}

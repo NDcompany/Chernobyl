@@ -132,7 +132,46 @@ struct OcState {
     images: HashMap<String, Vec<String>>,
     /// sessionID → the title of the session it was forked from.
     forks: HashMap<String, String>,
+    /// ADR-021: sessions the phone ended. OpenCode has no end route (and
+    /// `DELETE /session` destroys the history), so ending is ours: the turn
+    /// is aborted and the session refuses prompts until a restart.
+    ended: HashSet<String>,
+    /// ADR-021: the phone's permission modes OpenCode's agents back
+    /// (`default` = the built-in `build` agent, `plan` = `plan`).
+    offered_modes: Vec<&'static str>,
+    /// sessionID → the agent the phone chose (`build` | `plan`), sent with
+    /// every prompt of that session.
+    picked: HashMap<String, &'static str>,
+    /// sessionID → the agent its last answer ran as.
+    last_agent: HashMap<String, String>,
 }
+
+/// ADR-021: the model and agent a session's prompts carry.
+#[derive(Default)]
+struct Choice {
+    model: Option<String>,
+    agent: Option<&'static str>,
+}
+
+/// ADR-021: the phone's permission mode → OpenCode's built-in agent. Only
+/// these two: a user-defined agent may allow what `build` asks for.
+fn mode_agent(mode: &str) -> Option<&'static str> {
+    match mode {
+        "default" => Some("build"),
+        "plan" => Some("plan"),
+        _ => None,
+    }
+}
+
+fn agent_mode(agent: &str) -> Option<&'static str> {
+    match agent {
+        "build" => Some("default"),
+        "plan" => Some("plan"),
+        _ => None,
+    }
+}
+
+const ENDED: &str = "This session was ended; start a new one";
 
 /// ADR-021: what `GET /config/providers`, `GET /config` and `GET /command`
 /// answered on the last probe.
@@ -368,9 +407,47 @@ impl OpenCodeAdapter {
     /// `Ok(Ack)` never claims an outcome (G4.1), `Err` is a transport or
     /// validation fault for the caller to surface.
     pub fn send(&self, msg: &ClientMsg) -> Result<ServerMsg, AdapterError> {
+        // ADR-021: an ended session takes no prompt or setting (a fork is a
+        // new session, so it still may)
+        let refused = match msg {
+            ClientMsg::SubmitPrompt {
+                command_id,
+                session_id,
+                fork: false,
+                ..
+            }
+            | ClientMsg::SetModel {
+                command_id,
+                session_id,
+                ..
+            }
+            | ClientMsg::RenameSession {
+                command_id,
+                session_id,
+                ..
+            }
+            | ClientMsg::SetPermissionMode {
+                command_id,
+                session_id,
+                ..
+            } => Some((command_id, session_id)),
+            _ => None,
+        };
+        if let Some((command_id, session_id)) = refused
+            && self.inner.state.lock().unwrap().ended.contains(session_id)
+        {
+            return Ok(ack(
+                command_id,
+                false,
+                Some(ENDED.into()),
+                Some(session_id),
+                None,
+            ));
+        }
         match msg {
             ClientMsg::CreateSession {
                 command_id,
+                agent_id,
                 title,
                 prompt,
                 project,
@@ -379,12 +456,22 @@ impl OpenCodeAdapter {
                 ..
             } => self.inner.create_session(
                 command_id,
+                agent_id,
                 title,
                 prompt,
                 project.as_deref(),
                 images,
                 model.as_deref(),
             ),
+            ClientMsg::SessionEnd {
+                command_id,
+                session_id,
+            } => self.inner.end(command_id, session_id),
+            ClientMsg::SetPermissionMode {
+                command_id,
+                session_id,
+                mode,
+            } => Ok(self.inner.set_mode(command_id, session_id, mode)),
             // ADR-021: a native fork (`POST /session/{id}/fork`), then the
             // prompt in the fork
             ClientMsg::SubmitPrompt {
@@ -467,14 +554,11 @@ impl OpenCodeAdapter {
             | ClientMsg::Workspace { .. } => Err(AdapterError::Unsupported(
                 "session-neutral messages stay with the engine".into(),
             )),
-            // No end or permission-mode equivalent (§4.4). Subscriptions
-            // never land here (the server owns them per connection).
-            ClientMsg::SessionSubscribe { .. }
-            | ClientMsg::SessionUnsubscribe { .. }
-            | ClientMsg::SessionEnd { .. }
-            | ClientMsg::SetPermissionMode { .. } => Err(AdapterError::Unsupported(
-                "not supported by this agent".into(),
-            )),
+            // Subscriptions never land here (the server owns them per
+            // connection).
+            ClientMsg::SessionSubscribe { .. } | ClientMsg::SessionUnsubscribe { .. } => Err(
+                AdapterError::Unsupported("not supported by this agent".into()),
+            ),
         }
     }
 
@@ -846,7 +930,19 @@ impl Inner {
         let arr = json::as_arr(&v).ok_or_else(|| {
             AdapterError::InvalidResponse("`GET /agent` did not answer an array".into())
         })?;
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
+        // ADR-021: the modes the built-in `build` and `plan` agents back
+        st.offered_modes = ["build", "plan"]
+            .into_iter()
+            .filter(|name| {
+                arr.iter().any(|a| {
+                    json::get_str(a, "name") == Some(*name)
+                        && matches!(json::get_str(a, "mode"), Some("primary" | "all"))
+                        && json::get_bool(a, "hidden") != Some(true)
+                })
+            })
+            .filter_map(agent_mode)
+            .collect();
         Ok(arr
             .iter()
             .filter_map(|a| Self::map_agent(a, &self.id, &st))
@@ -909,6 +1005,10 @@ impl Inner {
     fn map_agent(v: &Json, host_id: &str, st: &OcState) -> Option<Agent> {
         let healthy = st.healthy;
         let cat = &st.catalog;
+        // hidden agents (compaction, summary, title) are OpenCode's own
+        if json::get_bool(v, "hidden") == Some(true) {
+            return None;
+        }
         let name = json::get_str(v, "name")?.to_string();
         let mode = json::get_str(v, "mode").unwrap_or("primary");
         let mut caps = vec![mode.to_string()];
@@ -925,13 +1025,13 @@ impl Inner {
             accepts_new_session: mode == "primary" && healthy,
             simulated: false,
             // §4.4/§4.6: a mid-turn prompt runs as its own turn afterwards;
-            // abort works; no end-session or permission-mode equivalent.
-            // ADR-021: the serve's folder and the composer extras OpenCode has
+            // abort works. ADR-021: End (companion-side), the build/plan
+            // agents as modes, the serve's folder and the composer extras
             live: Some(AgentLive {
                 prompt_while_busy: "queue",
                 interrupt: true,
-                end: false,
-                permission_modes: Vec::new(),
+                end: true,
+                permission_modes: st.offered_modes.iter().map(|m| m.to_string()).collect(),
                 workspaces: st.workspace.iter().cloned().collect(),
                 composer: [
                     ("model", !cat.models.is_empty()),
@@ -968,8 +1068,20 @@ impl Inner {
     /// its last answer ran on, else OpenCode's configured one), the models
     /// and commands on offer, and its context use.
     fn live_state(st: &OcState, sid: &str, status: &'static str) -> LiveState {
+        let mode = st
+            .picked
+            .get(sid)
+            .copied()
+            .or_else(|| st.last_agent.get(sid).map(String::as_str))
+            .and_then(agent_mode)
+            .unwrap_or("default");
         LiveState {
-            status,
+            status: if st.ended.contains(sid) {
+                "ended"
+            } else {
+                status
+            },
+            permission_mode: (!st.offered_modes.is_empty()).then(|| mode.to_string()),
             model: st
                 .chosen
                 .get(sid)
@@ -984,14 +1096,82 @@ impl Inner {
                 .collect(),
             commands: st.catalog.commands.clone(),
             context: st.context.get(sid).copied(),
-            ..Default::default()
         }
+    }
+
+    /// ADR-021 `session_end`: aborts a running turn, then the session is
+    /// ended here (`state` ended, prompts refused). Never `DELETE /session`:
+    /// that destroys the history on the PC.
+    fn end(
+        self: &Arc<Self>,
+        command_id: &str,
+        session_id: &str,
+    ) -> Result<ServerMsg, AdapterError> {
+        let running = {
+            let st = self.state.lock().unwrap();
+            st.statuses.get(session_id).is_some_and(|s| s == "running")
+                && !st.ended.contains(session_id)
+        };
+        if running {
+            self.abort(session_id)?;
+        }
+        {
+            let mut st = self.state.lock().unwrap();
+            st.ended.insert(session_id.to_string());
+            if st.ended.len() > MAP_MAX {
+                st.ended.clear();
+            }
+        }
+        if self.hub.streams(session_id) {
+            self.hub.end_session(session_id);
+        }
+        self.emit(vec![result(
+            command_id,
+            "completed",
+            None,
+            Some(session_id.to_string()),
+        )]);
+        Ok(ack(command_id, true, None, Some(session_id), None))
+    }
+
+    /// ADR-021 `set_permission_mode`: the phone's `default` / `plan` pick
+    /// OpenCode's `build` / `plan` agent for the session's next prompts.
+    fn set_mode(&self, command_id: &str, session_id: &str, mode: &str) -> ServerMsg {
+        let state = {
+            let mut st = self.state.lock().unwrap();
+            let agent = mode_agent(mode).filter(|_| st.offered_modes.contains(&mode));
+            let Some(agent) = agent else {
+                return ack(
+                    command_id,
+                    false,
+                    Some(format!("OpenCode has no agent for the {mode} mode")),
+                    Some(session_id),
+                    None,
+                );
+            };
+            st.picked.insert(session_id.to_string(), agent);
+            trim(&mut st.picked);
+            let status = match st.live.get(session_id).map_or("", |l| l.state) {
+                "" => "idle",
+                s => s,
+            };
+            Self::live_state(&st, session_id, status)
+        };
+        self.push(session_id, Op::State(state));
+        self.emit(vec![result(
+            command_id,
+            "completed",
+            None,
+            Some(session_id.to_string()),
+        )]);
+        ack(command_id, true, None, Some(session_id), None)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn create_session(
         self: &Arc<Self>,
         command_id: &str,
+        agent_id: &str,
         title: &str,
         prompt: &str,
         project: Option<&str>,
@@ -1040,6 +1220,13 @@ impl Inner {
                 None => st.chosen.remove(&session_id),
             };
             trim(&mut st.chosen);
+            // a task started on the `plan` agent runs as plan
+            match agent_mode(agent_id).filter(|m| st.offered_modes.contains(m)) {
+                Some(_) if agent_id == "plan" => st.picked.insert(session_id.clone(), "plan"),
+                _ => st.picked.remove(&session_id),
+            };
+            trim(&mut st.picked);
+            st.ended.remove(&session_id);
             if let Some(mapped) = Self::map_session(&v, &self.id, &st) {
                 Self::upsert_session(&mut st.sessions, mapped);
             }
@@ -1074,20 +1261,23 @@ impl Inner {
         text: &str,
         images: &[PromptImage],
     ) -> Result<(), AdapterError> {
-        let (model, command) = {
+        let (choice, command) = {
             let st = self.state.lock().unwrap();
             (
-                st.chosen.get(session_id).cloned(),
+                Choice {
+                    model: st.chosen.get(session_id).cloned(),
+                    agent: st.picked.get(session_id).copied(),
+                },
                 slash(text, &st.catalog.commands).map(|(n, a)| (n.to_string(), a.to_string())),
             )
         };
         match command {
             Some((name, args)) => {
                 self.track_prompt(session_id, command_id);
-                self.run_command(command_id, session_id, &name, &args, images, model)
+                self.run_command(command_id, session_id, &name, &args, images, choice)
             }
             None => {
-                self.prompt_accept(session_id, text, images, model.as_deref())?;
+                self.prompt_accept(session_id, text, images, &choice)?;
                 self.track_prompt(session_id, command_id);
             }
         }
@@ -1105,10 +1295,11 @@ impl Inner {
         name: &str,
         args: &str,
         images: &[PromptImage],
-        model: Option<String>,
+        choice: Choice,
     ) {
         let mut fields = vec![("command", json::s(name)), ("arguments", json::s(args))];
-        fields.extend(model.map(|m| ("model", json::s(&m))));
+        fields.extend(choice.agent.map(|a| ("agent", json::s(a))));
+        fields.extend(choice.model.map(|m| ("model", json::s(&m))));
         if !images.is_empty() {
             fields.push(("parts", Json::Arr(image_parts(images))));
         }
@@ -1292,7 +1483,7 @@ impl Inner {
         session_id: &str,
         text: &str,
         images: &[PromptImage],
-        model: Option<&str>,
+        choice: &Choice,
     ) -> Result<(), AdapterError> {
         let mut parts = vec![json::obj(vec![
             ("type", json::s("text")),
@@ -1300,7 +1491,8 @@ impl Inner {
         ])];
         parts.extend(image_parts(images));
         let mut fields = vec![("parts", Json::Arr(parts))];
-        if let Some((provider, id)) = model.and_then(|m| m.split_once('/')) {
+        fields.extend(choice.agent.map(|a| ("agent", json::s(a))));
+        if let Some((provider, id)) = choice.model.as_deref().and_then(|m| m.split_once('/')) {
             fields.push((
                 "model",
                 json::obj(vec![
@@ -3274,6 +3466,10 @@ fn catalog_models(v: &Json, default: Option<&str>) -> Vec<(String, String, i64)>
 /// context use (every token of the message: input, output, reasoning and
 /// cache) against that model's limit. True when the context changed.
 fn note_usage(st: &mut OcState, sid: &str, info: &Json) -> bool {
+    if let Some(agent) = json::get_str(info, "agent").or_else(|| json::get_str(info, "mode")) {
+        st.last_agent.insert(sid.to_string(), agent.to_string());
+        trim(&mut st.last_agent);
+    }
     if let (Some(p), Some(m)) = (
         json::get_str(info, "providerID"),
         json::get_str(info, "modelID"),
@@ -5409,6 +5605,9 @@ pub(crate) mod tests {
 "default":{"opencode":"big-pickle","ollama":"qwen3.5:4b"}}"#;
     const COMMANDS: &str = r#"[{"name":"init","source":"command","template":"t","hints":["$ARGUMENTS"]},{"name":"review","source":"command","template":"t","hints":[]},{"name":"broken","template":"t","hints":[]},{"name":"has space","template":"t","hints":[]}]"#;
     const QWEN24: &str = "ollama/chernobyl-qwen35-24k";
+    /// 1.19.4's built-ins (hidden ones included) plus a user agent that
+    /// allows everything: never offered as a mode.
+    const PARITY_AGENTS: &str = r#"[{"name":"build","mode":"primary","native":true},{"name":"plan","mode":"primary","native":true},{"name":"explore","mode":"subagent","native":true},{"name":"title","mode":"primary","native":true,"hidden":true},{"name":"yolo","mode":"primary","permission":[{"permission":"*","pattern":"*","action":"allow"}]}]"#;
 
     /// A workspace folder (the serve's cwd) and a data dir outside it.
     struct Dirs {
@@ -5450,6 +5649,7 @@ pub(crate) mod tests {
                 ("GET /config/providers".into(), PROVIDERS.into()),
                 ("GET /config".into(), format!(r#"{{"model":"{QWEN24}"}}"#)),
                 ("GET /command".into(), COMMANDS.into()),
+                ("GET /agent".into(), PARITY_AGENTS.into()),
                 (
                     "GET /session".into(),
                     format!(
@@ -5853,6 +6053,210 @@ pub(crate) mod tests {
         let context = json::get(&state, "context").unwrap();
         assert_eq!(json::get_i64(context, "maxTokens"), Some(200_000));
         r.ad.dispose();
+    }
+
+    #[test]
+    fn end_aborts_the_turn_and_the_session_refuses_prompts() {
+        let d = dirs();
+        let r = rig_in(
+            parity_opts(&d.work.to_string_lossy()),
+            "ses_test1",
+            Some(&d.data),
+        );
+        r.ad.refresh().unwrap();
+        assert!(
+            r.ad.agents()[0].live.as_ref().unwrap().end,
+            "End is advertised"
+        );
+        let ev = |t: &str, status: &str| {
+            format!(
+                r#"data: {{"payload":{{"type":"{t}","properties":{{"sessionID":"ses_test1"{status}}}}}}}"#
+            )
+        };
+        r.feed(&ev("session.status", r#","status":{"type":"busy"}"#));
+        let end =
+            r.ad.send(&ClientMsg::SessionEnd {
+                command_id: "e1".into(),
+                session_id: "ses_test1".into(),
+            })
+            .unwrap();
+        assert!(matches!(end, ServerMsg::Ack { ok: true, .. }), "{end:?}");
+        assert_eq!(r.requests("POST /session/ses_test1/abort").len(), 1);
+        assert!(r.requests("DELETE").is_empty(), "the history stays");
+        assert!(results(&r.events()).contains(&("e1".into(), "completed".into())));
+        let status =
+            |r: &Rig| json::get_str(&last_state(&r.ops("ses_test1")), "status").map(str::to_string);
+        assert_eq!(status(&r).as_deref(), Some("ended"));
+        // the aborted turn ends; the session stays ended
+        r.feed(&ev("session.idle", ""));
+        assert_eq!(status(&r).as_deref(), Some("ended"));
+        let refusal = |m: ClientMsg| match r.ad.send(&m).unwrap() {
+            ServerMsg::Ack {
+                ok: false, error, ..
+            } => error.unwrap(),
+            other => panic!("{other:?}"),
+        };
+        let prompt = |fork| ClientMsg::SubmitPrompt {
+            command_id: "p".into(),
+            session_id: "ses_test1".into(),
+            text: "more".into(),
+            images: vec![],
+            fork,
+        };
+        assert_eq!(refusal(prompt(false)), ENDED);
+        assert_eq!(
+            refusal(ClientMsg::SetPermissionMode {
+                command_id: "m".into(),
+                session_id: "ses_test1".into(),
+                mode: "plan".into(),
+            }),
+            ENDED
+        );
+        assert_eq!(
+            refusal(ClientMsg::RenameSession {
+                command_id: "n".into(),
+                session_id: "ses_test1".into(),
+                title: "x".into(),
+            }),
+            ENDED
+        );
+        assert!(r.requests("prompt_async").is_empty());
+        // a fork is a new session, so it may; ending twice is a no-op
+        assert!(matches!(
+            r.ad.send(&prompt(true)).unwrap(),
+            ServerMsg::Ack { ok: true, .. }
+        ));
+        let again =
+            r.ad.send(&ClientMsg::SessionEnd {
+                command_id: "e2".into(),
+                session_id: "ses_test1".into(),
+            })
+            .unwrap();
+        assert!(matches!(again, ServerMsg::Ack { ok: true, .. }));
+        assert_eq!(
+            r.requests("/abort").len(),
+            1,
+            "an idle session is not aborted"
+        );
+        // a re-hydration keeps it ended
+        r.ad.on_subscribe("ses_test1");
+        wait_for("re-hydrated", || {
+            r.requests("/session/ses_test1/message").len() == 1
+        });
+        wait_for("its state", || status(&r).as_deref() == Some("ended"));
+        r.ad.dispose();
+    }
+
+    #[test]
+    fn permission_modes_are_the_build_and_plan_agents() {
+        let d = dirs();
+        let r = rig_in(
+            parity_opts(&d.work.to_string_lossy()),
+            "ses_test1",
+            Some(&d.data),
+        );
+        r.ad.refresh().unwrap();
+        let agents = r.ad.agents();
+        let names: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            names,
+            ["build", "plan", "explore", "yolo"],
+            "hidden ones left out"
+        );
+        let live = agents[0].live.clone().unwrap();
+        assert_eq!(live.permission_modes, ["default", "plan"], "never `yolo`");
+        let mode = |cmd: &str, m: &str| {
+            r.ad.send(&ClientMsg::SetPermissionMode {
+                command_id: cmd.into(),
+                session_id: "ses_test1".into(),
+                mode: m.into(),
+            })
+            .unwrap()
+        };
+        assert!(matches!(
+            mode("m1", "acceptEdits"),
+            ServerMsg::Ack { ok: false, .. }
+        ));
+        assert!(matches!(
+            mode("m2", "plan"),
+            ServerMsg::Ack { ok: true, .. }
+        ));
+        let state = last_state(&r.ops("ses_test1"));
+        assert_eq!(json::get_str(&state, "permissionMode"), Some("plan"));
+        submit_to(&r.ad, "ses_test1", "p1");
+        assert!(
+            r.requests("prompt_async")
+                .pop()
+                .unwrap()
+                .contains(r#""agent":"plan""#)
+        );
+        // slash commands run as the same agent
+        let ack =
+            r.ad.send(&ClientMsg::SubmitPrompt {
+                command_id: "s1".into(),
+                session_id: "ses_test1".into(),
+                text: "/review".into(),
+                images: vec![],
+                fork: false,
+            })
+            .unwrap();
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }));
+        wait_for("the command", || {
+            !r.requests("ses_test1/command").is_empty()
+        });
+        assert!(
+            r.requests("ses_test1/command")
+                .pop()
+                .unwrap()
+                .contains(r#""agent":"plan""#)
+        );
+        assert!(matches!(
+            mode("m3", "default"),
+            ServerMsg::Ack { ok: true, .. }
+        ));
+        submit_to(&r.ad, "ses_test1", "p2");
+        assert!(
+            r.requests("prompt_async")
+                .pop()
+                .unwrap()
+                .contains(r#""agent":"build""#)
+        );
+        let done = results(&r.events());
+        assert!(done.contains(&("m2".into(), "completed".into())));
+        // a task started on the plan agent runs as plan; a session nobody
+        // chose for reports the agent its last answer ran as
+        let ack =
+            r.ad.send(&ClientMsg::CreateSession {
+                command_id: "c1".into(),
+                agent_id: "plan".into(),
+                title: "t".into(),
+                prompt: "plan it".into(),
+                project: None,
+                images: vec![],
+                model: None,
+            })
+            .unwrap();
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }));
+        assert!(
+            r.requests("ses_created1/prompt_async")
+                .pop()
+                .unwrap()
+                .contains(r#""agent":"plan""#)
+        );
+        r.feed(r#"data: {"payload":{"type":"message.updated","properties":{"info":{"id":"msg_a9","sessionID":"ses_test2","role":"assistant","parentID":"msg_u9","agent":"plan","providerID":"ollama","modelID":"qwen3.5:4b","time":{"created":1}}}}}"#);
+        let st = r.ad.inner.state.lock().unwrap();
+        assert_eq!(
+            Inner::live_state(&st, "ses_test2", "idle")
+                .permission_mode
+                .as_deref(),
+            Some("plan")
+        );
+        assert_eq!(
+            Inner::live_state(&st, "ses_other", "idle")
+                .permission_mode
+                .as_deref(),
+            Some("default")
+        );
     }
 
     #[test]

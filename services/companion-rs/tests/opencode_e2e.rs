@@ -1224,6 +1224,94 @@ fn live_opencode_parity() {
         command_status(&comp, "p-fork")
     );
 
+    // 10b) the plan agent as a permission mode, then End
+    let mode = acked(comp.handle_client_msg(ClientMsg::SetPermissionMode {
+        command_id: "p-mode".into(),
+        session_id: sid.clone(),
+        mode: "plan".into(),
+    }));
+    assert!(mode.is_ok(), "{mode:?}");
+    prompt(
+        &comp,
+        &sid,
+        "p-plan",
+        "Reply with exactly the word PLANOK and nothing else.",
+    );
+    live_wait(&comp, &mut phone, "the plan-agent turn", |c, _| {
+        done(c, "p-plan")
+    });
+    let msgs = chernobyl_companion::json::stringify(&oc.messages(&sid).unwrap());
+    assert!(
+        msgs.contains(r#""agent":"plan""#),
+        "the turn did not run as the plan agent"
+    );
+    assert!(phone.seen.contains(r#""permissionMode":"plan""#));
+    eprintln!(
+        "LIVE: plan agent turn → {:?}",
+        command_status(&comp, "p-plan")
+    );
+    let end = acked(comp.handle_client_msg(ClientMsg::SessionEnd {
+        command_id: "p-end".into(),
+        session_id: sid.clone(),
+    }));
+    assert!(end.is_ok(), "{end:?}");
+    live_wait(&comp, &mut phone, "the ended state", |_, p| {
+        p.seen.contains(r#""status":"ended""#)
+    });
+    let after = acked(comp.handle_client_msg(ClientMsg::SubmitPrompt {
+        command_id: "p-after-end".into(),
+        session_id: sid.clone(),
+        text: "more".into(),
+        images: vec![],
+        fork: false,
+    }));
+    assert!(
+        after.as_ref().is_err_and(|e| e.contains("start a new one")),
+        "{after:?}"
+    );
+    assert!(oc.messages(&sid).is_ok(), "ending kept the history");
+    eprintln!("LIVE: End → state ended, the next prompt refused, history kept");
+
+    // 10c) `opencode run --attach` goes through the watched serve: its
+    // session reaches the companion on the event stream, not a probe
+    let attached = Command::new(&exe)
+        .args([
+            "run",
+            "--attach",
+            &addr,
+            "--dir",
+            &work.to_string_lossy(),
+            "--model",
+            &alias,
+            "--title",
+            "ATTACHRUN",
+            "Reply with exactly the word ATTACHOK and nothing else.",
+        ])
+        .env("HOME", iso.join("home"))
+        .env("USERPROFILE", iso.join("home"))
+        .env("XDG_DATA_HOME", iso.join("data"))
+        .env("XDG_CONFIG_HOME", iso.join("config"))
+        .env("XDG_CACHE_HOME", iso.join("cache"))
+        .env("XDG_STATE_HOME", iso.join("state"))
+        .env("PWD", &work)
+        .current_dir(&work)
+        .stdin(Stdio::null())
+        .output()
+        .expect("opencode run --attach");
+    eprintln!(
+        "LIVE: opencode run --attach exit {:?}, stdout {:?}",
+        attached.status.code(),
+        String::from_utf8_lossy(&attached.stdout).trim()
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            comp.pump();
+            events_contain(&comp, "ATTACHRUN")
+        }),
+        "the attached run's session never arrived on the event stream"
+    );
+    eprintln!("LIVE: `opencode run --attach` session arrived on the event stream");
+
     // 11) Files and Changes in the serve's folder
     let query = |cmd: &str, op: WorkspaceOp| {
         let (result, ack) = comp.workspace_query(cmd, &ws.id, &op);
