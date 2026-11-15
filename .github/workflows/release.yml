@@ -16,19 +16,22 @@ jobs:
   kitkat-apk:
     name: Build KitKat APK
     runs-on: ubuntu-latest
+    environment: release
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Setup Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
 
       - name: Install Android SDK Packages
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
@@ -47,26 +50,41 @@ jobs:
           UNSIGNED_APK="android-kitkat/build/outputs/apk/release/android-kitkat-release.apk"
           VERSION=$(grep "versionName" android-kitkat/build.gradle | head -n 1 | sed "s/.*'\(.*\)'.*/\1/")
           OUT_APK="release/chernobyl-kitkat-${VERSION}.apk"
-          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASS" ]; then
-            SIGNING_DIR="$RUNNER_TEMP/keystore"
-            mkdir -p "$SIGNING_DIR"
-            JKS_PATH="$SIGNING_DIR/chernobyl-release.jks"
-            PASS_PATH="$SIGNING_DIR/chernobyl-release.pass"
-            echo "$KEYSTORE_BASE64" | base64 -d > "$JKS_PATH"
-            printf "%s" "$KEYSTORE_PASS" > "$PASS_PATH"
-            APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
-            "$APKSIGNER" sign --ks "$JKS_PATH" --ks-pass "file:$PASS_PATH" --ks-key-alias chernobyl \
-              --min-sdk-version 19 --v1-signing-enabled true --v2-signing-enabled true --v4-signing-enabled false \
-              --out "$OUT_APK" "$UNSIGNED_APK"
-            "$APKSIGNER" verify --min-sdk-version 19 --verbose "$OUT_APK"
-            echo "KitKat APK signed successfully with release key"
-          else
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASS" ]; then
+            if [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ]; then
+              echo "::error::ANDROID_KEYSTORE_BASE64 and ANDROID_KEYSTORE_PASS are required on tag builds"
+              exit 1
+            fi
             echo "ANDROID_KEYSTORE_BASE64 and/or ANDROID_KEYSTORE_PASS not provided: KitKat APK remains unsigned/debug-signed"
             cp "$UNSIGNED_APK" "$OUT_APK"
+            exit 0
           fi
 
+          SIGNING_DIR="$RUNNER_TEMP/keystore"
+          mkdir -p "$SIGNING_DIR"
+          trap 'rm -rf "$RUNNER_TEMP/keystore"' EXIT
+
+          JKS_PATH="$SIGNING_DIR/chernobyl-release.jks"
+          PASS_PATH="$SIGNING_DIR/chernobyl-release.pass"
+
+          echo "$KEYSTORE_BASE64" | base64 -d > "$JKS_PATH"
+          printf "%s" "$KEYSTORE_PASS" > "$PASS_PATH"
+
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          "$APKSIGNER" sign --ks "$JKS_PATH" --ks-pass "file:$PASS_PATH" --ks-key-alias chernobyl \
+            --min-sdk-version 19 --v1-signing-enabled true --v2-signing-enabled true --v4-signing-enabled false \
+            --out "$OUT_APK" "$UNSIGNED_APK"
+
+          CERTS_OUT=$("$APKSIGNER" verify --min-sdk-version 19 --print-certs "$OUT_APK")
+          echo "$CERTS_OUT"
+          if ! echo "$CERTS_OUT" | grep -qi "certificate SHA-256 digest: c8cc22bdfb6c244447d2a5beb007f8fd6adcd20fb8632b0e5998c6b96ead7d36"; then
+            echo "::error::Signer certificate digest does not match pinned SHA-256 c8cc22bdfb6c244447d2a5beb007f8fd6adcd20fb8632b0e5998c6b96ead7d36"
+            exit 1
+          fi
+          echo "KitKat APK signed and verified successfully with release key"
+
       - name: Upload KitKat APK Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: chernobyl-kitkat-apk
           path: release/*.apk
@@ -80,19 +98,23 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, pinned
+        with:
+          toolchain: 1.99.0
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index/
@@ -102,11 +124,8 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('services/companion-rs/Cargo.lock', 'services/companion-rs/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-release-
 
-      - name: Install dependencies
-        run: npm ci
-
       - name: Download KitKat APK
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: chernobyl-kitkat-apk
           path: release
@@ -118,7 +137,7 @@ jobs:
         run: node scripts/package-release.mjs
 
       - name: Create Draft Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           draft: true
           files: |
