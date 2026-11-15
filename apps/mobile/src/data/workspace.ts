@@ -90,6 +90,8 @@ export interface ChangeOutcome {
   ok: boolean;
   /** git's own summary when it failed (push rejected, hook failed, …) */
   error?: string;
+  /** `git_pull` only: changed agent-configuration paths (see the protocol) */
+  agentConfigChanged?: string[];
 }
 
 /**
@@ -109,7 +111,11 @@ export function useGitChange(): (msg: WorkspaceChange) => Promise<ChangeOutcome 
       // subscribed before sending: a fast git action can finish before its ack arrives
       const off = getTransport().subscribe((m) => {
         if (m.type === 'command_result' && m.commandId === commandId) {
-          settle({ ok: m.status === 'completed', error: m.error });
+          settle({
+            ok: m.status === 'completed',
+            error: m.error,
+            agentConfigChanged: m.agentConfigChanged,
+          });
         }
       });
       const timer = setTimeout(() => settle(null), RESULT_TIMEOUT_MS);
