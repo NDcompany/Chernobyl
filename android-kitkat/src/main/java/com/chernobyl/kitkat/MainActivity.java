@@ -56,6 +56,8 @@ public final class MainActivity extends Activity implements App.Change {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        // tapjacking: no touch reaches any screen (Approve included) while another window covers the app
+        getWindow().getDecorView().setFilterTouchesWhenObscured(true);
         LinearLayout root = Ui.row(this);
         root.setGravity(Gravity.NO_GRAVITY);
         root.setBackgroundColor(Ui.WHITE);
@@ -97,7 +99,8 @@ public final class MainActivity extends Activity implements App.Change {
         final String probe = i.getStringExtra("tlsprobe");
         if (probe != null) {
             i.removeExtra("tlsprobe");
-            new Thread(new Runnable() {
+            // debug builds only, like pairPayload: any app could otherwise make this one dial a host of its choosing
+            if (debuggable()) new Thread(new Runnable() {
                 @Override
                 public void run() {
                     try {
@@ -655,6 +658,9 @@ public final class MainActivity extends Activity implements App.Change {
         page.addView(pairStatus);
         payloadField = new EditText(this);
         payloadField.setHint(app.pairing == null ? "payload: {\"v\":1, ...}" : "Leave empty to keep this pairing and only change the token");
+        // the payload holds the pairing key: no suggestions, no keyboard learning
+        payloadField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         payloadField.setMinLines(3);
         payloadField.setTypeface(android.graphics.Typeface.MONOSPACE);
         payloadField.setTextSize(13);
@@ -663,7 +669,7 @@ public final class MainActivity extends Activity implements App.Change {
         final EditText token = new EditText(this);
         token.setHint("Access token (optional)");
         token.setSingleLine(true);
-        token.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        token.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         if (prefillToken != null) token.setText(prefillToken);
         prefillPayload = null;
         prefillToken = null;

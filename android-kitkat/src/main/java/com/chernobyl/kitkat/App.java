@@ -20,7 +20,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -487,12 +486,21 @@ public final class App extends Application {
                 .putExtra("permissionId", p.optString("id")).setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         PendingIntent pi = PendingIntent.getActivity(this, noteId(p.optString("id")), open,
                 PendingIntent.FLAG_UPDATE_CURRENT | (android.os.Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
+        String detail = (p.optString("title").contains(" wants ") ? p.optString("title")
+                : who + " wants to " + p.optString("title").toLowerCase(java.util.Locale.ROOT)) + ": " + p.optString("command");
+        String title = p.optBoolean("fromPc") ? "Approval needed (PC session)" : "Approval needed";
         Notification.Builder b = new Notification.Builder(this).setSmallIcon(R.drawable.ic_note)
-                .setContentTitle(p.optBoolean("fromPc") ? "Approval needed (PC session)" : "Approval needed")
-                .setContentText((p.optString("title").contains(" wants ") ? p.optString("title")
-                        : who + " wants to " + p.optString("title").toLowerCase(java.util.Locale.ROOT)) + ": " + p.optString("command"))
+                .setContentTitle(title)
+                // API 21+: the command shows only on an unlocked screen; the lock screen gets the public version.
+                // API 19/20 have no lock-screen visibility, so the body there never holds the command.
+                .setContentText(android.os.Build.VERSION.SDK_INT >= 21 ? detail : "Approval needed")
                 .setContentIntent(pi).setAutoCancel(true).setDefaults(Notification.DEFAULT_ALL)
                 .setPriority(Notification.PRIORITY_HIGH);
+        if (android.os.Build.VERSION.SDK_INT >= 21) {
+            b.setVisibility(Notification.VISIBILITY_PRIVATE);
+            b.setPublicVersion(new Notification.Builder(this).setSmallIcon(R.drawable.ic_note)
+                    .setContentTitle("Approval needed").setContentText("Unlock to see the request").build());
+        }
         if (android.os.Build.VERSION.SDK_INT >= 26) b.setChannelId(ConnService.channel(this, "approvals", "Approvals", NotificationManager.IMPORTANCE_HIGH));
         ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(noteId(p.optString("id")), b.build());
     }
@@ -541,12 +549,10 @@ public final class App extends Application {
                 for (String p : new String[] {"TLSv1.3", "TLSv1.2"}) if (supported.contains(p)) want.add(p);
                 if (want.isEmpty()) throw new IOException("this device has no TLS 1.2");
                 s.setEnabledProtocols(want.toArray(new String[0]));
-                Set<String> suites = new LinkedHashSet<String>();
-                for (String c : s.getSupportedCipherSuites())
-                    if ((c.contains("_ECDHE_") && (c.contains("_GCM_") || c.contains("CHACHA20"))) || c.startsWith("TLS_AES_") || c.startsWith("TLS_CHACHA20"))
-                        suites.add(c);
-                for (String c : s.getEnabledCipherSuites()) if (!c.contains("_RC4_") && !c.contains("_NULL_") && !c.contains("_EXPORT_") && !c.contains("_anon_")) suites.add(c);
-                s.setEnabledCipherSuites(suites.toArray(new String[0]));
+                // only ECDHE + AES-GCM / ChaCha20; a platform with none keeps its own list so the connection still works
+                String[] suites = Composer.tlsSuites(s.getSupportedCipherSuites());
+                if (suites.length > 0) s.setEnabledCipherSuites(suites);
+                else Log.w(TAG, "no ECDHE AES-GCM / ChaCha20 TLS suite on this device: keeping the platform's list");
                 try { // SNI: ngrok routes by it
                     Method m = s.getClass().getMethod("setHostname", String.class);
                     m.invoke(s, host);
