@@ -175,6 +175,19 @@ bugs at the end say what fixed each one.
 
 **Runner notes:** uiautomator cannot dump a screen whose countdown ticks every second (the 2-minute hook request) or whose output streams; a failed dump used to return the previous `ui.xml` (now deleted first, `adb.mjs`), so 10.6 Stop and 10.8 Approve Once are tapped at their measured places on the 720 px emulator and the screens are screencaps. The new-task button sits below the fold since the Model row, so `newTask` scrolls to it.
 
+## K. Android 4.4 tablet with four live agents (ADR-019)
+
+Run 2026-11-15/16 on the `kitkat` AVD (Android 4.4.2, Nexus 7 profile, `emulator-5556`) with `release/chernobyl-kitkat-0.2.0.apk` rebuilt from this tree (`android-kitkatuild-release.ps1`, v1+v2 signed), by `scripts/device/validate-kitkat.mjs` (new: pairs by paste, one companion with Claude on Haiku, OpenCode on an isolated `opencode serve` with Ollama qwen3.5:4b, Codex and Antigravity, the real logins). Evidence: `evidence/kitkat/K-*` (screenshots are the unrotated 4.4 framebuffer, so they show the landscape UI turned 90 degrees). The emulator was heavily loaded by other builds on the PC for most of the run: adb calls timed out and taps were lost, which is why K.2 to K.4 are PARTIAL.
+
+| # | Check | Status |
+|---|-------|--------|
+| K.1 | Pair by paste; Home lists all four runtimes with their names | **PASS** — rail "Online", "Hosts online 4 / 4", "Agents 7 / 7": Claude Code, Codex, Antigravity and OpenCode's own agents build, explore, general and plan (the companion's names; `K-home-four-agents.png`) |
+| K.2 | One short prompt to each agent streams a reply | **PARTIAL** — Claude Code PASS (reply "I ran `echo hi > note.txt` …", footer "Done"); Codex environment limit (usage limit shown on the tablet, `K-codex-limit.png`); OpenCode and Antigravity: turn started, reply not completed from the tablet (see K.3) |
+| K.3 | One approval each, Allow | **PARTIAL** — Claude Code PASS (card with Allow / Allow for this project / Allow for this session / Deny, Allow tapped on the tablet, tool completed); OpenCode ("Allow once" / "Deny", risk High) and Antigravity ("Allow" / "Deny" / "More…") cards render correctly with their marks and names, Allow was not completed (taps lost on the loaded emulator, `K-opencode-approval.png`, `K-antigravity-approval.png`); Codex: no approval, the account refused the turn |
+| K.4 | Stop works | **PARTIAL** — the Stop button is present in every running conversation; "Stopped" not captured (Haiku answered before Stop; the other runs waited at their cards); Codex not run |
+
+Found on the way: the KitKat New session dialog offered Claude's four aliases for every agent: it now offers the agent's own model list (OpenCode, Antigravity) behind Default, like the main app (`b97f93d`, `Composer.newSessionModels`, JVM test). Runner notes: Android 4.4 needs `uiautomator dump` to a path under `/data/local/tmp` (`UI_DUMP`) and `screencap` to a file plus `adb pull` (no `exec-out`); its uiautomator reports an empty field's hint as the field text, so typed text cannot be read back; the soft keyboard covers the lower fields of a dialog (a tap there hits a key), so the runner hides it after every field. One of the K.3 reruns picked the wrong agent in the New session dialog (a Codex-titled session landed on Antigravity): taps on the slow emulator are not reliable, not a client bug found in the app code.
+
 ## Known risks to watch during the first device run
 
 1. **Origin header (D1):** native RN WebSocket is expected to send **no** `Origin` header (ws

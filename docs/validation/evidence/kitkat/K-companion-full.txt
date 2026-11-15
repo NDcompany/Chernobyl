@@ -1,0 +1,30 @@
+
+--- start 2026-11-15T18:26:07.124Z --bind 127.0.0.1 --port 18797 --diagnostics-port 19497
+[companion] listening on 127.0.0.1:18797 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19497
+
+--- start 2026-11-15T18:30:15.088Z --bind 127.0.0.1 --port 18797 --diagnostics-port 19497
+[companion] listening on 127.0.0.1:18797 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19497
+
+--- start 2026-11-15T18:32:28.112Z --bind 127.0.0.1 --port 18797 --diagnostics-port 19497
+[companion] listening on 127.0.0.1:18797 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19497
+
+--- start 2026-11-15T18:35:13.740Z --bind 127.0.0.1 --port 18797 --diagnostics-port 19497
+[companion] listening on 127.0.0.1:18797 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19497
+
+--- start 2026-11-15T18:40:19.964Z --bind 127.0.0.1 --port 18797 --diagnostics-port 19497
+[companion] listening on 127.0.0.1:18797 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19497
+[ws] connection 3 ended: heartbeat miss limit
+[ws] connection 4 ended: heartbeat miss limit
+[ws] connection 5 ended: heartbeat miss limit
+
+--- start 2026-11-15T20:12:30.855Z --bind 127.0.0.1 --port 18797 --diagnostics-port 19497
+[companion] listening on 127.0.0.1:18797 (protocol v2, token auth OFF)
+[companion] diagnostics on 127.0.0.1:19497
+[ws] connection 2 ended: heartbeat miss limit
+[ws] connection 3 ended: heartbeat miss limit
+[ws] connection 4 ended: heartbeat miss limit

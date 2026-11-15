@@ -1,0 +1,22 @@
+{
+  "K.1": {
+    "pass": true,
+    "observed": "paired by paste (rail \"Online\"); Home lists Claude Code=true, Codex=true, Antigravity=true, build=true; companion agents: Codex (codex, online); Antigravity (antigravity, online); build (opencode, online); explore (opencode, online); general (opencode, online); plan (opencode, online); Claude Code (claude-code, online); screen: CHERNOBYL | ● Online | Home | Sessions | Approvals | Files | Settings | Pair | Home | Connected | 4 / 4 | Hosts online | 7 / 7 | Agents | 0 | Running sessions | 0 | Pending approvals | AGENTS | Codex | online | Antigravity | online | build | online | explore |",
+    "at": "2026-11-15T20:13:16.500Z"
+  },
+  "K.2": {
+    "pass": null,
+    "at": "2026-11-15T20:45:24.090Z",
+    "observed": "PARTIAL. Claude Code: streamed reply and footer \"Done\" on the tablet (K-claude-done.png). OpenCode (build): its reply could not be completed from the tablet (the Allow tap did not register, K-opencode-done.png still shows the pending card). Codex: refused by the account (usage limit, K-codex-limit.png, environment limit). Antigravity: the turn started and asked for approval (K-antigravity-approval.png), the runner did not get past the card."
+  },
+  "K.3": {
+    "pass": null,
+    "at": "2026-11-15T20:45:24.090Z",
+    "observed": "PARTIAL. Claude Code: card \"Claude wants to use Bash: echo hi > note.txt\" with Allow / Allow for this project / Allow for this session / Deny -> Allow on the tablet -> tool completed (K-claude-approval.png, K-runs.json). OpenCode: card \"OpenCode permission: bash\" with Allow once / Deny, risk High (K-opencode-approval.png); Antigravity: card \"Antigravity wants to run a command\" with Allow / Deny / More… (K-antigravity-approval.png): both rendered correctly with the runtime marks and names, but Allow was not completed from the runner (tap did not register on the slow emulator). Codex: no approval, the account refused the turn."
+  },
+  "K.4": {
+    "pass": null,
+    "at": "2026-11-15T20:45:24.090Z",
+    "observed": "PARTIAL. Stop was visible in every running conversation (Claude, OpenCode, Antigravity: K-*-approval.png) and \"Stopped\" was not captured: Haiku finished its reply before Stop, the other runs stopped at the approval card. Codex: not run (usage limit)."
+  }
+}
