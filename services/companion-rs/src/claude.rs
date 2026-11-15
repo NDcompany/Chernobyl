@@ -221,9 +221,22 @@ impl ClaudeAdapter {
 /* live-verified; unknown hooks are ignored, never fabricated)          */
 /* ------------------------------------------------------------------ */
 
+/// Longest hook-supplied text surfaced in an activity line (E2: a hook body
+/// may be 64 KB and 60 activity lines ride in every hello).
+const HOOK_TEXT_MAX: usize = 500;
+
+/// Hook-supplied text as shown to the phone: secrets redacted, then capped.
+fn hook_text(s: &str) -> String {
+    crate::runtime_io::redact(s)
+        .chars()
+        .take(HOOK_TEXT_MAX)
+        .collect()
+}
+
 fn normalize_hook(v: &Json, event_name: &str) -> Option<EventKind> {
-    let session_id = json::get_str(v, "session_id").unwrap_or("(unknown session)");
-    let cwd = json::get_str(v, "cwd").unwrap_or("");
+    let session_id = hook_text(json::get_str(v, "session_id").unwrap_or("(unknown session)"));
+    let session_id = session_id.as_str();
+    let cwd = hook_text(json::get_str(v, "cwd").unwrap_or(""));
     let activity = |kind: &str, text: String| {
         Some(EventKind::Activity(ActivityEvent {
             id: next_id("evt"),
@@ -235,7 +248,7 @@ fn normalize_hook(v: &Json, event_name: &str) -> Option<EventKind> {
     };
     match event_name {
         "SessionStart" => {
-            let source = json::get_str(v, "source").unwrap_or("unknown");
+            let source = hook_text(json::get_str(v, "source").unwrap_or("unknown"));
             activity(
                 "session",
                 format!("Claude Code session started ({source}) in {cwd}"),
@@ -254,15 +267,15 @@ fn normalize_hook(v: &Json, event_name: &str) -> Option<EventKind> {
             format!("Claude Code subagent turn complete ({session_id})"),
         ),
         "Notification" => {
-            let msg = json::get_str(v, "message").unwrap_or("(no message)");
+            let msg = hook_text(json::get_str(v, "message").unwrap_or("(no message)"));
             activity("session", format!("Claude Code notification: {msg}"))
         }
         "PreToolUse" => {
-            let tool = json::get_str(v, "tool_name").unwrap_or("(unknown tool)");
+            let tool = hook_text(json::get_str(v, "tool_name").unwrap_or("(unknown tool)"));
             activity("agent", format!("Claude Code about to use tool {tool}"))
         }
         "PostToolUse" => {
-            let tool = json::get_str(v, "tool_name").unwrap_or("(unknown tool)");
+            let tool = hook_text(json::get_str(v, "tool_name").unwrap_or("(unknown tool)"));
             activity("agent", format!("Claude Code used tool {tool}"))
         }
         // UserPromptSubmit, PreCompact, and anything newer: counted by the
@@ -281,12 +294,15 @@ fn normalize_hook(v: &Json, event_name: &str) -> Option<EventKind> {
 /// hook to this companion's loopback ingress. The operator pastes it in
 /// themselves. `ingress_url` is the companion's loopback diagnostics
 /// `/hooks/claude` endpoint.
-pub fn bridge_config(ingress_url: &str) -> String {
-    // The bridge is a one-line curl that streams stdin to the ingress. It
-    // fails closed: if the companion is down, curl exits non-zero and Claude
-    // Code continues (hooks are advisory — a dead bridge never blocks a turn).
+pub fn bridge_config(ingress_url: &str, control_key: &str) -> String {
+    // The bridge is a one-line curl that streams stdin to the ingress, with
+    // the control key the route requires (security pass 2026-11-15, E2; the
+    // key is as private as this settings file). It fails closed: if the
+    // companion is down, curl exits non-zero and Claude Code continues (hooks
+    // are advisory — a dead bridge never blocks a turn).
     let cmd = format!(
-        "curl -sS -X POST -H \"content-type: application/json\" --data-binary @- \"{ingress_url}\""
+        "curl -sS -X POST -H \"content-type: application/json\" -H \"{}: {control_key}\" --data-binary @- \"{ingress_url}\"",
+        crate::server::CONTROL_KEY_HEADER
     );
     let events = [
         "SessionStart",
@@ -696,10 +712,48 @@ mod tests {
         assert_eq!(p.status, "unavailable");
     }
 
+    /// Security pass 2026-11-15 (E2): hook text is redacted and capped, so a
+    /// 60 KB hook can neither leak a secret nor bloat the snapshot.
+    #[test]
+    fn hook_text_is_redacted_and_capped() {
+        let big = "x".repeat(60_000);
+        let secret = format!("ghp_{}", "x".repeat(36));
+        let hook = format!(
+            r#"{{"hook_event_name":"Notification","session_id":"s1","cwd":"{big}","message":"token {secret} {big}"}}"#
+        );
+        let v = json::parse(&hook).unwrap();
+        let Some(EventKind::Activity(a)) = normalize_hook(&v, "Notification") else {
+            panic!("a Notification surfaces as activity");
+        };
+        assert!(
+            a.text.chars().count() <= HOOK_TEXT_MAX + 40,
+            "{}",
+            a.text.len()
+        );
+        assert!(!a.text.contains(&secret), "{}", a.text);
+        let start = format!(
+            r#"{{"hook_event_name":"SessionStart","session_id":"s1","source":"{big}","cwd":"{big}"}}"#
+        );
+        let v = json::parse(&start).unwrap();
+        let Some(EventKind::Activity(a)) = normalize_hook(&v, "SessionStart") else {
+            panic!("a SessionStart surfaces as activity");
+        };
+        assert!(
+            a.text.chars().count() <= 2 * HOOK_TEXT_MAX + 80,
+            "{}",
+            a.text.len()
+        );
+    }
+
     #[test]
     fn bridge_config_targets_ingress_and_is_explicit() {
-        let cfg = bridge_config("http://127.0.0.1:9191/hooks/claude");
+        let cfg = bridge_config("http://127.0.0.1:9191/hooks/claude", "k3y");
         assert!(cfg.contains("http://127.0.0.1:9191/hooks/claude"), "{cfg}");
+        // E2: the ingress route needs the control key
+        assert!(
+            cfg.contains(&format!("{}: k3y", crate::server::CONTROL_KEY_HEADER)),
+            "{cfg}"
+        );
         assert!(
             cfg.contains("settings.json"),
             "must name the file the user edits"

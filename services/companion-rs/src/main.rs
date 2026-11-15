@@ -654,7 +654,19 @@ fn revoke_offline(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
 /// install; the companion never writes the user's settings). Socket-free.
 fn claude_hooks_main(cfg: &config::CompanionConfig) -> i32 {
     let ingress = format!("http://127.0.0.1:{}/hooks/claude", cfg.diagnostics_port);
-    print!("{}", chernobyl_companion::claude::bridge_config(&ingress));
+    // the ingress route needs the control key the daemon minted on first boot
+    let key = control_key(cfg);
+    if key.is_empty() {
+        eprintln!(
+            "[companion] no control key in {}: start the companion once, then run --claude-hooks again",
+            cfg.data_dir.display()
+        );
+        return 1;
+    }
+    print!(
+        "{}",
+        chernobyl_companion::claude::bridge_config(&ingress, &key)
+    );
     0
 }
 

@@ -13,6 +13,20 @@ use crate::protocol::{
 use crate::runtime_io::show_format_chars;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Longest activity line kept (in characters). 60 lines ride in every hello
+/// snapshot, which must stay under the 256 000-byte frame cap whatever a hook
+/// or runtime sends (security pass 2026-11-15, E2).
+pub const ACTIVITY_TEXT_MAX: usize = 500;
+
+/// Activity text as stored and broadcast: invisible format characters shown,
+/// then capped.
+fn clean_activity_text(s: &str) -> String {
+    show_format_chars(s)
+        .chars()
+        .take(ACTIVITY_TEXT_MAX)
+        .collect()
+}
+
 pub const TICK_MS: i64 = 1_000;
 pub const STEP_MS: i64 = 450;
 const MAX_ACK_CACHE: usize = 500;
@@ -92,6 +106,14 @@ impl Engine {
     /// SAME seq/envelope/emit path as engine events, so one sequence stays
     /// continuous (C2) across mock and native sources.
     pub fn publish_external(&mut self, kind: EventKind) {
+        // E2: an adapter's activity text is bounded like the engine's own
+        let kind = match kind {
+            EventKind::Activity(mut a) => {
+                a.text = clean_activity_text(&a.text);
+                EventKind::Activity(a)
+            }
+            other => other,
+        };
         match &kind {
             EventKind::Activity(a) => {
                 // the snapshot must show what the event stream already says
@@ -1109,7 +1131,7 @@ impl Engine {
             id: next_id("ev"),
             ts: now_ms(),
             kind: kind.to_string(),
-            text: show_format_chars(text),
+            text: clean_activity_text(text),
             ref_id: ref_id.map(str::to_string),
         };
         self.state.activity.insert(0, event.clone());

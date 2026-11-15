@@ -881,7 +881,10 @@ fn hook_ingress(
     // Security review 2026-10-25: the same browser guard as the sibling
     // routes. A text/plain POST needs no CORS preflight, so without it any
     // web page could forge hook activity into the persisted event pipeline.
-    if h.header("origin").is_some() {
+    // Security pass 2026-11-15 (E2): and the control key, like the permission
+    // route: any local process reaches 127.0.0.1, so without it any of them
+    // could forge activity (and 60 KB payloads) into every phone's feed.
+    if h.header("origin").is_some() || !has_control_key(h, companion) {
         drain_body(reader, h);
         let _ = ws::write_http_error(writer, 403, "Forbidden", "");
         return Ok(());
@@ -3143,7 +3146,8 @@ mod e2e_tests {
 
         // diagnostics listener (loopback): accepted, event enters the pipeline
         let diag = format!("http://127.0.0.1:{}", f.handle.diagnostics_port);
-        let r = http_request("POST", &format!("{diag}/hooks/claude"), None, Some(payload)).unwrap();
+        let key = f.companion.control_key().to_string();
+        let r = control_post(&format!("{diag}/hooks/claude"), &key, payload).unwrap();
         assert!(r.status == 200, "diag POST must accept, got {}", r.status);
         let snap = f.companion.snapshot();
         assert!(
@@ -3165,14 +3169,71 @@ mod e2e_tests {
         );
 
         // malformed payload on the ingress: 400, never a fabricated event
-        let bad =
-            http_request("POST", &format!("{diag}/hooks/claude"), None, Some("{nope")).unwrap();
+        let bad = control_post(&format!("{diag}/hooks/claude"), &key, "{nope").unwrap();
         assert!(
             bad.status == 400,
             "malformed hook must 400, got {}",
             bad.status
         );
 
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (E2): /hooks/claude needs the control key like
+    /// the permission route; any other local process is refused and nothing
+    /// it sends surfaces.
+    #[test]
+    fn claude_hook_ingress_requires_the_control_key() {
+        let f = fixture_claude("cc-key");
+        let body =
+            r#"{"hook_event_name":"Notification","session_id":"x","message":"forged no-key"}"#;
+        let url = format!(
+            "http://127.0.0.1:{}/hooks/claude",
+            f.handle.diagnostics_port
+        );
+        let none = http_request("POST", &url, None, Some(body)).unwrap();
+        assert_eq!(none.status, 403, "no key");
+        let wrong = control_post(&url, "not-the-key", body).unwrap();
+        assert_eq!(wrong.status, 403, "wrong key");
+        let forged = |c: &Companion| {
+            c.snapshot()
+                .activity
+                .iter()
+                .any(|a| a.text.contains("forged no-key"))
+        };
+        assert!(!forged(&f.companion));
+        let ok = control_post(&url, f.companion.control_key(), body).unwrap();
+        assert_eq!(ok.status, 200);
+        assert!(forged(&f.companion));
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (E2): sixty-odd 60 KB Notification hooks used
+    /// to push hello_ack past the 256 000-byte frame cap; the activity text is
+    /// capped now, so the snapshot a hello carries stays inside it.
+    #[test]
+    fn oversized_hooks_cannot_push_hello_past_the_frame_cap() {
+        let f = fixture_claude("cc-big");
+        let url = format!(
+            "http://127.0.0.1:{}/hooks/claude",
+            f.handle.diagnostics_port
+        );
+        let big = "A".repeat(60_000);
+        for i in 0..70 {
+            let body = format!(
+                r#"{{"hook_event_name":"Notification","session_id":"s{i}","message":"{big}"}}"#
+            );
+            let r = control_post(&url, f.companion.control_key(), &body).unwrap();
+            assert_eq!(r.status, 200);
+        }
+        let mut c = connect(&f);
+        c.send_text(&format!(
+            r#"{{"type":"hello","clientId":"big","protocol":{PROTOCOL_VERSION}}}"#
+        ))
+        .unwrap();
+        let ack = c.next_text().expect("hello_ack fits in a frame");
+        assert!(ack.contains("hello_ack"), "{}", &ack[..ack.len().min(200)]);
+        assert!(ack.len() < ws::MAX_PAYLOAD_BYTES, "{} bytes", ack.len());
         shutdown(f);
     }
 
@@ -3190,7 +3251,8 @@ mod e2e_tests {
                 .unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let req = format!(
-            "POST /hooks/claude HTTP/1.1\r\nHost: 127.0.0.1:{dport}\r\nOrigin: http://evil.example\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /hooks/claude HTTP/1.1\r\nHost: 127.0.0.1:{dport}\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            f.companion.control_key(),
             body.len(),
             dport = f.handle.diagnostics_port
         );
@@ -3212,7 +3274,12 @@ mod e2e_tests {
         assert!(!forged(&f.companion), "a refused hook must not surface");
         // control: the same payload without Origin is accepted and surfaces
         let diag = format!("http://127.0.0.1:{}", f.handle.diagnostics_port);
-        let ok = http_request("POST", &format!("{diag}/hooks/claude"), None, Some(body)).unwrap();
+        let ok = control_post(
+            &format!("{diag}/hooks/claude"),
+            f.companion.control_key(),
+            body,
+        )
+        .unwrap();
         assert_eq!(ok.status, 200);
         assert!(forged(&f.companion));
         shutdown(f);
