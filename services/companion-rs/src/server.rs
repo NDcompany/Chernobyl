@@ -3208,6 +3208,32 @@ mod e2e_tests {
         shutdown(f);
     }
 
+    /// Security pass 2026-11-15 (E2): the `--hook activity` client (key from the
+    /// caller, loopback Host) passes the key and Host checks of the real
+    /// diagnostics listener and its event surfaces; the permission-hook client
+    /// is covered by `permission_hook_round_trip_through_the_companion`.
+    #[test]
+    fn activity_hook_client_reaches_the_ingress() {
+        let f = fixture_claude("cc-activity-client");
+        let body =
+            r#"{"hook_event_name":"Notification","session_id":"x","message":"via activity hook"}"#;
+        let port = f.handle.diagnostics_port;
+        assert!(!crate::claude::activity_hook(body, port, "wrong-key"));
+        assert!(crate::claude::activity_hook(
+            body,
+            port,
+            f.companion.control_key()
+        ));
+        assert!(
+            f.companion
+                .snapshot()
+                .activity
+                .iter()
+                .any(|a| a.text.contains("via activity hook"))
+        );
+        shutdown(f);
+    }
+
     /// Security pass 2026-11-15 (E2): sixty-odd 60 KB Notification hooks used
     /// to push hello_ack past the 256 000-byte frame cap; the activity text is
     /// capped now, so the snapshot a hello carries stays inside it.

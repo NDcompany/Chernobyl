@@ -24,6 +24,9 @@
 //!                            stdin JSON to the running companion, waits for the phone
 //!                            (--timeout <s>, default 120), prints the decision or
 //!                            nothing; always exits 0
+//!   --hook activity          the activity bridge (`--claude-hooks` snippet): stdin JSON
+//!                            to the running companion's /hooks/claude, 2 s, silent,
+//!                            always exits 0
 //!   --install-hooks          add that hook to ~/.claude/settings.json (backup first)
 //!   --uninstall-hooks        remove it again
 //!   --tui                    boot the daemon and open the terminal UI (status,
@@ -216,7 +219,7 @@ fn run(args: &[String]) -> i32 {
     // THIS companion's loopback diagnostics ingress (explicit install: the
     // companion never writes the user's settings.json). Socket-free.
     if claude_hooks {
-        return claude_hooks_main(&cfg);
+        return claude_hooks_main(&cfg_path);
     }
     // ADR-018: written only on this explicit command, after a backup
     if install_hooks || uninstall_hooks {
@@ -652,22 +655,36 @@ fn revoke_offline(cfg: &config::CompanionConfig, device_id: &str) -> i32 {
 /// forwards every hook to THIS companion's loopback diagnostics ingress. The
 /// operator pastes it into `~/.claude/settings.json` themselves (explicit
 /// install; the companion never writes the user's settings). Socket-free.
-fn claude_hooks_main(cfg: &config::CompanionConfig) -> i32 {
-    let ingress = format!("http://127.0.0.1:{}/hooks/claude", cfg.diagnostics_port);
-    // the ingress route needs the control key the daemon minted on first boot
-    let key = control_key(cfg);
-    if key.is_empty() {
-        eprintln!(
-            "[companion] no control key in {}: start the companion once, then run --claude-hooks again",
-            cfg.data_dir.display()
-        );
-        return 1;
+fn claude_hooks_main(cfg_path: &std::path::Path) -> i32 {
+    // the snippet runs this exe (`--hook activity`), which reads the control
+    // key from the config's data dir itself: nothing secret is printed
+    match exe_and_config(cfg_path)
+        .and_then(|(exe, cfg)| chernobyl_companion::claude::bridge_config(&exe, &cfg))
+    {
+        Ok(snippet) => {
+            print!("{snippet}");
+            0
+        }
+        Err(e) => {
+            eprintln!("[companion] claude-hooks: {e}");
+            1
+        }
     }
-    print!(
-        "{}",
-        chernobyl_companion::claude::bridge_config(&ingress, &key)
-    );
-    0
+}
+
+/// This exe and the config file, canonical and without the `\\?\` prefix,
+/// for a command line a hook runs later.
+fn exe_and_config(
+    cfg_path: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let plain = |p: std::path::PathBuf| {
+        std::fs::canonicalize(&p)
+            .map(|c| std::path::PathBuf::from(chernobyl_companion::claude_live::plain(&c)))
+    };
+    let exe = std::env::current_exe().map_err(|e| format!("this exe's path: {e}"))?;
+    let exe = plain(exe.clone()).unwrap_or(exe);
+    let cfg = plain(cfg_path.to_path_buf()).map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+    Ok((exe, cfg))
 }
 
 /// ADR-018 `--hook permission-request`: Claude Code's `PermissionRequest`
@@ -677,9 +694,13 @@ fn claude_hooks_main(cfg: &config::CompanionConfig) -> i32 {
 /// PC as usual. Never writes a file, never blocks past `--timeout`.
 fn hook_main(mode: &str, timeout_s: Option<u64>, config_path: Option<&str>) -> i32 {
     use std::io::Read;
-    if mode != "permission-request" {
-        return 0;
-    }
+    // `activity` forwards a hook to the activity feed (fire and forget);
+    // `permission-request` waits for the phone's answer
+    let activity = match mode {
+        "permission-request" => false,
+        "activity" => true,
+        _ => return 0,
+    };
     let mut input = String::new();
     let cap = chernobyl_companion::claude::ClaudeAdapter::MAX_HOOK_PAYLOAD_BYTES as u64 + 1;
     if std::io::stdin()
@@ -694,6 +715,12 @@ fn hook_main(mode: &str, timeout_s: Option<u64>, config_path: Option<&str>) -> i
     };
     // the control key goes only to the companion that holds this journal
     if !companion_running(&cfg.data_dir) {
+        return 0;
+    }
+    if activity {
+        // never prints, never fails the turn: the result is ignored
+        let key = control_key(&cfg);
+        let _ = chernobyl_companion::claude::activity_hook(&input, cfg.diagnostics_port, &key);
         return 0;
     }
     let wait = Duration::from_secs(
@@ -735,17 +762,9 @@ fn install_hooks_main(cfg_path: &std::path::Path, install: bool, timeout_s: Opti
     };
     let result = if install {
         let timeout = timeout_s.unwrap_or(claude::HOOK_TIMEOUT_S).clamp(1, 600);
-        let exe = std::env::current_exe().map_err(|e| format!("this exe's path: {e}"));
-        let cfg = std::fs::canonicalize(cfg_path)
-            .map(|p| std::path::PathBuf::from(chernobyl_companion::claude_live::plain(&p)))
-            .map_err(|e| format!("{}: {e}", cfg_path.display()));
-        exe.and_then(|exe| {
-            let exe = std::fs::canonicalize(&exe)
-                .map(|p| std::path::PathBuf::from(chernobyl_companion::claude_live::plain(&p)))
-                .unwrap_or(exe);
-            cfg.and_then(|c| claude::hook_command(&exe, &c, timeout))
-        })
-        .and_then(|cmd| claude::install_hook(&settings, &cmd, timeout))
+        exe_and_config(cfg_path)
+            .and_then(|(exe, cfg)| claude::hook_command(&exe, &cfg, timeout))
+            .and_then(|cmd| claude::install_hook(&settings, &cmd, timeout))
     } else {
         claude::uninstall_hook(&settings)
     };

@@ -21,7 +21,9 @@
 //!
 //! The companion never writes the user's `settings.json` on its own.
 //! `bridge_config()` prints the exact snippet the operator pastes in
-//! themselves (explicit install). Ingestion is attach-only in reverse: a
+//! themselves (explicit install): each hook runs `companion --hook activity`
+//! ([`activity_hook`]), which reads the control key from the data directory
+//! itself, so no secret is ever in the snippet. Ingestion is attach-only in reverse: a
 //! dead/absent bridge simply means no events arrive — never a spawn or a
 //! config rewrite.
 //!
@@ -290,20 +292,18 @@ fn normalize_hook(v: &Json, event_name: &str) -> Option<EventKind> {
 /* writes the user's settings.json)                                     */
 /* ------------------------------------------------------------------ */
 
+/// What identifies the activity bridge command (and what `is_ours` must NOT
+/// match: `--install-hooks` manages only the permission hook).
+pub const ACTIVITY_ARGS: &str = "--hook activity";
+
 /// Print the `settings.json` hook snippet that forwards every Claude Code
 /// hook to this companion's loopback ingress. The operator pastes it in
-/// themselves. `ingress_url` is the companion's loopback diagnostics
-/// `/hooks/claude` endpoint.
-pub fn bridge_config(ingress_url: &str, control_key: &str) -> String {
-    // The bridge is a one-line curl that streams stdin to the ingress, with
-    // the control key the route requires (security pass 2026-11-15, E2; the
-    // key is as private as this settings file). It fails closed: if the
-    // companion is down, curl exits non-zero and Claude Code continues (hooks
-    // are advisory — a dead bridge never blocks a turn).
-    let cmd = format!(
-        "curl -sS -X POST -H \"content-type: application/json\" -H \"{}: {control_key}\" --data-binary @- \"{ingress_url}\"",
-        crate::server::CONTROL_KEY_HEADER
-    );
+/// themselves. The command is this exe with `--hook activity --config <file>`
+/// (security pass 2026-11-15, E2): the exe reads `control.key` from the data
+/// dir the config names, like the permission hook, so the snippet holds no
+/// secret. It refuses a path a shell would expand.
+pub fn bridge_config(exe: &Path, config: &Path) -> Result<String, String> {
+    let cmd = activity_command(exe, config)?;
     let events = [
         "SessionStart",
         "SessionEnd",
@@ -320,13 +320,27 @@ pub fn bridge_config(ingress_url: &str, control_key: &str) -> String {
             cmd.replace('\\', "\\\\").replace('"', "\\\"")
         ));
     }
-    format!(
+    Ok(format!(
         "// Paste into ~/.claude/settings.json (explicit install — CHERNOBYL never writes it).\n\
-         // Every hook above is forwarded to the companion ingress; a dead companion means\n\
-         // the hook exits non-zero and Claude Code simply continues (hooks are advisory).\n\
+         // Every hook below is forwarded to the companion ingress; with the companion down the\n\
+         // hook prints nothing and exits 0, and Claude Code simply continues (hooks are advisory).\n\
          {{\n  \"hooks\": {{\n{}\n  }}\n}}\n",
         hooks.join("\n")
-    )
+    ))
+}
+
+/// `companion --hook activity`: forwards the hook's stdin to the running
+/// companion's `/hooks/claude` route (loopback diagnostics, control key, a
+/// `Host` that is the loopback socket itself) with a 2 s bound. Fire and
+/// forget: returns whether it was accepted, and never prints or fails Claude
+/// Code's turn whatever happens.
+pub fn activity_hook(input: &str, diag_port: u16, key: &str) -> bool {
+    if key.is_empty() || input.len() > ClaudeAdapter::MAX_HOOK_PAYLOAD_BYTES {
+        return false;
+    }
+    let url = format!("http://127.0.0.1:{diag_port}/hooks/claude");
+    crate::server::control_post_within(&url, key, input, Duration::from_secs(2))
+        .is_ok_and(|r| r.status == 200)
 }
 
 /* ------------------------------------------------------------------ */
@@ -395,22 +409,32 @@ pub fn permission_hook(input: &str, diag_port: u16, key: &str, wait: Duration) -
 /// quotes work in Git Bash and cmd alike. Refuses a path a shell would
 /// expand.
 pub fn hook_command(exe: &Path, config: &Path, timeout_s: u64) -> Result<String, String> {
-    let quote = |p: &Path| -> Result<String, String> {
-        let s = p.to_string_lossy().replace('\\', "/");
-        if s.chars()
-            .any(|c| matches!(c, '"' | '$' | '`' | '%' | '!') || c.is_control())
-        {
-            return Err(format!(
-                "{s}: the path has a character a shell would expand"
-            ));
-        }
-        Ok(format!("\"{s}\""))
-    };
     Ok(format!(
         "{} {HOOK_ARGS} --timeout {timeout_s} --config {}",
-        quote(exe)?,
-        quote(config)?
+        quote_path(exe)?,
+        quote_path(config)?
     ))
+}
+
+/// The activity bridge's command line (same quoting rules as [`hook_command`]).
+pub fn activity_command(exe: &Path, config: &Path) -> Result<String, String> {
+    Ok(format!(
+        "{} {ACTIVITY_ARGS} --config {}",
+        quote_path(exe)?,
+        quote_path(config)?
+    ))
+}
+
+fn quote_path(p: &Path) -> Result<String, String> {
+    let s = p.to_string_lossy().replace('\\', "/");
+    if s.chars()
+        .any(|c| matches!(c, '"' | '$' | '`' | '%' | '!') || c.is_control())
+    {
+        return Err(format!(
+            "{s}: the path has a character a shell would expand"
+        ));
+    }
+    Ok(format!("\"{s}\""))
 }
 
 fn is_ours(hook: &Json) -> bool {
@@ -746,14 +770,30 @@ mod tests {
     }
 
     #[test]
-    fn bridge_config_targets_ingress_and_is_explicit() {
-        let cfg = bridge_config("http://127.0.0.1:9191/hooks/claude", "k3y");
-        assert!(cfg.contains("http://127.0.0.1:9191/hooks/claude"), "{cfg}");
-        // E2: the ingress route needs the control key
+    fn bridge_config_runs_this_exe_and_holds_no_secret() {
+        let exe = Path::new("C:/Programs/CHERNOBYL/chernobyl-companion.exe");
+        let conf = Path::new("C:/Users/u/AppData/Roaming/CHERNOBYL/companion.json");
+        let cfg = bridge_config(exe, conf).unwrap();
+        // E2: the command is this exe's activity hook, no curl, no key
         assert!(
-            cfg.contains(&format!("{}: k3y", crate::server::CONTROL_KEY_HEADER)),
+            cfg.contains(r#"\"C:/Programs/CHERNOBYL/chernobyl-companion.exe\" --hook activity --config \"C:/Users/u/AppData/Roaming/CHERNOBYL/companion.json\""#),
             "{cfg}"
         );
+        assert!(!cfg.contains("curl"), "{cfg}");
+        assert!(
+            !cfg.to_ascii_lowercase()
+                .contains(crate::server::CONTROL_KEY_HEADER)
+        );
+        assert!(!cfg.contains("k3y"));
+        // `--install-hooks` must not mistake it for the permission hook
+        let hook = json::obj(vec![(
+            "command",
+            json::s(&activity_command(exe, conf).unwrap()),
+        )]);
+        assert!(!is_ours(&hook));
+        // a path a shell would expand is refused
+        assert!(bridge_config(Path::new("C:/a$b/x.exe"), conf).is_err());
+        assert!(bridge_config(exe, Path::new("C:/100%/c.json")).is_err());
         assert!(
             cfg.contains("settings.json"),
             "must name the file the user edits"
@@ -808,6 +848,34 @@ mod tests {
         )
     }
 
+    /// The activity bridge posts the hook's stdin to `/hooks/claude` with the
+    /// key and a Host the diagnostics listener accepts (N7), and says nothing
+    /// when nothing listens or there is no key.
+    #[test]
+    fn activity_hook_posts_with_key_and_loopback_host_and_fails_quietly() {
+        let (port, t) = fake(Some(ok("")));
+        assert!(activity_hook(ASK, port, "k3y"));
+        let req = t.join().unwrap();
+        assert!(req.starts_with("POST /hooks/claude HTTP/1.1"), "{req}");
+        assert!(req.contains(&format!("{}: k3y\r\n", crate::server::CONTROL_KEY_HEADER)));
+        assert!(
+            req.contains(&format!("Host: 127.0.0.1:{port}\r\n")),
+            "{req}"
+        );
+        assert!(req.ends_with(ASK), "the hook's stdin is the body");
+        // nothing listening: false, within the 2 s bound
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let t0 = std::time::Instant::now();
+        assert!(!activity_hook(ASK, dead, "k3y"));
+        assert!(t0.elapsed() < Duration::from_secs(3));
+        // no key: never connects (a held listener would see nothing)
+        assert!(!activity_hook(ASK, port, ""));
+    }
+
     #[test]
     fn hook_prints_the_documented_decision_shape() {
         let (port, t) = fake(Some(ok(r#"{"behavior":"allow"}"#)));
@@ -822,6 +890,11 @@ mod tests {
             "{req}"
         );
         assert!(req.contains(&format!("{}: k3y\r\n", crate::server::CONTROL_KEY_HEADER)));
+        // N7: the Host is the loopback socket, which the listener requires
+        assert!(
+            req.contains(&format!("Host: 127.0.0.1:{port}\r\n")),
+            "{req}"
+        );
         assert!(req.ends_with(ASK), "the hook's stdin is the body");
 
         let (port, t) = fake(Some(ok(r#"{"behavior":"deny","message":"not on main"}"#)));

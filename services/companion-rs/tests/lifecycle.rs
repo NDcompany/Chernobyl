@@ -69,6 +69,60 @@ fn daemon_refuses_an_empty_or_short_token() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Security pass 2026-11-15 (E2): `--hook activity` with no companion running
+/// exits 0 and prints nothing at all (it must never disturb Claude Code), and
+/// with a body it never blocks.
+#[test]
+fn activity_hook_with_the_companion_down_is_silent_and_exits_zero() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = temp_dir("activity-hook");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("companion.json");
+    let data = dir.join("data").to_string_lossy().replace('\\', "/");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"{{"version":1,"name":"t","dataDir":"{data}","adapters":[{{"id":"mock-1","type":"mock","enabled":true}}],"diagnostics":{{"port":1}},"server":{{"port":0,"bind":"127.0.0.1"}}}}"#
+        ),
+    )
+    .unwrap();
+    for body in [
+        r#"{"hook_event_name":"Notification","session_id":"s","message":"hi"}"#,
+        "not json at all",
+        "",
+    ] {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_chernobyl-companion"))
+            .args(["--hook", "activity", "--config"])
+            .arg(&cfg)
+            .env("CHERNOBYL_HOME", &dir)
+            .env_remove("HOST_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(body.as_bytes()).unwrap();
+        drop(stdin);
+        let t0 = Instant::now();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{body:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Mandate §8 / §10 scenario 2:
 /// Shutdown while a client is mid E2E handshake (hs_hello sent, no hs_proof): stop() returns true.
 #[test]
