@@ -524,6 +524,27 @@ fn handle_conn(
         Err(_) => return Ok(()), // hostile/garbage/shutdown: drop the connection
     };
 
+    // Security pass 2026-11-15 (N9): a second Origin header is a smuggling
+    // attempt (a proxy and this check could each read a different one).
+    if handshake.origin_count() > 1 {
+        drain_body(&mut request, &handshake);
+        let _ = ws::write_http_error(&mut writer, 403, "Forbidden", "");
+        return Ok(());
+    }
+    // Security pass 2026-11-15 (N1): a request stamped by a reverse proxy or
+    // tunnel arrives from 127.0.0.1 but is remote. Treat this connection as
+    // remote posture (E2E required, no pre-session snapshot, /health behind
+    // the token); with no token to hold it to, refuse it outright. The
+    // diagnostics listener has no token, so a proxied request there is
+    // refused too. Spoofing these headers only makes the connection stricter.
+    let proxied = handshake.is_proxied();
+    if proxied && token.is_none() {
+        drain_body(&mut request, &handshake);
+        let _ = ws::write_http_error(&mut writer, 403, "Forbidden", "");
+        return Ok(());
+    }
+    let remote_posture = remote_posture || proxied;
+
     // HTTP routes (non-upgrade) -------------------------------------------
     if !handshake.is_websocket_upgrade() {
         // Phase 7: POST hook ingress (Claude Code) — reachable ONLY on the
@@ -2242,6 +2263,23 @@ mod e2e_tests {
         WsClient::connect(&format!("127.0.0.1:{}", f.handle.port), "/", None).unwrap()
     }
 
+    /// One raw request on a fresh connection; returns the response status line.
+    fn raw_status(port: u16, req: &str) -> String {
+        use std::io::Read;
+        let mut s = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        let mut buf = [0u8; 512];
+        while !resp.contains("\r\n") {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => resp.push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+        resp.lines().next().unwrap_or("").to_string()
+    }
+
     /// The server's challenge for one handshake + the client nonce it answers.
     struct Challenge {
         nonce: Vec<u8>,
@@ -2598,6 +2636,113 @@ mod e2e_tests {
         c.send_text(r#"{"type":"ping","commandId":"d1-ping"}"#)
             .unwrap();
         assert!(c.next_text().unwrap().contains("pong"));
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N1): a request a tunnel or reverse proxy
+    /// stamped is refused when there is no token to hold it to.
+    #[test]
+    fn proxied_request_without_a_token_is_refused_403() {
+        let f = fixture("n1-notoken", now_ms() + 60_000, false);
+        let port = f.handle.port;
+        for h in [
+            "X-Forwarded-For: 203.0.113.9",
+            "X-Forwarded-Host: abc.ngrok-free.app",
+            "X-Forwarded-Proto: https",
+            "Forwarded: for=203.0.113.9",
+            "ngrok-skip-browser-warning: 1",
+        ] {
+            let st = raw_status(
+                port,
+                &format!(
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{h}\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            assert!(st.contains("403"), "{h}: {st}");
+        }
+        let err = WsClient::connect_with_headers(
+            &format!("127.0.0.1:{port}"),
+            "/",
+            None,
+            &[("X-Forwarded-For", "203.0.113.9")],
+        )
+        .err()
+        .expect("proxied upgrade must be refused");
+        assert!(err.contains("403"), "{err}");
+        // control: the identical unproxied request is served
+        let st = raw_status(
+            port,
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(st.contains("200"), "{st}");
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N1): with a token, a proxied request on a
+    /// loopback bind gets remote posture for that connection: /health needs the
+    /// token and a pre-session hello returns no snapshot, while an unproxied
+    /// loopback peer on the same server is unchanged.
+    #[test]
+    fn proxied_request_gets_remote_posture_on_a_loopback_bind() {
+        let dir = temp_dir("n1-token");
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let handle = start_with_posture(
+            "127.0.0.1",
+            0,
+            0,
+            Some(REMOTE_TOKEN.into()),
+            companion.clone(),
+            false,
+        )
+        .unwrap();
+        let port = handle.port;
+        let addr = format!("127.0.0.1:{port}");
+        let health = |extra: &str| {
+            raw_status(
+                port,
+                &format!(
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra}Connection: close\r\n\r\n"
+                ),
+            )
+        };
+        assert!(health("").contains("200"), "loopback /health is open");
+        assert!(health("X-Forwarded-For: 203.0.113.9\r\n").contains("401"));
+        let authed =
+            format!("X-Forwarded-For: 203.0.113.9\r\nAuthorization: Bearer {REMOTE_TOKEN}\r\n");
+        assert!(health(&authed).contains("200"));
+        let hello = format!(r#"{{"type":"hello","clientId":"n1","protocol":{PROTOCOL_VERSION}}}"#);
+        let mut proxied = WsClient::connect_with_headers(
+            &addr,
+            "/",
+            Some(REMOTE_TOKEN),
+            &[("ngrok-skip-browser-warning", "1")],
+        )
+        .unwrap();
+        proxied.send_text(&hello).unwrap();
+        let ack = proxied.next_text().unwrap();
+        assert!(ack.contains("e2e session required"), "{ack}");
+        assert!(!ack.contains("snapshot"), "{ack}");
+        let mut local = WsClient::connect(&addr, "/", Some(REMOTE_TOKEN)).unwrap();
+        local.send_text(&hello).unwrap();
+        assert!(local.next_text().unwrap().contains("snapshot"));
+        drop((proxied, local));
+        let clean = handle.stop();
+        companion.shutdown(clean);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Security pass 2026-11-15 (N9): two Origin headers are refused.
+    #[test]
+    fn request_with_two_origin_headers_is_refused_403() {
+        let f = fixture("n9-origin", now_ms() + 60_000, false);
+        let req = |origins: &str| {
+            format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{origins}Connection: close\r\n\r\n")
+        };
+        let two = req("Origin: chernobyl://app\r\nOrigin: http://evil.example\r\n");
+        assert!(raw_status(f.handle.port, &two).contains("403"));
+        assert!(raw_status(f.handle.port, &req("")).contains("200"));
         shutdown(f);
     }
 
