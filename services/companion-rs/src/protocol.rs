@@ -1329,6 +1329,11 @@ pub enum EventKind {
         error: Option<String>,
         session_id: Option<String>,
         permission_id: Option<String>,
+        /// `git_pull` only (security pass 2026-11-15, E1): the changed paths
+        /// that are agent configuration (`.claude/`, `CLAUDE.md`, ...), which
+        /// a pull may have changed under a trusted workspace. Serialized
+        /// only when non-empty, so older phones see the same message.
+        agent_config_changed: Vec<String>,
     },
 }
 
@@ -1497,9 +1502,18 @@ impl ServerMsg {
                         error,
                         session_id,
                         permission_id,
+                        agent_config_changed,
                     } => {
                         fields.push(("commandId", json::s(command_id)));
                         fields.push(("status", json::s(status)));
+                        if !agent_config_changed.is_empty() {
+                            fields.push((
+                                "agentConfigChanged",
+                                Json::Arr(
+                                    agent_config_changed.iter().map(|p| json::s(p)).collect(),
+                                ),
+                            ));
+                        }
                         if let Some(e) = error {
                             fields.push(("error", json::s(e)));
                         }
@@ -1974,6 +1988,40 @@ mod tests {
         assert_eq!(json::get(&v, "duplicate").unwrap(), &Json::Bool(true));
         assert_eq!(json::get(&v, "ok").unwrap(), &Json::Bool(true));
         assert_eq!(json::get(&v, "sessionId").unwrap(), &json::s("s9"));
+    }
+
+    /// Security pass 2026-11-15 (E1): a pull's `command_result` names the agent
+    /// config it changed, and carries no extra field when it changed none.
+    #[test]
+    fn command_result_lists_changed_agent_config_only_when_there_is_some() {
+        let result = |changed: Vec<String>| ServerMsg::Event {
+            kind: EventKind::CommandResult {
+                command_id: "c1".into(),
+                status: "completed".into(),
+                error: None,
+                session_id: None,
+                permission_id: None,
+                agent_config_changed: changed,
+            },
+            env: Envelope {
+                seq: 1,
+                event_id: "evt_x".into(),
+                occurred_at: 1,
+            },
+        };
+        let v = json::parse(
+            &result(vec![".claude/settings.json".into(), "CLAUDE.md".into()]).to_text(),
+        )
+        .unwrap();
+        let listed: Vec<&str> = json::get(&v, "agentConfigChanged")
+            .and_then(json::as_arr)
+            .unwrap()
+            .iter()
+            .filter_map(json::as_str)
+            .collect();
+        assert_eq!(listed, [".claude/settings.json", "CLAUDE.md"]);
+        let v = json::parse(&result(vec![]).to_text()).unwrap();
+        assert!(json::get(&v, "agentConfigChanged").is_none(), "old shape");
     }
 
     #[test]

@@ -92,6 +92,19 @@ export function pullSource(s: GitStatus): { label: string; canPull: boolean } {
   return { label: `${s.upstream} → ${s.branch}`, canPull: true };
 }
 
+/**
+ * Shown after a Pull that changed agent configuration (`.claude/`, `AGENTS.md`, …):
+ * agents in the workspace follow those files, tool permissions and hooks included.
+ * `undefined` when nothing changed. Paths come from the PC's git, so they are
+ * capped and shown as text only.
+ */
+export function agentConfigWarning(paths: readonly string[] | undefined): string | undefined {
+  if (!paths || paths.length === 0) return undefined;
+  const shown = paths.slice(0, 5).join(', ');
+  const more = paths.length > 5 ? ` and ${paths.length - 5} more` : '';
+  return `This pull changed agent settings: ${shown}${more}. Agents in this workspace follow them, including tool permissions and hooks — review them on your PC.`;
+}
+
 /** "↑2 ↓1", "up to date", or '' without an upstream. */
 export function aheadBehind(s: GitStatus): string {
   if (!s.upstream) return '';

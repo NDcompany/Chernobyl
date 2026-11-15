@@ -21,7 +21,7 @@ const RUN = process.env.RUN ?? '2026-10-25-emulator';
 const OUT = join(process.cwd(), 'docs/validation/evidence', RUN);
 const HOME = join(process.env.TEMP ?? '.', 'chernobyl-device-run');
 const PKG = 'com.chernobyl.app';
-const TOKEN = 'device-run-token';
+const TOKEN = 'device-run-token-0123456789abcdef0123456789abcdef';
 mkdirSync(OUT, { recursive: true });
 const resultsPath = join(OUT, 'results.json');
 const results = existsSync(resultsPath) ? JSON.parse(readFileSync(resultsPath, 'utf8')) : {};

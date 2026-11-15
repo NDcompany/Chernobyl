@@ -198,12 +198,9 @@ impl Workspace {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let sensitive = is_env_file(&name);
-        let shown = if sensitive {
-            redact(&mask_env(&text))
-        } else {
-            redact(&text)
-        };
+        let masked = mask_secret_file(&name, &text);
+        let sensitive = masked.is_some();
+        let shown = redact(masked.as_deref().unwrap_or(&text));
         let mut fields = vec![
             ("kind", json::s("fs_read")),
             ("path", json::s(&display(rel))),
@@ -430,8 +427,18 @@ impl Workspace {
     /// config says. Diverged history, or local changes the incoming commits
     /// would overwrite, are refused by git and change nothing.
     pub fn pull(&self) -> Result<String, String> {
+        self.pull_report().map(|(message, _)| message)
+    }
+
+    /// [`pull`](Self::pull) plus the changed paths that are agent
+    /// configuration ([`is_agent_config`]): a pull can rewrite what the
+    /// workspace's agents trust (hooks, MCP servers, instructions), and the
+    /// phone is told which paths so the person can look before the next turn
+    /// (security pass 2026-11-15, E1).
+    pub fn pull_report(&self) -> Result<(String, Vec<String>), String> {
         self.repo()?;
         let (head, remote, merge) = self.upstream()?;
+        let before = self.git_text(&["rev-parse", "HEAD"]);
         let out = self.git_change(
             &[
                 "pull",
@@ -445,11 +452,30 @@ impl Workspace {
             PULL_TIMEOUT,
         )?;
         let from = format!("{remote}/{}", merge.trim_start_matches("refs/heads/"));
-        Ok(if out.contains("Already up to date") {
+        let changed = before
+            .and_then(|b| {
+                self.git(
+                    &["diff", "--name-only", "--no-renames", &b, "HEAD"],
+                    READ_TIMEOUT,
+                    GIT_OUT_MAX,
+                )
+                .ok()
+                .filter(|o| o.ok)
+            })
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter(|p| is_agent_config(p))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let message = if out.contains("Already up to date") {
             format!("{head} is up to date with {from}")
         } else {
             format!("{from} -> {head}")
-        })
+        };
+        Ok((message, changed))
     }
 
     /// The canonical workspace folder (ADR-020: the terminal's cwd).
@@ -545,10 +571,77 @@ fn decode_text(buf: Vec<u8>, truncated: bool) -> Option<String> {
     }
 }
 
+/// A repository path (as git prints it) that configures an agent: anything
+/// under a `.claude`, `.codex`, `.gemini` or `.opencode` folder, and the
+/// `.mcp.json`, `CLAUDE.md`, `AGENTS.md`, `GEMINI.md` and `opencode.json`
+/// files, at the top or in a subfolder. Repo settings stay trusted by design
+/// (T11); this only lets a pull say which ones it changed.
+pub fn is_agent_config(path: &str) -> bool {
+    let parts: Vec<String> = path
+        .split(['/', '\\'])
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let Some((file, dirs)) = parts.split_last() else {
+        return false;
+    };
+    dirs.iter()
+        .any(|d| matches!(d.as_str(), ".claude" | ".codex" | ".gemini" | ".opencode"))
+        || matches!(
+            file.as_str(),
+            ".mcp.json" | "claude.md" | "agents.md" | "gemini.md" | "opencode.json"
+        )
+}
+
 /// `.env`, `.env.local`, `prod.env`: dotenv files hold secrets by design.
+/// Also the credential files tools keep in `key=value` form: `.npmrc`,
+/// `.pypirc` and `credentials` (e.g. `.aws/credentials`).
 pub fn is_env_file(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n == ".env" || n.starts_with(".env.") || n.ends_with(".env")
+    n == ".env"
+        || n.starts_with(".env.")
+        || n.ends_with(".env")
+        || matches!(n.as_str(), ".npmrc" | ".pypirc" | "credentials")
+}
+
+/// The file with its secret values masked when its NAME or content says it
+/// holds them (shown as `sensitive`), else `None`: dotenv-style files keep
+/// only their keys, `.netrc` / `_netrc` hide every login, password and
+/// account, and a `.pem` holding a private key is hidden whole.
+fn mask_secret_file(name: &str, text: &str) -> Option<String> {
+    let n = name.to_ascii_lowercase();
+    if is_env_file(&n) {
+        Some(mask_env(text))
+    } else if n == ".netrc" || n == "_netrc" {
+        Some(mask_netrc(text))
+    } else if n.ends_with(".pem") && text.contains("PRIVATE KEY") {
+        Some("«redacted:private-key»\n".into())
+    } else {
+        None
+    }
+}
+
+/// `machine h login u password p` → the words after `login`, `password`
+/// and `account` are masked, on one line or many.
+fn mask_netrc(text: &str) -> String {
+    let mut hide = false;
+    text.split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_end_matches(['\r', '\n']);
+            let ending = &line[body.len()..];
+            let words: Vec<String> = body
+                .split(' ')
+                .map(|w| {
+                    if hide && !w.is_empty() {
+                        hide = false;
+                        return "«redacted:env»".to_string();
+                    }
+                    hide = matches!(w, "login" | "password" | "account");
+                    w.to_string()
+                })
+                .collect();
+            format!("{}{ending}", words.join(" "))
+        })
+        .collect()
 }
 
 /// Every non-empty `KEY=value` keeps its key only; comments stay.
@@ -982,17 +1075,74 @@ pub(crate) mod tests {
         assert_eq!(json::as_arr(get(&listing, "entries")).unwrap().len(), 0);
     }
 
+    /// Security pass 2026-11-15 (E4): the credential files tools keep are
+    /// masked the way `.env` is.
+    #[test]
+    fn credential_files_are_masked() {
+        let root = temp("cred");
+        let secret = "Zq8rT2vXw9pL";
+        let files = [
+            (".netrc", format!("machine h login bob password {secret}\n")),
+            (
+                "_netrc",
+                format!("machine h\n  login bob\n  password {secret}\n"),
+            ),
+            (
+                ".pypirc",
+                format!("[pypi]\nusername = __token__\npassword = {secret}\n"),
+            ),
+            (
+                ".npmrc",
+                format!("//registry.npmjs.org/:_authToken={secret}\n"),
+            ),
+            (
+                "credentials",
+                format!("[default]\naws_secret_access_key = {secret}\n"),
+            ),
+            (
+                "key.pem",
+                format!("-----BEGIN PRIVATE KEY-----\n{secret}=\n-----END PRIVATE KEY-----\n"),
+            ),
+        ];
+        for (name, body) in &files {
+            std::fs::write(root.join(name), body).unwrap();
+        }
+        std::fs::write(
+            root.join("cert.pem"),
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let (ws, _) = open(&root);
+        for (name, _) in &files {
+            let v = ws.read(name).unwrap();
+            let content = json::get_str(&v, "content").unwrap();
+            assert!(!content.contains(secret), "{name}: {content}");
+            assert_eq!(json::get_bool(&v, "sensitive"), Some(true), "{name}");
+        }
+        let net = ws.read(".netrc").unwrap();
+        let net = json::get_str(&net, "content").unwrap();
+        assert!(net.contains("machine h") && net.contains("login «redacted:env»"));
+        // a public certificate is not a secret file
+        let cert = ws.read("cert.pem").unwrap();
+        assert_eq!(json::get(&cert, "sensitive"), None);
+        assert!(
+            json::get_str(&cert, "content")
+                .unwrap()
+                .contains("CERTIFICATE")
+        );
+    }
+
     #[test]
     fn reads_are_redacted_capped_and_refuse_binary() {
         let root = temp("read");
         std::fs::write(
             root.join(".env.local"),
-            "# db\r\nDATABASE_URL=postgres://u:hunter2@db/app\r\nEMPTY=\r\nAPI_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz\r\n",
+            "# db\r\nDATABASE_URL=postgres://u:hunter2@db/app\r\nEMPTY=\r\nAPI_KEY=sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxx\r\n",
         )
         .unwrap();
         std::fs::write(
             root.join("config.js"),
-            "const token = \"ghp_abcdefghijklmnopqrstuvwxyz0123456789\";\nconst x = 1;\n",
+            "const token = \"ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\";\nconst x = 1;\n",
         )
         .unwrap();
         std::fs::write(root.join("big.txt"), "é".repeat(READ_MAX)).unwrap();
@@ -1088,7 +1238,7 @@ pub(crate) mod tests {
     #[test]
     fn summaries_mask_credentials_and_drop_hints() {
         let s = summary(
-            "To https://bob:ghp_abcdefghijklmnopqrstuvwxyz0123456789@github.com/o/r.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs to 'https://bob:pw@github.com/o/r.git'\nhint: Updates were rejected\nhint: git pull\n",
+            "To https://bob:ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@github.com/o/r.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs to 'https://bob:pw@github.com/o/r.git'\nhint: Updates were rejected\nhint: git pull\n",
         );
         assert!(
             !s.contains("ghp_") && !s.contains("bob") && !s.contains(":pw@"),
@@ -1109,7 +1259,7 @@ pub(crate) mod tests {
         std::fs::write(root.join("README.md"), "hello\nworld\n").unwrap();
         std::fs::write(
             root.join("new.txt"),
-            "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n",
+            "token=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
         )
         .unwrap();
         let s = ws.status().unwrap();
@@ -1234,6 +1384,77 @@ pub(crate) mod tests {
         std::fs::write(dir.join(name), text).unwrap();
         git(dir, &["add", name]);
         git(dir, &["commit", "-q", "-m", name]);
+    }
+
+    #[test]
+    fn agent_config_paths_are_recognised() {
+        for yes in [
+            ".claude/settings.json",
+            ".claude/commands/x.md",
+            ".codex/config.toml",
+            ".gemini/settings.json",
+            ".opencode/plugin/a.js",
+            ".mcp.json",
+            "CLAUDE.md",
+            "AGENTS.md",
+            "GEMINI.md",
+            "opencode.json",
+            "pkg/sub/CLAUDE.md",
+            "pkg/.claude/settings.local.json",
+            ".Claude/Settings.json",
+        ] {
+            assert!(is_agent_config(yes), "{yes}");
+        }
+        for no in [
+            "README.md",
+            "src/claude.rs",
+            "docs/CLAUDE.md.bak",
+            "claude/notes.md",
+            ".claudex/x",
+            "opencode.jsonc",
+            "",
+        ] {
+            assert!(!is_agent_config(no), "{no}");
+        }
+    }
+
+    /// Security pass 2026-11-15 (E1): a pull reports which of the paths it
+    /// changed are agent configuration, and nothing else.
+    #[test]
+    fn pull_reports_the_agent_config_it_changed() {
+        let remote = temp("pull-cfg-remote");
+        git(
+            &remote,
+            &["-c", "init.defaultBranch=main", "init", "-q", "--bare"],
+        );
+        let root = repo("pull-cfg");
+        let (ws, _) = open(&root);
+        git(
+            &root,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        git(&root, &["push", "-q", "-u", "origin", "main"]);
+        let (_, changed) = ws.pull_report().unwrap();
+        assert!(changed.is_empty(), "nothing pulled: {changed:?}");
+
+        let other = clone_of(&remote, "pull-cfg-other");
+        std::fs::create_dir_all(other.join(".claude")).unwrap();
+        std::fs::create_dir_all(other.join("src")).unwrap();
+        std::fs::write(other.join(".claude/settings.json"), "{}\n").unwrap();
+        std::fs::write(other.join("CLAUDE.md"), "be nice\n").unwrap();
+        std::fs::write(other.join("src/main.rs"), "fn main() {}\n").unwrap();
+        git(&other, &["add", "-A"]);
+        git(&other, &["commit", "-q", "-m", "config and code"]);
+        git(&other, &["push", "-q"]);
+        let (message, changed) = ws.pull_report().unwrap();
+        assert_eq!(message, "origin/main -> main");
+        assert_eq!(changed, [".claude/settings.json", "CLAUDE.md"]);
+
+        // a pull that only brings code reports none
+        commit_file(&other, "b.txt", "b\n");
+        git(&other, &["push", "-q"]);
+        let (_, changed) = ws.pull_report().unwrap();
+        assert!(changed.is_empty(), "{changed:?}");
     }
 
     #[test]

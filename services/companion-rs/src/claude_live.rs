@@ -32,7 +32,7 @@ use crate::json::{self, Json};
 use crate::protocol::{
     DecisionError, LiveWorkspace, PermissionOption, PermissionRequest, PromptImage, is_claude_model,
 };
-use crate::runtime_io::{child_env, redact};
+use crate::runtime_io::{child_env, redact, show_format_chars};
 use crate::transcript::{
     Field, FileDiff, Item, ItemKind, LiveState, McpAuthState, McpServer, Op, PlanStep, ToolCall,
     ToolStatus, TurnState, Usage,
@@ -2183,7 +2183,7 @@ fn describe(tool: &str, input: &Json, req: &Json, workspace: &str) -> Described 
             let mut f = vec![("kind", json::s("edit")), ("path", json::s(&path))];
             let patch = edit_patch(tool, input);
             if !patch.is_empty() {
-                f.push(("patch", json::s(&cap(&patch, DIFF_MAX).0)));
+                f.push(("patch", json::s(&cap_marked(&patch, DIFF_MAX))));
             }
             (json::obj(f), "file-write", "medium", path)
         }
@@ -2742,10 +2742,16 @@ fn cap(s: &str, max: usize) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
+/// `cap` for text an approval card shows: a cut is announced with the size
+/// of what is missing, so a truncated diff or command is never mistaken for
+/// the whole of it (security pass 2026-11-15, E5).
 fn cap_marked(s: &str, max: usize) -> String {
     match cap(s, max) {
-        (s, false) => s,
-        (s, true) => format!("{s}\n…"),
+        (cut, false) => cut,
+        (cut, true) => format!(
+            "{cut}\n… truncated: {} more bytes not shown",
+            s.len() - cut.len()
+        ),
     }
 }
 
@@ -2770,7 +2776,8 @@ fn first_chars(s: &str, n: usize) -> String {
 }
 
 /// Drops ANSI escape sequences and control characters (the CLI says
-/// `decision_reason` may carry them) but keeps newlines and tabs.
+/// `decision_reason` may carry them) but keeps newlines and tabs; invisible
+/// format characters (bidi, zero-width) become visible `<U+XXXX>` markers.
 fn plain_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -2790,7 +2797,7 @@ fn plain_text(s: &str) -> String {
             out.push(c);
         }
     }
-    out
+    show_format_chars(&out)
 }
 
 fn redact_json(v: Json) -> Json {
@@ -2964,6 +2971,50 @@ fn value_end(b: &[u8], i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security pass 2026-11-15 (E5): a diff cut for the approval card says
+    /// how much is missing; an uncut one is untouched.
+    #[test]
+    fn truncated_approval_diff_is_marked_with_the_missing_size() {
+        let content = "x".repeat(DIFF_MAX * 2);
+        let input = json::obj(vec![
+            ("file_path", json::s("a.txt")),
+            ("content", json::s(&content)),
+        ]);
+        let d = describe("Write", &input, &json::obj(vec![]), "C:/w");
+        let patch = json::get_str(&d.detail, "patch").unwrap().to_string();
+        assert!(
+            patch.contains("… truncated: "),
+            "{}",
+            &patch[patch.len() - 80..]
+        );
+        assert!(patch.ends_with("more bytes not shown"));
+        let small = json::obj(vec![
+            ("file_path", json::s("a.txt")),
+            ("content", json::s("hi")),
+        ]);
+        let d = describe("Write", &small, &json::obj(vec![]), "C:/w");
+        assert!(
+            !json::get_str(&d.detail, "patch")
+                .unwrap()
+                .contains("truncated")
+        );
+        assert_eq!(
+            cap_marked("abcdef", 4),
+            "abcd\n… truncated: 2 more bytes not shown"
+        );
+    }
+
+    /// Security pass 2026-11-15 (M3): text from the CLI shown on an approval
+    /// card has controls dropped and format characters made visible.
+    #[test]
+    fn plain_text_marks_bidi_and_zero_width_characters() {
+        assert_eq!(
+            plain_text("ok \u{1b}[31mred\u{1b}[0m\u{7} \u{202E}fdp.exe"),
+            "ok red <U+202E>fdp.exe"
+        );
+        assert_eq!(plain_text("a\u{200B}b\nc\td"), "a<U+200B>b\nc\td");
+    }
     use crate::runtime_io::{ChildEvent, ChildIo, PendingAuth, check_callback_url};
     use std::cell::RefCell;
     use std::time::Duration;

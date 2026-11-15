@@ -2365,6 +2365,18 @@ pub(crate) fn clip(s: &str, max: usize) -> (String, bool) {
     (s[..s.floor_char_boundary(max)].into(), true)
 }
 
+/// [`clip`] for text an approval card shows: a cut is announced with the size
+/// of what is missing (security pass 2026-11-15, E5).
+pub(crate) fn clip_marked(s: &str, max: usize) -> String {
+    match clip(s, max) {
+        (cut, false) => cut,
+        (cut, true) => format!(
+            "{cut}\n… truncated: {} more bytes not shown",
+            s.len() - cut.len()
+        ),
+    }
+}
+
 /// Head and tail of `s` within `max` bytes (§3.5 tool output).
 pub(crate) fn head_tail(s: &str, max: usize) -> (String, bool) {
     const CUT: &str = "\n…\n";
@@ -2473,13 +2485,13 @@ fn answer(kind: &AskKind, option: &str, answers: &[(String, Vec<String>)]) -> Js
 pub(crate) fn detail_shell(command: &str, cwd: Option<&str>, reason: &str) -> Json {
     let mut fields = vec![
         ("kind", json::s("shell")),
-        ("command", json::s(&clip(command, DETAIL_CAP).0)),
+        ("command", json::s(&clip_marked(command, DETAIL_CAP))),
     ];
     if let Some(cwd) = cwd {
         fields.push(("cwd", json::s(cwd)));
     }
     if !reason.is_empty() {
-        fields.push(("reason", json::s(&clip(reason, CONTEXT_CAP).0)));
+        fields.push(("reason", json::s(&clip_marked(reason, CONTEXT_CAP))));
     }
     json::obj(fields)
 }
@@ -2492,7 +2504,7 @@ pub(crate) fn detail_edit(diffs: &[FileDiff]) -> Json {
     json::obj(vec![
         ("kind", json::s("edit")),
         ("path", json::s(&paths_title(diffs))),
-        ("patch", json::s(&clip(&patch, DETAIL_CAP).0)),
+        ("patch", json::s(&clip_marked(&patch, DETAIL_CAP))),
     ])
 }
 
@@ -2749,6 +2761,10 @@ pub fn find_codex(path: Option<&OsStr>, local_app_data: Option<&Path>) -> Result
     let on_path = path
         .into_iter()
         .flat_map(std::env::split_paths)
+        // a relative PATH entry (including an empty one) resolves against the
+        // daemon's cwd: never take a binary from there (security pass
+        // 2026-11-15, E6; the git and claude lookups do the same)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join("codex.exe"))
         .find(|p| real(p));
     if let Some(p) = on_path {
@@ -4793,6 +4809,48 @@ mod tests {
                 }
             )
         )));
+    }
+
+    /// Security pass 2026-11-15 (E5): a command, reason or diff cut for the
+    /// approval card says how much is missing.
+    #[test]
+    fn truncated_approval_detail_is_marked_with_the_missing_size() {
+        assert_eq!(
+            clip_marked("abcdef", 4),
+            "abcd\n… truncated: 2 more bytes not shown"
+        );
+        assert_eq!(clip_marked("abcd", 4), "abcd");
+        let long = "y".repeat(DETAIL_CAP + 10);
+        let shell = detail_shell(&long, None, &"r".repeat(CONTEXT_CAP + 3));
+        let command = json::get_str(&shell, "command").unwrap();
+        assert!(command.ends_with("… truncated: 10 more bytes not shown"));
+        let reason = json::get_str(&shell, "reason").unwrap();
+        assert!(reason.ends_with("… truncated: 3 more bytes not shown"));
+        let diff = FileDiff {
+            path: "a.txt".into(),
+            status: "modified",
+            additions: 0,
+            deletions: 0,
+            patch: "p".repeat(DETAIL_CAP * 2),
+            truncated: false,
+        };
+        let edit = detail_edit(&[diff]);
+        assert!(
+            json::get_str(&edit, "patch")
+                .unwrap()
+                .contains("… truncated: ")
+        );
+    }
+
+    #[test]
+    fn find_codex_skips_relative_path_entries() {
+        let rel = format!("chb-rel-codex-{}", std::process::id());
+        std::fs::create_dir_all(&rel).unwrap();
+        std::fs::write(Path::new(&rel).join("codex.exe"), b"planted").unwrap();
+        let paths = std::env::join_paths([Path::new(&rel), Path::new("")]).unwrap();
+        let found = find_codex(Some(&paths), None);
+        let _ = std::fs::remove_dir_all(&rel);
+        assert!(found.unwrap_err().contains("not found"));
     }
 
     #[test]

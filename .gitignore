@@ -21,6 +21,11 @@ ios/
 .env
 .env.*
 !.env.example
+*.jks
+*.keystore
+*.pass
+companion.json
+control.key
 
 # Logs & OS
 *.log

@@ -689,6 +689,13 @@ export type ServerMessage =
       error?: string;
       sessionId?: string;
       permissionId?: string;
+      /**
+       * `git_pull` only: changed paths that are agent configuration
+       * (`.claude/`, `.codex/`, `.gemini/`, `.opencode/`, `.mcp.json`,
+       * `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `opencode.json`). Omitted when
+       * none changed; older clients ignore it.
+       */
+      agentConfigChanged?: string[];
     } & EventEnvelope)
   /** ADR-015: transcript frames reach only connections that subscribed; never journaled. */
   | LiveServerMessage
@@ -1069,6 +1076,8 @@ export function isServerMessage(v: unknown): v is ServerMessage {
           v.status === 'cancelled' ||
           v.status === 'expired' ||
           v.status === 'unknown') &&
+        (v.agentConfigChanged === undefined ||
+          (Array.isArray(v.agentConfigChanged) && v.agentConfigChanged.every(isStr))) &&
         hasEnvelope(v)
       );
     case 'transcript':

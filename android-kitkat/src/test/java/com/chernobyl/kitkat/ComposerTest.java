@@ -16,6 +16,30 @@ import org.junit.Test;
 
 /** ADR-017/018/020 helpers against apps/mobile's rules and the repo's composer, terminal and workspace fixtures. */
 public class ComposerTest {
+    @Test
+    public void tlsSuitesKeepOnlyEcdheGcmAndChacha() {
+        String[] supported = {"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                "TLS_RSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", "TLS_ECDHE_RSA_WITH_RC4_128_SHA",
+                "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384", "TLS_RSA_WITH_NULL_SHA", "TLS_ECDH_anon_WITH_AES_128_CBC_SHA",
+                "TLS_AES_128_GCM_SHA256", "TLS_CHACHA20_POLY1305_SHA256", "TLS_EMPTY_RENEGOTIATION_INFO_SCSV"};
+        assertArrayEquals(new String[] {"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                "TLS_AES_128_GCM_SHA256", "TLS_CHACHA20_POLY1305_SHA256"}, Composer.tlsSuites(supported));
+        // nothing modern on the device: empty, so the caller keeps the platform's list
+        assertEquals(0, Composer.tlsSuites(new String[] {"TLS_RSA_WITH_AES_128_CBC_SHA", "SSL_RSA_WITH_RC4_128_SHA"}).length);
+        assertEquals(0, Composer.tlsSuites(new String[0]).length);
+    }
+
+    @Test
+    public void agentConfigWarningNamesPathsAndCapsThem() throws Exception {
+        assertNull(Composer.agentConfigWarning(null));
+        assertNull(Composer.agentConfigWarning(new JSONArray()));
+        String one = Composer.agentConfigWarning(new JSONArray("[\".claude/settings.json\"]"));
+        assertTrue(one.startsWith("This pull changed agent settings: .claude/settings.json. Agents in this workspace follow them"));
+        assertTrue(one.contains("tool permissions and hooks"));
+        assertTrue(one.endsWith("review them on your PC."));
+        assertTrue(Composer.agentConfigWarning(new JSONArray("[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\"]")).contains("a, b, c, d, e and 2 more."));
+    }
+
     static JSONObject composerState() throws Exception {
         JSONArray ops = ModelTest.fixture("composer-transcript.json").getJSONArray("ops");
         return ops.getJSONObject(1).getJSONObject("state");

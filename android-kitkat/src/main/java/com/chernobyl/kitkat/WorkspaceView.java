@@ -466,6 +466,8 @@ final class WorkspaceView extends LinearLayout implements App.Change {
             public void done(JSONObject result, String err) {
                 status.setText(result != null && err == null ? (okText == null ? "" : okText) : err == null ? "" : err);
                 if (result != null && err != null) new AlertDialog.Builder(getContext()).setTitle("Git said").setMessage(err).setPositiveButton("OK", null).show();
+                String warn = result != null && err == null ? Composer.agentConfigWarning(result.optJSONArray("agentConfigChanged")) : null;
+                if (warn != null) new AlertDialog.Builder(getContext()).setTitle("Agent settings changed").setMessage(warn).setPositiveButton("OK", null).show();
                 loadStatus();
             }
         });

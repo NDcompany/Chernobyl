@@ -274,6 +274,35 @@ public final class Composer {
         return new String[] {s.optString("branch") + " → " + s.optString("upstream"), "1"};
     }
 
+    /**
+     * After a Pull: the warning for changed agent configuration (`agentConfigChanged` on the
+     * command_result), or null when none changed. At most five paths are named.
+     */
+    public static String agentConfigWarning(JSONArray paths) {
+        if (paths == null || paths.length() == 0) return null;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < paths.length() && i < 5; i++) sb.append(i > 0 ? ", " : "").append(paths.optString(i));
+        String more = paths.length() > 5 ? " and " + (paths.length() - 5) + " more" : "";
+        return "This pull changed agent settings: " + sb + more + ". Agents in this workspace follow them, "
+                + "including tool permissions and hooks \u2014 review them on your PC.";
+    }
+
+    /* ---------------- tls ---------------- */
+
+    /**
+     * The TLS suites to enable: of the platform's supported ones only ECDHE with AES-GCM or
+     * ChaCha20 (and TLS 1.3's own AES / ChaCha20 suites). Empty when the platform offers none:
+     * the caller then keeps its current list, so the connection still works.
+     */
+    public static String[] tlsSuites(String[] supported) {
+        List<String> out = new ArrayList<String>();
+        for (String c : supported) {
+            boolean modern = c.contains("_ECDHE_") && (c.contains("_GCM_") || c.contains("CHACHA20"));
+            if (modern || c.startsWith("TLS_AES_") || c.startsWith("TLS_CHACHA20")) out.add(c);
+        }
+        return out.toArray(new String[0]);
+    }
+
     /* ---------------- terminal (terminal.ts, data/terminal.ts) ---------------- */
 
     /** `line` first, without an earlier copy, at most HISTORY_MAX; a blank line changes nothing. */

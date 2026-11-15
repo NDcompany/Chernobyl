@@ -22,7 +22,8 @@ import { colors, radii, spacing, typography } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { applyMessage } from '@/data/state';
 import { zodHandler } from '@/forms/zodBridge';
-import { saveHostToken, savePairing } from '@/platform/secure';
+import { clearHostToken, readPairing, saveHostToken, savePairing } from '@/platform/secure';
+import { pairingNotices } from '@/utils/pairing';
 import { Button, Chip, Text, TextField } from '@/ui/primitives';
 import { Screen, PageHeader, Card } from '@/ui/surface';
 import { Icon } from '@/ui/icons';
@@ -64,6 +65,18 @@ export default function ConnectHostScreen() {
   const [pairing, setPairing] = useState<PairingCredential | null>(null);
   const [pairErr, setPairErr] = useState<string | null>(null);
   const [pairBusy, setPairBusy] = useState(false);
+  // where the payload on the confirm step came from, and the pairing it would replace
+  const [fromLink, setFromLink] = useState(false);
+  const [currentHost, setCurrentHost] = useState<string | null>(null);
+  useEffect(() => {
+    void readPairing().then((json) => {
+      try {
+        setCurrentHost(json ? parsePairingPayload(json).host : null);
+      } catch {
+        setCurrentHost(null); // a corrupt stored pairing is replaced silently, as before
+      }
+    });
+  }, []);
 
   // Camera QR scanning state
   const [scanning, setScanning] = useState(false);
@@ -77,8 +90,9 @@ export default function ConnectHostScreen() {
       (permission.status === PermissionStatus.DENIED || !permission.canAskAgain),
   );
 
-  const handlePayload = (text: string): boolean => {
+  const handlePayload = (text: string, viaLink = false): boolean => {
     setQrText(text);
+    setFromLink(viaLink);
     setPairing(null);
     setPairErr(null);
     const trimmed = text.trim();
@@ -106,7 +120,7 @@ export default function ConnectHostScreen() {
   useEffect(() => {
     if (!linkPayload) return;
     if (!useAppStore.getState().authed) useAppStore.getState().signIn();
-    handlePayload(linkPayload);
+    handlePayload(linkPayload, true);
   }, [linkPayload]);
 
   if (!authed && !linkPayload) return <Redirect href="/sign-in" />;
@@ -142,6 +156,8 @@ export default function ConnectHostScreen() {
   const savePairingNow = async () => {
     if (!pairing) return;
     setPairBusy(true);
+    // the old host token must never ride along to the new pairing's endpoints
+    await clearHostToken();
     await savePairing(qrText.trim());
     // credential changed → the provider tears the transport down and
     // rebuilds it through the real handshake
@@ -335,6 +351,11 @@ export default function ConnectHostScreen() {
 
         {pairing ? (
           <View style={{ gap: 2 }}>
+            {pairingNotices(currentHost, fromLink).map((n) => (
+              <Text key={n} variant="xs" color={colors.warning} accessibilityRole="alert">
+                {n}
+              </Text>
+            ))}
             <Text variant="xs" color={colors.text2}>
               Host: {pairing.host}
             </Text>

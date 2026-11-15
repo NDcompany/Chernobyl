@@ -13,8 +13,9 @@ use crate::json;
 use crate::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg, WorkspaceOp, parse_client_message};
 use crate::storage::{DeviceRecord, PairingRecord, Storage};
 use crate::ws::{self, Frame, Handshake};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,26 @@ pub const CLOSE_DEVICE_REVOKED: u16 = 4003;
 pub const APP_ORIGIN: &str = "chernobyl://app";
 
 pub const AUTH_FAILURE_LIMIT: u32 = 5;
+/// Security pass 2026-11-15 (N5): the shortest access token the daemon will
+/// start with (setup-windows.ps1 mints 48 hex characters). A short token is
+/// guessable even with the failure limiter.
+pub const MIN_TOKEN_LEN: usize = 32;
+
+/// Refuses an empty or short access token (`--token` / `HOST_TOKEN`).
+pub fn validate_token(token: &str) -> Result<(), String> {
+    if token.chars().count() < MIN_TOKEN_LEN {
+        return Err(format!(
+            "the access token must be at least {MIN_TOKEN_LEN} characters (got {}); use 24 random bytes as hex",
+            token.chars().count()
+        ));
+    }
+    Ok(())
+}
+
+/// Security pass 2026-11-15 (N6): once the limit is hit, a wrong token is
+/// answered only after this pause, so guessing is slow even though the 429
+/// itself costs nothing.
+const AUTH_THROTTLE: Duration = Duration::from_millis(250);
 
 // Per-message-class outbound bounds (D8 + mandate §4): ONE FIFO, TWO admission
 // policies, so a bulk event burst can never consume the room a control frame
@@ -163,6 +184,45 @@ pub const MAIN_CONNECTION_CAP: usize = 1024;
 /// Maximum concurrent connections on the loopback diagnostics listener (mandate §2, audit P7).
 pub const DIAG_CONNECTION_CAP: usize = 64;
 
+/// Security pass 2026-11-15 (N2): concurrent connections one peer address may
+/// hold on a listener, so a single host cannot fill the global cap with idle
+/// sockets.
+pub const PER_PEER_CAP: usize = 32;
+/// The same for a loopback peer, which is larger because tunnel traffic
+/// (ngrok, cloudflared) all arrives from 127.0.0.1.
+pub const PER_LOOPBACK_CAP: usize = 256;
+
+/// Live connection count per peer address (one per listener).
+#[derive(Default)]
+struct PeerCounts(Mutex<HashMap<IpAddr, usize>>);
+
+impl PeerCounts {
+    fn admit(&self, ip: IpAddr) -> bool {
+        let cap = if ip.is_loopback() {
+            PER_LOOPBACK_CAP
+        } else {
+            PER_PEER_CAP
+        };
+        let mut map = self.0.lock().unwrap();
+        let n = map.entry(ip).or_insert(0);
+        if *n >= cap {
+            return false;
+        }
+        *n += 1;
+        true
+    }
+
+    fn release(&self, ip: IpAddr) {
+        let mut map = self.0.lock().unwrap();
+        if let Some(n) = map.get_mut(&ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&ip);
+            }
+        }
+    }
+}
+
 type ConnRegistry = Arc<Mutex<Vec<(TcpStream, thread::JoinHandle<()>)>>>;
 
 pub struct ServerHandle {
@@ -275,17 +335,26 @@ pub fn start_with_caps(
     main_cap: usize,
     diag_cap: usize,
 ) -> Result<ServerHandle, String> {
-    let listener = match crate::ffi::bind_listener_backlog(bind, port) {
-        Ok(l) => l,
-        Err(e) => {
-            // IPv6 binds (and any exotic config) keep std's ~128-handshake backlog
-            eprintln!("[companion] large-backlog listener unavailable ({e}); using std bind");
-            TcpListener::bind((bind, port)).map_err(|e2| format!("bind {bind}:{port}: {e2}"))?
-        }
+    // "localhost" is the IPv4 loopback here, so it takes the protected path
+    let bind = if bind == "localhost" {
+        "127.0.0.1"
+    } else {
+        bind
+    };
+    let listener = if bind.parse::<std::net::Ipv4Addr>().is_ok() {
+        // N3: an IPv4 bind is exclusive (SO_EXCLUSIVEADDRUSE); if that cannot
+        // be had, the bind fails rather than falling back to a hijackable one
+        crate::ffi::bind_listener_backlog(bind, port)
+            .map_err(|e| format!("bind {bind}:{port}: {e}"))?
+    } else {
+        // IPv6 binds keep std's ~128-handshake backlog, without the exclusive
+        // flag (ponytail: std exposes no pre-bind socket option; raw IPv6 if it matters)
+        eprintln!("[companion] {bind} is not IPv4; using std bind");
+        TcpListener::bind((bind, port)).map_err(|e| format!("bind {bind}:{port}: {e}"))?
     };
     let actual_port = listener.local_addr().map_err(|e| e.to_string())?.port();
     // diagnostics is loopback-only by contract (PRD §15.2)
-    let diag_listener = TcpListener::bind(("127.0.0.1", diagnostics_port))
+    let diag_listener = crate::ffi::bind_listener_backlog("127.0.0.1", diagnostics_port)
         .map_err(|e| format!("bind diagnostics: {e}"))?;
     let actual_diag_port = diag_listener
         .local_addr()
@@ -377,6 +446,7 @@ fn accept_loop(
         return;
     }
     let listener_active = Arc::new(AtomicUsize::new(0));
+    let peers = Arc::new(PeerCounts::default());
     while !stop.load(Ordering::SeqCst) {
         // Opportunistic reaping of finished connection handles (mandate §2, audit P6)
         if let Ok(mut conns) = conn_threads.lock() {
@@ -392,7 +462,8 @@ fn accept_loop(
         }
 
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
+                let peer_ip = peer.ip().to_canonical();
                 // Connection cap check (audit P7)
                 let admitted = listener_active
                     .try_update(Ordering::SeqCst, Ordering::SeqCst, |curr| {
@@ -400,6 +471,16 @@ fn accept_loop(
                     })
                     .is_ok();
                 if !admitted {
+                    companion
+                        .shared
+                        .connections_rejected
+                        .fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                    continue;
+                }
+                // per-peer cap (N2); the global slot is given back on refusal
+                if !peers.admit(peer_ip) {
+                    listener_active.fetch_sub(1, Ordering::SeqCst);
                     companion
                         .shared
                         .connections_rejected
@@ -421,6 +502,7 @@ fn accept_loop(
                     Ok(s) => s,
                     Err(_) => {
                         listener_active.fetch_sub(1, Ordering::SeqCst);
+                        peers.release(peer_ip);
                         companion
                             .shared
                             .connections_active
@@ -440,11 +522,14 @@ fn accept_loop(
 
                 struct ActiveGuard {
                     listener_active: Arc<AtomicUsize>,
+                    peers: Arc<PeerCounts>,
+                    peer_ip: IpAddr,
                     shared: Arc<crate::companion::Shared>,
                 }
                 impl Drop for ActiveGuard {
                     fn drop(&mut self) {
                         self.listener_active.fetch_sub(1, Ordering::SeqCst);
+                        self.peers.release(self.peer_ip);
                         self.shared
                             .connections_active
                             .fetch_sub(1, Ordering::SeqCst);
@@ -452,9 +537,12 @@ fn accept_loop(
                 }
 
                 let stop_conn = stop.clone();
+                let guard_peers = peers.clone();
                 let spawn_res = thread::Builder::new().name("conn".into()).spawn(move || {
                     let _guard = ActiveGuard {
                         listener_active: active_guard_count,
+                        peers: guard_peers,
+                        peer_ip,
                         shared: shared_guard_count,
                     };
                     let _ = handle_conn(
@@ -475,6 +563,7 @@ fn accept_loop(
                     }
                     Err(_) => {
                         listener_active.fetch_sub(1, Ordering::SeqCst);
+                        peers.release(peer_ip);
                         companion
                             .shared
                             .connections_active
@@ -512,17 +601,57 @@ fn handle_conn(
     // half-sent request
     stream.set_read_timeout(Some(IDLE_POLL))?;
     let mut reader = crate::ffi::clone_stream(&stream)?;
+    let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
     let mut writer = stream;
 
     let mut request = StopAwareReader {
         inner: &mut reader,
         stop: &stop,
-        deadline: Instant::now() + HTTP_REQUEST_DEADLINE,
+        deadline: Instant::now() + HTTP_HEAD_DEADLINE,
     };
     let handshake = match ws::read_handshake(&mut request) {
         Ok(h) => h,
         Err(_) => return Ok(()), // hostile/garbage/shutdown: drop the connection
     };
+    // the head is in: a POST body (loopback hooks only) gets the longer bound
+    request.deadline = Instant::now() + HTTP_REQUEST_DEADLINE;
+
+    // Security pass 2026-11-15 (N9): a second Origin header is a smuggling
+    // attempt (a proxy and this check could each read a different one).
+    if handshake.origin_count() > 1 {
+        drain_body(&mut request, &handshake);
+        let _ = ws::write_http_error(&mut writer, 403, "Forbidden", "");
+        return Ok(());
+    }
+    // Security pass 2026-11-15 (N1): a request stamped by a reverse proxy or
+    // tunnel arrives from 127.0.0.1 but is remote. Treat this connection as
+    // remote posture (E2E required, no pre-session snapshot, /health behind
+    // the token); with no token to hold it to, refuse it outright. The
+    // diagnostics listener has no token, so a proxied request there is
+    // refused too. Spoofing these headers only makes the connection stricter.
+    let proxied = handshake.is_proxied();
+    if proxied && token.is_none() {
+        drain_body(&mut request, &handshake);
+        let _ = ws::write_http_error(&mut writer, 403, "Forbidden", "");
+        return Ok(());
+    }
+    let remote_posture = remote_posture || proxied;
+    if diagnostics_only {
+        // N7: only a request addressed to the loopback socket itself is ours.
+        // A DNS-rebound page carries its own hostname in Host, and a browser
+        // cannot forge Host.
+        if !diag_host_ok(&handshake, local_port) {
+            drain_body(&mut request, &handshake);
+            let _ = ws::write_http_error(&mut writer, 403, "Forbidden", "");
+            return Ok(());
+        }
+        // N4: no client opens a WebSocket here, so refuse the upgrade rather
+        // than serve a token-less, session-less event stream.
+        if handshake.is_websocket_upgrade() {
+            let _ = ws::write_http_error(&mut writer, 404, "Not Found", "");
+            return Ok(());
+        }
+    }
 
     // HTTP routes (non-upgrade) -------------------------------------------
     if !handshake.is_websocket_upgrade() {
@@ -612,7 +741,8 @@ fn handle_conn(
         let failures = *companion.shared.auth_failures.lock().unwrap();
         let ok_now = authorized(&handshake, expected);
         if !ok_now && failures >= AUTH_FAILURE_LIMIT {
-            // brute-force cooldown: refuse fast, do not even upgrade
+            // brute-force cooldown: do not even upgrade, and make each guess cost time
+            thread::sleep(AUTH_THROTTLE);
             let _ = ws::write_http_error(&mut writer, 429, "Too Many Requests", "");
             return Ok(());
         }
@@ -633,6 +763,19 @@ fn handle_conn(
     }
     ws::write_handshake_response(&mut writer, &accept)?;
     serve_ws(reader, writer, companion, remote_posture, &stop)
+}
+
+/// N7: the diagnostics listener answers only `Host: 127.0.0.1:<port>` or
+/// `Host: localhost:<port>` (what every in-repo client sends).
+fn diag_host_ok(h: &Handshake, port: u16) -> bool {
+    let mut hosts = h.headers.iter().filter(|(k, _)| k == "host");
+    match (hosts.next(), hosts.next()) {
+        (Some((_, v)), None) => {
+            let v = v.to_ascii_lowercase();
+            v == format!("127.0.0.1:{port}") || v == format!("localhost:{port}")
+        }
+        _ => false,
+    }
 }
 
 fn close_payload(code: u16, reason: &str) -> Vec<u8> {
@@ -738,7 +881,10 @@ fn hook_ingress(
     // Security review 2026-10-25: the same browser guard as the sibling
     // routes. A text/plain POST needs no CORS preflight, so without it any
     // web page could forge hook activity into the persisted event pipeline.
-    if h.header("origin").is_some() {
+    // Security pass 2026-11-15 (E2): and the control key, like the permission
+    // route: any local process reaches 127.0.0.1, so without it any of them
+    // could forge activity (and 60 KB payloads) into every phone's feed.
+    if h.header("origin").is_some() || !has_control_key(h, companion) {
         drain_body(reader, h);
         let _ = ws::write_http_error(writer, 403, "Forbidden", "");
         return Ok(());
@@ -1072,6 +1218,24 @@ struct HsPending {
     nonce: [u8; 16],
     salt: [u8; 16],
     cnonce: [u8; 16],
+}
+
+/// Security pass 2026-11-15 (N8): at remote posture a connection that fails
+/// this many handshake steps is closed.
+const MAX_HS_ERRORS: u32 = 5;
+/// At remote posture a connection that has not established an E2E session
+/// this long after the upgrade is closed (it holds only the token).
+const REMOTE_SESSION_DEADLINE: Duration = Duration::from_secs(20);
+
+/// [`hs_err`] that also counts the failure and, when `limited`, ends the
+/// connection at [`MAX_HS_ERRORS`].
+fn hs_fail(outbound: &Outbound, reason: &str, count: &mut u32, limited: bool) -> io::Result<()> {
+    *count += 1;
+    hs_err(outbound, reason).map_err(|_| io::Error::other("outbound queue saturated"))?;
+    if limited && *count >= MAX_HS_ERRORS {
+        return Err(io::Error::other("too many failed handshakes"));
+    }
+    Ok(())
 }
 
 fn hs_err(outbound: &Outbound, reason: &str) -> Result<(), EnqueueError> {
@@ -1619,7 +1783,10 @@ impl Drop for ConnGuard {
 
 /// Read-timeout poll interval while a connection is idle (audit P6).
 const IDLE_POLL: Duration = Duration::from_millis(250);
-/// Total time a peer gets to send its HTTP request head (and a POST body).
+/// Time a peer gets to send its HTTP request head (security pass 2026-11-15,
+/// N2: was 30 s, which let idle sockets hold the connection cap).
+const HTTP_HEAD_DEADLINE: Duration = Duration::from_secs(5);
+/// Time a POST body gets once its head has arrived.
 const HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
 fn is_timeout(e: &io::Error) -> bool {
@@ -1719,12 +1886,21 @@ fn serve_ws(
     // fan-out path so events are sealed too). `hs` holds the in-flight
     // handshake between hs_hello and hs_proof.
     let mut hs: Option<HsPending> = None;
+    let mut hs_errors: u32 = 0;
+    let connected_at = Instant::now();
 
     // heartbeat: every HEARTBEAT_MS of silence is a miss (ping sent); N
     // misses → dead peer (parity with the Node host's cadence and limit)
     let beat = Duration::from_millis(crate::protocol::HEARTBEAT_MS);
     let mut idle_since = Instant::now();
     let result: io::Result<()> = loop {
+        // N8: a token alone must not park a connection at remote posture
+        if require_e2e
+            && connected_at.elapsed() >= REMOTE_SESSION_DEADLINE
+            && !outbound.has_session()
+        {
+            break Err(io::Error::other("no e2e session within the deadline"));
+        }
         match reader.peek(&mut [0u8; 1]) {
             Ok(_) => {} // data or EOF: read_frame reports either
             Err(e) if is_timeout(&e) => {
@@ -1844,10 +2020,13 @@ fn serve_ws(
                             else {
                                 hs = None;
                                 outbound.set_handshaking(false);
-                                if hs_err(&outbound, "hs_hello needs a 16-byte base64 cnonce")
-                                    .is_err()
-                                {
-                                    break Err(io::Error::other("outbound queue saturated"));
+                                if let Err(e) = hs_fail(
+                                    &outbound,
+                                    "hs_hello needs a 16-byte base64 cnonce",
+                                    &mut hs_errors,
+                                    require_e2e,
+                                ) {
+                                    break Err(e);
                                 }
                                 continue;
                             };
@@ -1873,8 +2052,13 @@ fn serve_ws(
                         }
                         ClientMsg::HsProof { proof } => {
                             let Some(pending) = hs.take() else {
-                                if hs_err(&outbound, "no handshake in progress").is_err() {
-                                    break Err(io::Error::other("outbound queue saturated"));
+                                if let Err(e) = hs_fail(
+                                    &outbound,
+                                    "no handshake in progress",
+                                    &mut hs_errors,
+                                    require_e2e,
+                                ) {
+                                    break Err(e);
                                 }
                                 continue;
                             };
@@ -1920,8 +2104,10 @@ fn serve_ws(
                                 }
                                 Err(reason) => {
                                     outbound.set_handshaking(false);
-                                    if hs_err(&outbound, &reason).is_err() {
-                                        break Err(io::Error::other("outbound queue saturated"));
+                                    if let Err(e) =
+                                        hs_fail(&outbound, &reason, &mut hs_errors, require_e2e)
+                                    {
+                                        break Err(e);
                                     }
                                 }
                             }
@@ -2240,6 +2426,23 @@ mod e2e_tests {
 
     fn connect(f: &Fixture) -> WsClient {
         WsClient::connect(&format!("127.0.0.1:{}", f.handle.port), "/", None).unwrap()
+    }
+
+    /// One raw request on a fresh connection; returns the response status line.
+    fn raw_status(port: u16, req: &str) -> String {
+        use std::io::Read;
+        let mut s = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        let mut buf = [0u8; 512];
+        while !resp.contains("\r\n") {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => resp.push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+        resp.lines().next().unwrap_or("").to_string()
     }
 
     /// The server's challenge for one handshake + the client nonce it answers.
@@ -2601,6 +2804,113 @@ mod e2e_tests {
         shutdown(f);
     }
 
+    /// Security pass 2026-11-15 (N1): a request a tunnel or reverse proxy
+    /// stamped is refused when there is no token to hold it to.
+    #[test]
+    fn proxied_request_without_a_token_is_refused_403() {
+        let f = fixture("n1-notoken", now_ms() + 60_000, false);
+        let port = f.handle.port;
+        for h in [
+            "X-Forwarded-For: 203.0.113.9",
+            "X-Forwarded-Host: abc.ngrok-free.app",
+            "X-Forwarded-Proto: https",
+            "Forwarded: for=203.0.113.9",
+            "ngrok-skip-browser-warning: 1",
+        ] {
+            let st = raw_status(
+                port,
+                &format!(
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{h}\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            assert!(st.contains("403"), "{h}: {st}");
+        }
+        let err = WsClient::connect_with_headers(
+            &format!("127.0.0.1:{port}"),
+            "/",
+            None,
+            &[("X-Forwarded-For", "203.0.113.9")],
+        )
+        .err()
+        .expect("proxied upgrade must be refused");
+        assert!(err.contains("403"), "{err}");
+        // control: the identical unproxied request is served
+        let st = raw_status(
+            port,
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(st.contains("200"), "{st}");
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N1): with a token, a proxied request on a
+    /// loopback bind gets remote posture for that connection: /health needs the
+    /// token and a pre-session hello returns no snapshot, while an unproxied
+    /// loopback peer on the same server is unchanged.
+    #[test]
+    fn proxied_request_gets_remote_posture_on_a_loopback_bind() {
+        let dir = temp_dir("n1-token");
+        let mut c = default_config();
+        c.data_dir = dir.clone();
+        let companion = Arc::new(Companion::boot(c).unwrap());
+        let handle = start_with_posture(
+            "127.0.0.1",
+            0,
+            0,
+            Some(REMOTE_TOKEN.into()),
+            companion.clone(),
+            false,
+        )
+        .unwrap();
+        let port = handle.port;
+        let addr = format!("127.0.0.1:{port}");
+        let health = |extra: &str| {
+            raw_status(
+                port,
+                &format!(
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra}Connection: close\r\n\r\n"
+                ),
+            )
+        };
+        assert!(health("").contains("200"), "loopback /health is open");
+        assert!(health("X-Forwarded-For: 203.0.113.9\r\n").contains("401"));
+        let authed =
+            format!("X-Forwarded-For: 203.0.113.9\r\nAuthorization: Bearer {REMOTE_TOKEN}\r\n");
+        assert!(health(&authed).contains("200"));
+        let hello = format!(r#"{{"type":"hello","clientId":"n1","protocol":{PROTOCOL_VERSION}}}"#);
+        let mut proxied = WsClient::connect_with_headers(
+            &addr,
+            "/",
+            Some(REMOTE_TOKEN),
+            &[("ngrok-skip-browser-warning", "1")],
+        )
+        .unwrap();
+        proxied.send_text(&hello).unwrap();
+        let ack = proxied.next_text().unwrap();
+        assert!(ack.contains("e2e session required"), "{ack}");
+        assert!(!ack.contains("snapshot"), "{ack}");
+        let mut local = WsClient::connect(&addr, "/", Some(REMOTE_TOKEN)).unwrap();
+        local.send_text(&hello).unwrap();
+        assert!(local.next_text().unwrap().contains("snapshot"));
+        drop((proxied, local));
+        let clean = handle.stop();
+        companion.shutdown(clean);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Security pass 2026-11-15 (N9): two Origin headers are refused.
+    #[test]
+    fn request_with_two_origin_headers_is_refused_403() {
+        let f = fixture("n9-origin", now_ms() + 60_000, false);
+        let req = |origins: &str| {
+            format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n{origins}Connection: close\r\n\r\n")
+        };
+        let two = req("Origin: chernobyl://app\r\nOrigin: http://evil.example\r\n");
+        assert!(raw_status(f.handle.port, &two).contains("403"));
+        assert!(raw_status(f.handle.port, &req("")).contains("200"));
+        shutdown(f);
+    }
+
     /* D2 + D6: remote posture — beyond loopback a live E2E session gates
     every command and /health joins the token gate. The server still binds
     loopback inside the test; the posture flag makes it behave as if bound
@@ -2836,7 +3146,8 @@ mod e2e_tests {
 
         // diagnostics listener (loopback): accepted, event enters the pipeline
         let diag = format!("http://127.0.0.1:{}", f.handle.diagnostics_port);
-        let r = http_request("POST", &format!("{diag}/hooks/claude"), None, Some(payload)).unwrap();
+        let key = f.companion.control_key().to_string();
+        let r = control_post(&format!("{diag}/hooks/claude"), &key, payload).unwrap();
         assert!(r.status == 200, "diag POST must accept, got {}", r.status);
         let snap = f.companion.snapshot();
         assert!(
@@ -2858,14 +3169,97 @@ mod e2e_tests {
         );
 
         // malformed payload on the ingress: 400, never a fabricated event
-        let bad =
-            http_request("POST", &format!("{diag}/hooks/claude"), None, Some("{nope")).unwrap();
+        let bad = control_post(&format!("{diag}/hooks/claude"), &key, "{nope").unwrap();
         assert!(
             bad.status == 400,
             "malformed hook must 400, got {}",
             bad.status
         );
 
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (E2): /hooks/claude needs the control key like
+    /// the permission route; any other local process is refused and nothing
+    /// it sends surfaces.
+    #[test]
+    fn claude_hook_ingress_requires_the_control_key() {
+        let f = fixture_claude("cc-key");
+        let body =
+            r#"{"hook_event_name":"Notification","session_id":"x","message":"forged no-key"}"#;
+        let url = format!(
+            "http://127.0.0.1:{}/hooks/claude",
+            f.handle.diagnostics_port
+        );
+        let none = http_request("POST", &url, None, Some(body)).unwrap();
+        assert_eq!(none.status, 403, "no key");
+        let wrong = control_post(&url, "not-the-key", body).unwrap();
+        assert_eq!(wrong.status, 403, "wrong key");
+        let forged = |c: &Companion| {
+            c.snapshot()
+                .activity
+                .iter()
+                .any(|a| a.text.contains("forged no-key"))
+        };
+        assert!(!forged(&f.companion));
+        let ok = control_post(&url, f.companion.control_key(), body).unwrap();
+        assert_eq!(ok.status, 200);
+        assert!(forged(&f.companion));
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (E2): the `--hook activity` client (key from the
+    /// caller, loopback Host) passes the key and Host checks of the real
+    /// diagnostics listener and its event surfaces; the permission-hook client
+    /// is covered by `permission_hook_round_trip_through_the_companion`.
+    #[test]
+    fn activity_hook_client_reaches_the_ingress() {
+        let f = fixture_claude("cc-activity-client");
+        let body =
+            r#"{"hook_event_name":"Notification","session_id":"x","message":"via activity hook"}"#;
+        let port = f.handle.diagnostics_port;
+        assert!(!crate::claude::activity_hook(body, port, "wrong-key"));
+        assert!(crate::claude::activity_hook(
+            body,
+            port,
+            f.companion.control_key()
+        ));
+        assert!(
+            f.companion
+                .snapshot()
+                .activity
+                .iter()
+                .any(|a| a.text.contains("via activity hook"))
+        );
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (E2): sixty-odd 60 KB Notification hooks used
+    /// to push hello_ack past the 256 000-byte frame cap; the activity text is
+    /// capped now, so the snapshot a hello carries stays inside it.
+    #[test]
+    fn oversized_hooks_cannot_push_hello_past_the_frame_cap() {
+        let f = fixture_claude("cc-big");
+        let url = format!(
+            "http://127.0.0.1:{}/hooks/claude",
+            f.handle.diagnostics_port
+        );
+        let big = "A".repeat(60_000);
+        for i in 0..70 {
+            let body = format!(
+                r#"{{"hook_event_name":"Notification","session_id":"s{i}","message":"{big}"}}"#
+            );
+            let r = control_post(&url, f.companion.control_key(), &body).unwrap();
+            assert_eq!(r.status, 200);
+        }
+        let mut c = connect(&f);
+        c.send_text(&format!(
+            r#"{{"type":"hello","clientId":"big","protocol":{PROTOCOL_VERSION}}}"#
+        ))
+        .unwrap();
+        let ack = c.next_text().expect("hello_ack fits in a frame");
+        assert!(ack.contains("hello_ack"), "{}", &ack[..ack.len().min(200)]);
+        assert!(ack.len() < ws::MAX_PAYLOAD_BYTES, "{} bytes", ack.len());
         shutdown(f);
     }
 
@@ -2883,8 +3277,10 @@ mod e2e_tests {
                 .unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let req = format!(
-            "POST /hooks/claude HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
+            "POST /hooks/claude HTTP/1.1\r\nHost: 127.0.0.1:{dport}\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            f.companion.control_key(),
+            body.len(),
+            dport = f.handle.diagnostics_port
         );
         s.write_all(req.as_bytes()).unwrap();
         let mut resp = String::new();
@@ -2904,7 +3300,12 @@ mod e2e_tests {
         assert!(!forged(&f.companion), "a refused hook must not surface");
         // control: the same payload without Origin is accepted and surfaces
         let diag = format!("http://127.0.0.1:{}", f.handle.diagnostics_port);
-        let ok = http_request("POST", &format!("{diag}/hooks/claude"), None, Some(body)).unwrap();
+        let ok = control_post(
+            &format!("{diag}/hooks/claude"),
+            f.companion.control_key(),
+            body,
+        )
+        .unwrap();
         assert_eq!(ok.status, 200);
         assert!(forged(&f.companion));
         shutdown(f);
@@ -3532,9 +3933,10 @@ mod e2e_tests {
         let body = format!("{{\"deviceId\":\"{}\"}}", f.device_id);
         // a valid control key: the 403 must come from the Origin rule alone
         let req = format!(
-            "POST /devices/revoke HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /devices/revoke HTTP/1.1\r\nHost: 127.0.0.1:{dport}\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             f.companion.control_key(),
-            body.len()
+            body.len(),
+            dport = f.handle.diagnostics_port
         );
         s.write_all(req.as_bytes()).unwrap();
 
@@ -3671,9 +4073,10 @@ mod e2e_tests {
         let body = r#"{"endpoints":["ws://127.0.0.1:8787"]}"#;
         // a valid control key: the 403 must come from the Origin rule alone
         let req = format!(
-            "POST /pairing/offer HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /pairing/offer HTTP/1.1\r\nHost: 127.0.0.1:{dport}\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             companion.control_key(),
-            body.len()
+            body.len(),
+            dport = handle.diagnostics_port
         );
         s.write_all(req.as_bytes()).unwrap();
 
@@ -3874,7 +4277,7 @@ mod e2e_tests {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         write!(
             s,
-            "POST /hooks/claude/permission?wait=30000 HTTP/1.1\r\nHost: x\r\n{CONTROL_KEY_HEADER}: {key}\r\nContent-Length: {}\r\n\r\n{ask}",
+            "POST /hooks/claude/permission?wait=30000 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{CONTROL_KEY_HEADER}: {key}\r\nContent-Length: {}\r\n\r\n{ask}",
             ask.len()
         )
         .unwrap();
@@ -4803,6 +5206,217 @@ mod e2e_tests {
                 other => panic!("expected close 4003, got {other:?}"),
             }
         }
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N7): the diagnostics listener answers only a
+    /// request addressed to its own loopback socket, which a DNS-rebound page
+    /// (its own hostname in Host) is not.
+    #[test]
+    fn diagnostics_listener_refuses_a_foreign_host_header() {
+        let f = fixture("n7-host", now_ms() + 60_000, false);
+        let port = f.handle.diagnostics_port;
+        let get = |hosts: &str| {
+            raw_status(
+                port,
+                &format!("GET /health HTTP/1.1\r\n{hosts}Connection: close\r\n\r\n"),
+            )
+        };
+        for ok in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
+            assert!(get(&format!("Host: {ok}\r\n")).contains("200"), "{ok}");
+        }
+        for bad in [
+            "Host: rebind.example.com\r\n".to_string(),
+            format!("Host: rebind.example.com:{port}\r\n"),
+            "Host: 127.0.0.1\r\n".to_string(),
+            format!("Host: 127.0.0.1:{}\r\n", port.wrapping_add(1)),
+            format!("Host: 127.0.0.1:{port}\r\nHost: rebind.example.com\r\n"),
+            String::new(),
+        ] {
+            assert!(get(&bad).contains("403"), "{bad:?}");
+        }
+        // the main listener keeps serving any Host (tunnels rewrite it)
+        let st = raw_status(
+            f.handle.port,
+            "GET /health HTTP/1.1\r\nHost: abc.ngrok-free.app\r\nConnection: close\r\n\r\n",
+        );
+        assert!(st.contains("200"), "{st}");
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N4): no client opens a WebSocket on the
+    /// diagnostics listener, so it answers an upgrade with 404.
+    #[test]
+    fn diagnostics_listener_refuses_websocket_upgrades() {
+        let f = fixture("n4-diag-ws", now_ms() + 60_000, false);
+        let err = WsClient::connect(
+            &format!("127.0.0.1:{}", f.handle.diagnostics_port),
+            "/",
+            None,
+        )
+        .err()
+        .expect("upgrade on the diagnostics listener must be refused");
+        assert!(err.contains("404"), "{err}");
+        // control: the same upgrade on the main listener connects
+        let _ok = connect(&f);
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N8): at remote posture a connection is closed
+    /// after MAX_HS_ERRORS failed handshake steps; on a plain loopback server
+    /// the same peer is never cut off.
+    #[test]
+    fn remote_posture_closes_a_connection_after_repeated_handshake_errors() {
+        let bad = r#"{"type":"hs_proof","proof":"AAAA"}"#;
+        let f = fixture_remote("n8-hs-errors");
+        let mut c = connect_remote(&f);
+        c.set_read_timeout_ms(5_000).unwrap();
+        for i in 0..MAX_HS_ERRORS {
+            c.send_text(bad).unwrap();
+            let reply = c.next_text().unwrap_or_else(|e| panic!("reply {i}: {e}"));
+            assert!(reply.contains("hs_err"), "{reply}");
+        }
+        // the connection is gone: the next read ends instead of answering
+        assert!(c.send_text(bad).is_err() || c.next_text().is_err());
+        shutdown(f);
+
+        let f = fixture("n8-hs-errors-local", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        for _ in 0..MAX_HS_ERRORS + 2 {
+            c.send_text(bad).unwrap();
+            assert!(c.next_text().unwrap().contains("hs_err"));
+        }
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N8): at remote posture a connection that never
+    /// establishes a session is closed REMOTE_SESSION_DEADLINE after the upgrade.
+    #[test]
+    fn remote_posture_closes_a_connection_that_never_gets_a_session() {
+        let f = fixture_remote("n8-idle");
+        let mut c = connect_remote(&f);
+        c.set_read_timeout_ms(40_000).unwrap();
+        let t = Instant::now();
+        // heartbeat pings (unanswered) may arrive; the close ends the loop
+        while c
+            .read_frame()
+            .is_ok_and(|fr| !matches!(fr, Frame::Close(..)))
+        {}
+        let took = t.elapsed();
+        assert!(
+            took >= REMOTE_SESSION_DEADLINE - Duration::from_secs(1)
+                && took < REMOTE_SESSION_DEADLINE + Duration::from_secs(8),
+            "closed after {took:?}"
+        );
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N6): past the failure limit a wrong token is
+    /// answered with 429 only after a pause; the right token still connects.
+    #[test]
+    fn wrong_token_past_the_failure_limit_is_throttled() {
+        let f = fixture_remote("n6-throttle");
+        let addr = format!("127.0.0.1:{}", f.handle.port);
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            let mut c = WsClient::connect(&addr, "/", Some("wrong")).unwrap();
+            assert!(c.next_text().is_err()); // closed 4001
+        }
+        let t = Instant::now();
+        let err = WsClient::connect(&addr, "/", Some("wrong"))
+            .err()
+            .expect("429");
+        assert!(err.contains("429"), "{err}");
+        assert!(t.elapsed() >= AUTH_THROTTLE - Duration::from_millis(20));
+        let _ok = connect_remote(&f);
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N5): empty and short tokens are refused.
+    #[test]
+    fn validate_token_requires_32_characters() {
+        assert!(validate_token("").is_err());
+        assert!(validate_token("st-secret").is_err());
+        assert!(validate_token(&"a".repeat(MIN_TOKEN_LEN - 1)).is_err());
+        assert!(validate_token(&"a".repeat(MIN_TOKEN_LEN)).is_ok());
+        // what setup-windows.ps1 mints: 24 random bytes as hex
+        assert!(validate_token(&"0f".repeat(24)).is_ok());
+    }
+
+    /* ---- security pass 2026-11-15, N2: per-peer cap + head deadline --- */
+
+    #[test]
+    fn peer_counts_cap_each_address_and_free_slots_on_release() {
+        let counts = PeerCounts::default();
+        let ip: IpAddr = "192.0.2.7".parse().unwrap();
+        let other: IpAddr = "192.0.2.8".parse().unwrap();
+        for _ in 0..PER_PEER_CAP {
+            assert!(counts.admit(ip));
+        }
+        assert!(!counts.admit(ip), "one peer past its cap");
+        assert!(counts.admit(other), "another peer is unaffected");
+        counts.release(ip);
+        assert!(counts.admit(ip), "a released slot is reusable");
+        // loopback peers (tunnel exits) share the larger cap
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        for _ in 0..PER_LOOPBACK_CAP {
+            assert!(counts.admit(lo));
+        }
+        assert!(!counts.admit(lo));
+        // an IPv4-mapped loopback is the same peer once canonicalised
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(!counts.admit(mapped.to_canonical()));
+    }
+
+    #[test]
+    fn one_loopback_peer_cannot_exceed_its_cap_on_the_listener() {
+        use std::io::Read;
+        let f = fixture("n2-peer-cap", now_ms() + 60_000, false);
+        let addr = format!("127.0.0.1:{}", f.handle.port);
+        let held: Vec<TcpStream> = (0..PER_LOOPBACK_CAP)
+            .map(|_| TcpStream::connect(&addr).unwrap())
+            .collect();
+        let rejected = |f: &Fixture| {
+            f.companion
+                .shared
+                .connections_rejected
+                .load(Ordering::SeqCst)
+        };
+        let t = Instant::now();
+        while f.companion.shared.connections_active.load(Ordering::SeqCst) < PER_LOOPBACK_CAP as u64
+        {
+            assert!(t.elapsed() < Duration::from_secs(5), "cap not reached");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(rejected(&f), 0);
+        // the next connection is accepted by the OS and dropped by the server
+        let mut extra = TcpStream::connect(&addr).unwrap();
+        extra
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut b = [0u8; 1];
+        assert!(
+            matches!(extra.read(&mut b), Ok(0) | Err(_)),
+            "an over-cap connection gets no service"
+        );
+        assert_eq!(rejected(&f), 1);
+        drop(held);
+        shutdown(f);
+    }
+
+    #[test]
+    fn silent_connection_is_dropped_at_the_head_deadline() {
+        use std::io::Read;
+        let f = fixture("n2-head", now_ms() + 60_000, false);
+        let mut s = TcpStream::connect(format!("127.0.0.1:{}", f.handle.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        let t = Instant::now();
+        let mut b = [0u8; 1];
+        assert!(matches!(s.read(&mut b), Ok(0) | Err(_)));
+        let took = t.elapsed();
+        assert!(
+            took >= Duration::from_secs(4) && took < Duration::from_secs(10),
+            "head deadline is 5 s, closed after {took:?}"
+        );
         shutdown(f);
     }
 

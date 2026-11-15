@@ -53,7 +53,7 @@ import {
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const BIN = resolve(HERE, '..', 'target', 'debug', 'chernobyl-companion.exe');
-const TOKEN = 'interop-token';
+const TOKEN = 'interop-token-0123456789abcdef0123456789abcdef';
 const FAKE_CODEX = resolve(HERE, 'fake-codex-app-server.mjs');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

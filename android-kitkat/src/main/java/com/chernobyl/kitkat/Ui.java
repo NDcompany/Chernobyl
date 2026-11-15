@@ -310,6 +310,7 @@ final class Ui {
     /* ---------------- markdown → spans ---------------- */
 
     static void confirmOpen(final Context c, final String url) {
+        if (!Md.safeUrl(url)) return;
         new AlertDialog.Builder(c).setTitle("Open link?").setMessage(url)
                 .setPositiveButton("Open", new DialogInterface.OnClickListener() {
                     @Override

@@ -16,6 +16,7 @@ import {
   pullSource,
   pushTarget,
   workspaceForProject,
+  agentConfigWarning,
 } from './workspace.ts';
 
 type GitStatus = Extract<WorkspaceResult, { kind: 'git_status' }>;
@@ -94,4 +95,15 @@ test('push target is honest about detached heads and missing upstreams', () => {
 test('file content is chunked by lines without a trailing empty line', () => {
   assert.deepEqual(lineChunks('a\nb\nc\n', 2), ['a\nb', 'c']);
   assert.deepEqual(lineChunks(''), ['']);
+});
+
+test('agentConfigWarning names the changed paths and caps long lists', () => {
+  assert.equal(agentConfigWarning(undefined), undefined);
+  assert.equal(agentConfigWarning([]), undefined);
+  const one = agentConfigWarning(['.claude/settings.json'])!;
+  assert.match(one, /^This pull changed agent settings: \.claude\/settings\.json\. Agents in this workspace follow them/);
+  assert.match(one, /tool permissions and hooks/);
+  assert.match(one, /review them on your PC\.$/);
+  const many = agentConfigWarning(['a', 'b', 'c', 'd', 'e', 'f', 'g'])!;
+  assert.match(many, /a, b, c, d, e and 2 more\./);
 });

@@ -96,6 +96,24 @@ impl Handshake {
             .map(|(_, v)| v.as_str())
     }
 
+    /// True when a reverse proxy or tunnel (ngrok, cloudflared, nginx, ...)
+    /// stamped this request. A loopback peer that carries one of these is a
+    /// tunnel exit, not a local process. The headers are trivially spoofable,
+    /// but spoofing them only makes the connection stricter.
+    pub fn is_proxied(&self) -> bool {
+        self.headers.iter().any(|(k, _)| {
+            matches!(
+                k.as_str(),
+                "x-forwarded-for" | "x-forwarded-host" | "x-forwarded-proto" | "forwarded"
+            ) || k.starts_with("ngrok-")
+        })
+    }
+
+    /// Number of `Origin` headers (more than one is a smuggling attempt).
+    pub fn origin_count(&self) -> usize {
+        self.headers.iter().filter(|(k, _)| k == "origin").count()
+    }
+
     pub fn is_websocket_upgrade(&self) -> bool {
         let upgrade = self.header("upgrade").map(str::to_ascii_lowercase);
         let connection = self.header("connection").unwrap_or("");

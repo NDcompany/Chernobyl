@@ -28,6 +28,7 @@ import {
   aheadBehind,
   changeSections,
   findWorkspace,
+  agentConfigWarning,
   pullSource,
   pushTarget,
   type ChangeSection,
@@ -72,6 +73,7 @@ export default function ChangesScreen() {
   const [diff, setDiff] = useState<Diff | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
+  const [configWarning, setConfigWarning] = useState<string | undefined>();
   const [confirmPush, setConfirmPush] = useState(false);
   const [confirmPull, setConfirmPull] = useState(false);
   const form = useForm<CommitForm>({ defaultValues: { message: '' } });
@@ -81,8 +83,10 @@ export default function ChangesScreen() {
     async (what: string, msg: WorkspaceChange, done?: string) => {
       setBusy(what);
       setFailure(null);
+      setConfigWarning(undefined);
       const outcome = await change(msg);
       setBusy(null);
+      if (outcome?.ok) setConfigWarning(agentConfigWarning(outcome.agentConfigChanged));
       if (outcome && !outcome.ok) setFailure(outcome.error ?? `${what} failed`);
       if (outcome?.ok && done) addToast(done, 'success');
       refresh();
@@ -233,6 +237,17 @@ export default function ChangesScreen() {
               </Text>
               <Text variant="mono" color={colors.text} selectable>
                 {failure}
+              </Text>
+            </Card>
+          ) : null}
+
+          {configWarning ? (
+            <Card style={{ borderColor: colors.warning, gap: spacing.xs }}>
+              <Text variant="smStrong" color={colors.warning} accessibilityRole="alert">
+                Agent settings changed
+              </Text>
+              <Text variant="sm" color={colors.text} selectable>
+                {configWarning}
               </Text>
             </Card>
           ) : null}

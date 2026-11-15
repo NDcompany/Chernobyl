@@ -189,7 +189,9 @@ shown inline (never a toast). Git changes go through `useCommands` (ack errors t
 is an unknown outcome) via `useGitChange`, which resolves with the command's `command_result`;
 git's own failure text shows in a "Git said" card, and the status is re-read after every change.
 Push always confirms with the exact `branch → upstream`; Pull (fast-forward only, ADR-016 §7)
-with the exact `upstream → branch` (`pullSource` in `@/utils/workspace`).
+with the exact `upstream → branch` (`pullSource` in `@/utils/workspace`). A Pull whose `command_result`
+carries `agentConfigChanged` adds a `warning`-outlined "Agent settings changed" card (`agentConfigWarning`: the
+paths, five at most, then "review them on your PC"); the next change clears it.
 
 **Terminal (ADR-020):** shown only when `hello_ack.features` has `terminal.v1` (the PC opted in;
 off by default) and the workspace is listed; the simulation never advertises it, and a deep link
@@ -272,3 +274,19 @@ only a legacy record without options gets Approve Once / Reject, plus "Approve f
 notifications carry that route in `data.url` (a `fromPc` request is titled "Approval needed (PC session)"); `onNotificationOpen` (`@/platform/notify`, wired in
 `TransportProvider`) opens it on tap, also when the tap launched the app, and accepts only
 `/session/…` and `/permission/…` routes.
+
+## Security hardening (security review)
+
+- **Pairing confirm step** (`connect-host`, `pairingNotices` in `@/utils/pairing`): `warning`-coloured `xs` alert lines
+  above the host details. "This replaces your current host <host>" whenever a pairing is stored; "Opened from
+  another app or link — only continue if you started this pairing" when the payload came from a
+  `chernobyl://connect-host?payload=` link (editing the field or scanning clears that mark). Saving a pairing
+  also clears the stored host token, so an old token is never appended to the new endpoints.
+- **Tapjacking:** `plugins/withAndroidHardening.js` (a config plugin in `app.json`) sets
+  `window.decorView.filterTouchesWhenObscured = true` in MainActivity.onCreate, so every screen, Approve
+  buttons included, ignores touches while another window covers the app; it also sets an empty
+  `android:taskAffinity` on MainActivity. Needs a prebuild/rebuild to take effect.
+- **Manifest:** `android.allowBackup: false`; `blockedPermissions` removes SYSTEM_ALERT_WINDOW and the external-storage
+  permissions (the app uses none).
+- **Alerts:** `notify()` posts to the `alerts` channel with PRIVATE lock-screen visibility: a locked screen shows
+  "Contents hidden", the command only once unlocked (expo-notifications has no per-notification public version).

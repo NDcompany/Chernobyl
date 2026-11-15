@@ -675,6 +675,7 @@ impl Inner {
     /// Done at once: the command has nothing to act on.
     fn noop(&self, command_id: &str, session_id: &str) -> ServerMsg {
         (self.sink)(EventKind::CommandResult {
+            agent_config_changed: Vec::new(),
             command_id: command_id.into(),
             status: "completed".into(),
             error: None,
@@ -739,19 +740,18 @@ impl Inner {
     /// replayed again (the probe-cadence mirror).
     fn threads(self: &Arc<Self>, st: &mut State, list: Vec<FoundThread>) {
         let now = now_ms();
-        let roots: Vec<&Path> = self
-            .cfg
-            .workspaces
-            .iter()
-            .map(|w| Path::new(&w.path))
-            .collect();
         let mut found = Vec::new();
         let mut out = Vec::new();
         let mut stale = Vec::new();
-        for t in list {
-            // T11: the filter is codex's; the allow-list is checked here again
-            let inside = roots.iter().any(|r| codex::within(Path::new(&t.cwd), r));
-            if !inside || st.sessions.iter().any(|s| s.id == t.id) {
+        for mut t in list {
+            // T11: the filter is codex's; the allow-list is checked here again,
+            // on the canonical path (a `..` or a junction must not escape it),
+            // and the canonical cwd is what the session keeps
+            let Some(canon) = crate::claude_history::inside(&t.cwd, &self.cfg.workspaces) else {
+                continue;
+            };
+            t.cwd = canon;
+            if st.sessions.iter().any(|s| s.id == t.id) {
                 continue;
             }
             let old = st.found.iter().find(|f| f.thread.id == t.id);
@@ -927,6 +927,7 @@ impl Inner {
                         continue;
                     }
                     (self.sink)(EventKind::CommandResult {
+                        agent_config_changed: Vec::new(),
                         session_id: st.tags.remove(&tag),
                         command_id: tag,
                         status: status.into(),
@@ -939,6 +940,7 @@ impl Inner {
                     if let Err(e) = (self.opener)(&url) {
                         st.dropped.insert(tag.clone());
                         (self.sink)(EventKind::CommandResult {
+                            agent_config_changed: Vec::new(),
                             session_id: st.tags.remove(&tag),
                             command_id: tag,
                             status: "failed".into(),
@@ -1019,6 +1021,65 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
+
+    /// Security pass 2026-11-15 (E3): a listed thread counts only when its
+    /// CANONICAL cwd is inside a workspace: a `..` path or a junction that
+    /// leaves the folder is dropped (the old check was lexical), and the
+    /// canonical cwd is what the session keeps.
+    #[test]
+    fn listed_threads_are_checked_on_the_canonical_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "chb-codex-canon-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let (ws, outside) = (root.join("ws"), root.join("outside"));
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // a junction inside the workspace pointing outside it
+        let link = ws.join("link");
+        let junction = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let ws_canon = std::fs::canonicalize(&ws).unwrap();
+        let plain = |p: &Path| p.to_string_lossy().trim_start_matches(r"\\?\").to_string();
+        let cfg = launch(&plain(&ws_canon));
+        let (sink, _seen) = recorder();
+        let rt = CodexRuntime::new("codex-1", cfg, HubHandle::default(), sink, no_opener());
+        let thread = |id: &str, cwd: String| FoundThread {
+            id: id.into(),
+            title: id.into(),
+            cwd,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let mut list = vec![
+            thread("inside", plain(&ws_canon.join("sub"))),
+            thread(
+                "dotdot",
+                plain(&ws_canon.join("sub").join("..").join("..").join("outside")),
+            ),
+            thread("missing", plain(&ws_canon.join("gone"))),
+        ];
+        if junction {
+            list.push(thread("junction", plain(&link)));
+        }
+        {
+            let mut st = rt.inner.st.lock().unwrap();
+            rt.inner.threads(&mut st, list);
+            let ids: Vec<&str> = st.found.iter().map(|f| f.thread.id.as_str()).collect();
+            assert_eq!(ids, ["inside"], "only the thread really inside is kept");
+            assert_eq!(st.found[0].thread.cwd, plain(&ws_canon.join("sub")));
+        }
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "rmdir"])
+            .arg(&link)
+            .output();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn session_cap_and_create_rate_limit_refuse() {

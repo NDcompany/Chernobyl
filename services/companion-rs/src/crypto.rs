@@ -207,173 +207,121 @@ pub fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [
 }
 
 /// Poly1305 one-time authenticator (RFC 8439 §2.5). Returns the 16-byte tag.
-/// `key` is the 32-byte one-time key (r || s). Arithmetic is base-2^26 limbs
-/// (5 limbs = 130 bits) with an explicit mod-(2^130 - 5) reduce.
+/// `key` is the 32-byte one-time key (r || s).
+///
+/// "poly1305-donna-32": five 26-bit limbs, fixed-shape multiply and carry
+/// chain, and a mask-select final reduction. Nothing branches or loops on the
+/// value of the key or the accumulator (security pass 2026-11-15, C1: the
+/// earlier u128 version skipped zero limbs and looped until a carry was
+/// absorbed, which is data-dependent timing). The loop count depends only on
+/// the message length, which is public. Mirrors
+/// android-kitkat/.../Crypto.java `poly1305`.
 pub fn poly1305(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
-    // clamp r into 5x26-bit limbs (RFC 8439 §2.5 / Poly1305 spec): clear the
-    // top 4 bits of each 32-bit word (bits 28-31, 60-63, 92-95, 124-127) AND
-    // the low 2 bits of words 1-3 (bits 32-33, 64-65, 96-97).
-    let mut rint: u128 = 0;
-    for (i, &byte) in key[..16].iter().enumerate() {
-        rint |= (byte as u128) << (8 * i);
+    const M: u64 = 0x3ff_ffff;
+    let le32 = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as u64;
+    // clamp r (RFC 8439 §2.5) while splitting it into limbs
+    let r0 = le32(key, 0) & 0x3ff_ffff;
+    let r1 = (le32(key, 3) >> 2) & 0x3ff_ff03;
+    let r2 = (le32(key, 6) >> 4) & 0x3ff_c0ff;
+    let r3 = (le32(key, 9) >> 6) & 0x3f0_3fff;
+    let r4 = (le32(key, 12) >> 8) & 0x00f_ffff;
+    let (s1, s2, s3, s4) = (r1 * 5, r2 * 5, r3 * 5, r4 * 5);
+    let (mut h0, mut h1, mut h2, mut h3, mut h4) = (0u64, 0u64, 0u64, 0u64, 0u64);
+
+    for chunk in msg.chunks(16) {
+        let n = chunk.len();
+        let mut blk = [0u8; 17];
+        blk[..n].copy_from_slice(chunk);
+        blk[n] = 1; // the +1 bit above a short final block
+        // a full block's +1 bit is bit 128 = bit 24 of limb 4
+        let hibit = if n == 16 { 1u64 << 24 } else { 0 };
+        h0 += le32(&blk, 0) & M;
+        h1 += (le32(&blk, 3) >> 2) & M;
+        h2 += (le32(&blk, 6) >> 4) & M;
+        h3 += (le32(&blk, 9) >> 6) & M;
+        h4 += (le32(&blk, 12) >> 8) | hibit;
+
+        let d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
+        let mut d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
+        let mut d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
+        let mut d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
+        let mut d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+        let mut c = d0 >> 26;
+        h0 = d0 & M;
+        d1 += c;
+        c = d1 >> 26;
+        h1 = d1 & M;
+        d2 += c;
+        c = d2 >> 26;
+        h2 = d2 & M;
+        d3 += c;
+        c = d3 >> 26;
+        h3 = d3 & M;
+        d4 += c;
+        c = d4 >> 26;
+        h4 = d4 & M;
+        h0 += c * 5;
+        c = h0 >> 26;
+        h0 &= M;
+        h1 += c;
     }
-    rint &= 0x0fff_fffc_0fff_fffc_0fff_fffc_0fff_ffffu128;
-    let r = [
-        (rint & 0x3ff_ffff) as u64,
-        ((rint >> 26) & 0x3ff_ffff) as u64,
-        ((rint >> 52) & 0x3ff_ffff) as u64,
-        ((rint >> 78) & 0x3ff_ffff) as u64,
-        ((rint >> 104) & 0x3ff_ffff) as u64,
-    ];
 
-    let mut acc = [0u64; 5];
-    for block in msg.chunks(16) {
-        // n = block as a 130-bit little-endian integer, with a +1 bit at
-        // position 8*len (RFC 8439 §2.5.1).
-        let flen = block.len().min(16);
-        let mut nint: u128 = 0;
-        for (i, &byte) in block[..flen].iter().enumerate() {
-            nint |= (byte as u128) << (8 * i);
-        }
-        let mut n = [
-            (nint & 0x3ff_ffff) as u64,
-            ((nint >> 26) & 0x3ff_ffff) as u64,
-            ((nint >> 52) & 0x3ff_ffff) as u64,
-            ((nint >> 78) & 0x3ff_ffff) as u64,
-            ((nint >> 104) & 0x3ff_ffff) as u64,
-        ];
-        let bit = 8 * flen;
-        if bit / 26 < 5 {
-            n[bit / 26] |= 1u64 << (bit % 26);
-        }
+    // full carry, then compute h - p and select it by mask if h >= p
+    let mut c = h1 >> 26;
+    h1 &= M;
+    h2 += c;
+    c = h2 >> 26;
+    h2 &= M;
+    h3 += c;
+    c = h3 >> 26;
+    h3 &= M;
+    h4 += c;
+    c = h4 >> 26;
+    h4 &= M;
+    h0 += c * 5;
+    c = h0 >> 26;
+    h0 &= M;
+    h1 += c;
 
-        acc = add_mod_p(acc, n);
-        acc = mul_mod_p(acc, r);
-    }
-    acc = final_reduce(acc);
+    let mut g0 = h0 + 5;
+    c = g0 >> 26;
+    g0 &= M;
+    let mut g1 = h1 + c;
+    c = g1 >> 26;
+    g1 &= M;
+    let mut g2 = h2 + c;
+    c = g2 >> 26;
+    g2 &= M;
+    let mut g3 = h3 + c;
+    c = g3 >> 26;
+    g3 &= M;
+    let g4 = (h4 + c).wrapping_sub(1 << 26);
+    // g4 wrapped (top bit set) means h < p: keep h (mask 0); else take g
+    let mask = (g4 >> 63).wrapping_sub(1);
+    h0 = (h0 & !mask) | (g0 & mask);
+    h1 = (h1 & !mask) | (g1 & mask);
+    h2 = (h2 & !mask) | (g2 & mask);
+    h3 = (h3 & !mask) | (g3 & mask);
+    h4 = (h4 & !mask) | (g4 & mask);
 
-    // serialize 5x26-bit limbs to 16 little-endian bytes (drop bits 128-129;
-    // storing into a u128 already truncates to the low 128 bits).
-    let v: u128 = (acc[0] as u128)
-        | ((acc[1] as u128) << 26)
-        | ((acc[2] as u128) << 52)
-        | ((acc[3] as u128) << 78)
-        | ((acc[4] as u128) << 104);
+    // pack to four 32-bit words, add s (mod 2^128), serialize little-endian
+    let w0 = (h0 | (h1 << 26)) & 0xffff_ffff;
+    let w1 = ((h1 >> 6) | (h2 << 20)) & 0xffff_ffff;
+    let w2 = ((h2 >> 12) | (h3 << 14)) & 0xffff_ffff;
+    let w3 = ((h3 >> 18) | (h4 << 8)) & 0xffff_ffff;
+    let mut f = w0 + le32(key, 16);
+    let t0 = f & 0xffff_ffff;
+    f = w1 + le32(key, 20) + (f >> 32);
+    let t1 = f & 0xffff_ffff;
+    f = w2 + le32(key, 24) + (f >> 32);
+    let t2 = f & 0xffff_ffff;
+    f = w3 + le32(key, 28) + (f >> 32);
+    let t3 = f & 0xffff_ffff;
     let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = (v >> (8 * i)) as u8;
-    }
-
-    // add s = key[16..32] (mod 2^128)
-    let mut carry = 0u16;
-    for i in 0..16 {
-        let sum = out[i] as u16 + key[16 + i] as u16 + carry;
-        out[i] = sum as u8;
-        carry = sum >> 8;
+    for (i, t) in [t0, t1, t2, t3].into_iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&(t as u32).to_le_bytes());
     }
     out
-}
-
-const P26: u64 = (1 << 26) - 1;
-
-/// (a + b) mod (2^130 - 5): limb-wise add, then fold the 2^130 overflow as *5.
-fn add_mod_p(a: [u64; 5], b: [u64; 5]) -> [u64; 5] {
-    let mut out = [0u64; 5];
-    let mut c = 0u64;
-    for i in 0..5 {
-        let v = a[i] + b[i] + c;
-        out[i] = v & P26;
-        c = v >> 26;
-    }
-    // c is 0 or 1 (both inputs < 2^130); 2^130 ≡ 5, so add 5*c to limb 0.
-    let mut t = 5 * c;
-    let mut i = 0;
-    while t > 0 && i < 5 {
-        let v = out[i] + t;
-        out[i] = v & P26;
-        t = v >> 26;
-        i += 1;
-    }
-    out
-}
-
-/// (a * r) mod (2^130 - 5): schoolbook multiply into base-2^26 limbs, then
-/// fold the high limbs (weight 2^130 * 2^(26k) ≡ 5 * 2^(26k)) back down until
-/// only 5 remain.
-fn mul_mod_p(a: [u64; 5], r: [u64; 5]) -> [u64; 5] {
-    // product < 2^260, so it fits in 10 base-2^26 limbs (0..9) with no
-    // overflow beyond limb 9.
-    let mut m = [0u128; 10];
-    for i in 0..5 {
-        for j in 0..5 {
-            m[i + j] += (a[i] as u128) * (r[j] as u128);
-        }
-    }
-    let mut limbs = [0u64; 10];
-    let mut c = 0u128;
-    for i in 0..10 {
-        let v = m[i] + c;
-        limbs[i] = (v as u64) & P26;
-        c = v >> 26;
-    }
-    debug_assert_eq!(c, 0, "product overflowed 10 limbs");
-
-    let mut guard = 0u32;
-    loop {
-        if limbs[5] == 0 && limbs[6] == 0 && limbs[7] == 0 && limbs[8] == 0 && limbs[9] == 0 {
-            break;
-        }
-        // fold top-down so a carry from limb i lands in a limb still to be
-        // processed (or is cleaned by the next outer pass).
-        for i in (5..10).rev() {
-            let hi = limbs[i];
-            if hi == 0 {
-                continue;
-            }
-            limbs[i] = 0;
-            let mut t = (hi as u128) * 5;
-            let mut j = i - 5;
-            while t > 0 {
-                debug_assert!(j < 10, "fold ran past the limb array");
-                let v = limbs[j] as u128 + t;
-                limbs[j] = (v as u64) & P26;
-                t = v >> 26;
-                j += 1;
-            }
-        }
-        guard += 1;
-        assert!(guard < 10, "poly1305 reduce did not converge");
-    }
-    [limbs[0], limbs[1], limbs[2], limbs[3], limbs[4]]
-}
-
-/// If acc >= p (p = 2^130 - 5), subtract p; otherwise keep acc.
-fn final_reduce(acc: [u64; 5]) -> [u64; 5] {
-    // p in 26-bit limbs: 2^130 - 5
-    let p = [P26 - 4, P26, P26, P26, P26];
-    let mut d = [0i64; 5];
-    let mut borrow = 0i64;
-    for i in 0..5 {
-        let mut v = acc[i] as i64 - p[i] as i64 - borrow;
-        if v < 0 {
-            v += 1i64 << 26;
-            borrow = 1;
-        } else {
-            borrow = 0;
-        }
-        d[i] = v;
-    }
-    if borrow == 0 {
-        [
-            d[0] as u64,
-            d[1] as u64,
-            d[2] as u64,
-            d[3] as u64,
-            d[4] as u64,
-        ]
-    } else {
-        acc
-    }
 }
 
 /// Constant-time equality for secrets (keys, tags). No early return.
@@ -539,6 +487,103 @@ mod tests {
         // of RFC 8439 §2.5.1 (the §2.8.2 AEAD vector below is the authoritative
         // RFC test and exercises this same poly1305 end-to-end).
         assert_eq!(hex(&tag), "b11b0b7e49d7c6554f014d679967a6fb");
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let s: String = s.split_whitespace().collect();
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// RFC 8439 Appendix A.3: Poly1305 known-answer vectors, including the
+    /// ones that probe the carry and final-reduction edges.
+    #[test]
+    fn poly1305_rfc8439_appendix_a3_vectors() {
+        let ietf: &[u8] = b"Any submission to the IETF intended by the Contributor for publication as all or part of an IETF Internet-Draft or RFC and any statement made within the context of an IETF activity is considered an \"IETF Contribution\". Such statements include oral statements in IETF sessions, as well as written and electronic communications made at any time or place, which are addressed to";
+        let jabber: &[u8] = b"'Twas brillig, and the slithy toves
+Did gyre and gimble in the wabe:
+All mimsy were the borogoves,
+And the mome raths outgrabe.";
+        let z = |n: usize| "00".repeat(n);
+        let ff = |n: usize| "ff".repeat(n);
+        let r_one = format!("01{}", z(15));
+        let r_two = format!("02{}", z(15));
+        let tag = |first: &str, rest: &str| format!("{first}{rest}");
+        // (key hex, message bytes, expected tag hex)
+        let cases: Vec<(String, Vec<u8>, String)> = vec![
+            // #1
+            (z(32), vec![0u8; 64], z(16)),
+            // #2: r = 0
+            (
+                format!("{}36e5f6b5c5e06070f0efca96227a863e", z(16)),
+                ietf.to_vec(),
+                "36e5f6b5c5e06070f0efca96227a863e".into(),
+            ),
+            // #3: s = 0
+            (
+                format!("36e5f6b5c5e06070f0efca96227a863e{}", z(16)),
+                ietf.to_vec(),
+                "f3477e7cd95417af89a6b8794c310cf0".into(),
+            ),
+            // #4
+            (
+                "1c9240a5eb55d38af333888604f6b5f0473917c1402b80099dca5cbc207075c0".into(),
+                jabber.to_vec(),
+                "4541669a7eaaee61e708dc7cbcc5eb62".into(),
+            ),
+            // #5: h = 2^130 - 5 + 4 wraps
+            (
+                format!("{r_two}{}", z(16)),
+                unhex(&ff(16)),
+                tag("03", &z(15)),
+            ),
+            // #6
+            (
+                format!("{r_two}{}", ff(16)),
+                unhex(&format!("02{}", z(15))),
+                tag("03", &z(15)),
+            ),
+            // #7: carry into the top limb
+            (
+                format!("{r_one}{}", z(16)),
+                unhex(&format!("{}f0{}11{}", ff(16), ff(15), z(15))),
+                tag("05", &z(15)),
+            ),
+            // #8: h lands exactly on 2^130 - 5
+            (
+                format!("{r_one}{}", z(16)),
+                unhex(&format!(
+                    "{}fb{}{}",
+                    ff(16),
+                    "fe".repeat(15),
+                    "01".repeat(16)
+                )),
+                z(16),
+            ),
+            // #9
+            (
+                format!("{r_two}{}", z(16)),
+                unhex(&format!("fd{}", ff(15))),
+                format!("fa{}", ff(15)),
+            ),
+            // reduction edge (RFC A.3 #11 shape; value checked against a BigInt
+            // reference of RFC 8439 §2.5.1)
+            (
+                format!("01{}04{}{}", z(7), z(7), z(16)),
+                unhex(&format!(
+                    "e33594d7505e43b9{}3394d7505e4379cd01{}{}",
+                    z(8),
+                    z(7),
+                    z(16)
+                )),
+                format!("13{}", z(15)),
+            ),
+        ];
+        for (n, (key, msg, want)) in cases.iter().enumerate() {
+            let key: [u8; 32] = unhex(key).try_into().unwrap();
+            assert_eq!(hex(&poly1305(&key, msg)), *want, "A.3 vector #{}", n + 1);
+        }
     }
 
     #[test]

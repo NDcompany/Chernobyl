@@ -16,6 +16,17 @@ pub struct WsClient {
 impl WsClient {
     /// Connects, performs the WS handshake, and validates the accept key.
     pub fn connect(addr: &str, path: &str, token: Option<&str>) -> Result<WsClient, String> {
+        Self::connect_with_headers(addr, path, token, &[])
+    }
+
+    /// [`connect`](Self::connect) plus extra request headers (tests drive the
+    /// proxy-header and Host policies through this).
+    pub fn connect_with_headers(
+        addr: &str,
+        path: &str,
+        token: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> Result<WsClient, String> {
         let stream = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
         let mut key_src = [0u8; 16];
         // deterministic nonce is fine for a client; servers accept any 16 bytes
@@ -27,8 +38,9 @@ impl WsClient {
             Some(t) => format!("Authorization: Bearer {t}\r\n"),
             None => String::new(),
         };
+        let extra: String = extra.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
         let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{auth}\r\n"
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{auth}{extra}\r\n"
         );
         let mut stream2 = stream.try_clone().map_err(|e| e.to_string())?;
         stream2

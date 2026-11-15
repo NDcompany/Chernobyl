@@ -49,11 +49,98 @@ const MAX_KEY_LEN: usize = 128;
 /// Values are found in two forms only: a bare `KEY=value` (no spaces, like
 /// env, CLI flags and query strings) or a quoted value after `=`/`:`
 /// (`"key": "v"`, `key = 'v'`, escaped `{\"key\":\"v\"}`). An unquoted value
-/// after spaces (`password = read()`) is code, not a secret.
+/// after spaces is a secret only behind a strong key (SECRET, PASSWORD,
+/// PASSWD, API_KEY, PRIVATE_KEY, CREDENTIAL; camelCase too) and only when it
+/// is 8+ characters and not a call: `password = read()` is code. Also masked:
+/// `Authorization: Basic …`, the password in `scheme://user:pass@host`, PGP
+/// private key blocks; zero-width characters do not hide a key.
+/// True for the invisible Unicode format characters (category Cf, plus the
+/// line/paragraph separators) that can reorder or hide text on a phone
+/// screen: bidi overrides and isolates, zero-width joiners and spaces, word
+/// joiners, the BOM, soft hyphen, language tags and the like.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+        | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
+/// Replaces every invisible format character with a visible `<U+XXXX>`
+/// marker, so text shown on an approval card or notification cannot reorder
+/// itself (`rm -rf x` + RLO + `txt.exe`) or hide a character. Everything else,
+/// including newlines, passes through. Idempotent.
+pub fn show_format_chars(s: &str) -> String {
+    if !s.chars().any(is_format_char) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        if is_format_char(c) {
+            out.push_str(&format!("<U+{:04X}>", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub fn redact(s: &str) -> String {
-    let b = s.as_bytes();
+    // Zero-width characters inside a key (`sk-ant-<ZWSP>…`) must not hide it:
+    // the scan runs on a copy without them and its spans map back onto the
+    // original, which keeps them (they stay visible to `show_format_chars`).
+    if s.chars().any(is_zero_width) {
+        let mut clean = String::with_capacity(s.len());
+        let mut map = Vec::with_capacity(s.len() + 1); // clean byte -> original byte
+        for (at, c) in s.char_indices() {
+            if !is_zero_width(c) {
+                map.extend((0..c.len_utf8()).map(|k| at + k));
+                clean.push(c);
+            }
+        }
+        map.push(s.len());
+        let mut out = String::with_capacity(s.len());
+        let mut copied = 0;
+        for (a, z, kind) in secret_spans(&clean) {
+            let (start, end) = (map[a], map[z]);
+            out.push_str(&s[copied..start]);
+            push_marker(&mut out, kind);
+            copied = end;
+        }
+        out.push_str(&s[copied..]);
+        return out;
+    }
     let mut out = String::with_capacity(s.len());
-    let (mut i, mut copied) = (0, 0);
+    let mut copied = 0;
+    for (start, end, kind) in secret_spans(s) {
+        out.push_str(&s[copied..start]);
+        push_marker(&mut out, kind);
+        copied = end;
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+fn push_marker(out: &mut String, kind: &str) {
+    out.push_str(REDACTED);
+    out.push_str(kind);
+    out.push('»');
+}
+
+/// Characters with no width that can split a key without changing how it reads.
+fn is_zero_width(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{180E}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'
+    )
+}
+
+/// The secret spans of `s` in order: `(start, end, kind)`.
+fn secret_spans(s: &str) -> Vec<(usize, usize, &'static str)> {
+    let b = s.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
     // every word byte visited here starts a word (or follows a marker): whole
     // words are skipped at once, which is what keeps the scan linear
     while i < b.len() {
@@ -64,17 +151,13 @@ pub fn redact(s: &str) -> String {
         let j = word_end(b, i);
         match secret_at(s, i, j) {
             Some((start, end, kind)) => {
-                out.push_str(&s[copied..start]);
-                out.push_str(REDACTED);
-                out.push_str(kind);
-                out.push('»');
-                (i, copied) = (end, end);
+                spans.push((start, end, kind));
+                i = end;
             }
             None => i = j,
         }
     }
-    out.push_str(&s[copied..]);
-    out
+    spans
 }
 
 fn is_word(c: u8) -> bool {
@@ -115,7 +198,14 @@ fn secret_at(s: &str, i: usize, j: usize) -> Option<(usize, usize, &'static str)
         return Some((i, end, "jwt"));
     }
     if w.len() >= 13 && w[w.len() - 13..].eq_ignore_ascii_case(b"authorization") {
-        return bearer_token(b, j).map(|(start, end)| (start, end, "bearer"));
+        return bearer_token(b, j);
+    }
+    // `scheme://user:pass@host`: mask the password
+    if b[j..].starts_with(b"://")
+        && w.iter().all(u8::is_ascii_alphabetic)
+        && let Some((start, end)) = url_password(b, j + 3)
+    {
+        return Some((start, end, "password"));
     }
     // separator first: it rejects almost every word in O(1)
     let (start, quote, bare) = after_key(b, j)?;
@@ -128,6 +218,21 @@ fn secret_at(s: &str, i: usize, j: usize) -> Option<(usize, usize, &'static str)
                     .iter()
                     .position(|&c| ends_bare_value(c))
                     .unwrap_or(b.len() - start)
+        }
+        // `password = hunter2hunter2` / `client_secret : x…`: after a STRONG
+        // key, a spaced unquoted value of 8+ characters is a secret; shorter
+        // ones, and calls, are code (`password = read()`)
+        None if strong => {
+            let end = start
+                + b[start..]
+                    .iter()
+                    .position(|&c| ends_bare_value(c))
+                    .unwrap_or(b.len() - start);
+            // a call (`read_password()`) is code too
+            if end - start < 8 || b.get(end) == Some(&b'(') {
+                return None;
+            }
+            end
         }
         None => return None,
     };
@@ -206,14 +311,17 @@ fn jwt_end(b: &[u8], i: usize, j: usize) -> Option<usize> {
 fn pem_end(s: &str, j: usize) -> Option<usize> {
     let b = s.as_bytes();
     let head = &b[j..b.len().min(j + 64)];
-    let at = find(head, b"PRIVATE KEY-----")?;
+    // `-----BEGIN PGP PRIVATE KEY BLOCK-----` is a private key too
+    let (at, tail) = find(head, b"PRIVATE KEY-----")
+        .map(|at| (at, 16))
+        .or_else(|| find(head, b"PRIVATE KEY BLOCK-----").map(|at| (at, 22)))?;
     if !head[..at]
         .iter()
         .all(|&c| c == b' ' || c.is_ascii_uppercase())
     {
         return None;
     }
-    let body = j + at + 16;
+    let body = j + at + tail;
     let limit = b.len().min(body + PEM_WINDOW);
     let mut end = match find(&b[body..limit], b"-----END") {
         Some(k) => {
@@ -228,17 +336,35 @@ fn pem_end(s: &str, j: usize) -> Option<usize> {
     Some(end)
 }
 
-/// The token after `Authorization: Bearer ` (also `"authorization": "bearer …`).
-fn bearer_token(b: &[u8], j: usize) -> Option<(usize, usize)> {
-    let (k, _, _) = after_key(b, j)?;
-    let word = b.get(k..k + 7)?;
-    if !word[..6].eq_ignore_ascii_case(b"bearer") || word[6] != b' ' {
+/// The userinfo password of `scheme://user:pass@host`, with `p` at the
+/// character after `://`. The user and password stop at `/`, whitespace or a
+/// quote, so only a real authority section matches.
+fn url_password(b: &[u8], p: usize) -> Option<(usize, usize)> {
+    let stop = |c: u8| c == b'/' || c.is_ascii_whitespace() || b"\"'`<>".contains(&c);
+    let colon = p + b[p..]
+        .iter()
+        .position(|&c| stop(c) || c == b':' || c == b'@')?;
+    if b[colon] != b':' || colon == p {
         return None;
     }
-    let start = skip_blanks(b, k + 7);
+    let at = colon + 1 + b[colon + 1..].iter().position(|&c| stop(c) || c == b'@')?;
+    (b[at] == b'@' && at > colon + 1 && !b[colon + 1..].starts_with(REDACTED.as_bytes()))
+        .then_some((colon + 1, at))
+}
+
+/// The credential after `Authorization: Bearer ` / `Basic ` (also
+/// `"authorization": "bearer …`).
+fn bearer_token(b: &[u8], j: usize) -> Option<(usize, usize, &'static str)> {
+    let (k, _, _) = after_key(b, j)?;
+    let (kind, skip) = match (b.get(k..k + 7), b.get(k..k + 6)) {
+        (Some(w), _) if w[..6].eq_ignore_ascii_case(b"bearer") && w[6] == b' ' => ("bearer", 7),
+        (_, Some(w)) if w[..5].eq_ignore_ascii_case(b"basic") && w[5] == b' ' => ("basic", 6),
+        _ => return None,
+    };
+    let start = skip_blanks(b, k + skip);
     let token = |c: &u8| c.is_ascii_alphanumeric() || b"-._~+/=".contains(c);
     let end = start + b[start..].iter().take_while(|c| token(c)).count();
-    (end > start).then_some((start, end))
+    (end > start).then_some((start, end, kind))
 }
 
 /// What follows a key: optional closing quote, `=` / `:` / `:=` (never `==`,
@@ -303,22 +429,28 @@ fn secret_key(w: &[u8]) -> Option<bool> {
     if w.len() < 5 || w.len() > MAX_KEY_LEN {
         return None;
     }
-    let key: Vec<u8> = w
-        .iter()
-        .map(|&c| {
-            if c == b'-' {
-                b'_'
-            } else {
-                c.to_ascii_uppercase()
+    // `apiKey` -> API_KEY, `clientSecret` -> CLIENT_SECRET: an upper-case
+    // letter after a lower-case letter or digit starts a new word
+    let mut key = Vec::with_capacity(w.len() + 4);
+    let mut prev = 0u8;
+    for &c in w {
+        if c == b'-' {
+            key.push(b'_');
+        } else {
+            if c.is_ascii_uppercase() && (prev.is_ascii_lowercase() || prev.is_ascii_digit()) {
+                key.push(b'_');
             }
-        })
-        .collect();
+            key.push(c.to_ascii_uppercase());
+        }
+        prev = c;
+    }
     let has = |k: &str| find(&key, k.as_bytes()).is_some();
     let strong = [
         "SECRET",
         "PASSWORD",
         "PASSWD",
         "API_KEY",
+        "APIKEY",
         "PRIVATE_KEY",
         "CREDENTIAL",
     ]
@@ -873,6 +1005,38 @@ impl<T> PendingAuth<T> {
 mod tests {
     use super::*;
 
+    /// Security pass 2026-11-15 (M3): invisible format characters are shown,
+    /// not rendered; ordinary text (including non-ASCII) is untouched.
+    #[test]
+    fn show_format_chars_marks_bidi_and_zero_width_characters() {
+        let spoof = "rm -rf build \u{202E}txt.exe\u{202C}";
+        assert_eq!(
+            show_format_chars(spoof),
+            "rm -rf build <U+202E>txt.exe<U+202C>"
+        );
+        for (c, marker) in [
+            ('\u{2066}', "<U+2066>"),
+            ('\u{2069}', "<U+2069>"),
+            ('\u{200E}', "<U+200E>"),
+            ('\u{200F}', "<U+200F>"),
+            ('\u{061C}', "<U+061C>"),
+            ('\u{200B}', "<U+200B>"),
+            ('\u{200C}', "<U+200C>"),
+            ('\u{200D}', "<U+200D>"),
+            ('\u{2060}', "<U+2060>"),
+            ('\u{FEFF}', "<U+FEFF>"),
+            ('\u{00AD}', "<U+00AD>"),
+            ('\u{E0041}', "<U+E0041>"),
+        ] {
+            assert_eq!(show_format_chars(&format!("a{c}b")), format!("a{marker}b"));
+        }
+        let plain = "git push origin main\n\tcaf\u{e9} \u{4e2d}\u{6587} \u{1f600}";
+        assert_eq!(show_format_chars(plain), plain);
+        // idempotent
+        let once = show_format_chars(spoof);
+        assert_eq!(show_format_chars(&once), once);
+    }
+
     /// Secret-shaped test data built at run time, so no key-looking literal
     /// sits in the source for secret scanners to trip on.
     fn fake(prefix: &str, n: usize) -> String {
@@ -887,6 +1051,81 @@ mod tests {
     fn pem(kind: &str, body: &str) -> String {
         let (begin, end) = ("-----BEGIN", "-----END");
         format!("{begin} {kind}PRIVATE KEY-----{body}{end} {kind}PRIVATE KEY-----")
+    }
+
+    /// Security pass 2026-11-15 (E4): the key shapes the scanner used to miss.
+    #[test]
+    fn redaction_covers_camel_case_spaced_basic_url_pgp_and_zero_width() {
+        let m = |kind: &str| format!("«redacted:{kind}»");
+        let v = "Zq8rT2vXw9pL";
+        let cases = [
+            // camelCase keys
+            (format!("apiKey={v}"), format!("apiKey={}", m("secret"))),
+            (
+                format!(r#"{{"clientSecret":"{v}"}}"#),
+                format!(r#"{{"clientSecret":"{}"}}"#, m("secret")),
+            ),
+            (
+                format!("privateKey: '{v}'"),
+                format!("privateKey: '{}'", m("secret")),
+            ),
+            // unquoted values after spaces, after a strong key
+            (
+                format!("password = {v}"),
+                format!("password = {}", m("secret")),
+            ),
+            (
+                format!("password: {v}\nnext"),
+                format!("password: {}\nnext", m("secret")),
+            ),
+            (
+                format!("client_secret : {v}"),
+                format!("client_secret : {}", m("secret")),
+            ),
+            (
+                format!("aws_secret_access_key = {v}"),
+                format!("aws_secret_access_key = {}", m("secret")),
+            ),
+            // Authorization: Basic
+            (
+                "Authorization: Basic dXNlcjpwYXNzd29yZA==".to_string(),
+                format!("Authorization: Basic {}", m("basic")),
+            ),
+            // URL userinfo
+            (
+                format!("git clone https://bob:{v}@host.example/r.git"),
+                format!("git clone https://bob:{}@host.example/r.git", m("password")),
+            ),
+            // a PGP private key block
+            (
+                "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGBF\n-----END PGP PRIVATE KEY BLOCK-----"
+                    .to_string(),
+                m("private-key"),
+            ),
+            // a zero-width space inside the key does not hide it
+            (
+                format!("k {} end", fake("sk-ant-\u{200B}api03-", 40)),
+                format!("k {} end", m("anthropic-key")),
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact(&input), want, "input: {input}");
+            assert_eq!(redact(&redact(&input)), want, "idempotent: {input}");
+        }
+        // ordinary text stays: short values, calls, ports, an `@` after a path,
+        // and a zero-width character that is not part of a secret
+        for same in [
+            "password = x",
+            "password = read()",
+            "host:8080/path",
+            "http://example.com:8080/a@b",
+            "see https://example.com/docs",
+            "a\u{200B}b",
+            "apikey",
+            "monkeyKey=1",
+        ] {
+            assert_eq!(redact(same), same, "false positive");
+        }
     }
 
     /// (input, expected) pairs covering every shape.
@@ -1138,13 +1377,13 @@ mod tests {
 
     #[test]
     fn redact_preserves_unicode_surrounding_tokens() {
-        let input = "🔐 sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456789 🔐";
+        let input = "🔐 sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx 🔐";
         assert_eq!(redact(input), "🔐 «redacted:anthropic-key» 🔐");
     }
 
     #[test]
     fn redact_multiple_different_secrets_in_single_line() {
-        let input = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456789 with password=\"secret\"";
+        let input = "sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx with password=\"secret\"";
         assert_eq!(
             redact(input),
             "«redacted:anthropic-key» with password=\"«redacted:secret»\""

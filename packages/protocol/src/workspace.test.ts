@@ -58,6 +58,22 @@ test('the simulation refuses workspace actions honestly (ADR-009)', () => {
   engine.dispose();
 });
 
+test('git_pull command_result: agentConfigChanged is optional and must be a string list', () => {
+  const base = {
+    type: 'command_result',
+    commandId: 'c',
+    status: 'completed',
+    seq: 1,
+    eventId: 'e',
+    occurredAt: 1,
+  };
+  assert.ok(isServerMessage(base), 'old shape stays valid');
+  assert.ok(isServerMessage({ ...base, agentConfigChanged: [] }));
+  assert.ok(isServerMessage({ ...base, agentConfigChanged: ['.claude/settings.json', 'CLAUDE.md'] }));
+  assert.ok(!isServerMessage({ ...base, agentConfigChanged: 'CLAUDE.md' }));
+  assert.ok(!isServerMessage({ ...base, agentConfigChanged: [1] }));
+});
+
 test('ADR-020 terminal: command bounds, golden server messages, honest simulation', () => {
   assert.equal(FEATURE_TERMINAL, 'terminal.v1');
   const run = (command: unknown) => ({ type: 'terminal_run', commandId: 'c', workspaceId: 'w', command });
