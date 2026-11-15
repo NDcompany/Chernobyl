@@ -42,3 +42,13 @@ Total about $0.16. 9.12 (OpenCode on local Ollama) costs nothing.
 2026-11-15T13:25:00.668Z rows 1.1 10.1 10.3: model claude-haiku-5-5, 1 turns, total_cost_usd 0.0097, claude -p on the PC 0.0000
 2026-11-15T13:43:09.497Z rows 1.1 4.1 10.1 10.3 10.4 10.8: model claude-haiku-5-5, 2 turns, total_cost_usd 0.0069, claude -p on the PC 0.0105
 2026-11-15T13:49:06.748Z rows 1.1 10.8: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0095
+2026-11-15T14:18:17.415Z rows 9.14: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-15T14:26:31.044Z rows 9.14: model gpt-6-luna, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-15T14:42:18.459Z rows 9.14: model gpt-6-luna, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-15T14:47:52.722Z rows 9.15: model gemini-3.8-flash-high, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-15T14:58:22.696Z rows 9.15: model gemini-3.8-flash-high, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-15T15:31:31.962Z rows 9.15: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-15T17:57:14.226Z rows 9.15: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-15T18:01:07.013Z rows 9.15: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-15T18:07:14.554Z rows 9.15: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-15T18:16:45.441Z rows 9.15: model gemini-3.8-flash-high, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000

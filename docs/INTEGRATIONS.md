@@ -101,7 +101,8 @@ page records **which versions were verified** and the limits that matter in prac
   continued on the phone only as a fork). Not offered: ending a session, permission modes,
   slash commands, phone-side MCP sign-in, a live token stream of a thread running in the
   Codex app (the app's app-server is a private child; nothing to attach to). When the
-  app-server exits, its sessions idle; the next prompt respawns it and resumes the thread. An
+  app-server exits, its sessions idle; the next prompt respawns it and resumes the thread. A
+  turn the account refuses (a usage limit) fails with the notice and the session goes idle. An
   interrupt with no turn end in 30 s is `unknown`; a desktop sign-in expires after 10 min.
   Sessions are capped at 8 open per adapter and one new session per 5 s. **Adding a folder to
   `workspaces` is trusting it:** Codex runs there with `approvalPolicy: untrusted` (it asks

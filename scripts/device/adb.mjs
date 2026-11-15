@@ -7,9 +7,20 @@ import { writeFileSync } from 'node:fs';
 
 const ADB = process.env.ADB ?? 'G:/Android/sdk/platform-tools/adb.exe';
 // with several devices attached, every call names one (ANDROID_SERIAL=emulator-5554)
+// Android 4.4 cannot write the dump under /sdcard: UI_DUMP=/data/local/tmp/ui.xml
+const UI = process.env.UI_DUMP ?? '/sdcard/ui.xml';
 const SERIAL = process.env.ANDROID_SERIAL ? ['-s', process.env.ANDROID_SERIAL] : [];
 
 export function adb(args, opts = {}) {
+  // one retry: a loaded emulator sometimes stalls a single adb call past its timeout
+  try {
+    return adbOnce(args, opts);
+  } catch (e) {
+    if (e.code !== 'ETIMEDOUT') throw e;
+    return adbOnce(args, opts);
+  }
+}
+function adbOnce(args, opts) {
   return execFileSync(ADB, [...SERIAL, ...args], { encoding: opts.binary ? 'buffer' : 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: opts.timeout ?? 60_000 });
 }
 export const shell = (cmd) => adb(['shell', cmd]);
@@ -21,8 +32,8 @@ export function dump() {
   for (let i = 0; i < 3 && !xml.includes('<hierarchy'); i++) {
     try {
       // a failed dump (no idle UI) leaves the previous file: never read a stale tree
-      shell('rm -f /sdcard/ui.xml; uiautomator dump /sdcard/ui.xml >/dev/null 2>&1');
-      xml = shell('cat /sdcard/ui.xml 2>/dev/null');
+      shell(`rm -f ${UI}; uiautomator dump ${UI} >/dev/null 2>&1`);
+      xml = shell(`cat ${UI} 2>/dev/null`);
     } catch {
       /* the dump fails while the screen animates; retry */
     }
@@ -118,5 +129,11 @@ export function key(code) {
 }
 
 export function screenshot(path) {
-  writeFileSync(path, adb(['exec-out', 'screencap', '-p'], { binary: true }));
+  try {
+    writeFileSync(path, adb(['exec-out', 'screencap', '-p'], { binary: true }));
+  } catch {
+    // Android 4.4: no exec-out. Screencap on the device, then pull.
+    shell('screencap -p /data/local/tmp/shot.png');
+    adb(['pull', '/data/local/tmp/shot.png', path]);
+  }
 }

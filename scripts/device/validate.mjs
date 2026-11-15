@@ -100,10 +100,18 @@ async function dismissSystemDialogs() {
   }
 }
 async function freshPair(row, { token, endpoints } = {}) {
-  a.shell(`pm clear ${PKG}`);
-  launch();
-  await untilScreen(/Skip onboarding/);
-  await a.tap('Skip onboarding');
+  // a slow emulator sometimes leaves the launcher up after pm clear: launch again
+  for (let t = 0; ; t++) {
+    a.shell(`pm clear ${PKG}`);
+    launch();
+    try {
+      await untilScreen(/Skip onboarding/, 60_000);
+      break;
+    } catch (e) {
+      if (t === 2) throw e;
+    }
+  }
+  await a.tap('Skip onboarding', 90_000);
   await a.waitFor('Pair with a host');
   // the pairing deep link opens the confirm step straight from the entry screen
   const { payload } = endpoints ? c.pair(comp, endpoints) : c.pair(comp);
@@ -405,7 +413,7 @@ const ROWS = {
     a.shell(`pm clear ${PKG}`);
     launch();
     await untilScreen(/Skip onboarding/, 30_000);
-    await a.tap('Skip onboarding');
+    await a.tap('Skip onboarding', 90_000);
     await a.tap('Pair with a host');
     openPairingLink(reused);
     await a.tap('Pair with this host');
@@ -424,7 +432,7 @@ const ROWS = {
     a.shell(`pm clear ${PKG}`);
     launch();
     await untilScreen(/Skip onboarding/, 30_000);
-    await a.tap('Skip onboarding');
+    await a.tap('Skip onboarding', 90_000);
     await a.tap('Pair with a host');
     openPairingLink(payload);
     await a.tap('Pair with this host');
@@ -555,6 +563,9 @@ function approvalsBadge() {
 async function goHome() {
   a.shell(`am start -a android.intent.action.VIEW -d 'chernobyl:///' ${PKG}`);
   await untilScreen(/^Home$/, 20_000);
+  // "Home" is also the tab bar label of whatever tab the app restored: tap that tab
+  await tab('Home');
+  await a.sleep(500);
 }
 /** Finds an element below the fold by swiping the screen up (uiautomator
  *  only lists on-screen views), then back to the top afterwards. */
@@ -567,12 +578,13 @@ async function scrollTo(match, swipes = 6) {
   }
   throw new Error(`not found after scrolling: ${match}`);
 }
-async function newTask(title, message, { doubleTap = false, expectNavigate = true, afterTap, verified = false, agent } = {}) {
+async function newTask(title, message, { doubleTap = false, expectNavigate = true, afterTap, verified = false, agent, beforeStart } = {}) {
   await a.tap(await scrollTo('Start a new task'));
   await a.waitFor('Start session', 15_000);
   if (agent) await a.tap(agent);
   await a.tap('Fix flaky API tests');
-  a.type(title);
+  if (verified) await a.typeVerified(title);
+  else a.type(title);
   await hideKeyboard();
   await a.tap('Describe what the agent should do');
   if (verified) await a.typeVerified(message);
@@ -580,6 +592,7 @@ async function newTask(title, message, { doubleTap = false, expectNavigate = tru
   await hideKeyboard();
   // below the fold since the new-task screen got its Model row
   const btn = await scrollTo('Start a new agent session');
+  if (beforeStart) await beforeStart();
   a.shell(`input tap ${btn.x} ${btn.y}`);
   if (doubleTap) a.shell(`input tap ${btn.x} ${btn.y}`);
   if (afterTap) afterTap();
@@ -1263,10 +1276,226 @@ Object.assign(ROWS, {
       rmSync(base, { recursive: true, force: true, maxRetries: 3 });
     }
   },
+  // 9.14 / 9.15: Codex (codex app-server) and Antigravity (agy acp) on the user's real logins
+  async '9.14'() {
+    await agentRow('9.14', { kind: 'codex', type: 'codex', label: 'Codex', chip: / · Codex$/, modelOnNewTask: false });
+  },
+  async '9.15'() {
+    await agentRow('9.15', { kind: 'antigravity', type: 'antigravity', label: 'Antigravity', chip: / · Antigravity$/, modelOnNewTask: true });
+  },
   async '9.13'() {
     record('9.13', null, 'NOT RUN: no pre-ADR-015 APK artifact kept');
   },
 });
+
+/* ---- rows 9.14 / 9.15: Codex and Antigravity (ADR-015 section 10, ADR-022) on the user's real logins ---- */
+
+// Each agent gets a fresh git repo of its own (never at a drive root, never in this repo)
+const AGENT_WS_BASE = process.env.LIVE_AGENT_WS ?? join(process.env.TEMP ?? '.', 'chernobyl-live-agent-ws');
+function agentRepo(kind) {
+  const dir = `${AGENT_WS_BASE}-${kind}`;
+  if (existsSync(join(dir, '.git'))) return dir;
+  mkdirSync(join(dir, 'src'), { recursive: true });
+  writeFileSync(join(dir, 'README.md'), `# ${kind} device run workspace\n`);
+  writeFileSync(join(dir, 'src', 'hello.txt'), `hello from the ${kind} device run\n`);
+  for (const args of [['init', '-q', '-b', 'main'], ['config', 'user.name', 'CHERNOBYL device run'], ['config', 'user.email', 'device-run@localhost'], ['add', '-A'], ['commit', '-q', '-m', 'Initial commit']]) {
+    const r = git(args, dir);
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+  }
+  return dir;
+}
+
+/** The New task screen for this runtime without starting anything: is there a Model row, and what chips. */
+async function newTaskModelRowNow(row, S) {
+  await goHome();
+  await a.tap(await scrollTo('Start a new task'));
+  await a.waitFor('Start session', 15_000);
+  await a.tap(S.chip);
+  await scrollTo('Start a new agent session');
+  const modelRow = appNode(/^Model$/);
+  const chips = modelRow ? a.dump().filter((n) => n.pkg === PKG && n.clickable && n.y > modelRow.y && n.y < modelRow.y + 200).map((n) => n.text || n.desc) : [];
+  shot(row, 'new-task-again');
+  await tapApp(/^Go back$/);
+  return { shown: !!modelRow, chips };
+}
+
+/** One live row for a spawning runtime: new task -> streamed reply -> inline approval -> Allow -> tool done ->
+ *  Stop mid-stream -> identity -> model chip -> Files and Changes -> companion restart -> history.
+ *  When the agent's own account refuses every turn (a usage limit), the model-dependent steps cannot run: the
+ *  row then records PARTIAL (`pass: null`) with the notice as evidence and checks the rest. */
+async function agentRow(row, S) {
+  const ws = agentRepo(S.kind);
+  rmSync(join(ws, 'note.txt'), { force: true });
+  const adapter = { id: `${S.kind}-1`, type: S.type, enabled: true, workspaces: [ws] };
+  await startLive([adapter]);
+  await ensureLive(row);
+  const agentNow = async () => (await snapshotNow())?.agents?.find((x) => x.kind === S.kind);
+  const agent = await until(async () => {
+    const x = await agentNow();
+    return x?.live?.workspaces?.length ? x : null;
+  }, 60_000, 1000);
+  if (!agent) return record(row, false, `no ${S.label} agent with a workspace in the companion snapshot (${JSON.stringify((await snapshotNow())?.agents?.map((x) => `${x.kind}:${x.state}`))})`);
+  const name = agent.name;
+  const title = `Live ${row}`;
+  const checks = {};
+  let newTaskModels = null;
+  // the wording of tests/opencode_e2e.rs: a shell tool call that needs an approval and leaves a file
+  await newTask(title, 'Use the shell tool to run exactly this command: echo hi > note.txt. When it has finished, write the integers from 1 to 900 separated by spaces, nothing else.', {
+    verified: true,
+    agent: S.chip,
+    beforeStart: async () => {
+      const modelRow = appNode(/^Model$/);
+      const chips = modelRow ? a.dump().filter((n) => n.pkg === PKG && n.clickable && n.y > modelRow.y && n.y < modelRow.y + 200).map((n) => n.text || n.desc) : [];
+      shot(row, 'new-task');
+      newTaskModels = { shown: !!modelRow, chips };
+    },
+  });
+  // a runtime that spawns lazily (agy) does not know its models before its first session: no row yet
+  checks.firstNewTaskModelRowHidden = newTaskModels?.shown === false;
+  const sid = await until(async () => (await snapshotNow())?.sessions?.find((x) => x.title === title)?.id, 60_000, 1000);
+  if (!sid) return record(row, false, `no ${S.label} session created; screen: ${a.screenText().slice(0, 300)}`);
+  live.sid = sid;
+  live.obs.send({ type: 'session_subscribe', commandId: `obs-${Date.now()}`, sessionId: sid });
+  const tools = () => [...view().items.values()].filter((i) => i.kind === 'tool');
+  const limitNotice = () => [...view().items.values()].find((i) => i.kind === 'notice' && i.level === 'error' && /usage limit|quota|exhausted|rate limit/i.test(i.text));
+  // an inline approval, or the account's refusal
+  const first = await until(async () => (limitNotice() ? 'limit' : ((await snapshotNow())?.permissions?.find((p) => p.sessionId === live.sid && p.status === 'pending') ?? null)), 240_000, 1500);
+  const limited = first === 'limit' ? limitNotice().text : null;
+  let perm = limited ? null : first;
+  let subtitle = null, waiting = null, waitingA11y = null, head = null, ran = null, wrote = null, reply = null, options = [];
+  let frames = [], grew = false, atStop = 0, stopped = null, lastTurn = null, poem = null;
+  if (!limited && !perm) {
+    shot(row, 'no-approval');
+    return record(row, false, `no approval request within 4 min (tools: ${tools().map((t) => `${t.tool.name}:${t.tool.status}`).join(', ') || 'none'}); screen: ${a.screenText().slice(0, 300)}`);
+  }
+  if (limited) {
+    await jumpLatest();
+    shot(row, 'limit');
+    // the session must not stay "running" with a Stop button once its turn failed
+    const idle = await until(async () => (await snapshotNow())?.sessions?.find((x) => x.id === sid)?.status === 'idle', 30_000, 1000);
+    checks.endsIdleAfterFailedTurn = !!idle && !appNode(/^Stop$/);
+    subtitle = await waitApp(new RegExp(`^${name} · `), 8000);
+    checks.identityHeader = !!subtitle;
+  } else {
+    await jumpLatest();
+    subtitle = await waitApp(new RegExp(`^${name} · `), 8000);
+    waiting = await seek(/^Waiting for you$/, 8000);
+    waitingA11y = appNode(new RegExp(`^${name} is waiting for you$`));
+    checks.identityWaiting = !!subtitle && !!waiting && !!waitingA11y;
+    const allow = await seek(/^Allow( once)?$/, 8000);
+    shot(row, 'approval');
+    options = (perm.options ?? []).map((o) => `${o.label} [${o.scope}]`);
+    if (!allow) return record(row, false, `approval card "${perm.title}: ${perm.command}" (options ${options.join(' | ')}) but no Allow button on the phone; screen: ${a.screenText().slice(0, 300)}`);
+    await a.tap(allow);
+    // the composer shows Stop for as long as the turn runs: take the node before the text streams
+    const stop = await waitApp(/^Stop$/, 15_000);
+    ran = await until(() => tools().find((t) => t.tool.status === 'completed'), 240_000, 1500);
+    // one turn: the approval, then the long reply of the same prompt streams in place and is stopped mid-way
+    // (sampled by screencap: uiautomator stalls while text streams)
+    const tStream = Date.now();
+    poem = await until(() => {
+      const it = [...view().items.values()].filter((i) => i.kind === 'text' && !i.done).at(-1);
+      const len = it?.text.length ?? 0;
+      if (len && len !== frames.at(-1)?.len && frames.length < 3) frames.push({ id: it.id, len, png: cap() });
+      // agy sends big chunks: keep sampling until two differing lengths were seen (or 25 s)
+      return len > 120 && (frames.length >= 2 || Date.now() - tStream > 25_000) ? it : null;
+    }, 240_000, 0);
+    atStop = poem?.text.length ?? 0;
+    // no blind fallback tap: the Send row's other buttons open the camera
+    if (stop) await a.tap(stop);
+    await waitTurnEnd(0, 120_000);
+    frames.slice(0, 2).forEach((f, i) => writeFileSync(join(OUT, `${row}-stream-${i + 1}.png`), f.png));
+    grew = frames.length >= 2 && new Set(frames.map((f) => f.id)).size === 1 && frames[1].len > frames[0].len && !frames[0].png.equals(frames[1].png);
+    stopped = await waitApp(/^Stopped$/, 30_000);
+    lastTurn = endedTurns().at(-1);
+    await jumpLatest();
+    shot(row, 'stopped');
+    const file = join(ws, 'note.txt');
+    // PowerShell's `>` writes UTF-16LE with a BOM
+    const raw = existsSync(file) ? readFileSync(file) : null;
+    wrote = raw ? (raw[0] === 0xff && raw[1] === 0xfe ? raw.toString('utf16le').slice(1) : raw.toString('utf8')).trim() : null;
+    reply = [...view().items.values()].find((i) => i.kind === 'text');
+    head = await seek(new RegExp(`^${name}$`), 5000);
+    checks.toolDone = !!ran && wrote === 'hi';
+    checks.streamed = !!poem && grew;
+    checks.stopped = !!stop && !!stopped && lastTurn?.status === 'interrupted';
+  }
+  const usage = [...view().turns.values()].map((t) => JSON.stringify(t.usage ?? null)).join(' ');
+  // the model chip: the runtime's own models in the conversation's sheet
+  const stateModels = view().state?.models ?? [];
+  const chip = await waitApp(/^Model: /, 20_000);
+  let sheetLabels = [];
+  if (chip) {
+    await a.tap(chip);
+    await waitApp(/^The next turn uses it/, 10_000);
+    const nodes = a.dump().filter((n) => n.pkg === PKG);
+    sheetLabels = stateModels.filter((m) => nodes.some((n) => n.text === m.label || n.desc === m.label)).map((m) => m.label);
+    shot(row, 'model-sheet');
+    a.key('KEYCODE_BACK');
+    await a.sleep(800);
+  }
+  checks.modelChip = !!chip && stateModels.length > 0 && sheetLabels.length >= Math.min(2, stateModels.length);
+  // Files and Changes chips of this agent's workspace
+  let files = null;
+  let changes = null;
+  await toTop();
+  if (await waitApp(/^Files of /, 10_000)) {
+    await tapApp(/^Files of /);
+    files = { src: !!(await waitApp(/^Folder src$/, 20_000)), readme: !!appNode(/^File README\.md$/), note: !!appNode(/^File note\.txt$/) };
+    shot(row, 'files');
+    await tapApp(/^Go back$/);
+  }
+  if (await waitApp(/^Git changes of /, 10_000)) {
+    await tapApp(/^Git changes of /);
+    changes = limited ? { opened: !!(await waitApp(/^Refresh the changes$/, 20_000)) } : { note: !!(await waitApp(/note\.txt/, 20_000)) };
+    shot(row, 'changes');
+    await tapApp(/^Go back$/);
+  }
+  checks.files = !!files?.src && !!files?.readme && (!!limited || !!files?.note);
+  checks.changes = !!(changes?.note ?? changes?.opened);
+  // the New task Model row again, now that a session exists (models are known)
+  const again = await newTaskModelRowNow(row, S);
+  checks.newTaskModelRow = again.shown === S.modelOnNewTask && (!S.modelOnNewTask || stateModels.some((m) => again.chips.includes(m.label)));
+  // the Sessions list, then a companion restart: the thread is listed again and reopens with its history
+  await goHome();
+  await tab('Sessions');
+  await a.sleep(1500);
+  const listed = appNode(new RegExp(`^${title}, .*${name}`));
+  shot(row, 'sessions');
+  checks.listed = !!listed;
+  await startLive([adapter]);
+  live.sid = null;
+  await goHome();
+  if (!(await waitText(/hosts? online/, 60_000))) throw new Error('phone not connected after the restart');
+  await observer();
+  const after = await until(async () => {
+    const list = (await snapshotNow())?.sessions?.filter((x) => x.agentId === agent.id) ?? [];
+    return list.find((x) => x.title === title) ?? list[0] ?? null;
+  }, 90_000, 2000);
+  let history = null;
+  if (after) {
+    await goHome();
+    await tab('Sessions');
+    await a.sleep(1500);
+    const rowNode = appNode(new RegExp(`^${after.title}, `)) ?? (await reveal(new RegExp(`^${after.title}, `)));
+    shot(row, 'sessions-after-restart');
+    if (rowNode) await a.tap(rowNode);
+    else a.shell(`am start -a android.intent.action.VIEW -d 'chernobyl:///session/${after.id}' ${PKG}`);
+    await waitApp(/^Message .+…$|^Continue on phone/, 30_000);
+    await a.sleep(2500);
+    await toTop();
+    history = { text: a.screenText().includes('note.txt') || /sea|numbers|1 2 3/i.test(a.screenText()) };
+    shot(row, 'history');
+  }
+  checks.history = !!history?.text;
+  const ok = Object.values(checks).every(Boolean);
+  record(
+    row,
+    limited ? null : ok,
+    `${limited ? `PARTIAL (environment limit: the ${S.label} login refuses every turn: "${limited.slice(0, 160)}"; the approval, Allow, tool, streaming and Stop steps could not run; the rest below did) ` : ''}${S.label} adapter (${name}); new-task screen: Model row on the first New task: shown=${newTaskModels?.shown}; on the next one (a session exists): shown=${again.shown} chips [${again.chips.join(', ')}] (${S.modelOnNewTask ? 'expected shown' : 'expected hidden'}); ${limited ? `header "${subtitle?.text ?? 'none'}", session ends idle and the Stop button is gone after the failed turn=${checks.endsIdleAfterFailedTurn}` : `approval "${perm.title}: ${perm.command}" options [${options.join(' | ')}]; header "${subtitle?.text ?? 'none'}", working row "${waiting?.text ?? 'none'}" a11y "${waitingA11y?.desc ?? 'none'}", reply head "${head?.text ?? 'none'}"; Allow -> tool ${ran ? `completed (${ran.tool.name}), note.txt=${JSON.stringify(wrote)}` : 'not completed'}; first reply ${JSON.stringify((reply?.text ?? '').slice(0, 60))}; poem streamed in place ${frames.map((f) => f.len).join(' -> ')} chars (differ=${grew}), ${atStop} chars at Stop, footer "Stopped"=${!!stopped}, companion turn ${lastTurn?.status}`}; model chip "${chip?.desc ?? 'none'}", sheet shows ${sheetLabels.length} of ${stateModels.length} companion models (${stateModels.slice(0, 6).map((m) => m.label).join(', ')}); Files ${JSON.stringify(files)}; Changes ${JSON.stringify(changes)}; Sessions row "${listed?.desc ?? 'none'}"; after a companion restart the session is ${after ? `listed ("${after.title}")` : 'NOT listed'} and reopens with its history (first message on screen)=${!!history?.text}; turn usage ${usage}; checks ${JSON.stringify(checks)}`,
+  );
+}
+
 
 /* ---- section 10: phone features of 2026-11-12 (ADR-016/017/018/020, agent identity) ---- */
 
