@@ -13,8 +13,9 @@ use crate::json;
 use crate::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg, WorkspaceOp, parse_client_message};
 use crate::storage::{DeviceRecord, PairingRecord, Storage};
 use crate::ws::{self, Frame, Handshake};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -162,6 +163,45 @@ fn has_control_key(h: &Handshake, companion: &Companion) -> bool {
 pub const MAIN_CONNECTION_CAP: usize = 1024;
 /// Maximum concurrent connections on the loopback diagnostics listener (mandate §2, audit P7).
 pub const DIAG_CONNECTION_CAP: usize = 64;
+
+/// Security pass 2026-11-15 (N2): concurrent connections one peer address may
+/// hold on a listener, so a single host cannot fill the global cap with idle
+/// sockets.
+pub const PER_PEER_CAP: usize = 32;
+/// The same for a loopback peer, which is larger because tunnel traffic
+/// (ngrok, cloudflared) all arrives from 127.0.0.1.
+pub const PER_LOOPBACK_CAP: usize = 256;
+
+/// Live connection count per peer address (one per listener).
+#[derive(Default)]
+struct PeerCounts(Mutex<HashMap<IpAddr, usize>>);
+
+impl PeerCounts {
+    fn admit(&self, ip: IpAddr) -> bool {
+        let cap = if ip.is_loopback() {
+            PER_LOOPBACK_CAP
+        } else {
+            PER_PEER_CAP
+        };
+        let mut map = self.0.lock().unwrap();
+        let n = map.entry(ip).or_insert(0);
+        if *n >= cap {
+            return false;
+        }
+        *n += 1;
+        true
+    }
+
+    fn release(&self, ip: IpAddr) {
+        let mut map = self.0.lock().unwrap();
+        if let Some(n) = map.get_mut(&ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&ip);
+            }
+        }
+    }
+}
 
 type ConnRegistry = Arc<Mutex<Vec<(TcpStream, thread::JoinHandle<()>)>>>;
 
@@ -377,6 +417,7 @@ fn accept_loop(
         return;
     }
     let listener_active = Arc::new(AtomicUsize::new(0));
+    let peers = Arc::new(PeerCounts::default());
     while !stop.load(Ordering::SeqCst) {
         // Opportunistic reaping of finished connection handles (mandate §2, audit P6)
         if let Ok(mut conns) = conn_threads.lock() {
@@ -392,7 +433,8 @@ fn accept_loop(
         }
 
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
+                let peer_ip = peer.ip().to_canonical();
                 // Connection cap check (audit P7)
                 let admitted = listener_active
                     .try_update(Ordering::SeqCst, Ordering::SeqCst, |curr| {
@@ -400,6 +442,16 @@ fn accept_loop(
                     })
                     .is_ok();
                 if !admitted {
+                    companion
+                        .shared
+                        .connections_rejected
+                        .fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                    continue;
+                }
+                // per-peer cap (N2); the global slot is given back on refusal
+                if !peers.admit(peer_ip) {
+                    listener_active.fetch_sub(1, Ordering::SeqCst);
                     companion
                         .shared
                         .connections_rejected
@@ -421,6 +473,7 @@ fn accept_loop(
                     Ok(s) => s,
                     Err(_) => {
                         listener_active.fetch_sub(1, Ordering::SeqCst);
+                        peers.release(peer_ip);
                         companion
                             .shared
                             .connections_active
@@ -440,11 +493,14 @@ fn accept_loop(
 
                 struct ActiveGuard {
                     listener_active: Arc<AtomicUsize>,
+                    peers: Arc<PeerCounts>,
+                    peer_ip: IpAddr,
                     shared: Arc<crate::companion::Shared>,
                 }
                 impl Drop for ActiveGuard {
                     fn drop(&mut self) {
                         self.listener_active.fetch_sub(1, Ordering::SeqCst);
+                        self.peers.release(self.peer_ip);
                         self.shared
                             .connections_active
                             .fetch_sub(1, Ordering::SeqCst);
@@ -452,9 +508,12 @@ fn accept_loop(
                 }
 
                 let stop_conn = stop.clone();
+                let guard_peers = peers.clone();
                 let spawn_res = thread::Builder::new().name("conn".into()).spawn(move || {
                     let _guard = ActiveGuard {
                         listener_active: active_guard_count,
+                        peers: guard_peers,
+                        peer_ip,
                         shared: shared_guard_count,
                     };
                     let _ = handle_conn(
@@ -475,6 +534,7 @@ fn accept_loop(
                     }
                     Err(_) => {
                         listener_active.fetch_sub(1, Ordering::SeqCst);
+                        peers.release(peer_ip);
                         companion
                             .shared
                             .connections_active
@@ -517,12 +577,14 @@ fn handle_conn(
     let mut request = StopAwareReader {
         inner: &mut reader,
         stop: &stop,
-        deadline: Instant::now() + HTTP_REQUEST_DEADLINE,
+        deadline: Instant::now() + HTTP_HEAD_DEADLINE,
     };
     let handshake = match ws::read_handshake(&mut request) {
         Ok(h) => h,
         Err(_) => return Ok(()), // hostile/garbage/shutdown: drop the connection
     };
+    // the head is in: a POST body (loopback hooks only) gets the longer bound
+    request.deadline = Instant::now() + HTTP_REQUEST_DEADLINE;
 
     // Security pass 2026-11-15 (N9): a second Origin header is a smuggling
     // attempt (a proxy and this check could each read a different one).
@@ -1640,7 +1702,10 @@ impl Drop for ConnGuard {
 
 /// Read-timeout poll interval while a connection is idle (audit P6).
 const IDLE_POLL: Duration = Duration::from_millis(250);
-/// Total time a peer gets to send its HTTP request head (and a POST body).
+/// Time a peer gets to send its HTTP request head (security pass 2026-11-15,
+/// N2: was 30 s, which let idle sockets hold the connection cap).
+const HTTP_HEAD_DEADLINE: Duration = Duration::from_secs(5);
+/// Time a POST body gets once its head has arrived.
 const HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
 fn is_timeout(e: &io::Error) -> bool {
@@ -4948,6 +5013,84 @@ mod e2e_tests {
                 other => panic!("expected close 4003, got {other:?}"),
             }
         }
+        shutdown(f);
+    }
+
+    /* ---- security pass 2026-11-15, N2: per-peer cap + head deadline --- */
+
+    #[test]
+    fn peer_counts_cap_each_address_and_free_slots_on_release() {
+        let counts = PeerCounts::default();
+        let ip: IpAddr = "192.0.2.7".parse().unwrap();
+        let other: IpAddr = "192.0.2.8".parse().unwrap();
+        for _ in 0..PER_PEER_CAP {
+            assert!(counts.admit(ip));
+        }
+        assert!(!counts.admit(ip), "one peer past its cap");
+        assert!(counts.admit(other), "another peer is unaffected");
+        counts.release(ip);
+        assert!(counts.admit(ip), "a released slot is reusable");
+        // loopback peers (tunnel exits) share the larger cap
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        for _ in 0..PER_LOOPBACK_CAP {
+            assert!(counts.admit(lo));
+        }
+        assert!(!counts.admit(lo));
+        // an IPv4-mapped loopback is the same peer once canonicalised
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(!counts.admit(mapped.to_canonical()));
+    }
+
+    #[test]
+    fn one_loopback_peer_cannot_exceed_its_cap_on_the_listener() {
+        use std::io::Read;
+        let f = fixture("n2-peer-cap", now_ms() + 60_000, false);
+        let addr = format!("127.0.0.1:{}", f.handle.port);
+        let held: Vec<TcpStream> = (0..PER_LOOPBACK_CAP)
+            .map(|_| TcpStream::connect(&addr).unwrap())
+            .collect();
+        let rejected = |f: &Fixture| {
+            f.companion
+                .shared
+                .connections_rejected
+                .load(Ordering::SeqCst)
+        };
+        let t = Instant::now();
+        while f.companion.shared.connections_active.load(Ordering::SeqCst) < PER_LOOPBACK_CAP as u64
+        {
+            assert!(t.elapsed() < Duration::from_secs(5), "cap not reached");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(rejected(&f), 0);
+        // the next connection is accepted by the OS and dropped by the server
+        let mut extra = TcpStream::connect(&addr).unwrap();
+        extra
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut b = [0u8; 1];
+        assert!(
+            matches!(extra.read(&mut b), Ok(0) | Err(_)),
+            "an over-cap connection gets no service"
+        );
+        assert_eq!(rejected(&f), 1);
+        drop(held);
+        shutdown(f);
+    }
+
+    #[test]
+    fn silent_connection_is_dropped_at_the_head_deadline() {
+        use std::io::Read;
+        let f = fixture("n2-head", now_ms() + 60_000, false);
+        let mut s = TcpStream::connect(format!("127.0.0.1:{}", f.handle.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        let t = Instant::now();
+        let mut b = [0u8; 1];
+        assert!(matches!(s.read(&mut b), Ok(0) | Err(_)));
+        let took = t.elapsed();
+        assert!(
+            took >= Duration::from_secs(4) && took < Duration::from_secs(10),
+            "head deadline is 5 s, closed after {took:?}"
+        );
         shutdown(f);
     }
 
