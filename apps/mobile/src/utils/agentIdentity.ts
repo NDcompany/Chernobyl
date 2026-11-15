@@ -73,8 +73,8 @@ export interface WorkingStatus {
 
 /**
  * What the newest running turn is doing: waiting for the user when a request
- * is pending (or its last item awaits approval), running a tool when its last
- * item is a pending/running tool, otherwise thinking (streaming text or
+ * is pending (or one of its tools awaits approval), running a tool when one of
+ * its tools is pending/running (the newest names it), otherwise thinking (streaming text or
  * reasoning). Null when no turn runs, so the indicator disappears and the
  * turn footer remains.
  */
@@ -87,15 +87,17 @@ export function workingStatus(
   for (const t of turns) if (t.status === 'running' && (!turn || t.startedAt >= turn.startedAt)) turn = t;
   if (!turn) return null;
   if (permissions.some((p) => p.status === 'pending')) return { state: 'waiting', turn };
-  let last: TranscriptItem | undefined;
-  for (let i = items.length - 1; i >= 0 && !last; i--) if (items[i].turnId === turn.id) last = items[i];
-  if (last?.kind === 'tool') {
-    if (last.tool.status === 'awaiting-approval') return { state: 'waiting', turn };
-    if (last.tool.status === 'running' || last.tool.status === 'pending') {
-      return { state: 'working', turn, tool: last.tool.name };
-    }
+  // Any tool of the open turn decides, not the last item: notices (usage
+  // warnings) and other items carry the running turn's id and can land after
+  // the tool card while it still runs.
+  let running: string | undefined;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.turnId !== turn.id || it.kind !== 'tool') continue;
+    if (it.tool.status === 'awaiting-approval') return { state: 'waiting', turn };
+    if (running === undefined && (it.tool.status === 'running' || it.tool.status === 'pending')) running = it.tool.name;
   }
-  return { state: 'thinking', turn };
+  return running === undefined ? { state: 'thinking', turn } : { state: 'working', turn, tool: running };
 }
 
 /** The visible line: "Pondering…", "Running Bash…" or "Waiting for you"; `seed` = the turn id. */

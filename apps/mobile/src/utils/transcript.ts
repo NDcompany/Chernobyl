@@ -463,9 +463,12 @@ export function turnFooter(turn: TurnState): { text: string; tone: FooterTone } 
       return { text: turn.error || 'Failed', tone: 'error' };
     case 'completed': {
       const parts = ['Done'];
-      if (turn.endedAt != null) parts.push(formatDuration(turn.endedAt - turn.startedAt));
-      if (turn.usage) parts.push(formatTokens(turn.usage.inputTokens + turn.usage.outputTokens));
-      if (turn.costUsd != null) parts.push(formatCost(turn.costUsd));
+      // 0 means unknown (a mirrored PC turn has no timing or usage): omit it
+      const ms = turn.endedAt != null ? turn.endedAt - turn.startedAt : 0;
+      const tokens = turn.usage ? turn.usage.inputTokens + turn.usage.outputTokens : 0;
+      if (ms > 0) parts.push(formatDuration(ms));
+      if (tokens > 0) parts.push(formatTokens(tokens));
+      if (turn.costUsd) parts.push(formatCost(turn.costUsd));
       return { text: parts.join(' · '), tone: 'done' };
     }
     default:

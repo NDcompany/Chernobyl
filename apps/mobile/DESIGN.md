@@ -47,14 +47,15 @@ root layout), `ConfirmModal` (destructive confirmations; `note` = scope/safety l
 
 **`lists.tsx`** — `AgentCard` (tile|row), `SessionRow` (agent mark before the agent · host line; ADR-018: `LivePcTag` instead
 of the status pill while `session.livePc`, a `text3` "Forked from “…”" line when `forkedFrom`), `MonoBlock` (command on black), `PermissionCard`
-(compact|full, `resolved` dims; " · from a PC session" after the agent · host line when `fromPc`), `ActivityRow`, `PromptComposer` (RHF+zod, 32,000-char limit, Stop
+(compact|full, `resolved` dims; a separate "From a PC session" line under the agent · host line when `fromPc`, so a long session title never cuts it), `ActivityRow`, `PromptComposer` (RHF+zod, 32,000-char limit, Stop
 while `busy`; `promptWhileBusy` `merge`|`queue` keeps Send enabled mid-turn with "Joins the current
 turn" / "Runs after this turn", `none` blocks it), `Timeline`, `OutputBlock` (stderr→error color,
 system→italic), `FileRow` (+add/−del), `DetailRow`, `SegmentedTabs`. ADR-017 composer extras, each
 only when the parent passes it (from `Agent.live.composer`): `slashCommands` (a leading `/` lists up
 to 8 matching names above the field, prefix matches first; a tap inserts `/<name> `), `canAttach`
 (a camera icon button; `PhotoCapture` is a full-screen black modal on `expo-camera` that shoots at
-≤1280 px and re-encodes the JPEG at falling quality until it fits the base64 budget; 56 px
+about 1280x960 (a fixed `pictureSize` from mount: setting it later rebinds the camera right after it opens) with `takePictureAsync({quality, base64})`, shooting again at falling quality until it fits the base64 budget
+(never `pictureRef` + `savePictureAsync`: expo-camera 58 on Android encodes any quality below 1 at 0); 56 px
 thumbnails with a black × above the field, "N of 4 photos" as the caption; before sending, the
 sealed frame size is checked and "Too large to send in one message" shows in `error`). No gallery:
 that needs `expo-image-picker`, which the app does not ship. Pure helpers in `src/utils/composer.ts`
@@ -82,11 +83,11 @@ a status mark per `ToolStatus`; expands to input `MonoBlock`, output with trunca
 ends in a space so Android's pixel rounding cannot wrap the widest line out of the box), `InlineApproval` /
 `StandaloneApproval` (detail by kind; eyebrow "Approval needed · from a PC session" when `fromPc`; primary + secondary + "More…" with session/persistent grants and
 "Deny and tell <agent> why"; persistent grants confirm the exact rule and file), `PlanCard`,
-`NoticeRow`, `TurnFooter`, reply heads (the first agent item after a prompt or of a new turn —
+`NoticeRow`, `TurnFooter` ("Done · 12.4 s · 4.2k tokens · $0.01"; a value that is 0 or missing, as on a mirrored PC turn, is left out, so just "Done"), reply heads (the first agent item after a prompt or of a new turn —
 `replyStarts` — shows a 16 px `AgentMark` + the agent's name; nested work and notices never do),
 `WorkingRow` (the list footer while a turn runs: animated mark, a status verb from `WORKING_VERBS`
-rotating every 3 s, "Running <tool>…" while a tool runs, "Waiting for you" while a request is
-pending, elapsed seconds and live tokens/cost when the turn reports them; gone when the turn ends, the
+rotating every 3 s, "Running <tool>…" while any tool of the open turn runs (notices after the card do not hide it), "Waiting for you" while a request is
+pending (wins over both), elapsed seconds and live tokens/cost when the turn reports them; gone when the turn ends, the
 footer stays. It ticks on its own `useNow(1000)`, so rows never re-render for it. One polite live
 region whose label only flips between "<agent> is working" and "<agent> is waiting for you"; iOS
 gets the same label via `announceForAccessibility`), `McpChip` ("MCP 4/5" + warning dot), `McpSheet` (status + §4.7 sign-in
@@ -243,6 +244,9 @@ Tabs: `(tabs)/index` Home · `agents` → `agent/[id]` · `sessions` → `sessio
 `permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field; agents with `live.composer` `model` get a Model chip row, Default sending no `model`; the chips are the agent's own `live.models` when it lists them (Antigravity, ADR-022), else Claude's aliases).
 `permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field; Claude Code agents with `live.composer` `model` get a Model chip row, Default sending no `model`; Codex picks its own models in the session).
 Full-screen (no gesture back): `onboarding`, `sign-in`.
+Android system Back pops the stack and leaves the app only from a root: `predictiveBackGestureEnabled` stays
+`false` in `app.json` (RN 0.88 registers its back callback only on Android 16+, so with the flag on, Android 13-15
+left the app from any screen).
 Workspace (ADR-016): `files/[workspace]?path=` (one screen per folder, so Back walks up),
 `file/[workspace]?path=` (text viewer), `changes/[workspace]` (git), `terminal/[workspace]`
 (ADR-020, only with `terminal.v1`). Entry points: the agent screen's Workspaces section (Files,
@@ -261,7 +265,10 @@ untouched", sends `submit_prompt {fork: true}` and, on an ok ack naming another 
 in the notes. Idle sessions from the PC keep the plain composer (they resume in place);
 `?focus=<toolItemId>` scrolls the conversation to that card. Requests open through
 `permissionHref` (`@/data/selectors`): the Approvals tab, Home's pending list and notification taps
-open a request from a live conversation at its card, any other request at `permission/[id]`. Local
+open a request from a live conversation at its card, any other request at `permission/[id]`. That screen draws
+a record with `options` through the same `InlineApproval` (labels verbatim: a PC-session hook request is Allow / Deny);
+only a legacy record without options gets Approve Once / Reject, plus "Approve for Session" when its
+`supportedDecisions` has it and it is not `fromPc`. Local
 notifications carry that route in `data.url` (a `fromPc` request is titled "Approval needed (PC session)"); `onNotificationOpen` (`@/platform/notify`, wired in
 `TransportProvider`) opens it on tap, also when the tap launched the app, and accepts only
 `/session/…` and `/permission/…` routes.

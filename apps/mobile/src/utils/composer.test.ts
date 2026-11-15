@@ -12,7 +12,6 @@ import {
   modelChoices,
   modelLabel,
   newTaskModels,
-  pickPictureSize,
   sealedFrameBytes,
   slashQuery,
   utf8Bytes,
@@ -50,15 +49,10 @@ test('frame budget: UTF-8 bytes and the sealed size', () => {
   assert.ok(sealedFrameBytes(cjk) > FRAME_MAX_BYTES);
 });
 
-test('image budget, picture size and base64 cleanup', () => {
+test('image budget and base64 cleanup', () => {
   assert.equal(imageBudgetLeft([], 100), 100);
   assert.equal(imageBudgetLeft([{ data: 'a'.repeat(60) }, { data: 'b'.repeat(30) }], 100), 10);
   assert.equal(imageBudgetLeft([{ data: 'a'.repeat(120) }], 100), 0);
-  const sizes = ['640x480', '1280x720', '1920x1080', '4032x3024', 'bogus'];
-  assert.equal(pickPictureSize(sizes, 1280), '1280x720');
-  assert.equal(pickPictureSize(sizes, 1000), '640x480');
-  assert.equal(pickPictureSize(['1920x1080', '4032x3024'], 1280), '1920x1080');
-  assert.equal(pickPictureSize([], 1280), undefined);
   assert.equal(cleanBase64('data:image/jpeg;base64,/9j/AA\nBB\r\n=='), '/9j/AABB==');
 });
 

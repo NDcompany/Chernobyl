@@ -1,8 +1,8 @@
 {
   "1.1": {
     "pass": true,
-    "observed": "home: 2 hosts online; companion clients=1; device 35dbb92bdaa3be38 registered=true",
-    "at": "2026-11-11T23:20:13.350Z"
+    "observed": "home: 2 hosts online; companion clients=1; device c5cc70ec62515c9f registered=true",
+    "at": "2026-11-15T13:46:20.505Z"
   },
   "6.2": {
     "pass": true,
@@ -53,7 +53,7 @@
   "4.1": {
     "pass": true,
     "observed": "sessions 5 -> 6; live output on the session screen=true",
-    "at": "2026-11-11T23:20:50.127Z"
+    "at": "2026-11-15T13:35:24.409Z"
   },
   "8.5n": {
     "pass": true,
@@ -192,8 +192,8 @@
   },
   "10.4": {
     "pass": true,
-    "observed": "workspace chernobyl-live-ws (1136971916ff); root lists src and .env, no .git=true; src/hello.txt opened: \"hello from the device run\"; .env shows \"API_KEY=«redacted:env»\" with \"Environment file: every value is hidden. Only the keys leave your PC.\"; the key on screen=false; header back: file -> src=true, src -> root=true; the system Back on the file screen -> left the app (launcher on top)",
-    "at": "2026-11-11T22:42:35.727Z"
+    "observed": "workspace chernobyl-live-ws (1136971916ff); root lists src and .env, no .git=true; src/hello.txt opened: \"hello from the device run\"; .env shows \"API_KEY=«redacted:env»\" with \"Environment file: every value is hidden. Only the keys leave your PC.\"; the key on screen=false; header back: file -> src=true, src -> root=true; the system Back on the file screen -> src; the system Back from .env left the app after 6 presses, from a pushed screen=false",
+    "at": "2026-11-15T13:40:38.304Z"
   },
   "10.5": {
     "pass": true,
@@ -206,9 +206,9 @@
     "at": "2026-11-11T22:37:26.168Z"
   },
   "10.1": {
-    "pass": false,
-    "observed": "header subtitle \"Claude Code · DESKTOP-EXAMPLE\" (mark before it, 10.1-waiting.png); reply head \"none\"; a working-row frame before the tool call (10.1-working-verb.png)=true; while the Bash request was pending: \"Waiting for you\", a11y \"Claude Code is waiting for you\", elapsed \"43s\"; after Allow: \"Running Bash…\" (companion tool status running=true; the turn's items after the tool then: []); the working row gone at turn end=true; Agents row \"Claude Code, Online, 13 total\" (10.1-agents.png); Sessions row \"Live 10.1 7304, idle, Claude Code\" (10.1-sessions.png)",
-    "at": "2026-11-11T23:26:50.901Z"
+    "pass": true,
+    "observed": "header subtitle \"Claude Code · DESKTOP-EXAMPLE\" (mark before it, 10.1-waiting.png); reply head \"Claude Code\"; a working-row frame before the tool call (10.1-working-verb.png)=true; while the Bash request was pending: \"Waiting for you\", a11y \"Claude Code is waiting for you\", elapsed \"28s\"; after Allow: \"Running Bash…\" (companion tool status running=true; the turn's items after the tool then: []); the working row gone at turn end=true; Agents row \"Claude Code, Online, 26 total\" (10.1-agents.png); Sessions row \"Live 10.1 3928, idle, Claude Code\" (10.1-sessions.png)",
+    "at": "2026-11-15T13:38:00.823Z"
   },
   "10.2": {
     "pass": true,
@@ -217,8 +217,8 @@
   },
   "10.3": {
     "pass": false,
-    "observed": "the photo the app captured was black (preview showed the room; 10.3-attached.png thumbnail is black); photo taken in the app's camera (10.3-camera.png), thumbnail in the composer (10.3-attached.png); user bubble \"1 image attached\", companion user item images=1; Claude answered \"Black\"",
-    "at": "2026-11-11T23:28:01.726Z"
+    "observed": "the photo the app captured was black (preview showed the room; 10.3-attached.png thumbnail is black); photo taken in the app's camera (10.3-camera.png), thumbnail in the composer (10.3-attached.png); user bubble \"1 image attached\", companion user item images=1; Claude answered \"Black.\"",
+    "at": "2026-11-15T13:39:04.095Z"
   },
   "10.7": {
     "pass": false,
@@ -227,7 +227,7 @@
   },
   "10.8": {
     "pass": true,
-    "observed": "temp settings from --install-hooks (CLAUDE_CONFIG_DIR=C:\\Users\\you\\AppData\\Local\\Temp\\chernobyl-hook-settings-1794439760369, 10.8-settings.json); request \"Claude wants to use Write: C:\\Users\\you\\AppData\\Local\\Temp\\chernobyl-live-ws\\hook.txt\" (options Allow / Deny) on the Approvals tab (10.8-approvals.png; the dump had 0 nodes, \"from a PC session\" in the card label and text=false); tapping the card title at (360, 450) opened a screen offering [] (10.8-request.png); tapped \"Approve Once (at 360, 1351)\" -> request approved; claude -p exit 0 ($0.0091); hook.txt=\"hi\"; no hook entry or backup in the user's settings.json=true",
-    "at": "2026-11-11T23:31:37.718Z"
+    "observed": "temp settings from --install-hooks (CLAUDE_CONFIG_DIR=C:\\Users\\you\\AppData\\Local\\Temp\\chernobyl-hook-settings-1794750405067, 10.8-settings.json); request \"Claude wants to use Write: C:\\Users\\you\\AppData\\Local\\Temp\\chernobyl-live-ws\\hook.txt\" (options Allow / Deny) on the Approvals tab (10.8-approvals.png; the dump had 0 nodes, \"from a PC session\" in the card label and text=false); tapping the card title at (360, 450) opened a screen offering [] (no dump: see 10.8-request.png) (10.8-request.png); tapped \"Allow (at 213, 1390)\" -> request approved; claude -p exit 0 ($0.0095); hook.txt=\"hi\"; no hook entry or backup in the user's settings.json=true",
+    "at": "2026-11-15T13:48:58.624Z"
   }
 }

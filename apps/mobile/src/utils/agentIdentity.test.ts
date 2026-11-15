@@ -71,6 +71,16 @@ test('workingStatus: thinking, running a tool, waiting', () => {
   assert.equal(workingStatus([tool('b', 't1', 'completed'), tool('c', 't0', 'running')], turns, [])?.state, 'thinking');
 });
 
+test('workingStatus: a notice after the tool card does not hide the running tool', () => {
+  const turns = [turn('t1', 'running')];
+  const notice: TranscriptItem = { id: 'n', ts: 0, turnId: 't1', kind: 'notice', level: 'warning', text: 'usage at 55%' };
+  assert.deepEqual(workingStatus([tool('b', 't1', 'running'), notice], turns, []), { state: 'working', turn: turns[0], tool: 'Bash' });
+  // a running tool anywhere in the open turn wins over later text; the newest one names it
+  assert.equal(workingStatus([tool('a', 't1', 'running', 'Read'), tool('b', 't1', 'pending', 'Edit'), text('c', 't1')], turns, [])?.tool, 'Edit');
+  // waiting for approval still wins over a running tool and over a later notice
+  assert.equal(workingStatus([tool('a', 't1', 'awaiting-approval'), tool('b', 't1', 'running'), notice], turns, [])?.state, 'waiting');
+});
+
 test('workingStatus: the newest running turn wins', () => {
   const turns = [turn('new', 'running', 2000), turn('old', 'running', 1000)];
   assert.equal(workingStatus([], turns, [])?.turn.id, 'new');

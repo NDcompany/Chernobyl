@@ -193,6 +193,10 @@ test('footer: done with duration, tokens and optional cost; stopped; error', () 
   };
   assert.deepEqual(turnFooter(turn), { text: 'Done · 12.4 s · 4.2k tokens · $0.01', tone: 'done' });
   assert.equal(turnFooter({ ...turn, costUsd: undefined })?.text, 'Done · 12.4 s · 4.2k tokens');
+  // a mirrored PC turn: endedAt = startedAt, zero usage, no cost → just "Done"
+  const mirrored = { ...turn, endedAt: turn.startedAt, usage: { inputTokens: 0, outputTokens: 0 }, costUsd: undefined };
+  assert.equal(turnFooter(mirrored)?.text, 'Done');
+  assert.equal(turnFooter({ ...mirrored, endedAt: undefined, usage: undefined, costUsd: 0 })?.text, 'Done');
   assert.deepEqual(turnFooter({ ...turn, status: 'interrupted' }), { text: 'Stopped', tone: 'stopped' });
   assert.deepEqual(turnFooter({ ...turn, status: 'failed', error: 'Claude Code exited with code 1' }), {
     text: 'Claude Code exited with code 1',

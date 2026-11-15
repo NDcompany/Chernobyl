@@ -115,13 +115,13 @@ async function freshPair(row, { token, endpoints } = {}) {
     await a.tap('Pair with a host');
     await a.tap(await scrollTo('Studio Mac'));
     a.type('Device run PC');
-    a.key('KEYCODE_BACK');
+    await hideKeyboard();
     await a.tap(await scrollTo('10.0.4.21:8787'));
     a.type('10.0.2.2:18787');
-    a.key('KEYCODE_BACK');
+    await hideKeyboard();
     await a.tap(await scrollTo('Paste the host token'));
     a.type(token);
-    a.key('KEYCODE_BACK');
+    await hideKeyboard();
     await a.tap(await scrollTo('Connect host'));
     await a.sleep(2000);
   }
@@ -573,11 +573,11 @@ async function newTask(title, message, { doubleTap = false, expectNavigate = tru
   if (agent) await a.tap(agent);
   await a.tap('Fix flaky API tests');
   a.type(title);
-  a.key('KEYCODE_BACK');
+  await hideKeyboard();
   await a.tap('Describe what the agent should do');
   if (verified) await a.typeVerified(message);
   else a.type(message);
-  a.key('KEYCODE_BACK');
+  await hideKeyboard();
   // below the fold since the new-task screen got its Model row
   const btn = await scrollTo('Start a new agent session');
   a.shell(`input tap ${btn.x} ${btn.y}`);
@@ -804,8 +804,13 @@ async function typePrompt(text) {
 }
 /** The soft keyboard covers the composer (the Send node stays in the tree
  *  under it, so a tap would hit a key): hide it first. */
+/** Back only while a real soft keyboard is up: with the AVD's hardware keyboard,
+ *  Gboard shows a small floating toolbar instead, and Back then pops the screen
+ *  (it used to be swallowed while the app opted into predictive back). */
 async function hideKeyboard() {
-  if (/mInputShown=true/.test(a.shell('dumpsys input_method'))) {
+  const ime = /Window\{[^}]*InputMethod\}:[\s\S]*?mGivenContentInsets=\[0,(\d+)\][\s\S]*?mHasSurface=(true|false)/.exec(a.shell('dumpsys window windows'));
+  const covers = !!ime && ime[2] === 'true' && Number(ime[1]) < 1200;
+  if (covers && /mInputShown=true/.test(a.shell('dumpsys input_method'))) {
     a.key('KEYCODE_BACK');
     await a.sleep(600);
   }
@@ -1364,7 +1369,7 @@ Object.assign(ROWS, {
     const perm = await waitPerm(90_000);
     if (!perm) return record('10.1', false, 'no Bash approval request within 90 s');
     await jumpLatest();
-    const head = await waitApp(new RegExp(`^${agentName}$`), 8000);
+    const headPending = await waitApp(new RegExp(`^${agentName}$`), 8000);
     const subtitle = appNode(new RegExp(`^${agentName} · `));
     // the working row is the list footer, under the open approval card
     const waiting = await seek(/^Waiting for you$/, 8000);
@@ -1374,15 +1379,18 @@ Object.assign(ROWS, {
     await tapApp(/^Allow$/);
     const ran = await until(() => tool()?.tool.status === 'running', 30_000, 200);
     const runFrame = cap();
-    const runningNode = ran ? await waitApp(/^Running Bash…$/, 5000) : null;
-    // the working row reads the turn's LAST item: a notice after the tool hides it
+    const runningNode = ran ? await waitApp(/^Running [A-Za-z]+…$/, 5000) : null;
+    // what followed the tool card (a notice there used to hide "Running <Tool>…"; Claude picks Bash or PowerShell)
     const turnItems = [...view().items.values()].filter((i) => i.turnId === tool()?.turnId);
     const afterTool = turnItems.slice(turnItems.indexOf(tool()) + 1).map((i) => i.kind);
     if (runningNode) shot('10.1', 'running-tool');
     else writeFileSync(join(OUT, '10.1-running-tool.png'), runFrame);
     await waitTurnEnd(0, 120_000);
     await jumpLatest();
-    const gone = !appNode(/^Waiting for you$|^Running Bash…$/);
+    const gone = !appNode(/^Waiting for you$|^Running [A-Za-z]+…$/);
+    // the head of the first reply can sit above the open approval card (a runner
+    // miss, not an app bug): the final reply's head is on screen at turn end
+    const head = headPending ?? (await seek(new RegExp(`^${agentName}$`), 5000));
     shot('10.1', 'done');
     await goHome();
     await tab('Sessions');
@@ -1531,6 +1539,10 @@ Object.assign(ROWS, {
       await tapApp(/^Folder src$/);
       await tapApp(/^File hello\.txt$/);
       await waitApp(/hello from the device run/, 20_000);
+    } else {
+      // Back popped to src: open the file again for the header-back walk
+      await tapApp(/^File hello\.txt$/);
+      await waitApp(/hello from the device run/, 20_000);
     }
     // the header's back button walks up: file -> src -> workspace root
     await tapApp(/^Go back$/);
@@ -1544,7 +1556,19 @@ Object.assign(ROWS, {
     const note = appNode(/^Environment file: every value is hidden/);
     const leaked = a.screenText().includes('FAKEFAKE');
     shot('10.4', 'env');
-    record('10.4', backOk && !!hello && !!content && !!env && !!masked && !!note && !leaked && noGit, `workspace ${ws.label} (${ws.id}); root lists src and .env, no .git=${noGit}; src/hello.txt opened: ${JSON.stringify(content?.text.trim() ?? null)}; .env shows ${JSON.stringify(masked?.text.trim() ?? null)} with "${note?.text ?? 'no note'}"; the key on screen=${leaked}; ${backNote}`);
+    // the system Back walks back screen by screen and leaves only from a root
+    // (a screen without the header's "Go back")
+    const onTop = () => a.shell('dumpsys activity activities | grep topResumedActivity');
+    let presses = 0;
+    let leftFromPushed = false;
+    for (; presses < 10 && !/launcher/.test(onTop()); presses++) {
+      const pushed = !!appNode(/^Go back$/);
+      a.key('KEYCODE_BACK');
+      await a.sleep(1500);
+      if (pushed && /launcher/.test(onTop())) leftFromPushed = true;
+    }
+    const walk = `the system Back from .env left the app after ${presses} presses, from a pushed screen=${leftFromPushed}`;
+    record('10.4', hwBack === 'src' && !leftFromPushed && presses > 2 && backOk && !!hello && !!content && !!env && !!masked && !!note && !leaked && noGit, `workspace ${ws.label} (${ws.id}); root lists src and .env, no .git=${noGit}; src/hello.txt opened: ${JSON.stringify(content?.text.trim() ?? null)}; .env shows ${JSON.stringify(masked?.text.trim() ?? null)} with "${note?.text ?? 'no note'}"; the key on screen=${leaked}; ${backNote}; ${walk}`);
   },
   // 10.5: Changes: modified file -> diff -> Stage -> commit -> Push to the bare
   // remote -> clean; a commit from a second clone -> Pull fast-forwards
@@ -1755,7 +1779,7 @@ Object.assign(ROWS, {
     // selectable text takes the tap)
     const nodes = a.dump();
     const row = nodes.find((n) => n.pkg === PKG && n.desc.includes(perm.command));
-    const fromPc = !!row?.desc.includes('from a PC session') && nodes.some((n) => n.text.endsWith(' · from a PC session'));
+    const fromPc = !!row?.desc.includes('from a PC session') && nodes.some((n) => n.text === 'From a PC session');
     const titleNode = nodes.find((n) => n.pkg === PKG && n.text === perm.title);
     a.shell(`input tap ${titleNode?.x ?? 360} ${titleNode?.y ?? 450}`);
     await a.sleep(3000);
@@ -1766,8 +1790,11 @@ Object.assign(ROWS, {
     let card = await until(() => a.dump().find((n) => n.pkg === PKG && /^(Approve Once|Allow)$/.test(n.text || n.desc)), 8000, 500);
     const screen = a.screenText();
     const opener = titleNode ? 'the card title (found by dump)' : 'the card title at (360, 450)';
-    if (!card) card = { x: 360, y: 1351, text: 'Approve Once (at 360, 1351)', desc: '' };
+    if (!card) card = { x: 213, y: 1390, text: 'Allow (at 213, 1390)', desc: '' };
     const offered = ['Approve Once', 'Reject', 'Approve this action for the entire session', 'Allow', 'Deny'].filter((l) => screen.includes(l));
+    // ADR-018: the record's Allow / Deny only, never the classic three (no session grant)
+    const legacy = offered.some((l) => /^Approve /.test(l));
+    const buttonsOk = screen ? !legacy && offered.includes('Allow') && offered.includes('Deny') : null;
     await a.tap(card);
     const r = await Promise.race([pc.done, a.sleep(150_000).then(() => null)]);
     const file = existsSync(join(LIVE_WS, 'hook.txt')) ? readFileSync(join(LIVE_WS, 'hook.txt'), 'utf8').trim() : null;
@@ -1775,7 +1802,7 @@ Object.assign(ROWS, {
     shot('10.8', 'after');
     const untouched = !oursBefore && !ours();
     rmSync(dir, { recursive: true, force: true });
-    record('10.8', file === 'hi' && untouched, `temp settings from --install-hooks (CLAUDE_CONFIG_DIR=${dir}, 10.8-settings.json); request "${perm.title}: ${perm.command}" (options ${opts}) on the Approvals tab (10.8-approvals.png; the dump had ${nodes.length} nodes, "from a PC session" in the card label and text=${fromPc}); tapping ${opener} opened a screen offering [${offered.join(", ")}] (10.8-request.png); tapped "${card.text || card.desc}" -> request ${after}; claude -p exit ${r?.code ?? 'timeout'} ($${r?.cost?.toFixed(4)}); hook.txt=${JSON.stringify(file)}; no hook entry or backup in the user's settings.json=${untouched}`);
+    record('10.8', file === 'hi' && untouched && buttonsOk !== false, `temp settings from --install-hooks (CLAUDE_CONFIG_DIR=${dir}, 10.8-settings.json); request "${perm.title}: ${perm.command}" (options ${opts}) on the Approvals tab (10.8-approvals.png; the dump had ${nodes.length} nodes, "from a PC session" in the card label and text=${fromPc}); tapping ${opener} opened a screen offering [${offered.join(", ")}]${buttonsOk === null ? ' (no dump: see 10.8-request.png)' : ''} (10.8-request.png); tapped "${card.text || card.desc}" -> request ${after}; claude -p exit ${r?.code ?? 'timeout'} ($${r?.cost?.toFixed(4)}); hook.txt=${JSON.stringify(file)}; no hook entry or backup in the user's settings.json=${untouched}`);
   },
 });
 

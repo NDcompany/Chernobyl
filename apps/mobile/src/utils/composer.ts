@@ -55,23 +55,6 @@ export function imageBudgetLeft(images: readonly { data: string }[], totalMax: n
   return Math.max(0, totalMax - images.reduce((n, im) => n + im.data.length, 0));
 }
 
-/**
- * The camera size to shoot at: the largest whose long edge is at most
- * `maxEdge`, else the smallest offered. Sizes look like "1280x720".
- */
-export function pickPictureSize(sizes: readonly string[], maxEdge: number): string | undefined {
-  const parsed = sizes
-    .map((s) => {
-      const m = /^(\d+)x(\d+)$/.exec(s);
-      return m ? { s, edge: Math.max(Number(m[1]), Number(m[2])), area: Number(m[1]) * Number(m[2]) } : null;
-    })
-    .filter((p): p is { s: string; edge: number; area: number } => p !== null);
-  if (!parsed.length) return undefined;
-  const fits = parsed.filter((p) => p.edge <= maxEdge).sort((a, b) => b.area - a.area);
-  if (fits.length) return fits[0].s;
-  return [...parsed].sort((a, b) => a.area - b.area)[0].s;
-}
-
 /** Base64 as the camera returns it, minus a `data:` prefix and line breaks. */
 export function cleanBase64(data: string): string {
   return data.replace(/^data:[^,]*,/, '').replace(/\s+/g, '');

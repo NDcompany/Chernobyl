@@ -1,7 +1,9 @@
 /**
  * Permission request — exact command, args, path, risk and honest scope
- * explanations. Approve once / Reject decide immediately; approving for the
- * whole session goes through a confirmation.
+ * explanations. A record with `options` gets exactly those buttons (the same
+ * InlineApproval as the conversation: labels verbatim, ADR-015/018); a legacy
+ * record gets Approve once / Reject, and approving for the whole session goes
+ * through a confirmation (never for a PC-session request).
  */
 import { useState } from 'react';
 import { StyleSheet, View } from 'react-native';
@@ -20,6 +22,7 @@ import { Screen, PageHeader, Card, ConfirmModal, EmptyState } from '@/ui/surface
 import { MonoBlock } from '@/ui/lists';
 import { AgentIcon } from '@/ui/graphics';
 import { Icon } from '@/ui/icons';
+import { InlineApproval, type ApprovalDecision } from '@/ui/transcript';
 
 export default function PermissionScreen() {
   const authed = useAppStore((s) => s.authed);
@@ -82,6 +85,18 @@ export default function PermissionScreen() {
     if (router.canGoBack()) router.back();
     else router.replace('/approvals');
   };
+
+  // the record's own options (ADR-015 §4.5): sent with the chosen optionId
+  const hasOptions = Boolean(permission.options?.length);
+  const decideOption = async ({ permissionId, decision, revision, ...extra }: ApprovalDecision) => {
+    const ack = await send(
+      commands.approve(permissionId, decision, revision, extra),
+      decision === 'reject' ? 'Request rejected' : 'Approved for this run',
+    );
+    if (ack?.ok) leave();
+  };
+  const offerSession =
+    !permission.fromPc && !hasOptions && permission.supportedDecisions.includes('approve-session');
 
   return (
     <Screen
@@ -194,7 +209,18 @@ export default function PermissionScreen() {
         </Card>
       ) : null}
 
-      {livePending ? (
+      {livePending && hasOptions ? (
+        <View style={{ gap: spacing.sm }}>
+          <Text variant="eyebrow" color={colors.text3} accessibilityRole="header">
+            Your decision
+          </Text>
+          <Card>
+            <InlineApproval permission={permission} onDecide={decideOption} agentKind={agent?.kind} />
+          </Card>
+        </View>
+      ) : null}
+
+      {livePending && !hasOptions ? (
         <>
           <View style={{ gap: spacing.sm }}>
             <Text variant="eyebrow" color={colors.text3} accessibilityRole="header">
@@ -238,26 +264,28 @@ export default function PermissionScreen() {
           </View>
 
           {/* separate, deliberately-not-primary persistent scope action */}
-          <Card style={styles.persistent}>
-            <View style={styles.scopeRow}>
-              <Icon name="shield-check" size={16} color={colors.warning} />
-              <Text variant="sm" color={colors.text2} style={{ flex: 1 }}>
-                <Text variant="smStrong" color={colors.text}>
-                  Separate action:{' '}
+          {offerSession ? (
+            <Card style={styles.persistent}>
+              <View style={styles.scopeRow}>
+                <Icon name="shield-check" size={16} color={colors.warning} />
+                <Text variant="sm" color={colors.text2} style={{ flex: 1 }}>
+                  <Text variant="smStrong" color={colors.text}>
+                    Separate action:{' '}
+                  </Text>
+                  approve this action for the whole session. The same command stays allowed until the
+                  session ends — no further prompts for it.
                 </Text>
-                approve this action for the whole session. The same command stays allowed until the
-                session ends — no further prompts for it.
-              </Text>
-            </View>
-            <Button
-              label="Approve for Session"
-              variant="secondary"
-              loading={busy === 'scope'}
-              disabled={busy !== null || isUnknown}
-              onPress={() => setConfirmSession(true)}
-              accessibilityLabel="Approve this action for the entire session"
-            />
-          </Card>
+              </View>
+              <Button
+                label="Approve for Session"
+                variant="secondary"
+                loading={busy === 'scope'}
+                disabled={busy !== null || isUnknown}
+                onPress={() => setConfirmSession(true)}
+                accessibilityLabel="Approve this action for the entire session"
+              />
+            </Card>
+          ) : null}
         </>
       ) : null}
 

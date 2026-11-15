@@ -43,7 +43,6 @@ import {
   cleanBase64,
   filterSlashCommands,
   imageBudgetLeft,
-  pickPictureSize,
   sealedFrameBytes,
   slashQuery,
 } from '@/utils/composer';
@@ -238,7 +237,11 @@ export function PermissionCard({
   const simulated = Boolean(agent?.simulated || host?.simulated);
   const simLabel = `${permission.fromPc ? ', from a PC session' : ''}${simulated ? ', simulated' : ''}`;
   // ADR-018: asked by a Claude Code session in a terminal or VS Code
-  const origin = permission.fromPc ? ' · from a PC session' : '';
+  const origin = permission.fromPc ? (
+    <Text variant="xs" color={colors.text3} numberOfLines={1}>
+      From a PC session
+    </Text>
+  ) : null;
 
   if (variant === 'compact') {
     return (
@@ -254,10 +257,10 @@ export function PermissionCard({
           <Text variant="mono" color={colors.text2} numberOfLines={1}>
             {permission.command}
           </Text>
-          <Text variant="xs" color={colors.text3} numberOfLines={1}>
+          <Text variant="xs" color={colors.text3} numberOfLines={2}>
             {agent?.name ?? 'Agent'} · {host?.name ?? 'host'}
-            {origin}
           </Text>
+          {origin}
           {simulated ? <SimulatedTag /> : null}
         </View>
         <View style={{ alignItems: 'flex-end', gap: 6 }}>
@@ -280,11 +283,11 @@ export function PermissionCard({
           <Text variant="bodyStrong" numberOfLines={1}>
             {permission.title}
           </Text>
-          <Text variant="xs" color={colors.text2} numberOfLines={1}>
+          <Text variant="xs" color={colors.text2} numberOfLines={2}>
             {agent?.name ?? 'Agent'} · {host?.name ?? 'host'}
             {session ? ` · ${session.title}` : ''}
-            {origin}
           </Text>
+          {origin}
           {simulated ? <SimulatedTag /> : null}
         </View>
         <RiskPill risk={permission.risk} />
@@ -535,8 +538,13 @@ export function PromptComposer({
   );
 }
 
-/** The camera shoots at most this long edge (Claude downsizes past 1568 px anyway). */
-const SHOT_EDGE = 1280;
+/**
+ * The size the camera aims for (CameraX takes the closest supported size at or
+ * below it; Claude downsizes past 1568 px anyway). A fixed prop from mount: a
+ * `pictureSize` set later (it was picked in onCameraReady) rebinds the camera
+ * just after it opened, and on the emulator that second session hung and failed.
+ */
+const SHOT_SIZE = '1280x960';
 /** JPEG qualities tried in turn until the photo fits what is left of the budget. */
 const SHOT_QUALITIES = [0.7, 0.5, 0.35, 0.2, 0.1];
 
@@ -560,7 +568,6 @@ function PhotoCapture({
   const [permission, requestPermission] = useCameraPermissions();
   const ref = useRef<CameraView>(null);
   const insets = useSafeAreaInsets();
-  const [size, setSize] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
 
@@ -574,21 +581,19 @@ function PhotoCapture({
     setBusy(true);
     setError(undefined);
     try {
-      const pic = await cam.takePictureAsync({ pictureRef: true, shutterSound: false });
-      try {
-        for (const quality of SHOT_QUALITIES) {
-          const out = await pic.savePictureAsync({ quality, base64: true });
-          const data = cleanBase64(out.base64 ?? '');
-          if (data.startsWith('/9j/') && data.length <= budget) {
-            onCapture({ uri: out.uri, mediaType: 'image/jpeg', data });
-            close();
-            return;
-          }
+      // Not `pictureRef` + `savePictureAsync`: expo-camera 58 on Android turns
+      // its fractional quality into 0 (`quality.toInt() * 100`) and recycles the
+      // bitmap after one save. A smaller quality is a fresh shot instead.
+      for (const quality of SHOT_QUALITIES) {
+        const out = await cam.takePictureAsync({ quality, base64: true, shutterSound: false });
+        const data = cleanBase64(out?.base64 ?? '');
+        if (out && data.startsWith('/9j/') && data.length <= budget) {
+          onCapture({ uri: out.uri, mediaType: 'image/jpeg', data });
+          close();
+          return;
         }
-        setError('This photo is too large to add. Remove a photo or send what you have.');
-      } finally {
-        pic.release();
       }
+      setError('This photo is too large to add. Remove a photo or send what you have.');
     } catch (e) {
       setError(e instanceof Error && e.message ? e.message : 'The camera could not take a photo');
     } finally {
@@ -616,13 +621,7 @@ function PhotoCapture({
                 ref={ref}
                 style={StyleSheet.absoluteFill}
                 facing="back"
-                pictureSize={size}
-                onCameraReady={() => {
-                  void ref.current
-                    ?.getAvailablePictureSizesAsync()
-                    .then((sizes) => setSize(pickPictureSize(sizes, SHOT_EDGE)))
-                    .catch(() => undefined);
-                }}
+                pictureSize={SHOT_SIZE}
                 onMountError={(e) => setError(e.message || 'The camera failed to start')}
               />
             ) : null}

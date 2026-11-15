@@ -729,6 +729,12 @@ impl Inner {
         {
             // ADR-018: a hook request from a session on the PC
             if let Some(at) = st.hooks.iter().position(|h| h.request.id == *permission_id) {
+                // ADR-018 §2.4: Allow or Deny only, never a session or
+                // persistent grant (the engine refuses those first; this
+                // keeps the hook from reading one as Allow)
+                if decision != "approve-once" && decision != "reject" {
+                    return refuse(command_id, "A PC-session request takes Allow or Deny only");
+                }
                 let h = st.hooks.remove(at);
                 let verdict = if decision == "reject" {
                     HookVerdict::Deny(
@@ -2946,6 +2952,24 @@ pub(crate) mod tests {
         );
         assert!((asked.expires_at - now - 60_000).abs() < 5_000);
         assert!(r.rt.knows_permission(&pid));
+        // never a session grant: the engine (G2) refuses it, and so does the runtime
+        let mut g2 = asked.clone();
+        g2.supported_decisions = crate::protocol::legacy_decisions(&g2.options);
+        assert_eq!(g2.supported_decisions, ["approve-once", "reject"]);
+        assert_eq!(
+            crate::protocol::evaluate_permission_decision(
+                &g2,
+                "approve-session",
+                None,
+                None,
+                &[],
+                g2.revision as f64,
+                now
+            )
+            .err(),
+            Some(crate::protocol::DecisionError::UnsupportedDecision)
+        );
+        assert!(!refusal(r.send(hook_decision("d0", &pid, "approve-session", None))).is_empty());
         ok(r.send(hook_decision("d1", &pid, "approve-once", None)));
         assert_eq!(rx.recv().unwrap(), HookVerdict::Allow);
         assert!(!refusal(r.send(hook_decision("d1b", &pid, "approve-once", None))).is_empty());

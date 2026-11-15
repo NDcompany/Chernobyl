@@ -26,3 +26,19 @@ Total about $0.16. 9.12 (OpenCode on local Ollama) costs nothing.
 2026-11-11T23:14:40.239Z rows 10.8: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
 2026-11-11T23:18:34.405Z rows 10.8: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0039
 2026-11-11T23:31:45.885Z rows 1.1 4.1 9.1 9.5 10.1 10.3 10.7 10.8: model claude-haiku-5-5, 8 turns, total_cost_usd 0.0368, claude -p on the PC 0.0152
+2026-11-12T01:23:41.631Z rows 10.3: model claude-haiku-5-5, 2 turns, total_cost_usd 0.0139, claude -p on the PC 0.0000
+2026-11-12T01:28:24.244Z rows 10.4: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-12T01:31:00.459Z rows 10.4: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-12T01:33:44.205Z rows 10.3: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-12T01:35:55.098Z rows 10.3: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-12T01:41:14.711Z rows 10.3: model claude-haiku-5-5, 2 turns, total_cost_usd 0.0093, claude -p on the PC 0.0000
+2026-11-12T01:49:20.400Z rows 10.3: model claude-haiku-5-5, 2 turns, total_cost_usd 0.0139, claude -p on the PC 0.0000
+2026-11-15T12:15:37.444Z rows 1.1 4.1 10.1 10.3 10.4 10.8: model claude-haiku-5-5, 2 turns, total_cost_usd 0.0114, claude -p on the PC 0.0104
+2026-11-15T12:19:42.312Z rows 10.3: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-15T12:24:12.805Z rows 10.1 10.3: model claude-haiku-5-5, 2 turns, total_cost_usd 0.0022, claude -p on the PC 0.0000
+2026-11-15T12:40:55.097Z rows 10.1 10.3: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0000
+2026-11-15T12:47:14.604Z rows 1.1 10.1 10.3: model claude-haiku-5-5, 1 turns, total_cost_usd 0.0060, claude -p on the PC 0.0000
+2026-11-15T13:00:58.591Z rows 1.1 10.1 10.3: model claude-haiku-5-5, 1 turns, total_cost_usd 0.0095, claude -p on the PC 0.0000
+2026-11-15T13:25:00.668Z rows 1.1 10.1 10.3: model claude-haiku-5-5, 1 turns, total_cost_usd 0.0097, claude -p on the PC 0.0000
+2026-11-15T13:43:09.497Z rows 1.1 4.1 10.1 10.3 10.4 10.8: model claude-haiku-5-5, 2 turns, total_cost_usd 0.0069, claude -p on the PC 0.0105
+2026-11-15T13:49:06.748Z rows 1.1 10.8: model null, 0 turns, total_cost_usd 0.0000, claude -p on the PC 0.0095

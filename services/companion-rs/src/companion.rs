@@ -721,7 +721,38 @@ impl Companion {
             // mock seed sessions/agents shown beside real ones would pass
             // demo data off as live (PRD §13.1, ADR-009). Permissions and
             // activity stay engine-owned — adapter permissions ARE
-            // engine records (ingested at subscribe time).
+            // engine records (ingested at subscribe time) — minus the
+            // seed's: those that point at a hidden demo entity go too.
+            let mut gone: std::collections::HashSet<String> = snap
+                .sessions
+                .iter()
+                .map(|s| s.id.clone())
+                .chain(snap.agents.iter().map(|a| a.id.clone()))
+                .chain(
+                    snap.hosts
+                        .iter()
+                        .filter(|h| h.simulated)
+                        .map(|h| h.id.clone()),
+                )
+                .collect();
+            for id in sessions
+                .iter()
+                .map(|s| &s.id)
+                .chain(agents.iter().map(|a| &a.id))
+            {
+                gone.remove(id);
+            }
+            snap.permissions.retain(|p| {
+                let demo = [&p.session_id, &p.agent_id, &p.host_id]
+                    .iter()
+                    .any(|id| gone.contains(*id));
+                if demo {
+                    gone.insert(p.id.clone());
+                }
+                !demo
+            });
+            snap.activity
+                .retain(|e| e.ref_id.as_ref().is_none_or(|r| !gone.contains(r)));
             snap.sessions = sessions;
             snap.agents = agents;
             // a live runtime is a host on this machine; without a record the
@@ -3195,7 +3226,8 @@ mod tests {
                 vec!["ses-a".into(), "ses-b".into()]
             )
         );
-        // each runtime is a real host; demo hosts go; permissions stay engine-owned
+        // each runtime is a real host; demo hosts go; so do the seed's
+        // permissions and activity (ADR-009: no untagged demo approvals)
         let snap = comp.snapshot();
         let hosts: Vec<&str> = snap.hosts.iter().map(|h| h.id.as_str()).collect();
         assert_eq!(hosts, ["rt-a", "rt-b"]);
@@ -3204,7 +3236,40 @@ mod tests {
                 .iter()
                 .all(|h| !h.simulated && h.status == "connected")
         );
-        assert_eq!(snap.permissions.len(), demo.permissions.len());
+        assert!(!demo.permissions.is_empty() && !demo.activity.is_empty());
+        assert!(snap.permissions.is_empty(), "{:?}", snap.permissions);
+        let demo_refs: Vec<&str> = demo
+            .activity
+            .iter()
+            .filter_map(|e| e.ref_id.as_deref())
+            .collect();
+        assert!(
+            snap.activity
+                .iter()
+                .all(|e| e.ref_id.as_deref().is_none_or(|r| !demo_refs.contains(&r))),
+            "{:?}",
+            snap.activity
+        );
+        // /health counts what the snapshot serves
+        let health = comp.health();
+        assert_eq!(crate::json::get_i64(&health, "pending"), Some(0));
+        assert_eq!(crate::json::get_i64(&health, "hosts"), Some(2));
+        assert_eq!(crate::json::get_i64(&health, "sessions"), Some(2));
+        // no healthy runtime again: the demo approvals and activity come back
+        a.healthy.store(false, Ordering::SeqCst);
+        b.healthy.store(false, Ordering::SeqCst);
+        let back = comp.snapshot();
+        assert_eq!(back.permissions.len(), demo.permissions.len());
+        assert_eq!(back.activity.len(), demo.activity.len());
+        let pending = back
+            .permissions
+            .iter()
+            .filter(|p| p.status == "pending")
+            .count() as i64;
+        assert_eq!(
+            crate::json::get_i64(&comp.health(), "pending"),
+            Some(pending)
+        );
         comp.shutdown(true);
         let _ = std::fs::remove_dir_all(&c.data_dir);
     }
