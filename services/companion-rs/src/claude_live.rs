@@ -32,7 +32,7 @@ use crate::json::{self, Json};
 use crate::protocol::{
     DecisionError, LiveWorkspace, PermissionOption, PermissionRequest, PromptImage, is_claude_model,
 };
-use crate::runtime_io::{child_env, redact};
+use crate::runtime_io::{child_env, redact, show_format_chars};
 use crate::transcript::{
     Field, FileDiff, Item, ItemKind, LiveState, McpAuthState, McpServer, Op, PlanStep, ToolCall,
     ToolStatus, TurnState, Usage,
@@ -2770,7 +2770,8 @@ fn first_chars(s: &str, n: usize) -> String {
 }
 
 /// Drops ANSI escape sequences and control characters (the CLI says
-/// `decision_reason` may carry them) but keeps newlines and tabs.
+/// `decision_reason` may carry them) but keeps newlines and tabs; invisible
+/// format characters (bidi, zero-width) become visible `<U+XXXX>` markers.
 fn plain_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -2790,7 +2791,7 @@ fn plain_text(s: &str) -> String {
             out.push(c);
         }
     }
-    out
+    show_format_chars(&out)
 }
 
 fn redact_json(v: Json) -> Json {
@@ -2964,6 +2965,17 @@ fn value_end(b: &[u8], i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security pass 2026-11-15 (M3): text from the CLI shown on an approval
+    /// card has controls dropped and format characters made visible.
+    #[test]
+    fn plain_text_marks_bidi_and_zero_width_characters() {
+        assert_eq!(
+            plain_text("ok \u{1b}[31mred\u{1b}[0m\u{7} \u{202E}fdp.exe"),
+            "ok red <U+202E>fdp.exe"
+        );
+        assert_eq!(plain_text("a\u{200B}b\nc\td"), "a<U+200B>b\nc\td");
+    }
     use crate::runtime_io::{ChildEvent, ChildIo, PendingAuth, check_callback_url};
     use std::cell::RefCell;
     use std::time::Duration;

@@ -10,6 +10,7 @@ use crate::protocol::{
     LIVE_PERMISSION_TTL_MS, OutputLine, PermissionOption, PermissionRequest, ServerMsg, Session,
     SessionStep, Snapshot, evaluate_permission_decision, legacy_decisions, next_id, now_ms,
 };
+use crate::runtime_io::show_format_chars;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub const TICK_MS: i64 = 1_000;
@@ -119,6 +120,16 @@ impl Engine {
     /// legacy buckets (an old phone never maps a tap to a persistent rule),
     /// and the expiry is the 24 h runtime TTL.
     pub fn ingest_permission(&mut self, mut pr: PermissionRequest) {
+        // security pass 2026-11-15 (M3): every runtime's request text reaches
+        // the phone through here; show invisible format characters (bidi
+        // overrides, zero-width) as markers instead of letting them reorder it
+        for s in [&mut pr.title, &mut pr.command, &mut pr.context] {
+            *s = show_format_chars(s);
+        }
+        for s in pr.args.iter_mut() {
+            *s = show_format_chars(s);
+        }
+        pr.directory = pr.directory.map(|d| show_format_chars(&d));
         if !pr.options.is_empty() {
             pr.supported_decisions = legacy_decisions(&pr.options);
         }
@@ -1098,7 +1109,7 @@ impl Engine {
             id: next_id("ev"),
             ts: now_ms(),
             kind: kind.to_string(),
-            text: text.to_string(),
+            text: show_format_chars(text),
             ref_id: ref_id.map(str::to_string),
         };
         self.state.activity.insert(0, event.clone());
@@ -1183,6 +1194,31 @@ fn plan_progress(cursor: usize, plan_len: usize) -> i64 {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// Security pass 2026-11-15 (M3): a runtime's approval text reaches the
+    /// phone (and the activity feed) with format characters made visible.
+    #[test]
+    fn runtime_permission_text_shows_format_characters() {
+        let (mut engine, _events) = make_engine();
+        let mut pr = runtime_permission("rt:fmt", vec![]);
+        pr.command = "rm -rf build \u{202E}txt.exe".into();
+        pr.title = "Run\u{200B} shell".into();
+        pr.args = vec!["--x\u{2066}".into()];
+        pr.directory = Some("C:\\work\u{FEFF}".into());
+        engine.ingest_permission(pr);
+        let p = stored(&engine, "rt:fmt");
+        assert_eq!(p.command, "rm -rf build <U+202E>txt.exe");
+        assert_eq!(p.title, "Run<U+200B> shell");
+        assert_eq!(p.args, ["--x<U+2066>"]);
+        assert_eq!(p.directory.as_deref(), Some("C:\\work<U+FEFF>"));
+        assert!(
+            engine
+                .state
+                .activity
+                .iter()
+                .any(|a| a.text.contains("<U+202E>") && !a.text.contains('\u{202E}'))
+        );
+    }
 
     fn make_engine() -> (Engine, Arc<Mutex<Vec<ServerMsg>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));

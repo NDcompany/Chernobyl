@@ -50,6 +50,38 @@ const MAX_KEY_LEN: usize = 128;
 /// env, CLI flags and query strings) or a quoted value after `=`/`:`
 /// (`"key": "v"`, `key = 'v'`, escaped `{\"key\":\"v\"}`). An unquoted value
 /// after spaces (`password = read()`) is code, not a secret.
+/// True for the invisible Unicode format characters (category Cf, plus the
+/// line/paragraph separators) that can reorder or hide text on a phone
+/// screen: bidi overrides and isolates, zero-width joiners and spaces, word
+/// joiners, the BOM, soft hyphen, language tags and the like.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+        | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
+/// Replaces every invisible format character with a visible `<U+XXXX>`
+/// marker, so text shown on an approval card or notification cannot reorder
+/// itself (`rm -rf x` + RLO + `txt.exe`) or hide a character. Everything else,
+/// including newlines, passes through. Idempotent.
+pub fn show_format_chars(s: &str) -> String {
+    if !s.chars().any(is_format_char) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        if is_format_char(c) {
+            out.push_str(&format!("<U+{:04X}>", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub fn redact(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
@@ -872,6 +904,38 @@ impl<T> PendingAuth<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security pass 2026-11-15 (M3): invisible format characters are shown,
+    /// not rendered; ordinary text (including non-ASCII) is untouched.
+    #[test]
+    fn show_format_chars_marks_bidi_and_zero_width_characters() {
+        let spoof = "rm -rf build \u{202E}txt.exe\u{202C}";
+        assert_eq!(
+            show_format_chars(spoof),
+            "rm -rf build <U+202E>txt.exe<U+202C>"
+        );
+        for (c, marker) in [
+            ('\u{2066}', "<U+2066>"),
+            ('\u{2069}', "<U+2069>"),
+            ('\u{200E}', "<U+200E>"),
+            ('\u{200F}', "<U+200F>"),
+            ('\u{061C}', "<U+061C>"),
+            ('\u{200B}', "<U+200B>"),
+            ('\u{200C}', "<U+200C>"),
+            ('\u{200D}', "<U+200D>"),
+            ('\u{2060}', "<U+2060>"),
+            ('\u{FEFF}', "<U+FEFF>"),
+            ('\u{00AD}', "<U+00AD>"),
+            ('\u{E0041}', "<U+E0041>"),
+        ] {
+            assert_eq!(show_format_chars(&format!("a{c}b")), format!("a{marker}b"));
+        }
+        let plain = "git push origin main\n\tcaf\u{e9} \u{4e2d}\u{6587} \u{1f600}";
+        assert_eq!(show_format_chars(plain), plain);
+        // idempotent
+        let once = show_format_chars(spoof);
+        assert_eq!(show_format_chars(&once), once);
+    }
 
     /// Secret-shaped test data built at run time, so no key-looking literal
     /// sits in the source for secret scanners to trip on.
