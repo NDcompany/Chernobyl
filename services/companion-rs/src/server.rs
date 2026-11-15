@@ -572,6 +572,7 @@ fn handle_conn(
     // half-sent request
     stream.set_read_timeout(Some(IDLE_POLL))?;
     let mut reader = crate::ffi::clone_stream(&stream)?;
+    let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
     let mut writer = stream;
 
     let mut request = StopAwareReader {
@@ -606,6 +607,22 @@ fn handle_conn(
         return Ok(());
     }
     let remote_posture = remote_posture || proxied;
+    if diagnostics_only {
+        // N7: only a request addressed to the loopback socket itself is ours.
+        // A DNS-rebound page carries its own hostname in Host, and a browser
+        // cannot forge Host.
+        if !diag_host_ok(&handshake, local_port) {
+            drain_body(&mut request, &handshake);
+            let _ = ws::write_http_error(&mut writer, 403, "Forbidden", "");
+            return Ok(());
+        }
+        // N4: no client opens a WebSocket here, so refuse the upgrade rather
+        // than serve a token-less, session-less event stream.
+        if handshake.is_websocket_upgrade() {
+            let _ = ws::write_http_error(&mut writer, 404, "Not Found", "");
+            return Ok(());
+        }
+    }
 
     // HTTP routes (non-upgrade) -------------------------------------------
     if !handshake.is_websocket_upgrade() {
@@ -716,6 +733,19 @@ fn handle_conn(
     }
     ws::write_handshake_response(&mut writer, &accept)?;
     serve_ws(reader, writer, companion, remote_posture, &stop)
+}
+
+/// N7: the diagnostics listener answers only `Host: 127.0.0.1:<port>` or
+/// `Host: localhost:<port>` (what every in-repo client sends).
+fn diag_host_ok(h: &Handshake, port: u16) -> bool {
+    let mut hosts = h.headers.iter().filter(|(k, _)| k == "host");
+    match (hosts.next(), hosts.next()) {
+        (Some((_, v)), None) => {
+            let v = v.to_ascii_lowercase();
+            v == format!("127.0.0.1:{port}") || v == format!("localhost:{port}")
+        }
+        _ => false,
+    }
 }
 
 fn close_payload(code: u16, reason: &str) -> Vec<u8> {
@@ -3093,8 +3123,9 @@ mod e2e_tests {
                 .unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let req = format!(
-            "POST /hooks/claude HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
+            "POST /hooks/claude HTTP/1.1\r\nHost: 127.0.0.1:{dport}\r\nOrigin: http://evil.example\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+            dport = f.handle.diagnostics_port
         );
         s.write_all(req.as_bytes()).unwrap();
         let mut resp = String::new();
@@ -3742,9 +3773,10 @@ mod e2e_tests {
         let body = format!("{{\"deviceId\":\"{}\"}}", f.device_id);
         // a valid control key: the 403 must come from the Origin rule alone
         let req = format!(
-            "POST /devices/revoke HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /devices/revoke HTTP/1.1\r\nHost: 127.0.0.1:{dport}\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             f.companion.control_key(),
-            body.len()
+            body.len(),
+            dport = f.handle.diagnostics_port
         );
         s.write_all(req.as_bytes()).unwrap();
 
@@ -3881,9 +3913,10 @@ mod e2e_tests {
         let body = r#"{"endpoints":["ws://127.0.0.1:8787"]}"#;
         // a valid control key: the 403 must come from the Origin rule alone
         let req = format!(
-            "POST /pairing/offer HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /pairing/offer HTTP/1.1\r\nHost: 127.0.0.1:{dport}\r\nOrigin: http://evil.example\r\n{CONTROL_KEY_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             companion.control_key(),
-            body.len()
+            body.len(),
+            dport = handle.diagnostics_port
         );
         s.write_all(req.as_bytes()).unwrap();
 
@@ -4084,7 +4117,7 @@ mod e2e_tests {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         write!(
             s,
-            "POST /hooks/claude/permission?wait=30000 HTTP/1.1\r\nHost: x\r\n{CONTROL_KEY_HEADER}: {key}\r\nContent-Length: {}\r\n\r\n{ask}",
+            "POST /hooks/claude/permission?wait=30000 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{CONTROL_KEY_HEADER}: {key}\r\nContent-Length: {}\r\n\r\n{ask}",
             ask.len()
         )
         .unwrap();
@@ -5013,6 +5046,59 @@ mod e2e_tests {
                 other => panic!("expected close 4003, got {other:?}"),
             }
         }
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N7): the diagnostics listener answers only a
+    /// request addressed to its own loopback socket, which a DNS-rebound page
+    /// (its own hostname in Host) is not.
+    #[test]
+    fn diagnostics_listener_refuses_a_foreign_host_header() {
+        let f = fixture("n7-host", now_ms() + 60_000, false);
+        let port = f.handle.diagnostics_port;
+        let get = |hosts: &str| {
+            raw_status(
+                port,
+                &format!("GET /health HTTP/1.1\r\n{hosts}Connection: close\r\n\r\n"),
+            )
+        };
+        for ok in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
+            assert!(get(&format!("Host: {ok}\r\n")).contains("200"), "{ok}");
+        }
+        for bad in [
+            "Host: rebind.example.com\r\n".to_string(),
+            format!("Host: rebind.example.com:{port}\r\n"),
+            "Host: 127.0.0.1\r\n".to_string(),
+            format!("Host: 127.0.0.1:{}\r\n", port.wrapping_add(1)),
+            format!("Host: 127.0.0.1:{port}\r\nHost: rebind.example.com\r\n"),
+            String::new(),
+        ] {
+            assert!(get(&bad).contains("403"), "{bad:?}");
+        }
+        // the main listener keeps serving any Host (tunnels rewrite it)
+        let st = raw_status(
+            f.handle.port,
+            "GET /health HTTP/1.1\r\nHost: abc.ngrok-free.app\r\nConnection: close\r\n\r\n",
+        );
+        assert!(st.contains("200"), "{st}");
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N4): no client opens a WebSocket on the
+    /// diagnostics listener, so it answers an upgrade with 404.
+    #[test]
+    fn diagnostics_listener_refuses_websocket_upgrades() {
+        let f = fixture("n4-diag-ws", now_ms() + 60_000, false);
+        let err = WsClient::connect(
+            &format!("127.0.0.1:{}", f.handle.diagnostics_port),
+            "/",
+            None,
+        )
+        .err()
+        .expect("upgrade on the diagnostics listener must be refused");
+        assert!(err.contains("404"), "{err}");
+        // control: the same upgrade on the main listener connects
+        let _ok = connect(&f);
         shutdown(f);
     }
 
