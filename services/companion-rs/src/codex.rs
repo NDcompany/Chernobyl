@@ -2739,6 +2739,10 @@ pub fn find_codex(path: Option<&OsStr>, local_app_data: Option<&Path>) -> Result
     let on_path = path
         .into_iter()
         .flat_map(std::env::split_paths)
+        // a relative PATH entry (including an empty one) resolves against the
+        // daemon's cwd: never take a binary from there (security pass
+        // 2026-11-15, E6; the git and claude lookups do the same)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join("codex.exe"))
         .find(|p| real(p));
     if let Some(p) = on_path {
@@ -4776,6 +4780,17 @@ mod tests {
                 }
             )
         )));
+    }
+
+    #[test]
+    fn find_codex_skips_relative_path_entries() {
+        let rel = format!("chb-rel-codex-{}", std::process::id());
+        std::fs::create_dir_all(&rel).unwrap();
+        std::fs::write(Path::new(&rel).join("codex.exe"), b"planted").unwrap();
+        let paths = std::env::join_paths([Path::new(&rel), Path::new("")]).unwrap();
+        let found = find_codex(Some(&paths), None);
+        let _ = std::fs::remove_dir_all(&rel);
+        assert!(found.unwrap_err().contains("not found"));
     }
 
     #[test]
