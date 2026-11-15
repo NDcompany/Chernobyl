@@ -29,7 +29,8 @@ public final class Md {
             this.bold = bold;
             this.italic = italic;
             this.code = code;
-            this.url = url;
+            // only a safe URL becomes a link; anything else stays the plain text it was
+            this.url = safeUrl(url) ? url : null;
         }
 
         @Override
@@ -150,6 +151,25 @@ public final class Md {
             if (r < cells.size() - 1) sb.append('\n');
         }
         return sb.toString();
+    }
+
+    /**
+     * True only for an http(s) URL without bidi / zero-width / format characters (a link
+     * whose text reads differently from where it goes). Other schemes (javascript:, intent:,
+     * file:, content:, sms:, ...) and null are not links.
+     */
+    public static boolean safeUrl(String url) {
+        if (url == null || !url.regionMatches(true, 0, "http://", 0, 7) && !url.regionMatches(true, 0, "https://", 0, 8)) {
+            return false;
+        }
+        for (int i = 0; i < url.length(); i++) {
+            char ch = url.charAt(i);
+            if (ch >= 0x200B && ch <= 0x200F || ch >= 0x202A && ch <= 0x202E
+                    || ch >= 0x2060 && ch <= 0x2069 || ch == 0xFEFF || ch == 0x061C) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static final Pattern BARE_URL = Pattern.compile("https?://[^\\s<>()\\[\\]]+[^\\s<>()\\[\\].,;:!?'\"]");

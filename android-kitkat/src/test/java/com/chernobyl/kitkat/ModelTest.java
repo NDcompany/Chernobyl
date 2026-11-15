@@ -3,6 +3,7 @@ package com.chernobyl.kitkat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.io.File;
@@ -165,6 +166,23 @@ public class ModelTest {
         assertEquals(Md.RULE, b.get(6).type);
         assertEquals("[[See ], L<https://example.com>[docs (https://example.com)], [ or ], L<https://x.dev/a>[https://x.dev/a], [.]]",
                 b.get(7).runs.toString());
+    }
+
+    @Test
+    public void onlyPlainWebLinksBecomeLinks() {
+        String[] bad = {"javascript:alert(1)", "intent://x#Intent;scheme=http;end", "file:///sdcard/a", "content://x/y",
+                "sms:123?body=hi", "https://example.com/\u202Egpj.exe", "https://exa\u200Bmple.com", "http://a.b/\u2066x",
+                "https://a.b/\uFEFF", "https://a.b/\u061C", "ftp://a.b", ""};
+        for (String u : bad) {
+            assertFalse(u, Md.safeUrl(u));
+            for (Md.Run run : Md.inline("[tap](" + u + ")")) assertNull(u, run.url);
+        }
+        assertFalse(Md.safeUrl(null));
+        assertTrue(Md.safeUrl("https://example.com/a?b=1"));
+        assertTrue(Md.safeUrl("HTTP://example.com"));
+        // a bare URL with a right-to-left override is text, not a link
+        for (Md.Run run : Md.inline("see https://example.com/\u202Egpj.exe now")) assertNull(run.url);
+        assertEquals("[[see ], L<https://x.dev>[https://x.dev], [ now]]", Md.inline("see https://x.dev now").toString());
     }
 
     @Test
