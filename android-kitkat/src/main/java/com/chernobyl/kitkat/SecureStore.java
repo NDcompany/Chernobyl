@@ -8,8 +8,11 @@ import java.security.KeyPairGenerator;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.PublicKey;
+import java.security.UnrecoverableKeyException;
 import java.util.Calendar;
+import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
 import javax.security.auth.x500.X500Principal;
 
 /**
@@ -38,23 +41,51 @@ final class SecureStore {
         return mode;
     }
 
+    /**
+     * True when a failed unwrap can never succeed: the wrap key is gone or was replaced
+     * (bad padding / block size, unrecoverable key, permanently invalidated key). False for a
+     * Keystore that is only unavailable for now (locked, busy, provider error): nothing may be
+     * wiped then. Looks through the cause chain.
+     */
+    static boolean unrecoverable(Throwable e) {
+        for (int depth = 0; e != null && depth < 5; depth++, e = e.getCause()) {
+            if (e instanceof BadPaddingException || e instanceof IllegalBlockSizeException
+                    || e instanceof UnrecoverableKeyException) return true;
+            for (Class<?> c = e.getClass(); c != null; c = c.getSuperclass()) {
+                if (c.getName().equals("android.security.keystore.KeyPermanentlyInvalidatedException")) return true;
+            }
+        }
+        return false;
+    }
+
+    /** The data key, or null while the Keystore cannot be used right now (retried on the next call). */
     private synchronized byte[] key() {
         if (dataKey != null) return dataKey;
         String wrapped = prefs.getString("dk", null), plain = prefs.getString("dk_plain", null);
-        try {
-            if (wrapped != null) {
+        if (wrapped != null) {
+            try {
                 dataKey = rsa(Cipher.DECRYPT_MODE, Crypto.b64decode(wrapped));
                 mode = "Android Keystore (RSA-wrapped key)";
+                if (plain != null) prefs.edit().remove("dk_plain").commit(); // a leftover from before the wrap worked
                 return dataKey;
+            } catch (Exception e) {
+                if (!unrecoverable(e)) return null;
+                // the Keystore lost the wrap key (lock screen reset): stored values are unreadable, start over
+                prefs.edit().clear().commit();
+                plain = null;
             }
-        } catch (Exception e) {
-            // the Keystore lost the wrap key (lock screen reset): stored values are unreadable, start over
-            prefs.edit().clear().commit();
         }
-        if (plain != null) {
-            dataKey = Crypto.b64decode(plain);
-            mode = "app-private storage (no Keystore)";
-            return dataKey;
+        byte[] stored = plain == null ? null : Crypto.b64decode(plain);
+        if (stored != null) {
+            // the Keystore refused last time: wrap the key now, and drop the plain copy once that worked
+            try {
+                prefs.edit().putString("dk", Crypto.b64encode(rsa(Cipher.ENCRYPT_MODE, stored))).remove("dk_plain").commit();
+                mode = "Android Keystore (RSA-wrapped key)";
+            } catch (Exception e) {
+                mode = "app-private storage (no Keystore)";
+            }
+            dataKey = stored;
+            return stored;
         }
         byte[] k = Crypto.random(32);
         try {
@@ -93,18 +124,22 @@ final class SecureStore {
         if (v == null) return null;
         byte[] b = Crypto.b64decode(v);
         if (b == null || b.length < 28) return null;
+        byte[] key = key();
+        if (key == null) return null;
         byte[] nonce = new byte[12], sealed = new byte[b.length - 12];
         System.arraycopy(b, 0, nonce, 0, 12);
         System.arraycopy(b, 12, sealed, 0, sealed.length);
-        byte[] plain = Crypto.open(key(), nonce, Crypto.utf8(name), sealed);
+        byte[] plain = Crypto.open(key, nonce, Crypto.utf8(name), sealed);
         return plain == null ? null : Crypto.utf8Decode(plain);
     }
 
     /** Synchronous (commit): callers rely on it being on disk, e.g. before acking a rekey. */
     boolean put(String name, String value) {
         if (value == null) return prefs.edit().remove("v_" + name).commit();
+        byte[] key = key();
+        if (key == null) return false;
         byte[] nonce = Crypto.random(12);
-        byte[] sealed = Crypto.seal(key(), nonce, Crypto.utf8(name), Crypto.utf8(value));
+        byte[] sealed = Crypto.seal(key, nonce, Crypto.utf8(name), Crypto.utf8(value));
         return prefs.edit().putString("v_" + name, Crypto.b64encode(Crypto.concat(nonce, sealed))).commit();
     }
 }
