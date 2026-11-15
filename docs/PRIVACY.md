@@ -39,7 +39,10 @@ conversations: every session whose folder is inside an allow-listed workspace, i
 started in a terminal or VS Code. The companion reads them from Claude Code's own files
 (`%USERPROFILE%\.claude\projects`) on your PC, only the last 4 MiB of one session at a time and
 only when your phone opens it, and redacts and caps them before they leave the PC, the same as
-live transcripts. Each listed session's title (at most 80 characters, redacted) is part of the
+live transcripts. Codex threads work the same way: the companion asks its own `codex app-server`
+for the threads Codex keeps under `%USERPROFILE%\.codex` (the 50 newest in allow-listed
+workspaces, including ones from the Codex desktop app) and replays a thread's newest 300 items
+only when your phone opens it, redacted and capped. Each listed session's title (at most 80 characters, redacted) is part of the
 session events the journal keeps. A session that a terminal or VS Code is writing right now
 (ADR-018) is followed while your phone has it open: the companion reads only what Claude Code
 appends to that file (at most 256 KiB every 750 ms), redacts and caps it like a live transcript,
