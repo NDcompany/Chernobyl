@@ -59,6 +59,16 @@
     "project": "3f2a9c1d0e4b",
     "model": "opencode/big-pickle"
   },
+  { "type": "set_model", "commandId": "c-model-7", "sessionId": "ses_live_1", "model": "gemini-3.8-flash-low" },
+  {
+    "type": "create_session",
+    "commandId": "c-new-4",
+    "agentId": "agy-1",
+    "title": "t",
+    "prompt": "p",
+    "project": "3f2a9c1d0e4b",
+    "model": "gpt-oss-120b-medium"
+  },
   { "type": "rename_session", "commandId": "c-name-1", "sessionId": "ses_live_1", "title": "Fix the login bug" },
   { "type": "rename_session", "commandId": "c-name-2", "sessionId": "ses_live_1", "title": "Ünïcode ✓ title" }
 ]

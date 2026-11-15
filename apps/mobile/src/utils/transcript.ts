@@ -583,6 +583,8 @@ export function agentShortName(kind?: AgentKind): string {
       return 'Codex';
     case 'opencode':
       return 'OpenCode';
+    case 'antigravity':
+      return 'Antigravity';
     default:
       return 'the agent';
   }

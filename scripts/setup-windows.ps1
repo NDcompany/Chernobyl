@@ -33,6 +33,11 @@
 # `opencode serve --port <port> --hostname 127.0.0.1` hidden in the first workspace folder, now and
 # at every login (HKCU Run).
 #
+# Antigravity (ADR-022): -Antigravity adds a Google Antigravity runtime (`agy acp`) for the same workspace
+# folders. Install agy and sign in first (run `agy` once). The phone answers agy's own permission prompts
+# (allow once or deny); nothing is ever written to agy's settings. -AntigravityModel sets the model new
+# sessions start on (for example gemini-3.8-flash-low; `agy models` lists them).
+#
 # Terminal (ADR-020): -EnableTerminal lets the paired phone run any command line in an allow-listed
 # workspace WITHOUT the agents' approval prompts. Off unless you pass it.
 #
@@ -51,6 +56,8 @@ param(
   [string]$OpenCodeUrl = 'http://127.0.0.1:4096',
   [switch]$StartOpenCode,
   [switch]$EnableTerminal,
+  [switch]$Antigravity,
+  [string]$AntigravityModel,
   [switch]$ConfigOnly
 )
 $ErrorActionPreference = 'Stop'
@@ -71,6 +78,13 @@ if ($NgrokDomain) {
   if ($NgrokDomain -notmatch '^[a-z0-9-]+(\.[a-z0-9-]+)+$') { throw "-NgrokDomain must be a bare host name (got $NgrokDomain)" }
   if (-not (Test-Path $Ngrok)) { throw "ngrok not found at $Ngrok (pass -Ngrok <path>)" }
   $TunnelUrl = "wss://$NgrokDomain"
+}
+if ($AntigravityModel) {
+  if ($AntigravityModel -notmatch '^[a-z][a-z0-9]*([.-][a-z0-9]+)+$' -or $AntigravityModel.Length -gt 64) { throw "-AntigravityModel must be a model id such as gemini-3.8-flash-low (got $AntigravityModel)" }
+  $Antigravity = [switch]$true
+}
+if ($Antigravity -and -not (Get-Command agy -ErrorAction SilentlyContinue) -and -not (Test-Path (Join-Path $env:LOCALAPPDATA 'agy\bin\agy.exe'))) {
+  Write-Warning 'agy is not installed: install Google Antigravity CLI and sign in (run "agy" once) before starting sessions.'
 }
 if ($TunnelUrl -and $TunnelUrl -notmatch '^wss://[^/\s]+/?$') { throw "-TunnelUrl must look like wss://host (got $TunnelUrl)" }
 
@@ -101,6 +115,12 @@ $adapters = @(
 if ($OpenCode) {
   # attach-only; the password (if any) stays in the user variable, never in this file
   $adapters += , ([ordered]@{ id = 'opencode-1'; type = 'opencode'; enabled = $true; endpoint = $OpenCodeUrl; basicAuthEnv = 'OPENCODE_SERVER_PASSWORD' })
+}
+if ($Antigravity) {
+  # ADR-022: agy acp in the same allow-listed folders; the phone never picks a folder
+  $agy = [ordered]@{ id = 'agy-1'; type = 'antigravity'; enabled = $true; workspaces = @($Workspaces | ForEach-Object { (Resolve-Path $_).Path }) }
+  if ($AntigravityModel) { $agy.model = $AntigravityModel }
+  $adapters += , $agy
 }
 $cfg = [ordered]@{
   version = 1

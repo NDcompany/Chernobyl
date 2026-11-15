@@ -46,7 +46,7 @@ export default function NewTaskScreen() {
   const params = useLocalSearchParams<{ agent?: string }>();
   const [busy, setBusy] = useState(false);
   const [submittedCommandId, setSubmittedCommandId] = useState<string | null>(null);
-  // ADR-017: Claude starts on this model (`--model`); 'default' sends none
+  // ADR-017/022: the session starts on this model; 'default' sends none
   const [model, setModel] = useState('default');
   const commandStates = useAppStore((s) => s.commandStates);
 
@@ -91,7 +91,8 @@ export default function NewTaskScreen() {
   const submit = zodHandler(taskSchema, form, (data) => {
     setBusy(true);
     void (async () => {
-      const chosen = pickModel && model !== 'default' ? model : undefined;
+      const offered = modelList.some((m) => m.value === model);
+      const chosen = pickModel && offered && model !== 'default' ? model : undefined;
       const msg = commands.createSession(data.agentId, data.title, data.prompt, data.project || undefined, chosen);
       setSubmittedCommandId('commandId' in msg ? msg.commandId : null);
       const ack = await send(msg);

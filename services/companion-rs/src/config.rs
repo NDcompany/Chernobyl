@@ -27,6 +27,9 @@ pub struct AdapterEntryConfig {
     /// `codex` entries (ADR-015 §4.3): `workspaces`, `binary`, `args`,
     /// validated at load (workspace policy §4.2.3).
     pub codex: Option<crate::codex::LaunchConfig>,
+    /// `antigravity` entries (ADR-022): `workspaces`, `binary`, `model`,
+    /// `maxSessions`, validated at load (the same workspace policy).
+    pub agy: Option<crate::agy::LaunchConfig>,
     /// `claude` entries (ADR-015 §4.2.3): folders the phone may start Claude
     /// Code in. Empty = hook ingress only. Adding a folder is trusting it:
     /// print mode skips Claude's folder-trust dialog. Checked at boot
@@ -222,6 +225,14 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
         } else {
             None
         };
+        let agy = if enabled && kind == "antigravity" {
+            Some(
+                crate::agy::launch_config(entry, &data_dir_ref)
+                    .map_err(|e| format!("adapters[{i}]: {e}"))?,
+            )
+        } else {
+            None
+        };
         let workspaces = match json::get(entry, "workspaces").filter(|_| kind == "claude") {
             None | Some(Json::Null) => Vec::new(),
             Some(Json::Arr(list)) => list
@@ -270,6 +281,7 @@ pub fn validate_config(raw: &Json) -> Result<CompanionConfig, String> {
             basic_auth,
             basic_auth_env,
             codex,
+            agy,
             workspaces,
             binary,
             max_sessions,
@@ -388,6 +400,15 @@ pub fn config_to_json(c: &CompanionConfig) -> Json {
                             fields.push(("binary", json::s(&cx.binary.to_string_lossy())));
                             let args = cx.args.iter().map(|a| json::s(a));
                             fields.push(("args", Json::Arr(args.collect())));
+                        }
+                        if let Some(ag) = &a.agy {
+                            let paths = ag.workspaces.iter().map(|w| json::s(&w.path));
+                            fields.push(("workspaces", Json::Arr(paths.collect())));
+                            fields.push(("binary", json::s(&ag.binary.to_string_lossy())));
+                            if let Some(m) = &ag.model {
+                                fields.push(("model", json::s(m)));
+                            }
+                            fields.push(("maxSessions", Json::Int(ag.max_sessions as i64)));
                         }
                         if !a.workspaces.is_empty() {
                             let list = a.workspaces.iter().map(|w| json::s(w)).collect();

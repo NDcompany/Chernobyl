@@ -127,6 +127,8 @@ export function agentKindLabel(kind: string): string {
       return 'OpenCode';
     case 'codex':
       return 'Codex';
+    case 'antigravity':
+      return 'Antigravity';
     case 'browser':
       return 'Browser automation';
     case 'local':

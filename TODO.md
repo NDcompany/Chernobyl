@@ -384,6 +384,14 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
       the serve's folder as workspace (Files, Changes, Pull, Terminal), model picker, photos,
       slash commands, context meter, rename and native fork; `live_opencode_parity` on 1.19.4 +
       local Ollama. Open: the OpenCode emulator rows.
+- [x] Google Antigravity runtime (ADR-022, branch `feat/antigravity`, 2026-11-12): `agy acp`
+      (Agent Client Protocol) instead of the stream-json approve-then-retry plan, because agy
+      1.5.x asks for permissions inline there; inline once-only approvals, steering, interrupt,
+      model/images/slash commands/mode/rename/end, history via `session/list`/`load`/`resume`,
+      `setup-windows.ps1 -Antigravity`, the saucer mark (app and KitKat). Fake `agy acp` tests
+      plus one live run on agy 1.5.6 (`gemini-3.8-flash-low`, about 75k tokens).
+- [ ] Antigravity on the emulator: create, approve, stop, history and the model picker on
+      screen; one `session_end` against real agy (only the fake answered `session/close`).
 - [ ] One physical-phone run of the checklist (S4), incl. a real camera QR scan.
 - [ ] A human third-party security audit (S9).
 - [x] APK release signing (2026-11-12): `scripts/make-signing-key.ps1` + `CHB_KEYSTORE` in

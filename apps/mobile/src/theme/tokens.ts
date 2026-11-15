@@ -35,6 +35,8 @@ export const agentColors = {
   codex: '#0F8A7E',
   /** OpenCode: indigo (5.4:1 on white, 3.8:1 on black) */
   opencode: '#5B5FC7',
+  /** Antigravity: violet (4.2:1 on white, 5.0:1 on black) */
+  antigravity: '#8B5CF6',
   /** every other agent (browser, local/Ollama, custom, unknown) */
   generic: '#666666',
 } as const;

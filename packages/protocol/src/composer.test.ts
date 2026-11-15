@@ -46,7 +46,14 @@ test('image data is capped across all images; titles count UTF-16 units', () => 
   for (const good of ['default', 'sonnet', 'opus', 'haiku', 'fable', 'opusplan', 'claude-x']) assert.ok(isModelName(good), good);
   const long = `claude-${'a'.repeat(57)}`;
   assert.ok(isModelName(long) && !isModelName(`${long}a`));
-  for (const bad of ['', 'claude-', 'claude-A', 'claude-a b', 'gpt-5', '-model', 7]) {
+  // ADR-022 runtime ids (Antigravity, Codex)
+  for (const good of ['claude-sonnet-4-6', 'gemini-3.8-flash-low', 'gpt-oss-120b-medium', 'gpt-5']) {
+    assert.ok(isModelName(good), good);
+  }
+  for (const bad of ['best', 'Opus', '--dangerously-skip-permissions', 'gemini..x', '9-model', 'gemini-3.8 flash']) {
+    assert.ok(!isModelName(bad), bad);
+  }
+  for (const bad of ['', 'claude-', 'claude-A', 'claude-a b', '-model', 7]) {
     assert.ok(!isModelName(bad), String(bad));
   }
   // ADR-021 OpenCode provider/model ids (Rust `is_provider_model` has the same cases)

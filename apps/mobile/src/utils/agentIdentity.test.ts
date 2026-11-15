@@ -20,6 +20,7 @@ test('markFor: each runtime family has its mark, everything else is generic', ()
   assert.equal(markFor('claude-code'), 'claude');
   assert.equal(markFor('codex'), 'codex');
   assert.equal(markFor('opencode'), 'opencode');
+  assert.equal(markFor('antigravity'), 'antigravity');
   for (const k of ['local', 'browser', 'custom', 'ollama', 'something-new', undefined]) assert.equal(markFor(k), 'generic');
 });
 

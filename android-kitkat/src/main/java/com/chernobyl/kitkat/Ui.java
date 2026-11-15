@@ -232,12 +232,14 @@ final class Ui {
     static final String[] CLAUDE = {"...##...", "..####..", ".######.", "##.##.##", "########", ".######.", "..####..", "...##..."};
     static final String[] CODEX = {"...##...", ".######.", ".#.##.#.", ".######.", ".##..##.", ".######.", "..#..#..", ".##..##."};
     static final String[] OPENCODE = {".##..##.", ".#....#.", ".#....#.", "#..##..#", "#..##..#", ".#....#.", ".#....#.", ".##..##."};
+    static final String[] ANTIGRAVITY = {"..####..", ".#.##.#.", "########", "#.#..#.#", "########", "..#..#..", ".#....#.", "#......#"};
     static final String[] GENERIC = {"..####..", ".######.", "##.##.##", "########", "########", "########", ".######.", ".#.##.#."};
 
     static String[] sprite(String kind) {
         if ("claude-code".equals(kind)) return CLAUDE;
         if ("codex".equals(kind)) return CODEX;
         if ("opencode".equals(kind)) return OPENCODE;
+        if ("antigravity".equals(kind)) return ANTIGRAVITY;
         return GENERIC;
     }
 
@@ -245,6 +247,7 @@ final class Ui {
         if ("claude-code".equals(kind)) return 0xFFD97757; // terracotta
         if ("codex".equals(kind)) return 0xFF0F8A7E; // teal
         if ("opencode".equals(kind)) return 0xFF5B5FC7; // indigo
+        if ("antigravity".equals(kind)) return 0xFF8B5CF6; // violet
         return 0xFF666666;
     }
 

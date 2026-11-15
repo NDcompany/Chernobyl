@@ -1,7 +1,7 @@
 # CHERNOBYL — privacy and data retention
 
 **Applies to:** the desktop companion (`chernobyl-companion.exe`) and the CHERNOBYL phone app.
-**Last reviewed:** 2026-11-12 against ADR-018 (Claude Code sessions running on the PC: live mirror, phone approvals through a hook, fork).
+**Last reviewed:** 2026-11-12 against ADR-022 (Google Antigravity as a live runtime) and ADR-018 (Claude Code sessions running on the PC: live mirror, phone approvals through a hook, fork).
 
 ## The short version
 
@@ -10,7 +10,7 @@ analytics, crash reporting or telemetry. Data moves only between your desktop an
 paired phone, over a connection that is end-to-end encrypted after pairing (ADR-011). Nothing
 is sent to us, because there is no "us" server to send it to.
 
-The agent runtimes you connect (OpenCode, Ollama, Claude Code, Codex) keep their own data under
+The agent runtimes you connect (OpenCode, Ollama, Claude Code, Codex, Antigravity) keep their own data under
 their own policies. CHERNOBYL reads from them on your machine. It does not copy their history
 anywhere else.
 
@@ -67,6 +67,13 @@ and the live transcript and history show only how many images a prompt had. The 
 preview only until the prompt is sent. Claude Code itself saves the prompt, images included, in
 its own session file under `%USERPROFILE%\.claude\projects`, as it does for terminal sessions.
 A model choice and a session name you set on the phone are journaled as sent.
+Antigravity (ADR-022): the companion talks to `agy acp` on your PC; agy keeps its conversations in
+its own files (`%USERPROFILE%\.gemini\antigravity-cli\conversations`) and sends prompts, and
+photos you attach, to Google like any agy session. The companion asks agy for the conversations in
+your allow-listed workspaces (their id, folder, title and time) and, when your phone opens one,
+has agy replay it; the replay is redacted, capped and kept in memory like a live transcript. A
+listed conversation's title is part of the session events the journal keeps. The companion never
+writes agy's settings: approvals are answered once, inside the running session.
 Workspace files and git (ADR-016): folder listings, file content,
 git status and diffs the phone opens are read on demand, sent only to the asking phone and
 never journaled; file content and diffs are redacted for known secret shapes, and `.env*`

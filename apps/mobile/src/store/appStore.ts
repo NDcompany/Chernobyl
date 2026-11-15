@@ -51,6 +51,7 @@ const DEFAULT_SETTINGS: Settings = {
     'claude-code': true,
     opencode: true,
     codex: true,
+    antigravity: true,
     browser: true,
     local: false,
     custom: true,
@@ -291,6 +292,19 @@ export const useAppStore = create<AppState>()(
         settings: s.settings,
         terminalHistory: s.terminalHistory,
       }),
+      // settings saved by an older app lack newer integrations (antigravity): defaults fill them in
+      merge: (persisted, current) => {
+        const p = (persisted ?? {}) as Partial<AppState>;
+        return {
+          ...current,
+          ...p,
+          settings: {
+            ...current.settings,
+            ...p.settings,
+            integrations: { ...current.settings.integrations, ...p.settings?.integrations },
+          },
+        };
+      },
     },
   ),
 );

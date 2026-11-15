@@ -293,7 +293,7 @@ fn user_text(v: &Json) -> Option<String> {
 }
 
 /// `2026-11-12T10:20:30.123Z` (UTC, as Claude writes it) → epoch ms.
-fn iso_ms(s: &str) -> Option<i64> {
+pub(crate) fn iso_ms(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[10] != b'T' {
         return None;

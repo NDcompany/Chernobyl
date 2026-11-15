@@ -18,7 +18,8 @@ number, radius, or font size — import from `@/theme/tokens`. Borders are hairl
   (subtle fill), `text #111111` / `text2 #666666` / `text3 #8B8B8B` (3-step hierarchy),
   `border #D2D2D2`, `borderStrong` (= black). State only: `success #2F7D4F`(+Bg), `warning #9A6B00`(+Bg), `error #A32B2B`(+Bg).
 - `agentColors` (identity, used **only** by `AgentMark`, never for text or state): `claude #D97757`
-  terracotta · `codex #0F8A7E` teal · `opencode #5B5FC7` indigo · `generic #666666`. Each keeps ≥3:1
+  terracotta · `codex #0F8A7E` teal · `opencode #5B5FC7` indigo · `antigravity #8B5CF6` violet ·
+  `generic #666666`. Each keeps ≥3:1
   on both white and black (asserted in `agentIdentity.test.ts`); agent names stay in text colours.
 - `spacing`: xs 4 · sm 8 · md 12 · lg 16 · xl 20 · xxl 24 · xxxl 32 · huge 40.
 - `radii`: screen 34 · lg 24 · md 16 · sm 12 · pill 999.
@@ -108,7 +109,8 @@ transcript's `DiffView`.
 
 **`agentMark.tsx`** — `AgentMark({ kind, size, state })`, the one place agent identity is drawn. Keyed
 by `Agent.kind` via `markFor` (`@/utils/agentIdentity`): `claude-code` → ember (diamond spark with
-eyes), `codex` → antenna bot, `opencode` → braces around a dot, everything else (browser, local/Ollama,
+eyes), `codex` → antenna bot, `opencode` → braces around a dot, `antigravity` → a flying saucer with
+two eyes on its beam (ADR-022; also in the KitKat client's `Ui.java`), everything else (browser, local/Ollama,
 custom, unknown kinds) → round blob. ORIGINAL 8×8 pixel characters — never trace or copy a company's
 logo or mascot; the agent's name is always written beside the mark in text. Sizes 16/24/32/48 stay
 pixel-crisp; eyes are holes so the surface shows through. States: `idle`/`done` still · `thinking`
@@ -238,6 +240,7 @@ carry a `SimulatedTag`. Derived from the keystore pairing and store transport st
 
 Tabs: `(tabs)/index` Home · `agents` → `agent/[id]` · `sessions` → `session/[id]` · `approvals` →
 `permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field; agents with `live.composer` `model` get a Model chip row, Default sending no `model`; the row lists `live.models` when the agent sends them (OpenCode's `provider/model` ids, `newTaskModels`), else Claude Code's aliases, and switching agents resets it to Default).
+`permission/[id]` · `profile` → `settings/[section]`. Modals: `connect-host` (Pair-with-QR camera scan via `expo-camera` with honest not-asked/denied/unavailable states + paste fallback; explicit confirm step before save), `new-task` (agents with `live.workspaces` get a workspace picker instead of the project field; `create_session.project` = the workspace id; other real agents get neither, only simulated agents keep the free-text project field; agents with `live.composer` `model` get a Model chip row, Default sending no `model`; the chips are the agent's own `live.models` when it lists them (Antigravity, ADR-022), else Claude's aliases).
 Full-screen (no gesture back): `onboarding`, `sign-in`.
 Workspace (ADR-016): `files/[workspace]?path=` (one screen per folder, so Back walks up),
 `file/[workspace]?path=` (text viewer), `changes/[workspace]` (git), `terminal/[workspace]`

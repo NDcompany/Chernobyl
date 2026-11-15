@@ -89,4 +89,5 @@ test('ADR-021 models: OpenCode sends its own list, Default stays first', () => {
   assert.deepEqual(newTaskModels([]).map((m) => m.value), ['default', 'sonnet', 'opus', 'haiku']);
   assert.equal(modelLabel('ollama/qwen3.5:4b', modelChoices({ models: oc })), 'qwen3.5 4b');
   assert.equal(modelLabel('ollama/other', oc), 'ollama/other');
+  assert.deepEqual(newTaskModels([{ value: 'gemini-3.8-flash-low', label: 'Gemini 3.8 Flash (Low)' }, { value: 'default', label: 'Default' }]).map((m) => m.value), ['default', 'gemini-3.8-flash-low']);
 });

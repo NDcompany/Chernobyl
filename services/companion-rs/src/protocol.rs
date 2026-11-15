@@ -130,9 +130,9 @@ pub struct AgentLive {
     /// ADR-017 composer features (model | images | commands | context |
     /// rename); the phone hides what is missing. Serialized only when non-empty.
     pub composer: Vec<&'static str>,
-    /// ADR-021: the models a new session may start with, (value, label),
-    /// for runtimes whose list is not Claude Code's aliases (OpenCode).
-    /// Serialized only when non-empty.
+    /// ADR-021/022: the models a new session may start with, (value, label),
+    /// for runtimes whose ids are not Claude Code's aliases. Serialized only
+    /// when non-empty.
     pub models: Vec<(String, String)>,
 }
 
@@ -528,10 +528,31 @@ pub struct PromptImage {
 }
 
 /// A model the phone may pick (TS `isModelName`): a Claude Code model
-/// (`is_claude_model`) or an OpenCode `provider/model` id, nothing a shell
-/// or flag parser could misread. Each runtime checks its own form again.
+/// (`is_claude_model`), an OpenCode `provider/model` id (`is_provider_model`)
+/// or a runtime's model id (`is_runtime_model`, ADR-022), nothing a shell or
+/// flag parser could misread. Each runtime checks the id against its own models.
+pub fn is_model_name(s: &str) -> bool {
+    is_model(s)
+}
+
+/// ADR-022: `gemini-3.8-flash-low`, `gpt-oss-120b-medium`: lowercase letters
+/// and digits in `-`/`.`-separated parts, at least two, starting with a
+/// letter, at most 64 chars.
+pub fn is_runtime_model(s: &str) -> bool {
+    let part = |p: &str| {
+        !p.is_empty()
+            && p.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    };
+    s.len() <= MODEL_MAX
+        && s.starts_with(|c: char| c.is_ascii_lowercase())
+        && s.split(['-', '.']).count() >= 2
+        && s.split(['-', '.']).all(part)
+}
+
+/// Any model the wire accepts (see `is_model_name`).
 pub fn is_model(s: &str) -> bool {
-    is_claude_model(s) || is_provider_model(s)
+    is_claude_model(s) || is_provider_model(s) || is_runtime_model(s)
 }
 
 /// ADR-017: a Claude Code alias or a full `claude-…` id (what `--model` and
@@ -1059,7 +1080,7 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
                 .map(str::to_string),
             images: opt_images(obj)?,
             model: match opt_str(obj, "model", MODEL_MAX)? {
-                Some(m) if !is_model(&m) => return None,
+                Some(m) if !is_model_name(&m) => return None,
                 m => m,
             },
         }),
@@ -1081,7 +1102,7 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMsg> {
         "set_model" => Some(ClientMsg::SetModel {
             command_id: req("commandId")?,
             session_id: req("sessionId")?,
-            model: req("model").filter(|m| is_model(m))?,
+            model: req("model").filter(|m| is_model_name(m))?,
         }),
         "rename_session" => Some(ClientMsg::RenameSession {
             command_id: req("commandId")?,
@@ -3010,7 +3031,9 @@ mod tests {
         }
         let long = format!("claude-{}", "a".repeat(57));
         assert!(is_claude_model(&long) && !is_model(&format!("{long}a")));
-        for bad in ["", "claude-", "claude-A", "claude-a b", "gpt-5", "-model"] {
+        // a runtime id (ADR-022) is a wire model, never a Claude one
+        assert!(is_model("gpt-5") && !is_claude_model("gpt-5"));
+        for bad in ["", "claude-", "claude-A", "claude-a b", "-model"] {
             assert!(!is_model(bad), "{bad}");
         }
         assert!(!is_claude_model("claude-a/b"));
@@ -3030,5 +3053,49 @@ mod tests {
         ] {
             assert!(!is_model(bad), "{bad}");
         }
+        // ADR-022: on the wire, any runtime's model id; Claude's still pass
+        for good in [
+            "default",
+            "claude-sonnet-4-6",
+            "gemini-3.8-flash-low",
+            "gpt-oss-120b-medium",
+            "gpt-5",
+        ] {
+            assert!(is_model_name(good), "{good}");
+        }
+        for bad in [
+            "",
+            "best",
+            "Opus",
+            "claude-",
+            "-model",
+            "--dangerously-skip-permissions",
+            "gemini..x",
+            "9-model",
+            "gemini-3.8 flash",
+            "gpt_5",
+            "claude-opus;calc",
+        ] {
+            assert!(!is_model_name(bad), "{bad}");
+        }
+        assert!(!is_model_name(&format!("claude-{}", "a".repeat(58))));
+        // `models` on Agent.live only when there are some
+        let mut live = AgentLive {
+            prompt_while_busy: "merge",
+            interrupt: true,
+            end: true,
+            permission_modes: vec![],
+            workspaces: vec![],
+            composer: vec![],
+            models: vec![],
+        };
+        assert!(!json::stringify(&live.to_json()).contains("models"));
+        live.models = vec![(
+            "gemini-3.8-flash-low".into(),
+            "Gemini 3.8 Flash (Low)".into(),
+        )];
+        assert!(json::stringify(&live.to_json()).contains(
+            r#""models":[{"value":"gemini-3.8-flash-low","label":"Gemini 3.8 Flash (Low)"}]"#
+        ));
     }
 }

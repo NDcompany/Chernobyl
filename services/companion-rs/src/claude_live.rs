@@ -2629,7 +2629,7 @@ fn split_lines(s: &str) -> Vec<&str> {
         .collect()
 }
 
-fn added_patch(content: &str) -> String {
+pub(crate) fn added_patch(content: &str) -> String {
     let lines = split_lines(content);
     if lines.is_empty() {
         return String::new();
@@ -2642,7 +2642,7 @@ fn added_patch(content: &str) -> String {
 /// The unified diff of `old` against `new` as two texts (an Edit before it
 /// runs, so file line numbers are unknown): common leading and trailing
 /// lines are context, the rest is replaced.
-fn replace_patch(old: &str, new: &str) -> String {
+pub(crate) fn replace_patch(old: &str, new: &str) -> String {
     let (a, b) = (split_lines(old), split_lines(new));
     let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
     let suf = a[pre..]
