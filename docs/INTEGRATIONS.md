@@ -10,7 +10,6 @@ page records **which versions were verified** and the limits that matter in prac
 | OpenCode | agent runtime (live sessions) | `opencode` **1.19.4** (rich parts live run PASS 2026-11-04 on local Ollama; live e2e PASS 2026-10-24), 1.17.7 (Phase 3) | `services/companion-rs/src/opencode.rs` | attach-only HTTP + SSE to a running `opencode serve`; never spawns a second server |
 | Ollama | model runtime | Ollama **0.40.9** | `services/companion-rs/src/ollama.rs` | attach-only HTTP (`/api/version`, `/api/tags`, `/api/ps`) |
 | Claude Code | hook ingress + driven sessions | Claude Code **2.1.309** (`SessionStart` captured live); driven sessions **2.1.310** (live Haiku run through the companion server) | `services/companion-rs/src/claude.rs`, `claude_live.rs`, `claude_runtime.rs` | hooks POST to the loopback diagnostics listener (install the snippet from `chernobyl-companion --claude-hooks` yourself, never auto-written); with `workspaces`, the phone also starts `claude.exe` sessions (stream-json on stdio) in allow-listed folders, and lists, replays and continues (`--resume`) the 50 newest Claude sessions on disk in those folders, refusing one written in the last 2 minutes (ADR-015 §10); the phone also picks the model, attaches camera photos, runs slash commands, shows context use and renames (ADR-017); a session running in a terminal or VS Code streams live to the phone ("Live on PC"), can be forked to continue on the phone (`--resume --fork-session`), and with `--install-hooks` its permission prompts reach the phone (allow once or deny; the PC asks as usual after 120 s, or at once when no phone is connected); the hook round trip is verified live with `claude -p` 2.1.322 (ADR-018) |
-| Codex | agent runtime (live sessions) | **no live run**: openai/codex `970111f` schema, fake app-server processes only | `services/companion-rs/src/codex.rs`, `codex_runtime.rs` | spawns one `codex app-server` (stdio JSON-RPC) per adapter on the first session, in an allow-listed workspace; each phone session is a thread |
 | Antigravity | agent runtime (live sessions) | `agy` **1.5.6** (`agy acp` live run through the runtime 2026-11-12, `gemini-3.8-flash-low`: create, approve a command, follow-up, interrupt, resume in a new process; about 75k tokens) | `services/companion-rs/src/agy.rs`, `agy_runtime.rs` | spawns one `agy acp` (Agent Client Protocol, JSON-RPC on stdio) per adapter; each phone session is an agy session in an allow-listed workspace; history from agy's own `session/list` (ADR-022) |
 | Codex | agent runtime (live sessions) | **codex-cli 0.167.0-alpha.4.1** (inside the Codex desktop app 26.1106; live runs PASS 2026-11-12, 11 short turns; schema from its `generate-ts`) | `services/companion-rs/src/codex.rs`, `codex_runtime.rs` | spawns one `codex app-server` (stdio JSON-RPC) per adapter, found on PATH or in the Codex app's install at every start; each phone session is a thread in an allow-listed workspace; lists, replays, resumes and forks the Codex threads (the Codex app's included) in those folders; model picker, images, context use, rename (ADR-015 §10) |
 | Hermes | — | not installed, deferred | ADR-008 | not offered; unsupported adapters stay invisible rather than half-working |
@@ -70,20 +69,6 @@ page records **which versions were verified** and the limits that matter in prac
   processes; one new session per 5 s. A process idle for 30 min with no phone watching is
   closed and resumed on the next prompt. A companion restart drops driven sessions from the
   phone (their transcripts stay in Claude's own files).
-- **Codex.** Every capability is `limited`: "implemented from openai/codex@970111f schema;
-  verified against fake app-server processes only; no live run". Sessions stream a live
-  transcript; approvals carry Codex's own options (allow, allow for this session, the
-  proposed exec-policy amendment as a persistent option, deny, deny and stop); follow-ups
-  steer the running turn; interrupt, MCP status, desktop MCP sign-in and reconnect (a
-  config reload) work. Not offered: ending a session, permission modes, phone-side MCP
-  sign-in. When the app-server process exits, its sessions idle; the next prompt to one
-  respawns it and resumes the thread (`thread/resume`), and a resume Codex refuses ends the
-  session. An interrupt with no turn end in 30 s is `unknown`; a desktop sign-in expires
-  after 10 min. Sessions are capped at 8 open per adapter and one new session per 5 s. **Adding a folder to `workspaces`
-  is trusting it:** Codex runs with `approvalPolicy: on-request` and
-  `sandbox: workspace-write` there. Workspaces are checked when the config loads, and a bad
-  folder stops the companion from starting. Set `binary` to the real `codex.exe`; npm's
-  `codex.cmd` shim is refused (no shell is ever used).
 - **Antigravity (ADR-022).** Driven through `agy acp`, not the headless `-p` stream-json mode,
   which cannot ask for permissions. Sessions stream a live transcript: text as it is generated
   (agy streams no thinking text), tool cards with the command, its output and edit diffs, a
@@ -104,7 +89,6 @@ page records **which versions were verified** and the limits that matter in prac
   `WindowsPowerShell\v1.0` makes every approved command fail (seen in the live run with a
   trimmed PATH). agy's own rules still apply: what your agy allow-list or `default` mode
   auto-allows (writes inside the workspace) runs without a phone prompt.
-- **Workspace files and git (ADR-016, `workspace.v1`).** Any Claude, Codex or Antigravity workspace on the
 - **Codex** (live-verified 2026-11-12, codex-cli 0.167.0-alpha.4.1, ADR-015 §10). Sessions,
   prompts, interrupt, the streamed transcript, approvals and diffs are `available`; the session
   list, history, spawn and MCP capabilities are `limited` with their reasons. Approvals carry
@@ -128,14 +112,14 @@ page records **which versions were verified** and the limits that matter in prac
   companion finds `codex.exe` on PATH or in the Codex app's install at every start (never a
   `WindowsApps` alias); npm's `codex.cmd` shim is refused (no shell is ever used). The
   companion runs one `codex app-server` from boot (about 200 MB) to list threads.
-- **Workspace files and git (ADR-016, `workspace.v1`).** Any Claude or Codex workspace on the
+- **Workspace files and git (ADR-016, `workspace.v1`).** Any Claude, Codex or Antigravity workspace on the
   allow-list can be browsed read-only from the phone and committed and pushed from it. Git is
   the desktop's own `git.exe` (found on PATH, else `C:\Program Files\Git\cmd\git.exe`; any
   version with `git restore`, 2.23+), run with no shell and no prompts: a push that needs a
   credential prompt fails instead of opening a window, so pushes rely on a credential
   helper or SSH key that already works without asking. Git actions need the workspace to
   be the repository root. Push sends the checked-out branch to its configured upstream only,
-  never forced; there is no pull. Verified against Git for Windows **2.55.0** with temporary
+  never forced. `git pull` is fast-forward only from the upstream (never a merge commit or rebase; ADR-016 §7). Verified against Git for Windows **2.55.0** with temporary
   repositories and a local bare remote (`workspace::tests`); no hosted remote run yet.
 
 ## Updating this page

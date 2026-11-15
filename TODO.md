@@ -1,6 +1,6 @@
 # CHERNOBYL — TODO
 
-Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Code driven sessions live-verified against Haiku, OpenCode rich parts live-verified on 1.19.4 + local Ollama, Codex `limited` against a fake app-server only; pairing QR replay fixed by device key rotation, emulator row 2.2 passes; checklist 30 of 31 rows run on the emulator, all pass; soak built into the binary; the owner's logo everywhere; emulator rows 9.1-9.13 run 2026-11-04: 11 of 13 pass, 9.5 fixed after a FAIL). Before that, 2026-10-25 night (emulator validation of the release APK: 14 checklist rows pass; 95-agent independent security review, 22 findings fixed — `docs/security/INDEPENDENT-REVIEW-2026-10-25.md`; Android foreground service built and device-tested; simulated-data provenance; D1 app-Origin allow-list; cleartext ws:// in release). Before that, 2026-10-25 late (reliability mandate closed: audit P1–P10 + extra findings, D4 live revoke, D9 option B, pairing-while-running fix, Phase 6 camera QR / host records / outcome honesty, Phase 9 gate assessed in `docs/validation/RELEASE-GATE.md`). Earlier: 24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria, `pass: true`; Phase 8 complete: TUI + pairing overlay + windowless autostart + packaging ADR-007; client read-timeout cross-handle fix). Status of the Rust companion rewrite + everything left.
+Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Code driven sessions live-verified against Haiku, OpenCode rich parts live-verified on 1.19.4 + local Ollama, Codex `limited` against a fake app-server until its live run on 2026-11-12; pairing QR replay fixed by device key rotation, emulator row 2.2 passes; checklist 30 of 31 rows run on the emulator, all pass; soak built into the binary; the owner's logo everywhere; emulator rows 9.1-9.13 run 2026-11-04: 11 of 13 pass, 9.5 fixed after a FAIL). Before that, 2026-10-25 night (emulator validation of the release APK: 14 checklist rows pass; 95-agent independent security review, 22 findings fixed — `docs/security/INDEPENDENT-REVIEW-2026-10-25.md`; Android foreground service built and device-tested; simulated-data provenance; D1 app-Origin allow-list; cleartext ws:// in release). Before that, 2026-10-25 late (reliability mandate closed: audit P1–P10 + extra findings, D4 live revoke, D9 option B, pairing-while-running fix, Phase 6 camera QR / host records / outcome honesty, Phase 9 gate assessed in `docs/validation/RELEASE-GATE.md`). Earlier: 24 h soak for S11 **PASSED 2026-10-24** — all 10 criteria, `pass: true`; Phase 8 complete: TUI + pairing overlay + windowless autostart + packaging ADR-007; client read-timeout cross-handle fix). Status of the Rust companion rewrite + everything left.
 
 ## Done
 
@@ -245,9 +245,8 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
       threat-model §3.9 review + S10 gate ✅ `74ce7f3`). Remaining transport decisions:
       **D3 re-scheduled** with interim statement (ADR-013, S7 ✅ — token = connection-admission
       only post-ADR-011; ticket flow deferred to the web-app milestone); **D4
-      recommendation only** (ADR-014, S8 ⛔ — terminate-on-revoke via in-process revoke, needs
-      product-owner ratification; not implemented, current restart-scoped semantics + exposure
-      documented). Optional-transport how-to: `docs/REMOTE-ACCESS.md` (2026-10-25); D4 implemented (`c1c98c7`).
+      implemented** (ADR-014, accepted 2026-10-25: terminate-on-revoke via the in-process revoke route,
+      `c1c98c7`; S8 ✅). Optional-transport how-to: `docs/REMOTE-ACCESS.md` (2026-10-25).
 - [~] Phase 6: mobile integration — **client + wiring done 2026-10-23** (ADR-012 `e7eec9d`,
       QR `dev` contract fix `4e9ff07`, `@chernobyl/e2e` + interop `e6f68b4`, app wiring
       `d5f828e`): crypto decision (pure-JS `@noble/*`, no build-model change), the real
@@ -299,8 +298,8 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
       items ✅ (security suites, revocation incl. live 4003, privacy/retention doc, backup/restore,
       credential scan, integrations doc, no mock advertised as real). **Update 2026-10-25 night:**
       the release APK builds (`scripts/build-android.mjs`) and passes 14 checklist rows on an Android
-      15 emulator; independent agent review done and fixed. Still owed (external): one physical-phone
-      run incl. a real camera QR scan (S4), a human third-party audit (S9), and release signing.
+      15 emulator; independent agent review done and fixed. Still owed (external): a physical-phone
+      run incl. a real camera QR scan (S4) and a human third-party audit (S9); see Open items.
       **Update 2026-11-04:** 30 of 31 checklist rows (sections 1-8) run on the emulator, all pass
       (row 2.2 after the device key rotation `9e460d7`; 6.3 needs a PC reboot). The live-session
       rows 9.1-9.13 ran 2026-11-04: 11 of 13 pass (see the open items).
@@ -318,7 +317,7 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
   - [x] Step 6: Claude Code driver and live runtime (`9cf8b3d`, `cf8dff9`); live round trip
         against Haiku, about $0.01.
   - [x] Step 7: Codex app-server adapter and runtime (`c83ab60`, `410d168`, `05b3481`); every
-        capability `limited`, no live run.
+        capability `limited` at first; live-verified 2026-11-12 (see Open items).
   - [x] Step 8: MCP plumbing and journal redaction (`85c54db`, `f4e5c35`, `cf8dff9`).
   - [x] Step 9: phone conversation UI, transcript store, subscribe lifecycle, workspace picker,
         approval deep links, simulated demo transcript (`ca5ed96`, `43714df`).
@@ -337,7 +336,7 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
 - [ ] Emulator: 9.9 sign-in on a throwaway MCP server, and 9.13 (needs a pre-ADR-015 APK build).
       Row 9.5 re-passed 2026-11-12; the keyboard and list-follow fixes were seen working on screen.
 - [x] Codex: `thread/resume` after the app-server exits, the 30 s interrupt-unknown timer and
-      the 10-min `mcp_auth` expiry (`97bb31a`; fake app-server only, ADR-015 §10).
+      the 10-min `mcp_auth` expiry (`97bb31a`; live-verified 2026-11-12, ADR-015 §10).
 - [x] Claude session history: every session in an allow-listed workspace (phone, terminal or
       VS Code) is listed, replayed and continued with `--resume` (`bd999f6`; live Haiku run
       $0.0076, ADR-015 §10).
@@ -406,17 +405,10 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
 
 ## Explicitly not done (honesty)
 
-- No external/independent security audit; hardening evidence is the hostile-input test corpus
-  (frames, handshake, JSON, client messages) plus the constant-time/limit checks above.
-- No measured numbers for loaded/burst memory — **now measured** for all three shapes: RSS
-  under sustained load (10.99 MB after 517 k persisted commands in 30 s, post-cap), a
-  multi-connection burst (3.8 → 10.4 MB across 400 simultaneous connections), and the soak
-  trend (**1-hour run: 5.1 → 9.9 MB, peak 10.5 MB**, 13 936 connects — and the full
-  **24 h window PASSED 2026-10-24**: 5.14 → 8.12 MB, peak 11.18 MB over 24 h).
-- ~~Command records have no retention cap~~ — **fixed 2026-10-21** (runtime caps + batched
-  eviction + in-process compaction trigger; re-measured footprint above). Residual honest
-  costs: stress throughput 17.2k/s vs 19.2k uncapped (retention selection + compaction
-  rewrites), and `unresolved`-heavy states may legally sit above the cap until boot
-  reconciliation marks them `unknown` (documented on `enforce_command_cap`).
+- No external/independent security audit (open item above). Memory under load is measured
+  (hardening round and soak harness in Done).
+- Retention caps have residual costs: stress throughput 17.2k/s vs 19.2k uncapped (retention
+  selection and compaction rewrites), and `unresolved`-heavy states may legally sit above the
+  cap until boot reconciliation marks them `unknown` (documented on `enforce_command_cap`).
 - `services/host` runs as the differential peer **and** as a test suite (its 21 tests ran
   green in today's `npm run verify`); it is not a supported runtime — the Rust binary is.

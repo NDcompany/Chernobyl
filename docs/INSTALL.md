@@ -152,13 +152,21 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 -Workspaces '
 
 | Flag | Effect |
 |---|---|
-| `-TunnelUrl wss://host` / `-NgrokDomain <name>.ngrok-free.dev` | second endpoint for away from home; turns on `requireE2e` |
+| `-Workspaces 'C:\path\a','C:\path\b'` | required: the folders the agents may work in (allow-listed; each must exist). Claude Code is always set up for them |
+| `-Port <n>` | companion port, default `8787` |
+| `-Exe <path>` | release exe to install, default `services\companion-rs\target\release\chernobyl-companion.exe` |
+| `-TunnelUrl wss://host` | second endpoint for away from home (a tunnel you run yourself); turns on `requireE2e` and checks that the tunnel reaches the companion |
+| `-NgrokDomain <name>.ngrok-free.dev` | runs `ngrok http <port> --url <domain>` hidden, now and at every login, and sets `-TunnelUrl` to `wss://<domain>`; run `ngrok config add-authtoken` once yourself |
+| `-Ngrok <path>` | where `ngrok.exe` is, default `C:\ngrok\ngrok.exe` (used with `-NgrokDomain`) |
+| `-PhoneApprovals` | installs the PermissionRequest hook in `%USERPROFILE%\.claude\settings.json` (same as `--install-hooks`), so Claude Code sessions in a terminal or VS Code also ask the phone; the PC still asks after 120 s. Undo with `--uninstall-hooks` |
 | `-Codex` | adds `{"id":"codex-1","type":"codex","enabled":true,"workspaces":[…]}` for the same folders; no `binary`: the companion finds `codex.exe` at every start (see Codex below) |
 | `-OpenCode [-OpenCodeUrl http://127.0.0.1:4096]` | adds `{"id":"opencode-1","type":"opencode","endpoint":…,"basicAuthEnv":"OPENCODE_SERVER_PASSWORD"}` (attach-only) |
 | `-StartOpenCode` | also runs `opencode serve --port <port> --hostname 127.0.0.1` hidden in the first workspace folder, now and at login (HKCU Run `CHERNOBYL OpenCode`); implies `-OpenCode`, loopback URLs only |
 | `-EnableTerminal` | writes `"terminal": {"enabled": true}`: the paired phone can run shell commands in the workspaces **without approval prompts** (ADR-020). Off otherwise |
+| `-Antigravity` | adds `{"id":"agy-1","type":"antigravity",…}` for the same folders (`agy acp`, ADR-022). Install agy and sign in first (run `agy` once); a warning is shown if agy is not found |
+| `-AntigravityModel <id>` | implies `-Antigravity`; the model new agy sessions start on, such as `gemini-3.8-flash-low` (`agy models` lists them) |
 | `-ConfigOnly` | writes `companion.json` (and the OpenCode launcher) and stops: no install, token, firewall, autostart or process changes |
-| `-NoAutostart`, `-Port`, `-Exe` | as named |
+| `-NoAutostart` | does not register start-on-login (the HKCU Run entries for the companion, ngrok and OpenCode) |
 
 **OpenCode password.** No password is ever written to `companion.json`. If you start `opencode
 serve` with `OPENCODE_SERVER_PASSWORD`, set it as a *user* environment variable (System
@@ -174,6 +182,7 @@ when the server has a password). A plain `opencode run "..."` starts its own pri
 same data folder: its session shows up on the phone only at the companion's next probe (within
 15 s), with its history, and is not streamed while it runs. The OpenCode TUI attached to the
 server (`opencode attach http://127.0.0.1:4096`) streams the same way.
+
 **Codex.** Install the Codex desktop app (or the CLI) and sign in there once (`codex login status`
 should say "Logged in"); the companion never reads or copies the credentials. It finds `codex.exe`
 on `PATH`, else the newest `%LOCALAPPDATA%\OpenAI\Codex\bin\<version>\codex.exe` the app
@@ -182,6 +191,8 @@ overrides it). Verified with codex-cli 0.167.0-alpha.4.1. The companion starts o
 app-server` at boot to list your Codex threads in the workspaces; Codex asks the phone before every
 file change and every command it does not know as read-only, runs without its sandbox, and marks
 each workspace trusted in `%USERPROFILE%\.codex\config.toml`. Turns use your ChatGPT plan's limits.
+
+**Antigravity.** Install Google Antigravity's `agy` CLI and sign in once (run `agy` in a terminal); `setup-windows.ps1 -Antigravity` (or `-AntigravityModel`) adds the runtime for the same folders. The companion runs `agy acp` (ADR-022) and uses `agy.exe` from `%LOCALAPPDATA%\agy\bin`, else from PATH, unless `binary` says otherwise. The phone answers agy's own permission prompts once at a time (allow or deny); the companion never writes agy's settings, so agy's own allow-rules still apply.
 
 `scripts\test-setup-windows.ps1` checks the script without touching your real config, Run key
 or variables (AST parse, then `-ConfigOnly` runs in a temp `APPDATA`, each file loaded by a debug
