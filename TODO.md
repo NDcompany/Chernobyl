@@ -380,6 +380,10 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
       terminal, Settings (alerts, audit), markdown tables, rotating working verbs; 40 JVM tests;
       emulator API 19 run PASS (live Haiku about $0.055). Open: a physical 4.4 tablet (camera
       photo orientation, QR) and the MCP sign-in flows (not run against real accounts).
+- [x] OpenCode parity with Claude Code (ADR-021, branch `feat/opencode-parity`, 2026-11-12):
+      the serve's folder as workspace (Files, Changes, Pull, Terminal), model picker, photos,
+      slash commands, context meter, rename and native fork; `live_opencode_parity` on 1.19.4 +
+      local Ollama. Open: the OpenCode emulator rows.
 - [ ] One physical-phone run of the checklist (S4), incl. a real camera QR scan.
 - [ ] A human third-party security audit (S9).
 - [x] APK release signing (2026-11-12): `scripts/make-signing-key.ps1` + `CHB_KEYSTORE` in

@@ -28,7 +28,7 @@ import {
   permissionById,
   sessionById,
 } from '@/data/selectors';
-import { relativeTime } from '@/utils/format';
+import { agentKindLabel, relativeTime } from '@/utils/format';
 import { useReducedMotion, useNow } from '@/hooks/useReducedMotion';
 import { LivePcTag, ProgressBar, SimulatedTag, StatusDot, StatusPill, Text } from '@/ui/primitives';
 import { Screen, PageHeader, Card, ConfirmModal, EmptyState } from '@/ui/surface';
@@ -392,11 +392,17 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
               dark
               mode={view.state.permissionMode}
               modes={live.permissionModes}
+              agentKind={agent?.kind}
               onChange={(mode) => void send(commands.setPermissionMode(sessionId, mode))}
             />
           ) : null}
           {showModel ? (
-            <ModelChip dark state={view.state} onChange={(model) => void send(commands.setModel(sessionId, model))} />
+            <ModelChip
+              dark
+              state={view.state}
+              agentName={agentKindLabel(agent?.kind ?? '')}
+              onChange={(model) => void send(commands.setModel(sessionId, model))}
+            />
           ) : null}
           {composer.has('context') ? <ContextChip dark context={view.state.context} /> : null}
           <View style={styles.flex} />
@@ -404,6 +410,7 @@ function ConversationScreen({ session, agent, host, focusItemId }: ConversationP
             <RenameChip
               dark
               title={session.title}
+              agentName={agentKindLabel(agent?.kind ?? '')}
               onRename={(title) => void send(commands.renameSession(sessionId, title))}
             />
           ) : null}

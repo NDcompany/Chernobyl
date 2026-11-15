@@ -600,8 +600,12 @@ export function isModeChoice(mode: string): mode is PermissionModeChoice {
   return (PERMISSION_MODE_CHOICES as readonly string[]).includes(mode);
 }
 
-/** Claude's mode names as the VS Code extension labels them; unknown modes verbatim. */
-export function modeLabel(mode?: string): string {
+/**
+ * Claude's mode names as the VS Code extension labels them; unknown modes verbatim. ADR-021:
+ * OpenCode's modes are its built-in agents (`default` = Build, `plan` = Plan).
+ */
+export function modeLabel(mode?: string, kind?: string): string {
+  if (kind === 'opencode' && mode === 'default') return 'Build';
   switch (mode) {
     case 'default':
       return 'Ask before edits';

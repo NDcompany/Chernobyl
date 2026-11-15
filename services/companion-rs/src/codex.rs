@@ -2157,6 +2157,7 @@ impl LaunchConfig {
             permission_modes: Vec::new(),
             workspaces: self.workspaces.clone(),
             composer: Vec::new(),
+            models: Vec::new(),
         }
     }
 }

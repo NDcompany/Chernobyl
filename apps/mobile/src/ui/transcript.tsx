@@ -1521,6 +1521,13 @@ const MODE_HINT: Record<PermissionModeChoice, string> = {
   plan: 'Reads and plans only; nothing changes until you approve the plan.',
 };
 
+/** ADR-021: OpenCode's modes are its built-in agents; acceptEdits is never offered. */
+const OPENCODE_MODE_HINT: Record<PermissionModeChoice, string> = {
+  default: 'OpenCode’s build agent: asks as its rules on your PC say.',
+  acceptEdits: '',
+  plan: 'OpenCode’s plan agent: reads and plans; by default it does not edit files.',
+};
+
 export interface ModeChipProps {
   /** `LiveState.permissionMode` */
   mode?: string;
@@ -1529,13 +1536,16 @@ export interface ModeChipProps {
   onChange: (mode: PermissionModeChoice) => void;
   /** on the black session header */
   dark?: boolean;
+  /** `Agent.kind`: OpenCode's modes are its agents (ADR-021) */
+  agentKind?: string;
 }
 
-/** Claude's permission mode with a picker; read-only when the agent offers no modes. */
-export function ModeChip({ mode, modes, onChange, dark = false }: ModeChipProps) {
+/** The permission mode with a picker; read-only when the agent offers no modes. */
+export function ModeChip({ mode, modes, onChange, dark = false, agentKind }: ModeChipProps) {
   const [open, setOpen] = useState(false);
   const choices = (modes ?? []).filter(isModeChoice);
-  const label = modeLabel(mode);
+  const label = modeLabel(mode, agentKind);
+  const hints = agentKind === 'opencode' ? OPENCODE_MODE_HINT : MODE_HINT;
   return (
     <>
       <Pressable
@@ -1561,13 +1571,13 @@ export function ModeChip({ mode, modes, onChange, dark = false }: ModeChipProps)
               }}
               accessibilityRole="radio"
               accessibilityState={{ checked: on }}
-              accessibilityLabel={modeLabel(m)}
+              accessibilityLabel={modeLabel(m, agentKind)}
               style={[styles.modeRow, on && styles.modeRowOn]}
             >
               <View style={styles.flex}>
-                <Text variant="bodyStrong">{modeLabel(m)}</Text>
+                <Text variant="bodyStrong">{modeLabel(m, agentKind)}</Text>
                 <Text variant="xs" color={colors.text2}>
-                  {MODE_HINT[m]}
+                  {hints[m]}
                 </Text>
               </View>
               {on ? <Icon name="check" size={18} /> : null}
@@ -1588,10 +1598,12 @@ export interface ModelChipProps {
   state: Pick<LiveState, 'model' | 'models'>;
   onChange: (model: string) => void;
   dark?: boolean;
+  /** "Claude Code", "OpenCode": who decides on the PC */
+  agentName?: string;
 }
 
-/** The session's model; the sheet lists what the CLI offers, else Claude Code's aliases. */
-export function ModelChip({ state, onChange, dark = false }: ModelChipProps) {
+/** The session's model; the sheet lists what the runtime offers, else Claude Code's aliases. */
+export function ModelChip({ state, onChange, dark = false, agentName = 'Claude Code' }: ModelChipProps) {
   const [open, setOpen] = useState(false);
   const choices = modelChoices(state);
   const label = modelLabel(state.model, choices);
@@ -1610,7 +1622,7 @@ export function ModelChip({ state, onChange, dark = false }: ModelChipProps) {
       </Pressable>
       <Sheet visible={open} title="Model" onClose={() => setOpen(false)}>
         <Text variant="xs" color={colors.text2}>
-          The next turn uses it. Claude Code on your PC decides which models your account may use.
+          {`The next turn uses it. ${agentName} on your PC decides which models your account may use.`}
         </Text>
         {choices.map((m) => {
           const on = m.value === state.model || modelLabel(state.model, choices) === m.label;
@@ -1662,10 +1674,12 @@ export interface RenameChipProps {
   title: string;
   onRename: (title: string) => void;
   dark?: boolean;
+  /** "Claude Code", "OpenCode": where the name shows on the PC */
+  agentName?: string;
 }
 
 /** A pencil chip whose sheet renames the session (1-80 characters, no control characters). */
-export function RenameChip({ title, onRename, dark = false }: RenameChipProps) {
+export function RenameChip({ title, onRename, dark = false, agentName = 'Claude Code' }: RenameChipProps) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(title);
   const next = draft.trim();
@@ -1696,7 +1710,7 @@ export function RenameChip({ title, onRename, dark = false }: RenameChipProps) {
           style={styles.input}
         />
         <Text variant="xs" color={colors.text3}>
-          {`${next.length}/${SESSION_TITLE_MAX} · the name shows in Claude Code on your PC too`}
+          {`${next.length}/${SESSION_TITLE_MAX} · the name shows in ${agentName} on your PC too`}
         </Text>
         <Button
           label="Rename"

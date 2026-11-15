@@ -19,7 +19,7 @@
 use chernobyl_companion::companion::Companion;
 use chernobyl_companion::config::{AdapterEntryConfig, CompanionConfig, default_config};
 use chernobyl_companion::opencode::OpenCodeAdapter;
-use chernobyl_companion::protocol::{ClientMsg, PermissionRequest, ServerMsg, now_ms};
+use chernobyl_companion::protocol::{ClientMsg, PermissionRequest, ServerMsg, WorkspaceOp, now_ms};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -92,6 +92,7 @@ fn spawn_server(exe: &Path, port: u16, base: &Path, work: &Path, log: &Path) -> 
         .env("XDG_CONFIG_HOME", dir("config"))
         .env("XDG_CACHE_HOME", dir("cache"))
         .env("XDG_STATE_HOME", dir("state"))
+        .env("PWD", work)
         .current_dir(work)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log2))
@@ -776,6 +777,631 @@ fn live_opencode_rich_parts() {
                 .events
                 .iter()
                 .any(|e| e.payload.contains("single word DONE"))
+        );
+    }
+    comp.shutdown(true);
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/* ------------------------------------------------------------------ */
+/* ADR-021: OpenCode parity with Claude Code against a live server     */
+/* ------------------------------------------------------------------ */
+
+fn git(work: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "user.name=chernobyl",
+            "-c",
+            "user.email=t@example.invalid",
+        ])
+        .args(args)
+        .current_dir(work)
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// The ack of a create/prompt-like message, `Ok(session id)` or the error.
+fn acked(reply: Option<ServerMsg>) -> Result<Option<String>, String> {
+    match reply {
+        Some(ServerMsg::Ack {
+            ok: true,
+            session_id,
+            ..
+        }) => Ok(session_id),
+        Some(ServerMsg::Ack { error, .. }) => Err(error.unwrap_or_default()),
+        other => Err(format!("{other:?}")),
+    }
+}
+
+fn done(comp: &Companion, id: &str) -> bool {
+    matches!(
+        command_status(comp, id).as_deref(),
+        Some("completed" | "failed" | "cancelled")
+    )
+}
+
+/// ADR-021 live run: the parity features against `opencode serve` 1.19.4
+/// and Ollama `qwen3.5:4b` (24k-context alias), everything isolated as in
+/// `live_opencode_rich_parts`. The serve runs in a temp git repository,
+/// which becomes the agent's workspace.
+///
+/// ```text
+/// CHERNOBYL_LIVE_OPENCODE=1 cargo test --test opencode_e2e live_opencode_parity -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "live: set CHERNOBYL_LIVE_OPENCODE=1 (opencode CLI + local Ollama)"]
+fn live_opencode_parity() {
+    if std::env::var("CHERNOBYL_LIVE_OPENCODE").as_deref() != Ok("1") {
+        eprintln!("skipped: set CHERNOBYL_LIVE_OPENCODE=1");
+        return;
+    }
+    let exe = opencode_exe().expect("opencode CLI not found (set OPENCODE_BIN)");
+    let root = std::env::var_os("CHERNOBYL_LIVE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let base = root.join(format!("chernobyl-opencode-parity-{}", now_ms()));
+    let (iso, work, comp_dir) = (base.join("iso"), base.join("work"), base.join("companion"));
+    let config = iso.join("config").join("opencode");
+    for d in [&work, &comp_dir, &config] {
+        std::fs::create_dir_all(d).expect("temp dirs");
+    }
+    // a repository with one commit: Changes has something to compare to
+    git(&work, &["init", "-q"]);
+    std::fs::write(work.join("README.md"), "parity\n").unwrap();
+    git(&work, &["add", "README.md"]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    let mut guard = LiveGuard { server: None };
+    let created = ollama(
+        "POST",
+        "/api/create",
+        &format!(
+            r#"{{"model":"{LIVE_ALIAS}","from":"qwen3.5:4b","parameters":{{"num_ctx":24576}},"stream":false}}"#
+        ),
+    )
+    .expect("Ollama at 127.0.0.1:11434");
+    assert!(created.contains("success"), "alias: {created}");
+    // the configured default is the plain 8k model, so a session that runs
+    // on the 24k alias proves the phone's model choice reached OpenCode; a
+    // config-defined slash command keeps /commands cheap
+    let opencode_json = format!(
+        r#"{{"$schema":"https://opencode.ai/config.json","autoupdate":false,"share":"disabled",
+"model":"ollama/qwen3.5:4b","small_model":"ollama/{LIVE_ALIAS}",
+"provider":{{"ollama":{{"npm":"@ai-sdk/openai-compatible","name":"Ollama",
+"options":{{"baseURL":"{OLLAMA}/v1"}},
+"models":{{"{LIVE_ALIAS}":{{"name":"qwen3.5 4b 24k","limit":{{"context":24576,"output":4096}}}},
+"qwen3.5:4b":{{"name":"qwen3.5 4b","limit":{{"context":8192,"output":2048}}}}}}}}}},
+"command":{{"hello":{{"description":"say hello","template":"Reply with exactly the word SLASHOK and then: $ARGUMENTS"}}}},
+"permission":{{"bash":"ask","edit":"ask"}}}}"#
+    );
+    std::fs::write(config.join("opencode.json"), opencode_json).unwrap();
+    let port = free_port();
+    let addr = format!("http://127.0.0.1:{port}");
+    guard.server = Some(spawn_server(
+        &exe,
+        port,
+        &iso,
+        &work,
+        &base.join("serve.log"),
+    ));
+    let pid = guard.server.as_ref().map(|s| s.id());
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2700));
+        eprintln!("live opencode parity: 45 min budget exceeded");
+        if let Some(pid) = pid {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+        }
+        std::process::exit(1);
+    });
+    let probe = OpenCodeAdapter::new("live-probe", &addr, None);
+    assert!(
+        wait_until(Duration::from_secs(60), || probe.refresh().is_ok()),
+        "opencode serve never became healthy"
+    );
+
+    let mut c: CompanionConfig = default_config();
+    c.data_dir = comp_dir.clone();
+    c.probe_interval_ms = 500;
+    c.terminal_enabled = true;
+    c.adapters.push(AdapterEntryConfig {
+        id: "oc-live".into(),
+        kind: "opencode".into(),
+        enabled: true,
+        endpoint: Some(addr.clone()),
+        basic_auth: None,
+        ..Default::default()
+    });
+    let comp = Companion::boot(c).unwrap();
+
+    // 1) the serve's folder is the workspace; the composer is advertised
+    let build = comp
+        .snapshot()
+        .agents
+        .into_iter()
+        .find(|a| a.id == "build")
+        .expect("build agent");
+    let live = build.live.expect("live");
+    assert_eq!(live.workspaces.len(), 1, "{:?}", live.workspaces);
+    let ws = live.workspaces[0].clone();
+    let canon = std::fs::canonicalize(&work).unwrap();
+    assert!(
+        canon.to_string_lossy().ends_with(&ws.path),
+        "{} vs {}",
+        canon.display(),
+        ws.path
+    );
+    assert_eq!(
+        live.composer,
+        ["model", "images", "commands", "context", "rename"]
+    );
+    let alias = format!("ollama/{LIVE_ALIAS}");
+    assert!(
+        live.models.iter().any(|m| m.0 == alias),
+        "{:?}",
+        live.models
+    );
+    eprintln!(
+        "LIVE: workspace {} ({}), {} models, composer {:?}",
+        ws.id,
+        ws.path,
+        live.models.len(),
+        live.composer
+    );
+    // a folder the phone picks is still refused
+    let refused = acked(comp.handle_client_msg(ClientMsg::CreateSession {
+        command_id: "p-refused".into(),
+        agent_id: "build".into(),
+        title: "x".into(),
+        prompt: String::new(),
+        project: Some("0123456789ab".into()),
+        images: vec![],
+        model: None,
+    }));
+    assert!(refused.is_err(), "{refused:?}");
+
+    // 2) a session made outside the companion (`opencode run`, same data)
+    let run = Command::new(&exe)
+        .args([
+            "run",
+            "--dir",
+            &work.to_string_lossy(),
+            "--model",
+            &alias,
+            "Reply with exactly the word RUNOK and nothing else.",
+        ])
+        .env("HOME", iso.join("home"))
+        .env("USERPROFILE", iso.join("home"))
+        .env("XDG_DATA_HOME", iso.join("data"))
+        .env("XDG_CONFIG_HOME", iso.join("config"))
+        .env("XDG_CACHE_HOME", iso.join("cache"))
+        .env("XDG_STATE_HOME", iso.join("state"))
+        // `run` takes its folder from PWD (Git Bash exports the caller's)
+        .env("PWD", &work)
+        .current_dir(&work)
+        .stdin(Stdio::null())
+        .output()
+        .expect("opencode run");
+    eprintln!(
+        "LIVE: opencode run exit {:?}, stdout {:?}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stdout).trim()
+    );
+    let mut ran = None;
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            comp.pump();
+            ran = comp
+                .snapshot()
+                .sessions
+                .into_iter()
+                .find(|s| s.host_id == "oc-live");
+            ran.is_some()
+        }),
+        "the opencode run session never listed"
+    );
+    let ran = ran.unwrap();
+    assert_eq!(ran.project, ws.path, "placed in the workspace");
+    let (out, rx) = chernobyl_companion::server::Outbound::new(
+        std::sync::Arc::new(chernobyl_companion::companion::Saturation::default()),
+        false,
+    );
+    let mut phone = Phone {
+        out,
+        rx,
+        seen: String::new(),
+    };
+    let ack = comp.subscribe(1, &phone.out, "sub-run", &ran.id, None);
+    assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+    live_wait(&comp, &mut phone, "the run session's history", |_, p| {
+        p.seen.contains("RUNOK and nothing else") && p.count(r#""kind":"text""#) > 0
+    });
+    eprintln!(
+        "LIVE: `opencode run` session {} listed and hydrated",
+        ran.id
+    );
+
+    // 3) create with a chosen model in the workspace; text streams
+    let sid = acked(comp.handle_client_msg(ClientMsg::CreateSession {
+        command_id: "p-create".into(),
+        agent_id: "build".into(),
+        title: "ADR-021 parity".into(),
+        prompt: "Reply with exactly the word HELLO and nothing else.".into(),
+        project: Some(ws.id.clone()),
+        images: vec![],
+        model: Some(alias.clone()),
+    }))
+    .expect("create")
+    .expect("session id");
+    let ack = comp.subscribe(1, &phone.out, "sub-1", &sid, None);
+    assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+    live_wait(&comp, &mut phone, "the first turn", |c, _| {
+        done(c, "p-create")
+    });
+    assert_eq!(
+        command_status(&comp, "p-create").as_deref(),
+        Some("completed")
+    );
+    let appends = phone.count(r#""op":"append""#);
+    assert!(appends > 0, "no streaming deltas");
+    // the answer ran on the chosen model, and the meter filled
+    live_wait(&comp, &mut phone, "the context meter", |_, p| {
+        p.seen.contains(r#""maxTokens":24576"#)
+    });
+    assert!(phone.seen.contains(&format!(r#""model":"{alias}""#)));
+    let oc = comp.shared.opencode.lock().unwrap().clone().unwrap();
+    let msgs = chernobyl_companion::json::stringify(&oc.messages(&sid).unwrap());
+    assert!(
+        msgs.contains(&format!(r#""modelID":"{LIVE_ALIAS}""#)),
+        "the answer did not run on the chosen model"
+    );
+    eprintln!("LIVE: created {sid} on {alias}; {appends} appends; context reported");
+
+    // 4) bash asks; allow once; the tool completes
+    prompt(
+        &comp,
+        &sid,
+        "p-bash",
+        "Use the bash tool to run exactly this command: echo hi > note.txt. Then reply with the single word DONE.",
+    );
+    live_wait(&comp, &mut phone, "the bash permission", |c, _| {
+        pending(c, &sid).is_some()
+    });
+    let p = pending(&comp, &sid).unwrap();
+    let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
+    eprintln!("LIVE: {} asks {:?}; options {labels:?}", p.id, p.command);
+    decide(&comp, &p, "p-bash-allow", "once", None);
+    live_wait(&comp, &mut phone, "the bash turn", |c, _| done(c, "p-bash"));
+    assert!(phone.seen.contains(r#""status":"completed""#));
+    assert!(work.join("note.txt").exists(), "the allowed command ran");
+
+    // 5) a follow-up sent mid-turn is queued and runs after
+    prompt(
+        &comp,
+        &sid,
+        "p-q1",
+        "Count from 1 to 20, separated by spaces.",
+    );
+    prompt(&comp, &sid, "p-q2", "Reply with exactly the word AFTER.");
+    live_wait(&comp, &mut phone, "both queued turns", |c, _| {
+        done(c, "p-q1") && done(c, "p-q2")
+    });
+    eprintln!(
+        "LIVE: queued follow-up → {:?} / {:?}",
+        command_status(&comp, "p-q1"),
+        command_status(&comp, "p-q2")
+    );
+    assert_eq!(command_status(&comp, "p-q2").as_deref(), Some("completed"));
+
+    // 6) Stop: interrupted, not failed
+    let before = phone.count(r#""op":"append""#);
+    prompt(
+        &comp,
+        &sid,
+        "p-story",
+        "Write a 400-word story about a lighthouse keeper. Do not use any tools.",
+    );
+    live_wait(&comp, &mut phone, "the story streaming", |_, p| {
+        p.count(r#""op":"append""#) >= before + 10
+    });
+    let reply = comp.handle_client_msg(ClientMsg::Interrupt {
+        command_id: "p-stop".into(),
+        session_id: sid.clone(),
+    });
+    assert!(
+        matches!(reply, Some(ServerMsg::Ack { ok: true, .. })),
+        "{reply:?}"
+    );
+    live_wait(&comp, &mut phone, "the stop", |c, p| {
+        command_status(c, "p-story").as_deref() == Some("cancelled")
+            && p.seen.contains(r#""status":"interrupted""#)
+    });
+    eprintln!("LIVE: stop → prompt cancelled, turn interrupted");
+
+    // 7) rename
+    let renamed = acked(comp.handle_client_msg(ClientMsg::RenameSession {
+        command_id: "p-rename".into(),
+        session_id: sid.clone(),
+        title: "Parity renamed".into(),
+    }));
+    assert!(renamed.is_ok(), "{renamed:?}");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            comp.pump();
+            comp.snapshot()
+                .sessions
+                .iter()
+                .any(|s| s.id == sid && s.title == "Parity renamed")
+        }),
+        "rename never showed"
+    );
+    assert_eq!(
+        command_status(&comp, "p-rename").as_deref(),
+        Some("completed")
+    );
+
+    // 8) set_model, then a slash command (config-defined /hello)
+    let set = acked(comp.handle_client_msg(ClientMsg::SetModel {
+        command_id: "p-model".into(),
+        session_id: sid.clone(),
+        model: alias.clone(),
+    }));
+    assert!(set.is_ok(), "{set:?}");
+    let commands: String = phone
+        .seen
+        .split(r#""slashCommands":"#)
+        .last()
+        .unwrap_or_default()
+        .chars()
+        .take(120)
+        .collect();
+    eprintln!("LIVE: slash commands {commands}");
+    assert!(phone.seen.contains(r#""hello""#));
+    prompt(&comp, &sid, "p-slash", "/hello from the phone");
+    live_wait(&comp, &mut phone, "the slash command", |c, _| {
+        done(c, "p-slash")
+    });
+    eprintln!(
+        "LIVE: /hello → {:?}; SLASHOK seen: {}",
+        command_status(&comp, "p-slash"),
+        phone.seen.contains("SLASHOK")
+    );
+    assert_eq!(
+        command_status(&comp, "p-slash").as_deref(),
+        Some("completed")
+    );
+
+    // 9) a photo rides along (the 4B model cannot see it; OpenCode says so)
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEUlEQVR4nGP4z8DwnwGMgRQAH+4D/dJQfRoAAAAASUVORK5CYII=";
+    let reply = comp.handle_client_msg(ClientMsg::SubmitPrompt {
+        command_id: "p-photo".into(),
+        session_id: sid.clone(),
+        text: "What color is this image? One word.".into(),
+        images: vec![chernobyl_companion::protocol::PromptImage {
+            media_type: "image/png".into(),
+            data: png.into(),
+        }],
+        fork: false,
+    });
+    assert!(
+        matches!(reply, Some(ServerMsg::Ack { ok: true, .. })),
+        "{reply:?}"
+    );
+    live_wait(&comp, &mut phone, "the photo turn", |c, p| {
+        done(c, "p-photo") && p.seen.contains(r#""images":1"#)
+    });
+    eprintln!(
+        "LIVE: photo prompt → {:?}",
+        command_status(&comp, "p-photo")
+    );
+
+    // 10) fork: a new session with the history, the original untouched
+    let fork = acked(comp.handle_client_msg(ClientMsg::SubmitPrompt {
+        command_id: "p-fork".into(),
+        session_id: sid.clone(),
+        text: "Reply with exactly the word FORKOK.".into(),
+        images: vec![],
+        fork: true,
+    }))
+    .expect("fork")
+    .expect("fork id");
+    assert_ne!(fork, sid);
+    let forked = comp
+        .snapshot()
+        .sessions
+        .into_iter()
+        .find(|s| s.id == fork)
+        .expect("fork listed");
+    assert_eq!(forked.forked_from.as_deref(), Some("Parity renamed"));
+    live_wait(&comp, &mut phone, "the fork's turn", |c, _| {
+        done(c, "p-fork")
+    });
+    eprintln!(
+        "LIVE: forked {sid} → {fork}: {:?}",
+        command_status(&comp, "p-fork")
+    );
+
+    // 10b) the plan agent as a permission mode, then End
+    let mode = acked(comp.handle_client_msg(ClientMsg::SetPermissionMode {
+        command_id: "p-mode".into(),
+        session_id: sid.clone(),
+        mode: "plan".into(),
+    }));
+    assert!(mode.is_ok(), "{mode:?}");
+    prompt(
+        &comp,
+        &sid,
+        "p-plan",
+        "Reply with exactly the word PLANOK and nothing else.",
+    );
+    live_wait(&comp, &mut phone, "the plan-agent turn", |c, _| {
+        done(c, "p-plan")
+    });
+    let msgs = chernobyl_companion::json::stringify(&oc.messages(&sid).unwrap());
+    assert!(
+        msgs.contains(r#""agent":"plan""#),
+        "the turn did not run as the plan agent"
+    );
+    assert!(phone.seen.contains(r#""permissionMode":"plan""#));
+    eprintln!(
+        "LIVE: plan agent turn → {:?}",
+        command_status(&comp, "p-plan")
+    );
+    let end = acked(comp.handle_client_msg(ClientMsg::SessionEnd {
+        command_id: "p-end".into(),
+        session_id: sid.clone(),
+    }));
+    assert!(end.is_ok(), "{end:?}");
+    live_wait(&comp, &mut phone, "the ended state", |_, p| {
+        p.seen.contains(r#""status":"ended""#)
+    });
+    let after = acked(comp.handle_client_msg(ClientMsg::SubmitPrompt {
+        command_id: "p-after-end".into(),
+        session_id: sid.clone(),
+        text: "more".into(),
+        images: vec![],
+        fork: false,
+    }));
+    assert!(
+        after.as_ref().is_err_and(|e| e.contains("start a new one")),
+        "{after:?}"
+    );
+    assert!(oc.messages(&sid).is_ok(), "ending kept the history");
+    eprintln!("LIVE: End → state ended, the next prompt refused, history kept");
+
+    // 10c) `opencode run --attach` goes through the watched serve: its
+    // session reaches the companion on the event stream, not a probe
+    let attached = Command::new(&exe)
+        .args([
+            "run",
+            "--attach",
+            &addr,
+            "--dir",
+            &work.to_string_lossy(),
+            "--model",
+            &alias,
+            "--title",
+            "ATTACHRUN",
+            "Reply with exactly the word ATTACHOK and nothing else.",
+        ])
+        .env("HOME", iso.join("home"))
+        .env("USERPROFILE", iso.join("home"))
+        .env("XDG_DATA_HOME", iso.join("data"))
+        .env("XDG_CONFIG_HOME", iso.join("config"))
+        .env("XDG_CACHE_HOME", iso.join("cache"))
+        .env("XDG_STATE_HOME", iso.join("state"))
+        .env("PWD", &work)
+        .current_dir(&work)
+        .stdin(Stdio::null())
+        .output()
+        .expect("opencode run --attach");
+    eprintln!(
+        "LIVE: opencode run --attach exit {:?}, stdout {:?}",
+        attached.status.code(),
+        String::from_utf8_lossy(&attached.stdout).trim()
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            comp.pump();
+            events_contain(&comp, "ATTACHRUN")
+        }),
+        "the attached run's session never arrived on the event stream"
+    );
+    eprintln!("LIVE: `opencode run --attach` session arrived on the event stream");
+
+    // 11) Files and Changes in the serve's folder
+    let query = |cmd: &str, op: WorkspaceOp| {
+        let (result, ack) = comp.workspace_query(cmd, &ws.id, &op);
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        format!("{result:?}")
+    };
+    let list = query(
+        "w-list",
+        WorkspaceOp::FsList {
+            path: String::new(),
+        },
+    );
+    assert!(
+        list.contains("note.txt") && list.contains("README.md"),
+        "{list}"
+    );
+    let read = query(
+        "w-read",
+        WorkspaceOp::FsRead {
+            path: "README.md".into(),
+        },
+    );
+    // (note.txt may be UTF-16: OpenCode's shell is PowerShell 5.1 when no
+    // SHELL is set, and its `>` writes UTF-16; fs_read calls that binary)
+    assert!(read.contains("parity"), "{read}");
+    let status = query("w-git", WorkspaceOp::GitStatus);
+    assert!(status.contains("note.txt"), "{status}");
+    eprintln!(
+        "LIVE: fs_list, fs_read and git_status answer in {}",
+        ws.path
+    );
+
+    // 12) the terminal runs in the same folder
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<ServerMsg>>> = Default::default();
+    let sink = seen.clone();
+    let reply = comp.handle_client_msg_with(
+        ClientMsg::Workspace {
+            command_id: "t-echo".into(),
+            workspace_id: ws.id.clone(),
+            op: WorkspaceOp::TerminalRun {
+                command: "echo parity-terminal && dir /b".into(),
+            },
+        },
+        Some(std::sync::Arc::new(move |m: ServerMsg| {
+            sink.lock().unwrap().push(m);
+            true
+        })),
+    );
+    assert!(
+        matches!(reply, Some(ServerMsg::Ack { ok: true, .. })),
+        "{reply:?}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || done(&comp, "t-echo")),
+        "terminal never finished"
+    );
+    let text: String = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::TerminalOutput { data, .. } => Some(data.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.contains("parity-terminal") && text.contains("note.txt"),
+        "{text}"
+    );
+    eprintln!("LIVE: terminal echo ran in the workspace");
+
+    // isolation held, nothing of the conversation reached the journal
+    let logs = iso.join("data").join("opencode").join("log");
+    for entry in std::fs::read_dir(&logs)
+        .expect("isolated log dir")
+        .flatten()
+    {
+        let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        assert!(
+            !text.contains("duplicate skill name"),
+            "user skills leaked in"
+        );
+    }
+    {
+        let store = comp.shared.storage.lock().unwrap();
+        assert!(
+            !store
+                .events
+                .iter()
+                .any(|e| e.payload.contains("lighthouse"))
         );
     }
     comp.shutdown(true);

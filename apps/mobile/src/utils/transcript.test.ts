@@ -429,13 +429,15 @@ test('rows: the first agent item of each reply carries the mark', () => {
 });
 
 test('mode labels, MCP summary and callback precheck', () => {
-  assert.deepEqual(['default', 'acceptEdits', 'plan', 'bypassPermissions', undefined].map(modeLabel), [
+  assert.deepEqual(['default', 'acceptEdits', 'plan', 'bypassPermissions', undefined].map((m) => modeLabel(m)), [
     'Ask before edits',
     'Accept edits',
     'Plan',
     'bypassPermissions',
     'Permission mode',
   ]);
+  // ADR-021: OpenCode's modes are its build and plan agents
+  assert.deepEqual(['default', 'plan'].map((m) => modeLabel(m, 'opencode')), ['Build', 'Plan']);
   assert.deepEqual(
     mcpSummary([
       { name: 'a', status: 'connected', authFlows: [] },

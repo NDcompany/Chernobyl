@@ -118,7 +118,7 @@ on both sides, and are never journaled (`docs/PRIVACY.md`).
 | Runtime | How | Status |
 | --- | --- | --- |
 | Claude Code | **driven**: the companion starts `claude.exe` (stream-json on stdio) in an allow-listed folder; also permission mode and end session | live round trip passed against Haiku, CLI 2.1.310 (about $0.01 per run) |
-| OpenCode | **attach** to a running `opencode serve` (HTTP + SSE), as before | live tests passed on 1.19.4 with local Ollama (`qwen3.5:4b`, 24k context) |
+| OpenCode | **attach** to a running `opencode serve` (HTTP + SSE), as before; since ADR-021 also the model picker, photos, slash commands, context, rename and fork, and the serve's folder as its workspace (Files, Changes, Terminal) | live tests passed on 1.19.4 with local Ollama (`qwen3.5:4b`, 24k context) |
 | Codex | **driven**: one `codex app-server` per adapter, each session a thread | every capability `limited`: tested only against a fake app-server, no live run |
 
 To enable them, add to `companion.json` (keys documented in `services/companion-rs/README.md`):

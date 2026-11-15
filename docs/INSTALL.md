@@ -166,6 +166,14 @@ in a PowerShell you then close), plus `OPENCODE_SERVER_USERNAME` if it is not `o
 a new PowerShell before running setup: the companion and the OpenCode launcher both read it at
 start, from `basicAuthEnv`. Unset means no auth (the server's loopback default).
 
+**OpenCode runs from a terminal.** To see a terminal task live on the phone, run it through the
+server the companion watches: `opencode run --attach http://127.0.0.1:4096 "..."` (the same URL
+as `-OpenCodeUrl`; add `--dir <folder>` to pick the project, `-p` or `OPENCODE_SERVER_PASSWORD`
+when the server has a password). A plain `opencode run "..."` starts its own private server on the
+same data folder: its session shows up on the phone only at the companion's next probe (within
+15 s), with its history, and is not streamed while it runs. The OpenCode TUI attached to the
+server (`opencode attach http://127.0.0.1:4096`) streams the same way.
+
 `scripts\test-setup-windows.ps1` checks the script without touching your real config, Run key
 or variables (AST parse, then `-ConfigOnly` runs in a temp `APPDATA`, each file loaded by a debug
 build of the companion).

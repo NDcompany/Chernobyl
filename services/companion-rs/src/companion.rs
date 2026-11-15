@@ -334,6 +334,7 @@ impl Companion {
                 &endpoint,
                 auth.as_deref(),
                 companion.hub(),
+                Some(&companion.shared.config.data_dir),
             ));
             let probe = oc.refresh();
             {
@@ -2719,6 +2720,7 @@ mod tests {
                             permission_modes: vec![],
                             workspaces: vec![w],
                             composer: Vec::new(),
+                            models: Vec::new(),
                         }
                     }),
                 };

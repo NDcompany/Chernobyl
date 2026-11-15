@@ -34,7 +34,7 @@ use crate::config::AdapterEntryConfig;
 use crate::json::{self, Json};
 use crate::protocol::{
     Agent, AgentLive, ClientMsg, DecisionError, EventKind, FileChange, LiveWorkspace,
-    PermissionRequest, PromptImage, ServerMsg, Session, is_model, now_ms,
+    PermissionRequest, PromptImage, ServerMsg, Session, is_claude_model, now_ms,
 };
 use crate::runtime_io::{
     AUTH_TTL_MS, ChildEvent, ChildIo, KILL_GRACE, PendingAuth, check_callback_url,
@@ -557,6 +557,7 @@ impl LiveRuntime for ClaudeRuntime {
                 permission_modes: PERMISSION_MODES.iter().map(|m| m.to_string()).collect(),
                 workspaces: self.inner.cfg.workspaces.clone(),
                 composer: vec!["model", "images", "commands", "context", "rename"],
+                models: Vec::new(),
             }),
         }]
     }
@@ -1386,7 +1387,7 @@ impl Inner {
         let model = live
             .driver
             .model()
-            .filter(|m| is_model(m))
+            .filter(|m| is_claude_model(m))
             .map(str::to_string);
         self.start(live, true, mode.as_deref(), model.as_deref(), now)
     }

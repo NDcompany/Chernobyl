@@ -148,6 +148,11 @@
     }
   },
   { "why": "set_model as a number", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": 5 } },
+  { "why": "set_model provider without a model", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "ollama/" } },
+  { "why": "set_model model without a provider", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "/qwen" } },
+  { "why": "set_model provider like a flag", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "-p/m" } },
+  { "why": "set_model provider/model with a space", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "ollama/qwen 3" } },
+  { "why": "set_model provider/model with a shell character", "msg": { "type": "set_model", "commandId": "c", "sessionId": "s", "model": "ollama/q;calc" } },
   { "why": "rename without title", "msg": { "type": "rename_session", "commandId": "c", "sessionId": "s" } },
   { "why": "rename empty", "msg": { "type": "rename_session", "commandId": "c", "sessionId": "s", "title": "" } },
   { "why": "rename blank", "msg": { "type": "rename_session", "commandId": "c", "sessionId": "s", "title": "   " } },

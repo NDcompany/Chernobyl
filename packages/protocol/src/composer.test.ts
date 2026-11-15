@@ -46,8 +46,17 @@ test('image data is capped across all images; titles count UTF-16 units', () => 
   for (const good of ['default', 'sonnet', 'opus', 'haiku', 'fable', 'opusplan', 'claude-x']) assert.ok(isModelName(good), good);
   const long = `claude-${'a'.repeat(57)}`;
   assert.ok(isModelName(long) && !isModelName(`${long}a`));
-  for (const bad of ['', 'claude-', 'claude-A', 'claude-a b', 'gpt-5', '-model', 'claude-a/b', 7]) {
+  for (const bad of ['', 'claude-', 'claude-A', 'claude-a b', 'gpt-5', '-model', 7]) {
     assert.ok(!isModelName(bad), String(bad));
+  }
+  // ADR-021 OpenCode provider/model ids (Rust `is_provider_model` has the same cases)
+  for (const good of ['ollama/qwen3.5:4b', 'opencode/big-pickle', 'openrouter/anthropic/claude-3.5-sonnet', 'cloudflare/@cf/meta/llama-3']) {
+    assert.ok(isModelName(good), good);
+  }
+  const longP = `p/${'a'.repeat(62)}`;
+  assert.ok(isModelName(longP) && !isModelName(`${longP}a`));
+  for (const bad of ['/m', 'p/', '-p/m', 'p/-m', 'p//m', 'p/m n', 'p/m;calc', 'p m/x', 'p/m$x']) {
+    assert.ok(!isModelName(bad), bad);
   }
 });
 

@@ -91,6 +91,16 @@ export const FALLBACK_MODELS: readonly { value: string; label: string }[] = [
   { value: 'haiku', label: 'Haiku' },
 ];
 
+/**
+ * ADR-021: the New task model row: Default (the runtime's own choice, no `model` sent) and the
+ * agent's `live.models` when it sends a list (OpenCode), else Claude Code's aliases.
+ */
+export function newTaskModels(
+  models: readonly { value: string; label: string }[] | undefined,
+): readonly { value: string; label: string }[] {
+  return models?.length ? [FALLBACK_MODELS[0], ...models.filter((m) => m.value !== 'default')] : FALLBACK_MODELS;
+}
+
 /** The models to offer: the CLI's list when it sent one. */
 export function modelChoices(state: Pick<LiveState, 'models'>): readonly { value: string; label: string }[] {
   return state.models?.length ? state.models : FALLBACK_MODELS;

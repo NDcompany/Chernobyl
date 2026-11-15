@@ -130,6 +130,10 @@ pub struct AgentLive {
     /// ADR-017 composer features (model | images | commands | context |
     /// rename); the phone hides what is missing. Serialized only when non-empty.
     pub composer: Vec<&'static str>,
+    /// ADR-021: the models a new session may start with, (value, label),
+    /// for runtimes whose list is not Claude Code's aliases (OpenCode).
+    /// Serialized only when non-empty.
+    pub models: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,6 +160,14 @@ impl AgentLive {
         if !self.composer.is_empty() {
             let list = self.composer.iter().map(|c| json::s(c)).collect();
             fields.push(("composer", Json::Arr(list)));
+        }
+        if !self.models.is_empty() {
+            let list = self
+                .models
+                .iter()
+                .map(|(v, l)| json::obj(vec![("value", json::s(v)), ("label", json::s(l))]))
+                .collect();
+            fields.push(("models", Json::Arr(list)));
         }
         if !self.workspaces.is_empty() {
             fields.push((
@@ -515,9 +527,16 @@ pub struct PromptImage {
     pub data: String,
 }
 
-/// A model the phone may pick (TS `isModelName`): a Claude Code alias or a
-/// full `claude-…` id, nothing a shell or flag parser could misread.
+/// A model the phone may pick (TS `isModelName`): a Claude Code model
+/// (`is_claude_model`) or an OpenCode `provider/model` id, nothing a shell
+/// or flag parser could misread. Each runtime checks its own form again.
 pub fn is_model(s: &str) -> bool {
+    is_claude_model(s) || is_provider_model(s)
+}
+
+/// ADR-017: a Claude Code alias or a full `claude-…` id (what `--model` and
+/// `set_model` take).
+pub fn is_claude_model(s: &str) -> bool {
     MODEL_ALIASES.contains(&s)
         || s.strip_prefix("claude-").is_some_and(|rest| {
             !rest.is_empty()
@@ -526,6 +545,22 @@ pub fn is_model(s: &str) -> bool {
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         })
+}
+
+/// ADR-021: an OpenCode `providerID/modelID` (`ollama/qwen3.5:4b`,
+/// `openrouter/anthropic/claude-x`), at most 64 characters. It travels as
+/// JSON to OpenCode, never as an argument.
+pub fn is_provider_model(s: &str) -> bool {
+    let Some((provider, model)) = s.split_once('/') else {
+        return false;
+    };
+    let word = |p: &str, extra: &[u8]| {
+        !p.is_empty()
+            && !p.starts_with(['-', '/'])
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b) || extra.contains(&b))
+    };
+    s.len() <= MODEL_MAX && word(provider, b"") && word(model, b":/@+")
 }
 
 /// TS `isPromptImage`: a whitelisted media type, strict base64 whose first
@@ -2843,10 +2878,18 @@ mod tests {
                 path: "C:\\work\\demo".into(),
             }],
             composer: vec![],
+            models: Vec::new(),
         });
         assert_eq!(
             json::stringify(json::get(&agent.to_json(), "live").unwrap()),
             r#"{"transcript":true,"promptWhileBusy":"merge","interrupt":true,"end":true,"permissionModes":["default","acceptEdits","plan"],"workspaces":[{"id":"3f2a9c1d0e4b","label":"demo","path":"C:\\work\\demo"}]}"#
+        );
+        // ADR-021: an OpenCode agent's models, only when it has some
+        let mut live = agent.live.clone().unwrap();
+        live.models = vec![("ollama/qwen3.5:4b".into(), "qwen3.5 4b".into())];
+        assert_eq!(
+            json::stringify(json::get(&live.to_json(), "models").unwrap()),
+            r#"[{"value":"ollama/qwen3.5:4b","label":"qwen3.5 4b"}]"#
         );
         let mut session = Session {
             id: "ses_live_1".into(),
@@ -2959,22 +3002,31 @@ mod tests {
         assert!(rename(&"\u{1F600}".repeat(40)).is_some());
         assert!(rename(&format!("{}x", "\u{1F600}".repeat(40))).is_none());
         assert!(rename(&"t".repeat(80)).is_some());
-        // models: the aliases and claude- ids only, 64 chars at most
+        // Claude models: the aliases and claude- ids only, 64 chars at most
         for good in [
             "default", "sonnet", "opus", "haiku", "fable", "opusplan", "claude-x",
         ] {
-            assert!(is_model(good), "{good}");
+            assert!(is_model(good) && is_claude_model(good), "{good}");
         }
         let long = format!("claude-{}", "a".repeat(57));
+        assert!(is_claude_model(&long) && !is_model(&format!("{long}a")));
+        for bad in ["", "claude-", "claude-A", "claude-a b", "gpt-5", "-model"] {
+            assert!(!is_model(bad), "{bad}");
+        }
+        assert!(!is_claude_model("claude-a/b"));
+        // ADR-021 OpenCode provider/model ids
+        for good in [
+            "ollama/qwen3.5:4b",
+            "opencode/big-pickle",
+            "openrouter/anthropic/claude-3.5-sonnet",
+            "cloudflare/@cf/meta/llama-3",
+        ] {
+            assert!(is_model(good) && !is_claude_model(good), "{good}");
+        }
+        let long = format!("p/{}", "a".repeat(62));
         assert!(is_model(&long) && !is_model(&format!("{long}a")));
         for bad in [
-            "",
-            "claude-",
-            "claude-A",
-            "claude-a b",
-            "gpt-5",
-            "-model",
-            "claude-a/b",
+            "/m", "p/", "-p/m", "p/-m", "p//m", "p/m n", "p/m;calc", "p m/x", "p/m$x",
         ] {
             assert!(!is_model(bad), "{bad}");
         }
