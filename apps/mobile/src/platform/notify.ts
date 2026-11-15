@@ -5,6 +5,7 @@
  */
 import {
   AndroidImportance,
+  AndroidNotificationVisibility,
   addNotificationResponseReceivedListener,
   clearLastNotificationResponse,
   getLastNotificationResponse,
@@ -19,6 +20,8 @@ import { Platform } from 'react-native';
 
 /** The only routes a notification may open (ours are local notifications; anything else is ignored). */
 const ROUTE_RE = /^\/(session|permission)\/[^/?#]+(\?focus=[^&#]+)?$/;
+
+const CHANNEL = 'alerts';
 
 let initialized = false;
 
@@ -38,9 +41,13 @@ export async function initNotifications(ask = true): Promise<boolean> {
       }),
     });
     if (Platform.OS === 'android') {
-      await setNotificationChannelAsync('default', {
-        name: 'CHERNOBYL',
+      // PRIVATE: on a locked screen Android shows only "Contents hidden" (expo-notifications
+      // has no per-notification public version), so an approval's command needs an unlocked
+      // device. A new id, since an existing channel's lock-screen setting cannot be changed.
+      await setNotificationChannelAsync(CHANNEL, {
+        name: 'CHERNOBYL alerts',
         importance: AndroidImportance.DEFAULT,
+        lockscreenVisibility: AndroidNotificationVisibility.PRIVATE,
         lightColor: '#050505',
         vibrationPattern: [0, 120, 80, 120],
       });
@@ -67,7 +74,7 @@ export async function notify(title: string, body: string, url?: string): Promise
   try {
     await scheduleNotificationAsync({
       content: { title, body, sound: false, autoDismiss: true, data: url ? { url } : {} },
-      trigger: null,
+      trigger: Platform.OS === 'android' ? { channelId: CHANNEL } : null,
     });
   } catch {
     /* notifications unavailable — silently skip */

@@ -282,3 +282,11 @@ notifications carry that route in `data.url` (a `fromPc` request is titled "Appr
   another app or link — only continue if you started this pairing" when the payload came from a
   `chernobyl://connect-host?payload=` link (editing the field or scanning clears that mark). Saving a pairing
   also clears the stored host token, so an old token is never appended to the new endpoints.
+- **Tapjacking:** `plugins/withAndroidHardening.js` (a config plugin in `app.json`) sets
+  `window.decorView.filterTouchesWhenObscured = true` in MainActivity.onCreate, so every screen, Approve
+  buttons included, ignores touches while another window covers the app; it also sets an empty
+  `android:taskAffinity` on MainActivity. Needs a prebuild/rebuild to take effect.
+- **Manifest:** `android.allowBackup: false`; `blockedPermissions` removes SYSTEM_ALERT_WINDOW and the external-storage
+  permissions (the app uses none).
+- **Alerts:** `notify()` posts to the `alerts` channel with PRIVATE lock-screen visibility: a locked screen shows
+  "Contents hidden", the command only once unlocked (expo-notifications has no per-notification public version).

@@ -108,7 +108,7 @@ or secrets. They are served on loopback; beyond loopback `/health` requires the 
 
 | Data | Where | Retention |
 |---|---|---|
-| Pairing payload (host id, endpoints, device id, per-device key) and the optional token | OS keystore (`expo-secure-store`, unlocked-device only) | until you unpair the host |
+| Pairing payload (host id, endpoints, device id, per-device key) and the optional token | OS keystore (`expo-secure-store`: Android Keystore-wrapped key, readable by the app while the phone is locked so approval alerts keep working; iOS Keychain, unlocked device only) | until you unpair the host |
 | App settings, onboarding flag, display name | app SQLite database | until the app is uninstalled or data cleared |
 | Your approval decisions (permission id, agent, command text, decision, risk, time) | app SQLite database | newest **1 000** |
 | Live state (sessions, approvals, live transcripts, opened files, git status and diffs) | memory, refreshed from the companion | not persisted |
