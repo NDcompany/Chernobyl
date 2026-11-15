@@ -142,6 +142,16 @@ public final class Composer {
         return out;
     }
 
+    /** New session's Model row (ADR-021/022): Default (no model sent), then the agent's own list when it sends one, else Claude Code's aliases. */
+    public static List<String[]> newSessionModels(JSONObject live) {
+        List<String[]> out = modelChoices(live);
+        if (live == null || live.optJSONArray("models") == null || live.optJSONArray("models").length() == 0) return out;
+        List<String[]> list = new ArrayList<String[]>();
+        list.add(new String[] {"default", "Default (the PC's setting)"});
+        for (String[] m : out) if (!"default".equals(m[0])) list.add(m);
+        return list;
+    }
+
     private static final Pattern MODEL_ID = Pattern.compile("^claude-([a-z]+)-(\\d+)(?:-(\\d{1,2}))?(?:-\\d{8})?$");
 
     /** "claude-haiku-5-5" → "Haiku 5.5"; a listed value → its label; empty → "Model". */

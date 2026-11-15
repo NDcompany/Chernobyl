@@ -543,8 +543,7 @@ public final class MainActivity extends Activity implements App.Change {
         final Spinner wsPick = new Spinner(this);
         final TextView modelLabel = Ui.text(this, "Model", 13, Ui.TEXT2, true);
         final Spinner modelPick = new Spinner(this);
-        final String[] models = {"default", "sonnet", "opus", "haiku"};
-        modelPick.setAdapter(spinnerAdapter(new String[] {"Default (the PC's setting)", "Sonnet", "Opus", "Haiku"}));
+        final List<String[]> models = new ArrayList<String[]>();
         final EditText project = new EditText(this);
         project.setHint("Project (optional)");
         form.addView(wsLabel);
@@ -577,9 +576,14 @@ public final class MainActivity extends Activity implements App.Change {
                 wsPick.setVisibility(wsVis);
                 project.setVisibility(workspaces.isEmpty() ? View.VISIBLE : View.GONE);
                 JSONArray composer = live == null ? null : live.optJSONArray("composer");
-                // the start-time choices are Claude Code's aliases; Codex picks its models in the session
-                boolean pickModel = "claude-code".equals(agents.get(pos).optString("kind"))
+                // Claude Code takes its aliases, OpenCode and Antigravity send their own lists; Codex picks its model in the session
+                boolean pickModel = !"codex".equals(agents.get(pos).optString("kind"))
                         && composer != null && composer.toString().contains("\"model\"");
+                models.clear();
+                for (String[] m : Composer.newSessionModels(live)) models.add(m);
+                String[] modelLabels = new String[models.size()];
+                for (int i = 0; i < modelLabels.length; i++) modelLabels[i] = "default".equals(models.get(i)[0]) ? "Default (the PC's setting)" : models.get(i)[1];
+                modelPick.setAdapter(spinnerAdapter(modelLabels));
                 modelLabel.setVisibility(pickModel ? View.VISIBLE : View.GONE);
                 modelPick.setVisibility(pickModel ? View.VISIBLE : View.GONE);
             }
@@ -602,7 +606,7 @@ public final class MainActivity extends Activity implements App.Change {
                         JSONObject agent = agents.get(agentPick.getSelectedItemPosition());
                         String proj = workspaces.isEmpty() ? project.getText().toString().trim()
                                 : workspaces.get(Math.max(0, wsPick.getSelectedItemPosition())).optString("id");
-                        String model = modelPick.getVisibility() == View.VISIBLE ? models[modelPick.getSelectedItemPosition()] : "default";
+                        String model = modelPick.getVisibility() == View.VISIBLE && !models.isEmpty() ? models.get(Math.max(0, modelPick.getSelectedItemPosition()))[0] : "default";
                         JSONObject m = App.msg("create_session", "agentId", agent.optString("id"), "title", t, "prompt", pr,
                                 "project", proj.isEmpty() ? null : proj, "model", "default".equals(model) ? null : model);
                         d.dismiss();

@@ -99,6 +99,14 @@ public class ComposerTest {
         assertEquals("Opus 5", Composer.modelLabel("claude-opus-5", choices));
         assertEquals("Model", Composer.modelLabel("", choices));
         assertEquals(4, Composer.modelChoices(new JSONObject()).size()); // the aliases when the CLI listed none
+        // the New session Model row: the agent's own list behind Default, else the aliases
+        JSONObject agy = new JSONObject("{\"models\":[{\"value\":\"default\",\"label\":\"x\"},{\"value\":\"gemini-3.8-flash-low\",\"label\":\"Gemini 3.8 Flash\"}]}");
+        List<String[]> own = Composer.newSessionModels(agy);
+        assertEquals(2, own.size());
+        assertEquals("default", own.get(0)[0]);
+        assertEquals("gemini-3.8-flash-low", own.get(1)[0]);
+        assertEquals(4, Composer.newSessionModels(new JSONObject()).size());
+        assertEquals(4, Composer.newSessionModels(null).size());
         assertEquals("Ask before edits", Composer.modeLabel("default"));
         assertEquals("Plan", Composer.modeLabel("plan"));
         assertEquals("bypassPermissions", Composer.modeLabel("bypassPermissions"));
