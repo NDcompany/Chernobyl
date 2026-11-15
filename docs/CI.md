@@ -40,8 +40,11 @@ Runs on every push to any branch and on all pull requests.
   * Runs `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-setup-windows.ps1 -Exe services/companion-rs/target/release/chernobyl-companion.exe`.
   * **Note on Scope**: `test-setup-windows.ps1` runs `setup-windows.ps1` in `-ConfigOnly` mode with redirected temp directories (`APPDATA` / `LOCALAPPDATA`) and validates generated configurations against the companion daemon's CLI parser (`--config <path> --devices`). It does not modify persistent system configuration, require administrative privileges, or depend on external runtimes (`agy`, `codex`, `claude`) or tunnels being installed on the runner. The test script exercises configuration generation and syntax verification; it does not support skip environment variables.
 
-- **Security & Concurrency**:
-  Runs with least-privilege permissions (`contents: read`) and cancel-in-progress concurrency grouped per ref.
+- **Security, Hardening & Concurrency**:
+  * **Pinned Action SHAs**: Every GitHub Action is pinned to an immutable full commit SHA with the version tag as a trailing comment (e.g. `actions/checkout@11d5960... # v4`, `dtolnay/rust-toolchain` pinned with `toolchain: 1.99.0`). Dependabot tracks and updates these SHAs weekly via `.github/dependabot.yml`.
+  * **Credential Isolation (`persist-credentials: false`)**: Every checkout step explicitly specifies `persist-credentials: false`, preventing runner tokens from lingering in `.git/config` where build scripts or third-party dependencies could exfiltrate them.
+  * **Least Privilege**: Global workflow permissions are restricted to `contents: read`. Elevated write permissions (`contents: write`) are granted only to the draft release publication job in `release.yml`.
+  * **Concurrency Controls**: Concurrency groups are keyed by workflow and ref (`${{ github.workflow }}-${{ github.ref }}`) with `cancel-in-progress: true` to prevent redundant runner usage.
 
 ---
 
@@ -49,15 +52,19 @@ Runs on every push to any branch and on all pull requests.
 
 Triggered on demand via `workflow_dispatch` and automatically on release tags matching `v*`.
 
-- Runs on `ubuntu-latest`.
+- Runs on `ubuntu-latest` within the `release` environment (`environment: release`).
 - Sets up JDK 17 (Temurin) and Android SDK components via `sdkmanager`:
   * Android Platform 36 (`platforms;android-36`)
   * Build-Tools 36.0.0 (`build-tools;36.0.0`)
   * NDK 27.1.12297006 (`ndk;27.1.12297006`)
   * CMake 3.31.6 (`cmake;3.31.6`)
-- Runs `npm ci` and `node scripts/build-android.mjs`.
+- **Build-Then-Sign Isolation**:
+  * Build executes first without keystore secrets on disk: `npm ci` and `node scripts/build-android.mjs` run while `CHB_KEYSTORE` is completely unset, producing a debug-signed APK. Untrusted npm dependencies and build hooks never run with access to the release signing key.
+  * Dedicated Signing Step: Once the build finishes, a separate signing step runs only when signing secrets are provided. It writes the keystore to `$RUNNER_TEMP/keystore/chernobyl-release.jks`, writes the password via `printf '%s'` into `chernobyl-release.pass`, and registers a bash exit trap (`trap 'rm -rf "$RUNNER_TEMP/keystore"' EXIT`) ensuring cryptographic material is removed immediately upon step completion or error.
+  * In-place Signing & Toolchain Integration: Calls `CHB_KEYSTORE="$JKS_PATH" node scripts/build-android.mjs --sign-only <apk>` to sign with production parameters.
+  * **Certificate Digest Verification**: Immediately after signing, executes `apksigner verify --print-certs <apk>` and verifies that the output contains the pinned release certificate SHA-256 digest (`c8cc22bdfb6c244447d2a5beb007f8fd6adcd20fb8632b0e5998c6b96ead7d36`). Any digest mismatch immediately fails the workflow.
+  * **Fail on Tag Without Secrets**: On release tags (`startsWith(github.ref, 'refs/tags/')`), missing signing secrets immediately FAIL the job, preventing unverified or debug-signed binaries from ever reaching release status. On manual `workflow_dispatch` or branch runs, missing secrets fall back to the debug-signed APK with a logged notice.
 - Produces the release APK (`arm64-v8a` + `x86_64`) into `release/` and uploads it as an artifact (`chernobyl-apk`).
-- If repository signing secrets are configured (see below), the APK is re-signed with the production release keystore; otherwise, the APK remains signed with the debug keystore for development.
 
 ---
 
@@ -66,16 +73,19 @@ Triggered on demand via `workflow_dispatch` and automatically on release tags ma
 Triggered automatically on release tags matching `v*`.
 
 - **`kitkat-apk` job** (`ubuntu-latest`):
-  * Sets up JDK 17 (Temurin) with Gradle caching and Android SDK (Platform 36, Build-Tools 36.0.0).
-  * Builds the Android 4.4 KitKat client release APK (`./gradlew assembleRelease --console=plain`).
-  * Signs the APK with `apksigner` (v1 JAR + v2 signature, min SDK 19) if repository secrets `ANDROID_KEYSTORE_BASE64` and `ANDROID_KEYSTORE_PASS` are present; if secrets are absent, keeps the APK debug-signed and logs an explanatory note.
+  * Runs within the `release` environment (`environment: release`).
+  * Sets up JDK 17 (Temurin) with Gradle caching and Android SDK (Platform 36, Build-Tools 36.0.0). Pinned Gradle wrapper binary integrity is verified by SHA-256 checksum in `gradle-wrapper.properties`.
+  * **Build-Then-Sign Order**: Builds the Android 4.4 KitKat client release APK (`./gradlew assembleRelease --console=plain`) with no signing secrets or keystores present on disk.
+  * **Dedicated Signing Step**: Decodes keystore secrets into `$RUNNER_TEMP/keystore/`, writes the password file, sets `trap 'rm -rf "$RUNNER_TEMP/keystore"' EXIT`, signs via `apksigner` (v1 JAR + v2 signature, min SDK 19), and verifies the signer certificate matches the pinned SHA-256 digest `c8cc22bdfb6c244447d2a5beb007f8fd6adcd20fb8632b0e5998c6b96ead7d36`.
+  * **Fail on Tag Without Secrets**: When triggered by a tag, missing signing secrets cause an immediate hard failure (`exit 1`).
   * Uploads the APK artifact (`chernobyl-kitkat-apk`).
 - **`release` job** (`windows-latest`, `needs: [kitkat-apk]`):
   * Downloads the built KitKat APK into `release/`.
   * Builds the optimized release companion binary:
     `cargo build --release --manifest-path services/companion-rs/Cargo.toml`
-  * Runs `node scripts/package-release.mjs` to calculate standard SHA-256 checksums across all release artifacts (`chernobyl-companion.exe` and `release/*.apk`).
-  * Publishes a draft GitHub Release using `softprops/action-gh-release@v2` with `contents: write` permissions, attaching:
+  * **No npm in Release Job**: Runs `node scripts/package-release.mjs` directly without running `npm ci`. Because `package-release.mjs` strictly imports Node standard library built-ins (`node:*`), dependency installation is completely omitted.
+  * Calculates standard SHA-256 checksums across all release artifacts (`chernobyl-companion.exe` and `release/*.apk`).
+  * Publishes a draft GitHub Release using `softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2` with `contents: write` permissions (the only job with write permissions), attaching:
     * `services/companion-rs/target/release/chernobyl-companion.exe`
     * `release/*.apk` (including the KitKat APK)
     * `release/SHA256SUMS.txt`
@@ -89,12 +99,28 @@ Checks GitHub Actions workflows on a weekly cadence for updates.
 
 ---
 
-## Android Signing Secrets
+## Android Signing Secrets & `release` Environment
 
-By default, CI produces a debug-signed APK that can be installed on testing devices. To produce production-signed APKs matching an existing installation, configure two GitHub Actions secrets in **Repository Settings → Secrets and variables → Actions**:
+By default on non-tag builds (e.g. `workflow_dispatch` on feature branches), CI produces a debug-signed APK that can be installed on testing devices. For production releases (triggered by tags matching `v*`), signing with the owner's release key is mandatory: missing secrets will immediately **FAIL** the build to prevent publishing debug-signed APKs.
 
-1. `ANDROID_KEYSTORE_BASE64`: The base64-encoded content of your `.jks` keystore file.
-2. `ANDROID_KEYSTORE_PASS`: The password string stored in your `.pass` file.
+### GitHub `release` Environment Setup
+
+The repository owner must create a protected GitHub environment named `release`:
+
+1. Navigate to **Repository Settings → Environments → New environment**.
+2. Name the environment `release`.
+3. Configure protection rules (ideally set **Required reviewers** so deployments and secret access require manual authorization).
+4. Add the signing secrets under **Environment secrets**:
+   * `ANDROID_KEYSTORE_BASE64`: The base64-encoded content of your `.jks` keystore file.
+   * `ANDROID_KEYSTORE_PASS`: The password string stored in your `.pass` file.
+
+### Build-Then-Sign Order & Cryptographic Hygiene
+
+In CI (`android.yml` and `release.yml` `kitkat-apk`), signing material is guarded by strict isolation:
+- **Zero secrets during build**: Dependency code (`npm ci`, Expo prebuild, Gradle tasks) executes while the keystore does not exist on runner storage.
+- **Dedicated signing step**: Only after compilation completes does the runner decode the keystore to `$RUNNER_TEMP/keystore/chernobyl-release.jks` and write the password via `printf '%s'` into `chernobyl-release.pass`.
+- **Guaranteed cleanup**: A bash exit trap (`trap 'rm -rf "$RUNNER_TEMP/keystore"' EXIT`) ensures the keystore and password files are deleted immediately when the step finishes or fails.
+- **Signer verification**: `apksigner verify --print-certs` verifies the APK signature and checks that the certificate SHA-256 digest matches the pinned release certificate `c8cc22bdfb6c244447d2a5beb007f8fd6adcd20fb8632b0e5998c6b96ead7d36`. If the digest does not match, the step terminates with an error.
 
 ### Generating the Secrets from Local Keys
 
@@ -123,7 +149,7 @@ Set-Clipboard -Value $pass
 Write-Host "Keystore password copied to clipboard! Paste into ANDROID_KEYSTORE_PASS secret."
 ```
 
-In CI, `android.yml` writes the decoded keystore to a temporary runner directory, writes the password with `printf "%s"` (no trailing newline) into a `.pass` file beside the `.jks`, and sets `CHB_KEYSTORE`. Secrets are never echoed to job logs.
+In CI, `android.yml` and `release.yml` decode the keystore in a dedicated post-build step into `$RUNNER_TEMP/keystore`, write the password with `printf "%s"` (no trailing newline) into a `.pass` file beside the `.jks`, register a cleanup exit trap, and execute the signing command. Secrets are never echoed to job logs.
 
 ---
 
