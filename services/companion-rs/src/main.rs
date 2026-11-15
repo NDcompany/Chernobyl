@@ -1479,7 +1479,7 @@ mod tests {
             cfg_str,
             "--require-e2e".into(),
             "--token".into(),
-            "e2e-secret".into(),
+            "e2e-secret-0123456789abcdef0123456789abcdef".into(),
             "--exit-after".into(),
             "50".into(),
         ]);
@@ -1541,7 +1541,12 @@ mod tests {
     fn cli_daemon_holds_the_journal_lock_while_it_runs() {
         use chernobyl_companion::storage::lock_data_dir;
         let (dir, cfg_path) = temp_config("daemon-lock", |_| {});
-        let daemon = ["--token", "t", "--exit-after", "1500"];
+        let daemon = [
+            "--token",
+            "daemon-lock-0123456789abcdef0123456789abcdef",
+            "--exit-after",
+            "1500",
+        ];
 
         let other = lock_data_dir(&dir).unwrap();
         assert_eq!(cli(&cfg_path, &daemon), 1, "booted on a held journal");
