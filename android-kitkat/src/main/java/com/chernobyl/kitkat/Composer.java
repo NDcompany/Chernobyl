@@ -264,6 +264,19 @@ public final class Composer {
         return new String[] {s.optString("branch") + " → " + s.optString("upstream"), "1"};
     }
 
+    /**
+     * After a Pull: the warning for changed agent configuration (`agentConfigChanged` on the
+     * command_result), or null when none changed. At most five paths are named.
+     */
+    public static String agentConfigWarning(JSONArray paths) {
+        if (paths == null || paths.length() == 0) return null;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < paths.length() && i < 5; i++) sb.append(i > 0 ? ", " : "").append(paths.optString(i));
+        String more = paths.length() > 5 ? " and " + (paths.length() - 5) + " more" : "";
+        return "This pull changed agent settings: " + sb + more + ". Agents in this workspace follow them, "
+                + "including tool permissions and hooks \u2014 review them on your PC.";
+    }
+
     /* ---------------- tls ---------------- */
 
     /**

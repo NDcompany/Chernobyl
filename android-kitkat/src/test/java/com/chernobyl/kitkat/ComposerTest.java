@@ -30,6 +30,22 @@ public class ComposerTest {
     }
 
     @Test
+    public void agentConfigWarningNamesPathsAndCapsThem() throws Exception {
+        assertNull(Composer.agentConfigWarning(null));
+        assertNull(Composer.agentConfigWarning(new JSONArray()));
+        String one = Composer.agentConfigWarning(new JSONArray("[\".claude/settings.json\"]"));
+        assertTrue(one.startsWith("This pull changed agent settings: .claude/settings.json. Agents in this workspace follow them"));
+        assertTrue(one.contains("tool permissions and hooks"));
+        assertTrue(one.endsWith("review them on your PC."));
+        assertTrue(Composer.agentConfigWarning(new JSONArray("[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\"]")).contains("a, b, c, d, e and 2 more."));
+    }
+
+    static JSONObject composerState() throws Exception {
+        JSONArray ops = ModelTest.fixture("composer-transcript.json").getJSONArray("ops");
+        return ops.getJSONObject(1).getJSONObject("state");
+    }
+
+    @Test
     public void slashMenuFiltersTheStatesCommands() throws Exception {
         assertEquals("com", Composer.slashQuery("/com"));
         assertEquals("", Composer.slashQuery("/"));
