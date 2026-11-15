@@ -31,6 +31,10 @@ pub const CLOSE_DEVICE_REVOKED: u16 = 4003;
 pub const APP_ORIGIN: &str = "chernobyl://app";
 
 pub const AUTH_FAILURE_LIMIT: u32 = 5;
+/// Security pass 2026-11-15 (N6): once the limit is hit, a wrong token is
+/// answered only after this pause, so guessing is slow even though the 429
+/// itself costs nothing.
+const AUTH_THROTTLE: Duration = Duration::from_millis(250);
 
 // Per-message-class outbound bounds (D8 + mandate §4): ONE FIFO, TWO admission
 // policies, so a bulk event burst can never consume the room a control frame
@@ -712,7 +716,8 @@ fn handle_conn(
         let failures = *companion.shared.auth_failures.lock().unwrap();
         let ok_now = authorized(&handshake, expected);
         if !ok_now && failures >= AUTH_FAILURE_LIMIT {
-            // brute-force cooldown: refuse fast, do not even upgrade
+            // brute-force cooldown: do not even upgrade, and make each guess cost time
+            thread::sleep(AUTH_THROTTLE);
             let _ = ws::write_http_error(&mut writer, 429, "Too Many Requests", "");
             return Ok(());
         }
@@ -1185,6 +1190,24 @@ struct HsPending {
     nonce: [u8; 16],
     salt: [u8; 16],
     cnonce: [u8; 16],
+}
+
+/// Security pass 2026-11-15 (N8): at remote posture a connection that fails
+/// this many handshake steps is closed.
+const MAX_HS_ERRORS: u32 = 5;
+/// At remote posture a connection that has not established an E2E session
+/// this long after the upgrade is closed (it holds only the token).
+const REMOTE_SESSION_DEADLINE: Duration = Duration::from_secs(20);
+
+/// [`hs_err`] that also counts the failure and, when `limited`, ends the
+/// connection at [`MAX_HS_ERRORS`].
+fn hs_fail(outbound: &Outbound, reason: &str, count: &mut u32, limited: bool) -> io::Result<()> {
+    *count += 1;
+    hs_err(outbound, reason).map_err(|_| io::Error::other("outbound queue saturated"))?;
+    if limited && *count >= MAX_HS_ERRORS {
+        return Err(io::Error::other("too many failed handshakes"));
+    }
+    Ok(())
 }
 
 fn hs_err(outbound: &Outbound, reason: &str) -> Result<(), EnqueueError> {
@@ -1835,12 +1858,21 @@ fn serve_ws(
     // fan-out path so events are sealed too). `hs` holds the in-flight
     // handshake between hs_hello and hs_proof.
     let mut hs: Option<HsPending> = None;
+    let mut hs_errors: u32 = 0;
+    let connected_at = Instant::now();
 
     // heartbeat: every HEARTBEAT_MS of silence is a miss (ping sent); N
     // misses → dead peer (parity with the Node host's cadence and limit)
     let beat = Duration::from_millis(crate::protocol::HEARTBEAT_MS);
     let mut idle_since = Instant::now();
     let result: io::Result<()> = loop {
+        // N8: a token alone must not park a connection at remote posture
+        if require_e2e
+            && connected_at.elapsed() >= REMOTE_SESSION_DEADLINE
+            && !outbound.has_session()
+        {
+            break Err(io::Error::other("no e2e session within the deadline"));
+        }
         match reader.peek(&mut [0u8; 1]) {
             Ok(_) => {} // data or EOF: read_frame reports either
             Err(e) if is_timeout(&e) => {
@@ -1960,10 +1992,13 @@ fn serve_ws(
                             else {
                                 hs = None;
                                 outbound.set_handshaking(false);
-                                if hs_err(&outbound, "hs_hello needs a 16-byte base64 cnonce")
-                                    .is_err()
-                                {
-                                    break Err(io::Error::other("outbound queue saturated"));
+                                if let Err(e) = hs_fail(
+                                    &outbound,
+                                    "hs_hello needs a 16-byte base64 cnonce",
+                                    &mut hs_errors,
+                                    require_e2e,
+                                ) {
+                                    break Err(e);
                                 }
                                 continue;
                             };
@@ -1989,8 +2024,13 @@ fn serve_ws(
                         }
                         ClientMsg::HsProof { proof } => {
                             let Some(pending) = hs.take() else {
-                                if hs_err(&outbound, "no handshake in progress").is_err() {
-                                    break Err(io::Error::other("outbound queue saturated"));
+                                if let Err(e) = hs_fail(
+                                    &outbound,
+                                    "no handshake in progress",
+                                    &mut hs_errors,
+                                    require_e2e,
+                                ) {
+                                    break Err(e);
                                 }
                                 continue;
                             };
@@ -2036,8 +2076,10 @@ fn serve_ws(
                                 }
                                 Err(reason) => {
                                     outbound.set_handshaking(false);
-                                    if hs_err(&outbound, &reason).is_err() {
-                                        break Err(io::Error::other("outbound queue saturated"));
+                                    if let Err(e) =
+                                        hs_fail(&outbound, &reason, &mut hs_errors, require_e2e)
+                                    {
+                                        break Err(e);
                                     }
                                 }
                             }
@@ -5099,6 +5141,75 @@ mod e2e_tests {
         assert!(err.contains("404"), "{err}");
         // control: the same upgrade on the main listener connects
         let _ok = connect(&f);
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N8): at remote posture a connection is closed
+    /// after MAX_HS_ERRORS failed handshake steps; on a plain loopback server
+    /// the same peer is never cut off.
+    #[test]
+    fn remote_posture_closes_a_connection_after_repeated_handshake_errors() {
+        let bad = r#"{"type":"hs_proof","proof":"AAAA"}"#;
+        let f = fixture_remote("n8-hs-errors");
+        let mut c = connect_remote(&f);
+        c.set_read_timeout_ms(5_000).unwrap();
+        for i in 0..MAX_HS_ERRORS {
+            c.send_text(bad).unwrap();
+            let reply = c.next_text().unwrap_or_else(|e| panic!("reply {i}: {e}"));
+            assert!(reply.contains("hs_err"), "{reply}");
+        }
+        // the connection is gone: the next read ends instead of answering
+        assert!(c.send_text(bad).is_err() || c.next_text().is_err());
+        shutdown(f);
+
+        let f = fixture("n8-hs-errors-local", now_ms() + 60_000, false);
+        let mut c = connect(&f);
+        for _ in 0..MAX_HS_ERRORS + 2 {
+            c.send_text(bad).unwrap();
+            assert!(c.next_text().unwrap().contains("hs_err"));
+        }
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N8): at remote posture a connection that never
+    /// establishes a session is closed REMOTE_SESSION_DEADLINE after the upgrade.
+    #[test]
+    fn remote_posture_closes_a_connection_that_never_gets_a_session() {
+        let f = fixture_remote("n8-idle");
+        let mut c = connect_remote(&f);
+        c.set_read_timeout_ms(40_000).unwrap();
+        let t = Instant::now();
+        // heartbeat pings (unanswered) may arrive; the close ends the loop
+        while c
+            .read_frame()
+            .is_ok_and(|fr| !matches!(fr, Frame::Close(..)))
+        {}
+        let took = t.elapsed();
+        assert!(
+            took >= REMOTE_SESSION_DEADLINE - Duration::from_secs(1)
+                && took < REMOTE_SESSION_DEADLINE + Duration::from_secs(8),
+            "closed after {took:?}"
+        );
+        shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N6): past the failure limit a wrong token is
+    /// answered with 429 only after a pause; the right token still connects.
+    #[test]
+    fn wrong_token_past_the_failure_limit_is_throttled() {
+        let f = fixture_remote("n6-throttle");
+        let addr = format!("127.0.0.1:{}", f.handle.port);
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            let mut c = WsClient::connect(&addr, "/", Some("wrong")).unwrap();
+            assert!(c.next_text().is_err()); // closed 4001
+        }
+        let t = Instant::now();
+        let err = WsClient::connect(&addr, "/", Some("wrong"))
+            .err()
+            .expect("429");
+        assert!(err.contains("429"), "{err}");
+        assert!(t.elapsed() >= AUTH_THROTTLE - Duration::from_millis(20));
+        let _ok = connect_remote(&f);
         shutdown(f);
     }
 
