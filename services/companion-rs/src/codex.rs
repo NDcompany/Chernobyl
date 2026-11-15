@@ -4777,4 +4777,223 @@ mod tests {
             )
         )));
     }
+
+    #[test]
+    fn find_codex_binary_discovery_helpers() {
+        use std::ffi::OsString;
+        use std::fs::{File, create_dir_all, write};
+
+        let temp = std::env::temp_dir().join(format!("test-find-codex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        create_dir_all(&temp).unwrap();
+
+        // 1. Path search: 0-byte files and WindowsApps aliases are skipped
+        let p_zero = temp.join("path_zero");
+        create_dir_all(&p_zero).unwrap();
+        File::create(p_zero.join("codex.exe")).unwrap(); // 0 bytes
+
+        let p_winapps = temp.join("WindowsApps").join("bin");
+        create_dir_all(&p_winapps).unwrap();
+        write(p_winapps.join("codex.exe"), b"not a real cli").unwrap();
+
+        let p_valid = temp.join("path_valid");
+        create_dir_all(&p_valid).unwrap();
+        write(p_valid.join("codex.exe"), b"valid cli exe").unwrap();
+
+        let path_var = std::env::join_paths([&p_zero, &p_winapps, &p_valid]).unwrap();
+        let found = find_codex(Some(&path_var), None).unwrap();
+        assert_eq!(found, p_valid.join("codex.exe"));
+
+        // 2. LocalAppData search: newest version directory containing real codex.exe
+        let local_app_data = temp.join("local_app_data");
+        let bin = local_app_data.join("OpenAI").join("Codex").join("bin");
+
+        let v1 = bin.join("v1.0.0");
+        create_dir_all(&v1).unwrap();
+        write(v1.join("codex.exe"), b"exe v1").unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let v2 = bin.join("v2.0.0");
+        create_dir_all(&v2).unwrap();
+        write(v2.join("codex.exe"), b"exe v2").unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let v3_zero = bin.join("v3.0.0");
+        create_dir_all(&v3_zero).unwrap();
+        File::create(v3_zero.join("codex.exe")).unwrap(); // 0 bytes, newer mtime, but skipped!
+
+        let v4_noexe = bin.join("v4.0.0");
+        create_dir_all(&v4_noexe).unwrap(); // no codex.exe
+
+        let empty_path = OsString::new();
+        let found_app = find_codex(Some(&empty_path), Some(&local_app_data)).unwrap();
+        assert_eq!(found_app, v2.join("codex.exe"));
+
+        // 3. Not found when neither has a valid binary
+        let not_found = find_codex(Some(&empty_path), None);
+        assert!(not_found.is_err());
+        assert!(not_found.unwrap_err().contains("Codex was not found"));
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn relative_path_display_and_diff_titles() {
+        // Child path relative to cwd
+        assert_eq!(relative(r"C:\work\src\lib.rs", r"C:\work"), "src/lib.rs");
+        assert_eq!(relative("C:/work/src/lib.rs", "C:/work"), "src/lib.rs");
+        assert_eq!(
+            relative(r"C:\work\sub\dir\file.txt", r"C:\work\"),
+            "sub/dir/file.txt"
+        );
+        // Case-insensitivity on Windows
+        assert_eq!(relative(r"c:\WORK\src\main.rs", r"C:\work"), "src/main.rs");
+        // External or sibling paths
+        assert_eq!(
+            relative(r"D:\other\file.rs", r"C:\work"),
+            r"D:\other\file.rs"
+        );
+        assert_eq!(
+            relative(r"C:\workshop\a.txt", r"C:\work"),
+            r"C:\workshop\a.txt"
+        );
+        assert_eq!(relative(r"C:\work", r"C:\work"), r"C:\work");
+
+        // paths_title
+        let d = |p: &str| FileDiff {
+            path: p.into(),
+            status: "modified",
+            additions: 1,
+            deletions: 0,
+            truncated: false,
+            patch: String::new(),
+        };
+        assert_eq!(paths_title(&[]), "");
+        assert_eq!(paths_title(&[d("src/a.rs")]), "src/a.rs");
+        assert_eq!(
+            paths_title(&[d("src/a.rs"), d("src/b.rs")]),
+            "src/a.rs (+1 more)"
+        );
+        assert_eq!(
+            paths_title(&[d("src/a.rs"), d("src/b.rs"), d("src/c.rs")]),
+            "src/a.rs (+2 more)"
+        );
+    }
+
+    #[test]
+    fn available_decisions_options_mapping_and_decision_names() {
+        // decision_name parsing
+        assert_eq!(decision_name(&json::s("accept")), Some("accept".into()));
+        let amend_obj = json::obj(vec![(
+            "acceptWithExecpolicyAmendment",
+            json::obj(vec![("execpolicy_amendment", Json::Arr(vec![]))]),
+        )]);
+        assert_eq!(
+            decision_name(&amend_obj),
+            Some("acceptWithExecpolicyAmendment".into())
+        );
+        assert_eq!(decision_name(&Json::Int(123)), None);
+
+        // AskKind::Command without availableDecisions: default list
+        let kind_default = AskKind::Command {
+            amendment: None,
+            available: None,
+        };
+        let opts_default = options(&kind_default);
+        let ids: Vec<&str> = opts_default.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, ["accept", "acceptForSession", "decline", "cancel"]);
+
+        // AskKind::Command with amendment
+        let kind_amend = AskKind::Command {
+            amendment: Some(Json::Arr(vec![json::s("git"), json::s("diff")])),
+            available: None,
+        };
+        let opts_amend = options(&kind_amend);
+        let ids_amend: Vec<&str> = opts_amend.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(
+            ids_amend,
+            [
+                "accept",
+                "acceptForSession",
+                "acceptWithExecpolicyAmendment",
+                "decline",
+                "cancel"
+            ]
+        );
+        let amend_opt = opts_amend
+            .iter()
+            .find(|o| o.id == "acceptWithExecpolicyAmendment")
+            .unwrap();
+        assert_eq!(amend_opt.decision, "approve-session");
+        assert_eq!(amend_opt.scope, "persistent");
+        assert_eq!(amend_opt.rule.as_deref(), Some("git diff"));
+
+        // AskKind::Command with availableDecisions filter
+        let kind_filtered = AskKind::Command {
+            amendment: Some(Json::Arr(vec![json::s("git")])),
+            available: Some(vec!["accept".into(), "cancel".into()]),
+        };
+        let opts_filtered = options(&kind_filtered);
+        let ids_filtered: Vec<&str> = opts_filtered.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids_filtered, ["accept", "cancel"]);
+
+        // AskKind::Question
+        let kind_q = AskKind::Question {
+            ids: vec!["q1".into()],
+        };
+        let opts_q = options(&kind_q);
+        assert_eq!(opts_q[0].id, "answer");
+        assert_eq!(opts_q[1].id, "skip");
+    }
+
+    #[test]
+    fn reasoning_item_hiding_until_first_text_delta() {
+        let (mut codex, mut peer) = session();
+        let turn = r#"{"threadId":"thr_1","turnId":"turn_1"}"#;
+        let _ = peer.note(&mut codex, "turn/started", turn);
+
+        // Empty reasoning item starts: nothing emitted to client
+        let empty_rs = r#"{"threadId":"thr_1","turnId":"turn_1","item":{"type":"reasoning","id":"rs_hide","summary":[],"content":[]}}"#;
+        let events_start = peer.note(&mut codex, "item/started", empty_rs);
+        assert_eq!(events_start.len(), 0, "empty reasoning item must be hidden");
+
+        // First text delta: emits Op::Item containing the initial text
+        let delta =
+            r#"{"threadId":"thr_1","turnId":"turn_1","itemId":"rs_hide","delta":"pondering"}"#;
+        let events_delta = peer.note(&mut codex, "item/reasoning/textDelta", delta);
+        assert_eq!(events_delta.len(), 1);
+        assert!(matches!(
+            &events_delta[0],
+            Event::Op(_, Op::Item(it))
+                if it.id == "rs_hide" && it.kind == ItemKind::Thinking && it.text == "pondering"
+        ));
+
+        // Subsequent delta: emits only Op::Append
+        let delta2 =
+            r#"{"threadId":"thr_1","turnId":"turn_1","itemId":"rs_hide","delta":" further"}"#;
+        let events_delta2 = peer.note(&mut codex, "item/reasoning/textDelta", delta2);
+        assert_eq!(events_delta2.len(), 1);
+        assert!(matches!(
+            &events_delta2[0],
+            Event::Op(
+                _,
+                Op::Append {
+                    field: Field::Text,
+                    text,
+                    ..
+                }
+            ) if text == " further"
+        ));
+
+        // Empty reasoning item that completes without text never emits anything
+        let empty_rs2 = r#"{"threadId":"thr_1","turnId":"turn_1","item":{"type":"reasoning","id":"rs_empty","summary":[],"content":[]}}"#;
+        let events_start2 = peer.note(&mut codex, "item/started", empty_rs2);
+        assert_eq!(events_start2.len(), 0);
+        let events_comp = peer.note(&mut codex, "item/completed", empty_rs2);
+        assert_eq!(
+            events_comp.len(),
+            0,
+            "empty reasoning never completed to client"
+        );
+    }
 }

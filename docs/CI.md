@@ -27,6 +27,19 @@ Runs on every push to any branch and on all pull requests.
   Depends on both `ts` and `rust` passing (`needs: [ts, rust]`). Runs on `windows-latest` to verify the end-to-end integration between the TypeScript packages and the compiled Rust companion daemon:
   * `npm run verify:e2e` (`node services/companion-rs/tools/e2e-interop.mjs`)
 
+- **`kitkat` job** (`ubuntu-latest`):
+  Runs unit tests for the native Android 4.4 KitKat client (`android-kitkat/`):
+  * Sets up JDK 17 (Temurin) with Gradle caching.
+  * Sets up Android SDK Platform 36 and Build-Tools 36.0.0.
+  * Makes `gradlew` executable (`chmod +x`).
+  * Runs `./gradlew testDebugUnitTest --console=plain` in `android-kitkat/`.
+
+- **`setup-script` job** (`windows-latest`):
+  Depends on the `rust` job passing (`needs: [rust]`). Verifies the Windows setup script (`scripts/setup-windows.ps1`) without touching real user directories:
+  * Builds the companion in release mode (`cargo build --release --manifest-path services/companion-rs/Cargo.toml`).
+  * Runs `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-setup-windows.ps1 -Exe services/companion-rs/target/release/chernobyl-companion.exe`.
+  * **Note on Scope**: `test-setup-windows.ps1` runs `setup-windows.ps1` in `-ConfigOnly` mode with redirected temp directories (`APPDATA` / `LOCALAPPDATA`) and validates generated configurations against the companion daemon's CLI parser (`--config <path> --devices`). It does not modify persistent system configuration, require administrative privileges, or depend on external runtimes (`agy`, `codex`, `claude`) or tunnels being installed on the runner. The test script exercises configuration generation and syntax verification; it does not support skip environment variables.
+
 - **Security & Concurrency**:
   Runs with least-privilege permissions (`contents: read`) and cancel-in-progress concurrency grouped per ref.
 
@@ -48,18 +61,25 @@ Triggered on demand via `workflow_dispatch` and automatically on release tags ma
 
 ---
 
-### 3. `release.yml` — Companion Binary & Draft Release
+### 3. `release.yml` — Companion Binary, KitKat APK & Draft Release
 
 Triggered automatically on release tags matching `v*`.
 
-- Runs on `windows-latest`.
-- Builds the optimized release companion binary:
-  `cargo build --release --manifest-path services/companion-rs/Cargo.toml`
-- Runs `node scripts/package-release.mjs` to calculate standard SHA-256 checksums across all release artifacts.
-- Publishes a draft GitHub Release using `softprops/action-gh-release@v2` with `contents: write` permissions, attaching:
-  * `services/companion-rs/target/release/chernobyl-companion.exe`
-  * `release/SHA256SUMS.txt`
-- The Android APK artifact built concurrently by `android.yml` can be downloaded and attached to this draft release prior to publishing.
+- **`kitkat-apk` job** (`ubuntu-latest`):
+  * Sets up JDK 17 (Temurin) with Gradle caching and Android SDK (Platform 36, Build-Tools 36.0.0).
+  * Builds the Android 4.4 KitKat client release APK (`./gradlew assembleRelease --console=plain`).
+  * Signs the APK with `apksigner` (v1 JAR + v2 signature, min SDK 19) if repository secrets `ANDROID_KEYSTORE_BASE64` and `ANDROID_KEYSTORE_PASS` are present; if secrets are absent, keeps the APK debug-signed and logs an explanatory note.
+  * Uploads the APK artifact (`chernobyl-kitkat-apk`).
+- **`release` job** (`windows-latest`, `needs: [kitkat-apk]`):
+  * Downloads the built KitKat APK into `release/`.
+  * Builds the optimized release companion binary:
+    `cargo build --release --manifest-path services/companion-rs/Cargo.toml`
+  * Runs `node scripts/package-release.mjs` to calculate standard SHA-256 checksums across all release artifacts (`chernobyl-companion.exe` and `release/*.apk`).
+  * Publishes a draft GitHub Release using `softprops/action-gh-release@v2` with `contents: write` permissions, attaching:
+    * `services/companion-rs/target/release/chernobyl-companion.exe`
+    * `release/*.apk` (including the KitKat APK)
+    * `release/SHA256SUMS.txt`
+  * The modern Android APK artifact built concurrently by `android.yml` can also be attached to this draft release prior to publication.
 
 ---
 
