@@ -160,27 +160,7 @@ impl LiveRuntime for AgyRuntime {
     fn agents(&self) -> Vec<Agent> {
         let i = &self.inner;
         let st = i.st.lock().unwrap();
-        let busy = st
-            .sessions
-            .iter()
-            .any(|s| matches!(s.status.as_str(), "running" | "waiting"));
-        let healthy = self.is_healthy();
-        let state = match (healthy, busy) {
-            (false, _) => "offline",
-            (true, true) => "busy",
-            (true, false) => "online",
-        };
-        vec![Agent {
-            id: i.id.clone(),
-            host_id: i.id.clone(),
-            kind: "antigravity".into(),
-            name: "Antigravity".into(),
-            state: state.into(),
-            capabilities: vec!["live".into()],
-            accepts_new_session: healthy,
-            simulated: false,
-            live: Some(i.cfg.agent_live(&st.models)),
-        }]
+        vec![i.agent(&st)]
     }
 
     fn sessions(&self) -> Vec<Session> {
@@ -253,6 +233,31 @@ impl LiveRuntime for AgyRuntime {
 }
 
 impl Inner {
+    /// The agent record: its `live` part carries the models agy has offered so far.
+    fn agent(&self, st: &State) -> Agent {
+        let busy = st
+            .sessions
+            .iter()
+            .any(|s| matches!(s.status.as_str(), "running" | "waiting"));
+        let healthy = self.healthy.load(Ordering::SeqCst);
+        let state = match (healthy, busy) {
+            (false, _) => "offline",
+            (true, true) => "busy",
+            (true, false) => "online",
+        };
+        Agent {
+            id: self.id.clone(),
+            host_id: self.id.clone(),
+            kind: "antigravity".into(),
+            name: "Antigravity".into(),
+            state: state.into(),
+            capabilities: vec!["live".into()],
+            accepts_new_session: healthy,
+            simulated: false,
+            live: Some(self.cfg.agent_live(&st.models)),
+        }
+    }
+
     fn check_health(&self) -> Result<(), AdapterError> {
         let running = self.st.lock().unwrap().agy.is_some();
         let res = if running || !self.probe_binary {
@@ -686,8 +691,12 @@ impl Inner {
     fn dispatch(&self, st: &mut State, events: Vec<Event>) {
         if let Some(models) = st.agy.as_ref().map(|a| a.models().to_vec())
             && !models.is_empty()
+            && models != st.models
         {
             st.models = models;
+            // agy only tells its models in the first session/new: a phone that connected before
+            // would keep an agent without the model picker until it reconnected
+            (self.sink)(EventKind::AgentUpdated(self.agent(st)));
         }
         for event in events {
             match event {
@@ -1096,6 +1105,18 @@ pub(crate) mod tests {
         let live = rt.agents()[0].live.clone().unwrap();
         assert_eq!(live.composer[0], "model");
         assert_eq!(live.models[1].0, "gemini-3.8-flash-low");
+        // and a connected phone is told: the agent is republished with the picker (once)
+        let updates: Vec<Agent> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|k| match k {
+                EventKind::AgentUpdated(a) => Some(a.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        assert_eq!(updates[0].live.as_ref().unwrap().composer[0], "model");
         peer.update(SID, r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Running it"}}"#);
         peer.update(SID, r#"{"sessionUpdate":"tool_call","toolCallId":"call_9","name":"run_command","status":"in_progress","kind":"execute","title":"hostname","rawInput":{"CommandLine":"hostname"}}"#);
         peer.say(ASK);
