@@ -335,17 +335,26 @@ pub fn start_with_caps(
     main_cap: usize,
     diag_cap: usize,
 ) -> Result<ServerHandle, String> {
-    let listener = match crate::ffi::bind_listener_backlog(bind, port) {
-        Ok(l) => l,
-        Err(e) => {
-            // IPv6 binds (and any exotic config) keep std's ~128-handshake backlog
-            eprintln!("[companion] large-backlog listener unavailable ({e}); using std bind");
-            TcpListener::bind((bind, port)).map_err(|e2| format!("bind {bind}:{port}: {e2}"))?
-        }
+    // "localhost" is the IPv4 loopback here, so it takes the protected path
+    let bind = if bind == "localhost" {
+        "127.0.0.1"
+    } else {
+        bind
+    };
+    let listener = if bind.parse::<std::net::Ipv4Addr>().is_ok() {
+        // N3: an IPv4 bind is exclusive (SO_EXCLUSIVEADDRUSE); if that cannot
+        // be had, the bind fails rather than falling back to a hijackable one
+        crate::ffi::bind_listener_backlog(bind, port)
+            .map_err(|e| format!("bind {bind}:{port}: {e}"))?
+    } else {
+        // IPv6 binds keep std's ~128-handshake backlog, without the exclusive
+        // flag (ponytail: std exposes no pre-bind socket option; raw IPv6 if it matters)
+        eprintln!("[companion] {bind} is not IPv4; using std bind");
+        TcpListener::bind((bind, port)).map_err(|e| format!("bind {bind}:{port}: {e}"))?
     };
     let actual_port = listener.local_addr().map_err(|e| e.to_string())?.port();
     // diagnostics is loopback-only by contract (PRD §15.2)
-    let diag_listener = TcpListener::bind(("127.0.0.1", diagnostics_port))
+    let diag_listener = crate::ffi::bind_listener_backlog("127.0.0.1", diagnostics_port)
         .map_err(|e| format!("bind diagnostics: {e}"))?;
     let actual_diag_port = diag_listener
         .local_addr()

@@ -51,6 +51,7 @@ unsafe extern "system" {
     -> u64;
     fn bind(s: u64, addr: *const u8, len: i32) -> i32;
     fn listen(s: u64, backlog: i32) -> i32;
+    fn setsockopt(s: u64, level: i32, name: i32, val: *const u8, len: i32) -> i32;
     fn closesocket(s: u64) -> i32;
 }
 
@@ -59,6 +60,11 @@ const SOCK_STREAM: i32 = 1;
 const IPPROTO_TCP: i32 = 6;
 const INVALID_SOCKET: u64 = u64::MAX;
 const SOMAXCONN: i32 = 0x7fffffff;
+const SOL_SOCKET: i32 = 0xffff;
+/// `!SO_REUSEADDR`: no other socket may bind this address:port, not even one
+/// that sets SO_REUSEADDR (otherwise any local process could bind the same
+/// port and take the connections meant for the companion).
+const SO_EXCLUSIVEADDRUSE: i32 = !0x0004;
 /// What std's own sockets use: overlapped, and never inherited by a child.
 const WSA_FLAG_OVERLAPPED: u32 = 0x01;
 const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
@@ -97,6 +103,14 @@ pub fn bind_listener_backlog(ipv4: &str, port: u16) -> Result<std::net::TcpListe
         );
         if s == INVALID_SOCKET {
             return Err(format!("WSASocketW() failed: {}", WSAGetLastError()));
+        }
+        // security pass 2026-11-15 (N3): before bind, and a failure is a
+        // failed bind (the caller must not fall back to an unprotected one)
+        let on = 1u32.to_le_bytes();
+        if setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, on.as_ptr(), 4) != 0 {
+            let e = WSAGetLastError();
+            closesocket(s);
+            return Err(format!("setsockopt(SO_EXCLUSIVEADDRUSE) failed: {e}"));
         }
         let mut addr = [0u8; 16]; // sockaddr_in: family(le), port(be), addr, zero[8]
         addr[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
@@ -434,6 +448,37 @@ mod tests {
         assert!(l.local_addr().unwrap().port() > 0);
         // IPv6 is the std-bind fallback path, not an error state for the server
         assert!(bind_listener_backlog("::1", 0).is_err());
+    }
+
+    /// Security pass 2026-11-15 (N3): a second socket that sets SO_REUSEADDR
+    /// (what a hijacking local process does) cannot bind the companion's port.
+    #[test]
+    fn listener_port_cannot_be_hijacked_with_so_reuseaddr() {
+        let l = bind_listener_backlog("127.0.0.1", 0).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let mut wsa = [0u8; 512];
+        unsafe {
+            WSAStartup(0x0202, wsa.as_mut_ptr());
+            let s = WSASocketW(
+                AF_INET,
+                SOCK_STREAM,
+                IPPROTO_TCP,
+                std::ptr::null(),
+                0,
+                WSA_FLAG_OVERLAPPED,
+            );
+            assert_ne!(s, INVALID_SOCKET);
+            let on = 1u32.to_le_bytes();
+            assert_eq!(setsockopt(s, SOL_SOCKET, 0x0004, on.as_ptr(), 4), 0);
+            let mut addr = [0u8; 16];
+            addr[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+            addr[2..4].copy_from_slice(&port.to_be_bytes());
+            addr[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            let rc = bind(s, addr.as_ptr(), addr.len() as i32);
+            closesocket(s);
+            assert_ne!(rc, 0, "a SO_REUSEADDR bind must not share the port");
+        }
+        drop(l);
     }
 
     #[test]
