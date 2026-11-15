@@ -535,19 +535,16 @@ pub fn is_model_name(s: &str) -> bool {
     is_model(s)
 }
 
-/// ADR-022: `gemini-3.8-flash-low`, `gpt-oss-120b-medium`: lowercase letters
-/// and digits in `-`/`.`-separated parts, at least two, starting with a
-/// letter, at most 64 chars.
+/// A runtime's own model name (Codex `gpt-6-luna`, Antigravity
+/// `gemini-3.8-flash-low`): lowercase letters, digits, `.`, `_`, `-`, at most
+/// 64, starting and ending with a letter or digit.
 pub fn is_runtime_model(s: &str) -> bool {
-    let part = |p: &str| {
-        !p.is_empty()
-            && p.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-    };
+    let edge = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
     s.len() <= MODEL_MAX
-        && s.starts_with(|c: char| c.is_ascii_lowercase())
-        && s.split(['-', '.']).count() >= 2
-        && s.split(['-', '.']).all(part)
+        && edge(s.as_bytes().first())
+        && edge(s.as_bytes().last())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
 
 /// Any model the wire accepts (see `is_model_name`).
@@ -3048,8 +3045,31 @@ mod tests {
         }
         let long = format!("p/{}", "a".repeat(62));
         assert!(is_model(&long) && !is_model(&format!("{long}a")));
+        for bad in ["claude-", "claude-A", "gpt-5", "best"] {
+            assert!(!is_claude_model(bad), "{bad}");
+        }
+        // the wire: any runtime's model name (Codex lists gpt-6-luna, gpt-5.6-terra)
+        for good in ["gpt-6-luna", "gpt-5.6-terra", "o4-mini", "codex_mini"] {
+            assert!(is_model(good), "{good}");
+        }
         for bad in [
-            "/m", "p/", "-p/m", "p/-m", "p//m", "p/m n", "p/m;calc", "p m/x", "p/m$x",
+            "/m",
+            "p/",
+            "-p/m",
+            "p/-m",
+            "p//m",
+            "p/m n",
+            "p/m;calc",
+            "p m/x",
+            "p/m$x",
+            "",
+            "claude-",
+            "claude-A",
+            "claude-a b",
+            "-model",
+            ".hidden",
+            "gpt-5.",
+            "sonnet[1m]",
         ] {
             assert!(!is_model(bad), "{bad}");
         }
@@ -3065,15 +3085,11 @@ mod tests {
         }
         for bad in [
             "",
-            "best",
             "Opus",
             "claude-",
             "-model",
             "--dangerously-skip-permissions",
-            "gemini..x",
-            "9-model",
             "gemini-3.8 flash",
-            "gpt_5",
             "claude-opus;calc",
         ] {
             assert!(!is_model_name(bad), "{bad}");

@@ -352,8 +352,15 @@ Updated: 2026-11-04 (ADR-015 live agent sessions implemented on main: Claude Cod
       first (does Claude Code cancel the hook, as assumed?), and a fork from an emulator run.
 - [ ] Composer: gallery attachments need `expo-image-picker` (not shipped); one camera run on a
       device; chunked uploads if bigger photos are wanted.
-- [ ] A live Codex run, when someone has Codex installed and signed in; capabilities stay
-      `limited` until then.
+- [x] Codex live (branch `feat/codex-live`, 2026-11-12): codex-cli 0.167.0-alpha.4.1 from the
+      Codex desktop app; schema diffed against its `generate-ts`; binary auto-discovery; policy
+      `untrusted` + `danger-full-access`; `availableDecisions`; model picker, images, context,
+      rename, history (list, replay, resume, Live on PC, fork); `setup-windows.ps1 -Codex`; live
+      tests `live_codex_runtime_round_trip` + `live_codex_companion_phone_round_trip` (11 turns
+      in all, probes included). ADR-015 §10.
+- [ ] Codex emulator rows (create, approve, model, photo, history, fork) on the phone and KitKat.
+- [ ] Codex: answer approvals of threads running in the Codex desktop app (needs an attachable
+      app-server; the app's is a private stdio child today); MCP OAuth sign-in run live.
 - [x] Files and Changes from the phone (ADR-016, branch `feat/files-git`, 2026-11-12):
       read-only browsing, git status/diff/stage/unstage/commit/push in allow-listed
       workspaces, `workspace.v1`. Open: an emulator run of the three screens and one push to a

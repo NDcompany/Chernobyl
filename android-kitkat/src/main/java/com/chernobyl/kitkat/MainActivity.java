@@ -577,7 +577,9 @@ public final class MainActivity extends Activity implements App.Change {
                 wsPick.setVisibility(wsVis);
                 project.setVisibility(workspaces.isEmpty() ? View.VISIBLE : View.GONE);
                 JSONArray composer = live == null ? null : live.optJSONArray("composer");
-                boolean pickModel = composer != null && composer.toString().contains("\"model\"");
+                // the start-time choices are Claude Code's aliases; Codex picks its models in the session
+                boolean pickModel = "claude-code".equals(agents.get(pos).optString("kind"))
+                        && composer != null && composer.toString().contains("\"model\"");
                 modelLabel.setVisibility(pickModel ? View.VISIBLE : View.GONE);
                 modelPick.setVisibility(pickModel ? View.VISIBLE : View.GONE);
             }

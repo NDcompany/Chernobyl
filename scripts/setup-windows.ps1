@@ -38,6 +38,11 @@
 # (allow once or deny); nothing is ever written to agy's settings. -AntigravityModel sets the model new
 # sessions start on (for example gemini-3.8-flash-low; `agy models` lists them).
 #
+# Codex: -Codex adds a Codex adapter (`codex app-server`, ADR-015 §4.3) for the same workspaces. No
+# binary is written: the companion finds codex.exe on PATH or in the Codex desktop app's install
+# (%LOCALAPPDATA%\OpenAI\Codex\bin\<version>\codex.exe) at every start, so app updates keep working.
+# Sign in once in the Codex app (or `codex login`); the companion never touches the credentials.
+#
 # Terminal (ADR-020): -EnableTerminal lets the paired phone run any command line in an allow-listed
 # workspace WITHOUT the agents' approval prompts. Off unless you pass it.
 #
@@ -53,6 +58,7 @@ param(
   [string]$NgrokDomain,
   [string]$Ngrok = 'C:\ngrok\ngrok.exe',
   [switch]$OpenCode,
+  [switch]$Codex,
   [string]$OpenCodeUrl = 'http://127.0.0.1:4096',
   [switch]$StartOpenCode,
   [switch]$EnableTerminal,
@@ -112,6 +118,10 @@ $adapters = @(
   [ordered]@{ id = 'mock-1'; type = 'mock'; enabled = $false },
   [ordered]@{ id = 'claude-1'; type = 'claude'; enabled = $true; workspaces = @($Workspaces | ForEach-Object { (Resolve-Path $_).Path }) }
 )
+if ($Codex) {
+  # the binary is found at every start (PATH, then the newest Codex app install)
+  $adapters += , ([ordered]@{ id = 'codex-1'; type = 'codex'; enabled = $true; workspaces = @($Workspaces | ForEach-Object { (Resolve-Path $_).Path }) })
+}
 if ($OpenCode) {
   # attach-only; the password (if any) stays in the user variable, never in this file
   $adapters += , ([ordered]@{ id = 'opencode-1'; type = 'opencode'; enabled = $true; endpoint = $OpenCodeUrl; basicAuthEnv = 'OPENCODE_SERVER_PASSWORD' })

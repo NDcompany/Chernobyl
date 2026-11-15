@@ -13,6 +13,7 @@ import {
   applyTranscript,
   emptyTranscriptView,
   isClientMessage,
+  isClaudeModelName,
   isModelName,
   isServerMessage,
   type LiveServerMessage,
@@ -43,17 +44,22 @@ test('image data is capped across all images; titles count UTF-16 units', () => 
   assert.ok(isClientMessage(rename('\u{1F600}'.repeat(40))));
   assert.ok(!isClientMessage(rename(`${'\u{1F600}'.repeat(40)}x`)));
   assert.ok(isClientMessage(rename('t'.repeat(80))));
-  for (const good of ['default', 'sonnet', 'opus', 'haiku', 'fable', 'opusplan', 'claude-x']) assert.ok(isModelName(good), good);
+  for (const good of ['default', 'sonnet', 'opus', 'haiku', 'fable', 'opusplan', 'claude-x']) {
+    assert.ok(isClaudeModelName(good) && isModelName(good), good);
+  }
   const long = `claude-${'a'.repeat(57)}`;
   assert.ok(isModelName(long) && !isModelName(`${long}a`));
   // ADR-022 runtime ids (Antigravity, Codex)
   for (const good of ['claude-sonnet-4-6', 'gemini-3.8-flash-low', 'gpt-oss-120b-medium', 'gpt-5']) {
     assert.ok(isModelName(good), good);
   }
-  for (const bad of ['best', 'Opus', '--dangerously-skip-permissions', 'gemini..x', '9-model', 'gemini-3.8 flash']) {
+  for (const bad of ['Opus', '--dangerously-skip-permissions', 'gemini-3.8 flash']) {
     assert.ok(!isModelName(bad), bad);
   }
-  for (const bad of ['', 'claude-', 'claude-A', 'claude-a b', '-model', 7]) {
+  // Codex names (gpt-6-luna, codex_mini, bare words) are wire names too; Claude stays strict
+  for (const bad of ['claude-', 'claude-A', 'gpt-5', 'best', 'ollama/qwen3.5:4b']) assert.ok(!isClaudeModelName(bad), bad);
+  for (const good of ['gpt-6-luna', 'gpt-5.6-terra', 'o4-mini', 'codex_mini', 'best']) assert.ok(isModelName(good), good);
+  for (const bad of ['', 'claude-', 'claude-A', 'claude-a b', '-model', '.hidden', 'gpt-5.', 'sonnet[1m]', 7]) {
     assert.ok(!isModelName(bad), String(bad));
   }
   // ADR-021 OpenCode provider/model ids (Rust `is_provider_model` has the same cases)

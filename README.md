@@ -121,6 +121,8 @@ on both sides, and are never journaled (`docs/PRIVACY.md`).
 | OpenCode | **attach** to a running `opencode serve` (HTTP + SSE), as before; since ADR-021 also the model picker, photos, slash commands, context, rename and fork, and the serve's folder as its workspace (Files, Changes, Terminal) | live tests passed on 1.19.4 with local Ollama (`qwen3.5:4b`, 24k context) |
 | Codex | **driven**: one `codex app-server` per adapter, each session a thread | every capability `limited`: tested only against a fake app-server, no live run |
 | Antigravity | **driven**: one `agy acp` (Agent Client Protocol) per adapter, each session an agy session (ADR-022) | inline approvals (allow once or deny), steering follow-ups, interrupt, model, images, slash commands, permission mode, history from agy's own list; no MCP status; live run against agy 1.5.6 |
+| OpenCode | **attach** to a running `opencode serve` (HTTP + SSE), as before | live tests passed on 1.19.4 with local Ollama (`qwen3.5:4b`, 24k context) |
+| Codex | **driven**: one `codex app-server` per adapter, each session a thread; its threads in the workspaces (the Codex app's too) listed, replayed, resumed, forked | live runs passed 2026-11-12 on codex-cli 0.167.0-alpha.4.1 (ChatGPT plan, 11 short turns) |
 
 To enable them, add to `companion.json` (keys documented in `services/companion-rs/README.md`):
 
@@ -134,6 +136,8 @@ To enable them, add to `companion.json` (keys documented in `services/companion-
   for new sessions, such as `gemini-3.8-flash-low`; `maxSessions` 1-16, default 3), or
   `setup-windows.ps1 -Antigravity`. Sign in to agy once in a terminal first. The phone answers
   agy's own permission prompts once at a time; the companion never writes agy's settings.
+  (or `setup-windows.ps1 -Codex`); `codex.exe` is found on PATH or in the Codex app's install at
+  every start (`binary` overrides it; the npm `.cmd` shim is refused).
 
 **Allow-listing a folder means trusting it.** The phone can start an agent in it, and Claude
 runs in print mode, which skips its folder-trust dialog, so that folder's project hooks and MCP
@@ -206,6 +210,7 @@ protocol-v2 the mobile app already emits:
   Claude Code as a hook ingress (loopback diagnostics POST only) plus driven sessions in
   allow-listed workspaces, a Codex app-server runtime (`limited`), a Google Antigravity
   `agy acp` runtime (ADR-022), and the in-process
+  allow-listed workspaces, a Codex app-server runtime (live-verified), and the in-process
   `mock` engine. Hermes is deferred by ADR-008 (not installed on this machine —
   not stubbed). Phase 7 complete.
 
@@ -226,6 +231,8 @@ production backend — use the companion for real connections.
   Code and Antigravity driven sessions are live-verified (Antigravity: no emulator run
   yet); Codex is implemented from its schema and
   tested only against a fake app-server; Ollama is a model runtime; Hermes is deferred
+- **Real agent integration**: OpenCode (attach-only HTTP/SSE, no spawned server) and
+  Claude Code and Codex driven sessions are live-verified; Ollama is a model runtime; Hermes is deferred
   (ADR-008 — not installed here, deliberately not stubbed). The live-session emulator rows
   (checklist 9.1-9.13) are not run yet. When no healthy real runtime is
   attached, sessions/agents fall back to the mock seed — the UI must not present that
@@ -288,8 +295,9 @@ packaging, windowless autostart, terminal TUI) are implemented and tested
 1. **Physical-device validation** — `docs/validation/PHONE-VALIDATION-CHECKLIST.md`:
    30 of 31 rows in sections 1-8 pass on the emulator; no physical phone yet.
 2. **Live-session emulator rows** — checklist section 9 (rows 9.1-9.13), NOT RUN.
-3. **Codex live run** — Codex stays `limited` until someone runs it against a real
-   `codex app-server`; session resume and the interrupt and sign-in timeouts are not built.
+3. **Codex on the phone** — live-verified at the runtime and companion level (2026-11-12);
+   the emulator rows for Codex are not run yet, and a thread running in the Codex app cannot
+   be mirrored live (its app-server is a private child process).
 4. **Independent security assessment** (S9) — automated tests + review are not a
    substitute for it.
 5. **Release signing** — the APK is debug-signed; Windows code signing is an ADR-007

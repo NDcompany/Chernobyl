@@ -46,6 +46,15 @@ try {
   & $Exe --config (Join-Path $tmp 'roaming\CHERNOBYL\companion.json') --devices | Out-Host
   if ($LASTEXITCODE) { throw 'the companion refused the antigravity config' }
 
+  if (@($c.adapters | Where-Object type -eq 'codex').Count) { throw 'no codex without -Codex' }
+
+  $c = Run-Setup @('-Codex')
+  $cx = @($c.adapters | Where-Object type -eq 'codex')
+  if ($cx.Count -ne 1 -or $cx[0].id -ne 'codex-1' -or -not $cx[0].enabled -or @($cx[0].workspaces)[0] -ne (Resolve-Path $ws).Path) { throw "bad codex entry: $($cx | ConvertTo-Json)" }
+  if ($cx[0].PSObject.Properties.Name -contains 'binary') { throw 'codex.exe is found at start, never written' }
+  & $Exe --config (Join-Path $tmp 'roaming\CHERNOBYL\companion.json') --devices | Out-Host
+  if ($LASTEXITCODE) { throw 'the companion refused the generated codex config' }
+
   $c = Run-Setup @('-OpenCode', '-EnableTerminal')
   $oc = @($c.adapters | Where-Object type -eq 'opencode')
   if ($oc.Count -ne 1 -or $oc[0].id -ne 'opencode-1' -or -not $oc[0].enabled -or $oc[0].endpoint -ne 'http://127.0.0.1:4096') { throw "bad opencode entry: $($oc | ConvertTo-Json)" }

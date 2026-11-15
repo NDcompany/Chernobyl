@@ -1,8 +1,15 @@
 //! ADR-015 §4.3 step 7: the Codex app-server as a [`LiveRuntime`]. One
-//! `codex app-server` child per adapter, spawned on the first
-//! `create_session` and again on the first command after it exited; each
-//! phone session is a codex thread inside it. A prompt to a session whose
-//! child exited respawns it and `thread/resume`s the thread (§10).
+//! `codex app-server` child per adapter, spawned on the first command (or the
+//! first session-list probe) and again on the first command after it exited;
+//! each phone session is a codex thread inside it. A prompt to a session
+//! whose child exited respawns it and `thread/resume`s the thread (§10).
+//!
+//! Codex keeps every thread on disk, the Codex desktop app's included, so
+//! the probe lists the ones in the allow-listed workspaces (`thread/list`)
+//! as idle sessions; the first subscriber replays one (`thread/items/list`),
+//! a prompt resumes it, and one the Codex app is writing (updated in the
+//! last 2 minutes) is "Live on PC": it is re-read at the probe cadence and
+//! continues on the phone only as a fork (ADR-018, `thread/fork`).
 //!
 //! [`Codex`] (the protocol core) turns codex output into [`Event`]s; this
 //! file routes them: transcript ops to the hub, approvals and withdrawals to
@@ -13,9 +20,13 @@
 //! neither the hub nor the engine calls a runtime.
 
 use crate::adapters::{AdapterError, Capability, LiveRuntime};
+use crate::claude_history::IN_USE_MS;
 use crate::claude_runtime::Timing;
-use crate::codex::{self, Codex, Event, LaunchConfig};
-use crate::protocol::{Agent, ClientMsg, EventKind, PermissionRequest, ServerMsg, Session, now_ms};
+use crate::codex::{self, Codex, Event, FoundThread, LaunchConfig, Prompt};
+use crate::protocol::{
+    Agent, AgentLive, ClientMsg, EventKind, PermissionRequest, PromptImage, ServerMsg, Session,
+    now_ms,
+};
 use crate::runtime_io::{ChildEvent, ChildIo, child_env};
 use crate::transcript::{HubHandle, Op};
 use std::collections::{HashMap, HashSet};
@@ -70,8 +81,10 @@ struct Inner {
     sink: Sink,
     opener: Opener,
     spawn: Spawn,
-    /// Production health = the binary resolves; injected spawners are healthy.
-    probe_binary: bool,
+    /// Production: health = the binary resolves, and the probe lists codex's
+    /// threads (which starts the app-server). Injected spawners are healthy
+    /// and list only when a test asks.
+    production: bool,
     /// T1 create rate limit, the §4.6 interrupt and sign-in timers, and the
     /// reader's timer tick (the Claude runtime's struct; tests shrink it).
     timing: Timing,
@@ -86,7 +99,11 @@ struct State {
     /// Bumped per spawn, so a reader never feeds a newer child's core.
     generation: u64,
     sessions: Vec<Session>,
-    /// `create_session` commands until codex names their thread.
+    /// Threads on disk in the workspaces that no phone session drives.
+    found: Vec<Found>,
+    /// The first `thread/list` came back: later changes are published.
+    scanned: bool,
+    /// `create_session` and fork commands until codex names their thread.
     creating: HashMap<String, Creating>,
     /// Command id → its session, for G1 events.
     tags: HashMap<String, String>,
@@ -94,8 +111,18 @@ struct State {
     dropped: HashSet<String>,
     /// Permissions ingested and not resolved yet, for a withdrawal's record.
     perms: HashMap<String, PermissionRequest>,
+    /// ADR-017 `set_model` per session, kept across a respawn.
+    models: HashMap<String, String>,
     /// When the last `create_session` was accepted (rate limit, T1).
     last_create: Option<i64>,
+}
+
+struct Found {
+    thread: FoundThread,
+    /// ADR-018: written in the last [`IN_USE_MS`] (by the Codex app).
+    live: bool,
+    /// `updated_at` of the last history replay.
+    hydrated: Option<i64>,
 }
 
 struct Creating {
@@ -103,15 +130,19 @@ struct Creating {
     reply: Option<Sender<Result<String, String>>>,
     title: String,
     path: String,
+    /// ADR-018: the title of the thread this one forks.
+    forked_from: Option<String>,
 }
 
 impl CodexRuntime {
-    /// The production runtime: spawns `cfg.binary` (no shell, scrubbed env).
+    /// The production runtime: spawns codex (no shell, scrubbed env),
+    /// resolving the binary at every spawn ([`LaunchConfig::resolve_binary`]).
     pub fn new(id: &str, cfg: LaunchConfig, hub: HubHandle, sink: Sink, opener: Opener) -> Self {
-        let (binary, argv) = (cfg.binary.clone(), cfg.argv());
+        let launch = cfg.clone();
         let spawn: Spawn = Box::new(move |cwd| {
+            let binary = launch.resolve_binary().map_err(io::Error::other)?;
             let env = child_env(std::env::vars_os(), &[]);
-            ChildIo::spawn(&binary, &argv, cwd, &env)
+            ChildIo::spawn(&binary, &launch.argv(), cwd, &env)
         });
         let timing = Timing {
             create_every_ms: CREATE_EVERY_MS,
@@ -128,7 +159,7 @@ impl CodexRuntime {
         sink: Sink,
         opener: Opener,
         spawn: Spawn,
-        probe_binary: bool,
+        production: bool,
         timing: Timing,
     ) -> Self {
         let inner = Arc::new(Inner {
@@ -138,14 +169,26 @@ impl CodexRuntime {
             sink,
             opener,
             spawn,
-            probe_binary,
+            production,
             timing,
             healthy: AtomicBool::new(false),
             st: Mutex::new(State::default()),
         });
         let rt = CodexRuntime { inner };
-        let _ = rt.refresh();
+        let healthy = !production || rt.inner.health().is_ok();
+        rt.inner.healthy.store(healthy, Ordering::SeqCst);
         rt
+    }
+
+    /// The session-list probe (`thread/list`), spawning codex if needed.
+    fn discover(&self) -> Result<(), AdapterError> {
+        let i = &self.inner;
+        let mut st = i.st.lock().unwrap();
+        let first = Path::new(&i.cfg.workspaces[0].path);
+        let cwds: Vec<String> = i.cfg.workspaces.iter().map(|w| w.path.clone()).collect();
+        i.running(&mut st, first)?
+            .list_threads(&cwds)
+            .map_err(|e| AdapterError::RuntimeUnavailable(e.into()))
     }
 }
 
@@ -160,26 +203,54 @@ impl LiveRuntime for CodexRuntime {
 
     fn agents(&self) -> Vec<Agent> {
         let i = &self.inner;
+        let healthy = self.is_healthy();
+        let busy = {
+            let st = i.st.lock().unwrap();
+            st.sessions
+                .iter()
+                .any(|s| matches!(s.status.as_str(), "running" | "waiting"))
+        };
+        let state = match (healthy, busy) {
+            (false, _) => "offline",
+            (true, true) => "busy",
+            (true, false) => "online",
+        };
+        let live = AgentLive {
+            // ADR-017: models from `model/list`, images as data URLs, the
+            // context meter from token usage, rename = `thread/name/set`
+            composer: vec!["model", "images", "context", "rename"],
+            ..i.cfg.agent_live()
+        };
         vec![Agent {
             id: i.id.clone(),
             host_id: i.id.clone(),
             kind: "codex".into(),
             name: "Codex".into(),
-            state: "online".into(),
+            state: state.into(),
             capabilities: codex::capabilities().into_iter().map(|c| c.id).collect(),
-            accepts_new_session: true,
+            accepts_new_session: healthy,
             simulated: false,
-            live: Some(i.cfg.agent_live()),
+            live: Some(live),
         }]
     }
 
+    /// Started or adopted here, then the threads found on disk (newest first).
     fn sessions(&self) -> Vec<Session> {
-        self.inner.st.lock().unwrap().sessions.clone()
+        let i = &self.inner;
+        let st = i.st.lock().unwrap();
+        let found = st.found.iter().map(|f| i.found_session(f));
+        st.sessions.iter().cloned().chain(found).collect()
     }
 
     /// Sessions outlive their process: a follow-up to one whose codex exited
     /// stays here (it resumes the thread), it is not handed to the engine.
     fn owns_session(&self, session_id: &str) -> bool {
+        let st = self.inner.st.lock().unwrap();
+        st.sessions.iter().any(|s| s.id == session_id)
+            || st.found.iter().any(|f| f.thread.id == session_id)
+    }
+
+    fn drives_session(&self, session_id: &str) -> bool {
         let st = self.inner.st.lock().unwrap();
         st.sessions.iter().any(|s| s.id == session_id)
     }
@@ -195,16 +266,30 @@ impl LiveRuntime for CodexRuntime {
         self.inner.send(msg)
     }
 
+    /// The first subscriber of a thread found on disk: its history.
+    fn on_subscribe(&self, session_id: &str) {
+        let i = &self.inner;
+        let mut st = i.st.lock().unwrap();
+        let Some(f) = st.found.iter().find(|f| f.thread.id == session_id) else {
+            return;
+        };
+        if f.hydrated == Some(f.thread.updated_at) && i.hub.has_items(session_id) {
+            return;
+        }
+        let cwd = f.thread.cwd.clone();
+        i.hydrate(&mut st, session_id, &cwd);
+    }
+
+    /// Health (the binary resolves), then, in production, codex's threads.
     fn refresh(&self) -> Result<(), AdapterError> {
         let i = &self.inner;
-        let running = i.st.lock().unwrap().codex.is_some();
-        let res = if running || !i.probe_binary {
-            Ok(())
-        } else {
-            probe(&i.cfg.binary)
-        };
+        if !i.production {
+            return Ok(());
+        }
+        let res = i.health();
         i.healthy.store(res.is_ok(), Ordering::SeqCst);
-        res
+        res?;
+        self.discover()
     }
 
     fn capabilities(&self) -> Vec<Capability> {
@@ -220,42 +305,120 @@ impl LiveRuntime for CodexRuntime {
 }
 
 impl Inner {
+    /// Without spawning: codex runs, or its binary resolves.
+    fn health(&self) -> Result<(), AdapterError> {
+        if self.st.lock().unwrap().codex.is_some() {
+            return Ok(());
+        }
+        let binary = self
+            .cfg
+            .resolve_binary()
+            .map_err(AdapterError::RuntimeUnavailable)?;
+        probe(&binary)
+    }
+
     fn send(self: &Arc<Self>, msg: &ClientMsg) -> Result<ServerMsg, AdapterError> {
         match msg {
-            // ADR-018: forking is Claude's
-            ClientMsg::SubmitPrompt { fork: true, .. } => Err(AdapterError::Unsupported(
-                "Codex sessions cannot be forked from the phone".into(),
-            )),
-            // ADR-017: the composer extras are Claude's
-            ClientMsg::CreateSession { images, .. } | ClientMsg::SubmitPrompt { images, .. }
-                if !images.is_empty() =>
-            {
-                Err(AdapterError::Unsupported(
-                    "Codex does not take images".into(),
-                ))
-            }
             ClientMsg::CreateSession { model: Some(_), .. } => Err(AdapterError::Unsupported(
-                "Codex sessions use the model Codex is configured with".into(),
+                "Codex sessions start on the model Codex is configured with; switch it in the \
+                 session"
+                    .into(),
             )),
             ClientMsg::CreateSession {
                 command_id,
                 title,
                 prompt,
                 project,
+                images,
                 ..
-            } => self.create(command_id, title, prompt, project.as_deref()),
+            } => {
+                let Some(ws) = self
+                    .cfg
+                    .workspaces
+                    .iter()
+                    .find(|w| Some(w.id.as_str()) == project.as_deref())
+                else {
+                    return Ok(ServerMsg::ack_err(
+                        command_id,
+                        "project must be one of this agent's workspaces",
+                    ));
+                };
+                let prompt = Prompt {
+                    text: prompt.clone(),
+                    images: images.clone(),
+                };
+                self.start(command_id, title, &ws.path, None, |c| {
+                    c.start_session(&ws.path, prompt, command_id)
+                })
+            }
             ClientMsg::SubmitPrompt {
                 command_id,
                 session_id,
                 text,
-                ..
-            } => self.prompt(command_id, session_id, text),
+                images,
+                fork,
+            } => {
+                if *fork {
+                    self.fork(command_id, session_id, text, images)
+                } else {
+                    self.prompt(command_id, session_id, text, images)
+                }
+            }
             ClientMsg::Interrupt {
                 command_id,
                 session_id,
-            } => self.command(command_id, session_id, |c| {
-                c.interrupt(session_id, command_id)
-            }),
+            } => {
+                if self.found(session_id).is_some() {
+                    // nothing of ours runs in it: stopping it is a no-op
+                    return Ok(self.noop(command_id, session_id));
+                }
+                self.command(command_id, session_id, |c| {
+                    c.interrupt(session_id, command_id)
+                })
+            }
+            ClientMsg::SetModel {
+                command_id,
+                session_id,
+                model,
+            } => {
+                let done = Event::Done {
+                    tag: command_id.clone(),
+                    status: "completed",
+                    error: None,
+                };
+                let ack = self.command(command_id, session_id, |c| {
+                    c.set_model(session_id, model).map(|mut events| {
+                        events.push(done);
+                        events
+                    })
+                })?;
+                if matches!(ack, ServerMsg::Ack { ok: true, .. }) {
+                    let mut st = self.st.lock().unwrap();
+                    st.models.insert(session_id.clone(), model.clone());
+                }
+                Ok(ack)
+            }
+            ClientMsg::RenameSession {
+                command_id,
+                session_id,
+                title,
+            } => {
+                let mut st = self.st.lock().unwrap();
+                let Some(cwd) = self.cwd_of(&st, session_id) else {
+                    return Err(AdapterError::Unsupported("unknown session".into()));
+                };
+                // codex names threads on disk: a loaded one is not needed
+                match self
+                    .running(&mut st, Path::new(&cwd))?
+                    .rename(session_id, title, command_id)
+                {
+                    Ok(()) => {
+                        st.tags.insert(command_id.clone(), session_id.clone());
+                        Ok(ServerMsg::ack_ok(command_id, Some(session_id)))
+                    }
+                    Err(e) => Ok(ServerMsg::ack_err(command_id, e)),
+                }
+            }
             ClientMsg::McpAuth {
                 command_id,
                 session_id,
@@ -316,26 +479,17 @@ impl Inner {
         }
     }
 
-    /// `create_session`: spawn codex if needed, `thread/start` in the chosen
-    /// workspace, and ack once codex names the thread (the session id).
-    fn create(
+    /// A new session (`create_session` or a fork): T1 admission, spawn codex
+    /// if needed, `begin` the request, and ack once codex names the thread
+    /// (the session id).
+    fn start(
         self: &Arc<Self>,
         command_id: &str,
         title: &str,
-        prompt: &str,
-        project: Option<&str>,
+        path: &str,
+        forked_from: Option<String>,
+        begin: impl FnOnce(&mut Codex) -> Result<(), &'static str>,
     ) -> Result<ServerMsg, AdapterError> {
-        let Some(ws) = self
-            .cfg
-            .workspaces
-            .iter()
-            .find(|w| Some(w.id.as_str()) == project)
-        else {
-            return Ok(ServerMsg::ack_err(
-                command_id,
-                "project must be one of this agent's workspaces",
-            ));
-        };
         let (reply, started) = mpsc::channel();
         {
             let mut st = self.st.lock().unwrap();
@@ -352,13 +506,13 @@ impl Inner {
                 return Ok(ServerMsg::ack_err(command_id, e));
             }
             st.last_create = Some(now);
-            self.running(&mut st, Path::new(&ws.path))?
-                .start_session(&ws.path, prompt, command_id)
+            begin(self.running(&mut st, Path::new(path))?)
                 .map_err(|e| AdapterError::RuntimeUnavailable(e.into()))?;
             let creating = Creating {
                 reply: Some(reply),
                 title: title.into(),
-                path: ws.path.clone(),
+                path: path.into(),
+                forked_from,
             };
             st.creating.insert(command_id.into(), creating);
         }
@@ -386,15 +540,55 @@ impl Inner {
         })
     }
 
+    /// ADR-018: continue a thread found on disk as a NEW session
+    /// (`thread/fork`); the ack names it. The original is never written.
+    fn fork(
+        self: &Arc<Self>,
+        command_id: &str,
+        session_id: &str,
+        text: &str,
+        images: &[PromptImage],
+    ) -> Result<ServerMsg, AdapterError> {
+        let source = {
+            let st = self.st.lock().unwrap();
+            if st.sessions.iter().any(|s| s.id == session_id) {
+                return Ok(ServerMsg::ack_err(
+                    command_id,
+                    "this session runs here; send a normal prompt",
+                ));
+            }
+            st.found
+                .iter()
+                .find(|f| f.thread.id == session_id)
+                .map(|f| (f.thread.title.clone(), f.thread.cwd.clone()))
+        };
+        let Some((title, cwd)) = source else {
+            return Err(AdapterError::Unsupported("unknown session".into()));
+        };
+        let prompt = Prompt {
+            text: text.into(),
+            images: images.to_vec(),
+        };
+        self.start(command_id, &title, &cwd, Some(title.clone()), |c| {
+            c.fork(session_id, &cwd, prompt, command_id)
+        })
+    }
+
     /// `submit_prompt`: on the live thread, or, when the session's app-server
-    /// exited, a respawn and `thread/resume` first (ADR-015 §10). A resume
-    /// is not a create: no T1 rate limit or session-cap slot is taken.
+    /// exited (or it was found on disk), a respawn and `thread/resume` first
+    /// (ADR-015 §10). A resume is not a create: no T1 rate limit or
+    /// session-cap slot is taken.
     fn prompt(
         self: &Arc<Self>,
         command_id: &str,
         session_id: &str,
         text: &str,
+        images: &[PromptImage],
     ) -> Result<ServerMsg, AdapterError> {
+        let prompt = Prompt {
+            text: text.into(),
+            images: images.to_vec(),
+        };
         {
             let mut st = self.st.lock().unwrap();
             let live = st
@@ -402,6 +596,18 @@ impl Inner {
                 .as_ref()
                 .is_some_and(|c| c.owns_session(session_id));
             if !live {
+                if let Some(at) = st.found.iter().position(|f| f.thread.id == session_id) {
+                    // T10: one writer per thread; the Codex app's is untouched
+                    if st.found[at].live {
+                        return Ok(ServerMsg::ack_err(
+                            command_id,
+                            "this Codex thread is running in the Codex app on the PC; continue \
+                             it there, or fork it to continue on the phone",
+                        ));
+                    }
+                    let f = st.found.remove(at);
+                    st.sessions.push(self.found_session(&f));
+                }
                 let Some(cwd) = st
                     .sessions
                     .iter()
@@ -413,8 +619,15 @@ impl Inner {
                         "this Codex session has ended; start a new session",
                     ));
                 };
+                let model = st.models.get(session_id).cloned();
                 let codex = self.running(&mut st, Path::new(&cwd))?;
-                return match codex.resume_session(session_id, &cwd, text, command_id) {
+                return match codex.resume_session(
+                    session_id,
+                    &cwd,
+                    model.as_deref(),
+                    prompt,
+                    command_id,
+                ) {
                     Ok(events) => {
                         st.tags.insert(command_id.into(), session_id.into());
                         self.dispatch(&mut st, events);
@@ -425,7 +638,7 @@ impl Inner {
             }
         }
         self.command(command_id, session_id, |c| {
-            c.prompt(session_id, text, command_id)
+            c.prompt(session_id, prompt, command_id)
         })
     }
 
@@ -459,6 +672,116 @@ impl Inner {
         }
     }
 
+    /// Done at once: the command has nothing to act on.
+    fn noop(&self, command_id: &str, session_id: &str) -> ServerMsg {
+        (self.sink)(EventKind::CommandResult {
+            command_id: command_id.into(),
+            status: "completed".into(),
+            error: None,
+            session_id: Some(session_id.into()),
+            permission_id: None,
+        });
+        ServerMsg::ack_ok(command_id, Some(session_id))
+    }
+
+    fn found(&self, session_id: &str) -> Option<String> {
+        let st = self.st.lock().unwrap();
+        let f = st.found.iter().find(|f| f.thread.id == session_id)?;
+        Some(f.thread.cwd.clone())
+    }
+
+    /// The folder of a session, driven or found.
+    fn cwd_of(&self, st: &State, session_id: &str) -> Option<String> {
+        let driven = st.sessions.iter().find(|s| s.id == session_id);
+        driven.map(|s| s.project.clone()).or_else(|| {
+            let f = st.found.iter().find(|f| f.thread.id == session_id)?;
+            Some(f.thread.cwd.clone())
+        })
+    }
+
+    /// Replays a found thread's history into the hub (`thread/items/list`).
+    fn hydrate(self: &Arc<Self>, st: &mut State, session_id: &str, cwd: &str) {
+        let Ok(codex) = self.running(st, Path::new(cwd)) else {
+            return;
+        };
+        if codex.history(session_id, cwd).is_ok()
+            && let Some(f) = st.found.iter_mut().find(|f| f.thread.id == session_id)
+        {
+            f.hydrated = Some(f.thread.updated_at);
+        }
+    }
+
+    fn found_session(&self, f: &Found) -> Session {
+        let t = &f.thread;
+        Session {
+            id: t.id.clone(),
+            agent_id: self.id.clone(),
+            host_id: self.id.clone(),
+            title: t.title.clone(),
+            project: t.cwd.clone(),
+            status: "idle".into(),
+            progress: 0,
+            created_at: t.created_at,
+            last_activity_at: t.updated_at,
+            prompt: None,
+            timeline: vec![],
+            output: vec![],
+            files: vec![],
+            transcript: true,
+            live_pc: f.live,
+            forked_from: None,
+        }
+    }
+
+    /// A `thread/list` result: the threads in the workspaces that no phone
+    /// session drives. After the first list, new and changed ones are
+    /// published; a watched one the Codex app wrote since its replay is
+    /// replayed again (the probe-cadence mirror).
+    fn threads(self: &Arc<Self>, st: &mut State, list: Vec<FoundThread>) {
+        let now = now_ms();
+        let roots: Vec<&Path> = self
+            .cfg
+            .workspaces
+            .iter()
+            .map(|w| Path::new(&w.path))
+            .collect();
+        let mut found = Vec::new();
+        let mut out = Vec::new();
+        let mut stale = Vec::new();
+        for t in list {
+            // T11: the filter is codex's; the allow-list is checked here again
+            let inside = roots.iter().any(|r| codex::within(Path::new(&t.cwd), r));
+            if !inside || st.sessions.iter().any(|s| s.id == t.id) {
+                continue;
+            }
+            let old = st.found.iter().find(|f| f.thread.id == t.id);
+            let f = Found {
+                live: now - t.updated_at < IN_USE_MS,
+                hydrated: old.and_then(|o| o.hydrated),
+                thread: t,
+            };
+            if st.scanned
+                && old.is_none_or(|o| o.thread.title != f.thread.title || o.live != f.live)
+            {
+                out.push(EventKind::SessionUpdated(self.found_session(&f)));
+            }
+            if f.hydrated.is_some_and(|h| h != f.thread.updated_at)
+                && self.hub.is_subscribed(&f.thread.id)
+            {
+                stale.push((f.thread.id.clone(), f.thread.cwd.clone()));
+            }
+            found.push(f);
+        }
+        st.found = found;
+        st.scanned = true;
+        for k in out {
+            (self.sink)(k);
+        }
+        for (id, cwd) in stale {
+            self.hydrate(st, &id, &cwd);
+        }
+    }
+
     /// The running core, spawning codex (and its reader) when there is none.
     fn running<'a>(
         self: &Arc<Self>,
@@ -467,10 +790,8 @@ impl Inner {
     ) -> Result<&'a mut Codex, AdapterError> {
         if st.codex.is_none() {
             let (io, rx) = (self.spawn)(cwd).map_err(|e| {
-                AdapterError::RuntimeUnavailable(format!(
-                    "could not start {}: {e}",
-                    self.cfg.binary.display()
-                ))
+                self.healthy.store(false, Ordering::SeqCst);
+                AdapterError::RuntimeUnavailable(format!("could not start Codex: {e}"))
             })?;
             st.generation += 1;
             let generation = st.generation;
@@ -517,7 +838,7 @@ impl Inner {
             }
             if exit {
                 eprintln!("[codex] {} exited: {}", self.id, core.stderr_tail().trim());
-                // the next create_session or prompt respawns it
+                // the next command or probe respawns it
                 st.codex = None;
             }
             self.dispatch(&mut st, events);
@@ -527,7 +848,7 @@ impl Inner {
         }
     }
 
-    fn dispatch(&self, st: &mut State, events: Vec<Event>) {
+    fn dispatch(self: &Arc<Self>, st: &mut State, events: Vec<Event>) {
         for event in events {
             match event {
                 Event::Op(thread, op) => self.op(st, &thread, op),
@@ -562,7 +883,7 @@ impl Inner {
                         files: vec![],
                         transcript: true,
                         live_pc: false,
-                        forked_from: None,
+                        forked_from: c.forked_from,
                     };
                     st.sessions.push(session.clone());
                     st.tags.insert(tag, thread.clone());
@@ -571,6 +892,19 @@ impl Inner {
                         let _ = reply.send(Ok(thread));
                     }
                 }
+                Event::Renamed { thread, title } => {
+                    if let Some(s) = st.sessions.iter_mut().find(|s| s.id == thread) {
+                        if s.title != title {
+                            s.title = title;
+                            (self.sink)(EventKind::SessionUpdated(s.clone()));
+                        }
+                    } else if let Some(f) = st.found.iter_mut().find(|f| f.thread.id == thread) {
+                        f.thread.title = title;
+                        let s = self.found_session(f);
+                        (self.sink)(EventKind::SessionUpdated(s));
+                    }
+                }
+                Event::Threads(list) => self.threads(st, list),
                 Event::Progress { tag, status } => {
                     if !st.dropped.contains(&tag) {
                         (self.sink)(EventKind::CommandProgress {
@@ -683,6 +1017,7 @@ pub(crate) mod tests {
     use crate::protocol::LiveWorkspace;
     use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
     use std::time::Instant;
 
     #[test]
@@ -698,7 +1033,7 @@ pub(crate) mod tests {
 
     pub(crate) fn launch(ws: &str) -> LaunchConfig {
         LaunchConfig {
-            binary: PathBuf::from("codex.exe"),
+            binary: Some(PathBuf::from("codex.exe")),
             args: Vec::new(),
             workspaces: vec![LiveWorkspace {
                 id: "ws0123456789".into(),
@@ -763,7 +1098,9 @@ pub(crate) mod tests {
             let (from_core, core_stdin) = io::pipe()?;
             let (frames_tx, frames) = mpsc::channel();
             thread::spawn(move || {
-                for line in BufReader::new(from_core).lines().map_while(Result::ok) {
+                // the core's own model/list (a background id) is answered by no one
+                let lines = BufReader::new(from_core).lines().map_while(Result::ok);
+                for line in lines.filter(|l| !l.contains(r#""method":"model/list""#)) {
                     if frames_tx.send(line).is_err() {
                         return;
                     }
@@ -1232,7 +1569,7 @@ pub(crate) mod tests {
             .join("tools")
             .join("fake-codex-app-server.mjs");
         let mut cfg = launch(&ws.to_string_lossy());
-        cfg.binary = PathBuf::from("node");
+        cfg.binary = Some(PathBuf::from("node"));
         cfg.args = vec![script.to_string_lossy().into_owned()];
         cfg.args.extend(extra.iter().map(|a| a.to_string()));
         Some(cfg)
@@ -1348,6 +1685,604 @@ pub(crate) mod tests {
         assert_eq!(rt.sessions()[0].id, thread);
         rt.dispose();
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// ADR-015 §10 / ADR-018 for Codex over the real spawn path: threads on
+    /// disk are listed, replayed on subscribe, resumed by a prompt (idle) or
+    /// forked (written by the Codex app in the last 2 minutes), renamed, and
+    /// switched to another listed model.
+    #[test]
+    fn fake_app_server_lists_replays_resumes_forks_and_renames() {
+        let root = std::env::temp_dir().join(format!("chb-codex-found-{}", std::process::id()));
+        let (ws, state) = (root.join("ws"), root.join("state"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let ws_path = ws.to_string_lossy().into_owned();
+        let saved = |id: &str, title: &str, updated: i64| {
+            let entry = |kind: &str, text: &str| {
+                let item = if kind == "user" {
+                    crate::json::obj(vec![
+                        ("type", crate::json::s("userMessage")),
+                        ("id", crate::json::s(&format!("{id}-u"))),
+                        ("clientId", crate::json::Json::Null),
+                        (
+                            "content",
+                            crate::json::Json::Arr(vec![crate::json::obj(vec![
+                                ("type", crate::json::s("text")),
+                                ("text", crate::json::s(text)),
+                            ])]),
+                        ),
+                    ])
+                } else {
+                    crate::json::obj(vec![
+                        ("type", crate::json::s("agentMessage")),
+                        ("id", crate::json::s(&format!("{id}-m"))),
+                        ("text", crate::json::s(text)),
+                    ])
+                };
+                crate::json::obj(vec![("turnId", crate::json::s("t1")), ("item", item)])
+            };
+            let body = crate::json::obj(vec![
+                ("id", crate::json::s(id)),
+                ("cwd", crate::json::s(&ws_path)),
+                ("model", crate::json::s("gpt-6-luna")),
+                ("name", crate::json::Json::Null),
+                (
+                    "items",
+                    crate::json::Json::Arr(vec![
+                        entry("user", title),
+                        entry("agent", &format!("{title}: done")),
+                    ]),
+                ),
+                ("createdAt", crate::json::Json::Int(updated - 60)),
+                ("updatedAt", crate::json::Json::Int(updated)),
+            ]);
+            std::fs::write(
+                state.join(format!("{id}.json")),
+                crate::json::stringify(&body),
+            )
+            .unwrap();
+        };
+        saved("old-1", "Old work", 1_700_000_000);
+        saved("live-1", "Live work", now_ms() / 1000);
+        let state_arg = state.to_string_lossy().into_owned();
+        let Some(cfg) = fake_codex(&ws, &["--state-dir", &state_arg]) else {
+            return;
+        };
+        let hub = HubHandle::default();
+        let (sink, seen) = recorder();
+        let rt = CodexRuntime::new("codex-1", cfg, hub.clone(), sink, no_opener());
+        assert_eq!(
+            rt.agents()[0].live.as_ref().unwrap().composer,
+            ["model", "images", "context", "rename"]
+        );
+        rt.refresh().unwrap();
+        wait_until("the listed threads", || rt.sessions().len() == 2);
+        let listed = |id: &str| rt.sessions().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(
+            (listed("old-1").title.as_str(), listed("old-1").live_pc),
+            ("Old work", false)
+        );
+        assert_eq!(
+            (listed("live-1").title.as_str(), listed("live-1").live_pc),
+            ("Live work", true)
+        );
+        assert!(rt.owns_session("old-1") && !rt.drives_session("old-1"));
+        // the first subscriber gets the history
+        rt.on_subscribe("old-1");
+        wait_until("the replay", || {
+            hub.ops("old-1").join("\n").contains("Old work: done")
+        });
+        let prompt = |cid: &str, sid: &str, fork: bool| ClientMsg::SubmitPrompt {
+            command_id: cid.into(),
+            session_id: sid.into(),
+            text: "go on".into(),
+            images: vec![],
+            fork,
+        };
+        let done = |cid: &str| results(&seen).contains(&(cid.into(), "completed".into()));
+        // T10: one the Codex app writes is not resumed, it is forked
+        let refused = rt.send(&prompt("p0", "live-1", false)).unwrap();
+        assert!(
+            matches!(&refused, ServerMsg::Ack { ok: false, error: Some(e), .. } if e.contains("Codex app")),
+            "{refused:?}"
+        );
+        let forked = match rt.send(&prompt("f1", "live-1", true)).unwrap() {
+            ServerMsg::Ack {
+                ok: true,
+                session_id: Some(s),
+                ..
+            } => s,
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(forked, "live-1");
+        wait_until("the forked turn", || done("f1"));
+        assert_eq!(listed(&forked).forked_from.as_deref(), Some("Live work"));
+        let ops = hub.ops(&forked).join("\n");
+        assert!(
+            ops.contains("Live work: done") && ops.contains("Forked from"),
+            "{ops}"
+        );
+        // an idle one is resumed by a prompt and driven from then on
+        let ack = rt.send(&prompt("p1", "old-1", false)).unwrap();
+        assert!(matches!(ack, ServerMsg::Ack { ok: true, .. }), "{ack:?}");
+        wait_until("the resumed turn", || done("p1"));
+        assert!(rt.drives_session("old-1"));
+        // rename and model switch
+        let rename = ClientMsg::RenameSession {
+            command_id: "r1".into(),
+            session_id: "old-1".into(),
+            title: "Renamed".into(),
+        };
+        assert!(matches!(
+            rt.send(&rename),
+            Ok(ServerMsg::Ack { ok: true, .. })
+        ));
+        wait_until("the rename", || {
+            done("r1") && listed("old-1").title == "Renamed"
+        });
+        let model = |cid: &str, m: &str| ClientMsg::SetModel {
+            command_id: cid.into(),
+            session_id: "old-1".into(),
+            model: m.into(),
+        };
+        assert!(matches!(
+            rt.send(&model("m1", "gpt-5.6-luna")),
+            Ok(ServerMsg::Ack { ok: true, .. })
+        ));
+        assert!(matches!(
+            rt.send(&model("m2", "gpt-9")),
+            Ok(ServerMsg::Ack { ok: false, .. })
+        ));
+        let ops = hub.ops("old-1").join("\n");
+        assert!(
+            ops.contains(r#""model":"gpt-5.6-luna""#) && ops.contains("GPT-5.6-Terra"),
+            "{ops}"
+        );
+        rt.dispose();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A temp git workspace for the live runs (`CHERNOBYL_LIVE_CODEX_DIR` is
+    /// its parent), and its codex adapter entry with no `binary`: the real
+    /// codex is found the way production finds it.
+    fn live_workspace(tag: &str) -> Option<(PathBuf, LaunchConfig)> {
+        std::env::var_os("CHERNOBYL_LIVE_CODEX")?;
+        let parent = std::env::var_os("CHERNOBYL_LIVE_CODEX_DIR")
+            .map_or_else(std::env::temp_dir, PathBuf::from);
+        let root = parent.join(format!("chb-live-codex-{tag}-{}", now_ms()));
+        let (work, data) = (root.join("work"), root.join("data"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(work.join("README.md"), "# live\n").unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "."],
+            &[
+                "-c",
+                "user.email=live@example.invalid",
+                "-c",
+                "user.name=live",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .status();
+            assert!(ok.is_ok_and(|s| s.success()), "git {args:?}");
+        }
+        let entry = crate::json::obj(vec![
+            ("type", crate::json::s("codex")),
+            (
+                "workspaces",
+                crate::json::Json::Arr(vec![crate::json::s(&work.to_string_lossy())]),
+            ),
+        ]);
+        let cfg = codex::launch_config(&entry, &data).unwrap();
+        assert_eq!(cfg.binary, None);
+        eprintln!("live: codex = {}", cfg.resolve_binary().unwrap().display());
+        Some((PathBuf::from(&cfg.workspaces[0].path), cfg))
+    }
+
+    /// The text of an ops log's agent messages (items and appends).
+    fn said(ops: &[String]) -> String {
+        ops.iter()
+            .filter(|o| o.contains(r#""kind":"text""#) || o.contains(r#""op":"append""#))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Approves every request as it comes (option `accept`), like a phone.
+    fn approver(rt: Arc<CodexRuntime>, seen: Arc<Mutex<Vec<EventKind>>>) -> Arc<AtomicBool> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let halt = stop.clone();
+        thread::spawn(move || {
+            let mut done = HashSet::new();
+            while !halt.load(Ordering::SeqCst) {
+                for p in requested(&seen) {
+                    if done.insert(p.id.clone()) {
+                        let ids: Vec<&str> = p.options.iter().map(|o| o.id.as_str()).collect();
+                        eprintln!(
+                            "live: approval {:?} {:?} options {ids:?}",
+                            p.title, p.command
+                        );
+                        let reply = rt.send(&ClientMsg::PermissionDecision {
+                            command_id: format!("d-{}", p.id),
+                            permission_id: p.id.clone(),
+                            decision: "approve-once".into(),
+                            revision: 1.0,
+                            option_id: Some("accept".into()),
+                            message: None,
+                            answers: vec![],
+                        });
+                        assert!(
+                            matches!(reply, Ok(ServerMsg::Ack { ok: true, .. })),
+                            "{reply:?}"
+                        );
+                    }
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        stop
+    }
+
+    /// LIVE (ignored; 6 short turns on the owner's ChatGPT plan, the default
+    /// model): `CHERNOBYL_LIVE_CODEX=1 cargo test --lib live_codex_runtime --
+    /// --ignored --nocapture`. The real `codex app-server` (found, not
+    /// configured) in a temp git workspace: stream → approvals (file change
+    /// and command) → model switch, context → image → interrupt → resume
+    /// after the server exits → rename → the thread listed by a second
+    /// runtime, replayed, and forked. Prints counts and replies only.
+    #[test]
+    #[ignore = "spawns the real Codex app-server (ChatGPT plan usage)"]
+    fn live_codex_runtime_round_trip() {
+        let Some((work, cfg)) = live_workspace("rt") else {
+            return;
+        };
+        let hub = HubHandle::default();
+        let (sink, seen) = recorder();
+        let rt = Arc::new(CodexRuntime::new(
+            "codex-1",
+            cfg.clone(),
+            hub.clone(),
+            sink,
+            no_opener(),
+        ));
+        assert!(rt.is_healthy());
+        rt.refresh().unwrap();
+        let stop = approver(rt.clone(), seen.clone());
+        let wait = |what: &str, cid: &str| {
+            let deadline = Instant::now() + Duration::from_secs(240);
+            loop {
+                if let Some((_, s)) = results(&seen).into_iter().find(|(c, _)| c == cid) {
+                    eprintln!("live: {what}: {cid} {s}");
+                    return s;
+                }
+                assert!(Instant::now() < deadline, "timed out: {what}");
+                thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let prompt =
+            |cid: &str, sid: &str, text: &str, images: Vec<PromptImage>| ClientMsg::SubmitPrompt {
+                command_id: cid.into(),
+                session_id: sid.into(),
+                text: text.into(),
+                images,
+                fork: false,
+            };
+        // 1: create, streamed
+        let mut create = create("c1");
+        if let ClientMsg::CreateSession {
+            project, prompt, ..
+        } = &mut create
+        {
+            *project = Some(cfg.workspaces[0].id.clone());
+            *prompt = "Reply with exactly: pong".into();
+        }
+        let sid = match rt.send(&create).unwrap() {
+            ServerMsg::Ack {
+                ok: true,
+                session_id: Some(s),
+                ..
+            } => s,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(wait("turn 1", "c1"), "completed");
+        let ops = hub.ops(&sid);
+        let appends = ops
+            .iter()
+            .filter(|o| o.contains(r#""op":"append""#))
+            .count();
+        eprintln!(
+            "live: turn 1 appends={appends} said={:?}",
+            said(&ops).contains("pong")
+        );
+        assert!(said(&ops).to_lowercase().contains("pong"));
+        let state = ops
+            .iter()
+            .rev()
+            .find(|o| o.contains(r#""op":"state""#))
+            .unwrap()
+            .clone();
+        assert!(state.contains(r#""models":["#), "{state}");
+        // 2: model switch, then a file change and a command, approved
+        let model = ClientMsg::SetModel {
+            command_id: "m1".into(),
+            session_id: sid.clone(),
+            model: "gpt-5.6-luna".into(),
+        };
+        assert!(matches!(
+            rt.send(&model),
+            Ok(ServerMsg::Ack { ok: true, .. })
+        ));
+        let text = "Create a file named probe.txt containing the single word ok using your file \
+                    edit tool. Then run the shell command: git add probe.txt";
+        assert!(matches!(
+            rt.send(&prompt("p2", &sid, text, vec![])),
+            Ok(ServerMsg::Ack { ok: true, .. })
+        ));
+        assert_eq!(wait("turn 2", "p2"), "completed");
+        let asked = requested(&seen).len();
+        eprintln!("live: turn 2 approvals={asked}");
+        assert!(asked >= 2, "a file change and a command");
+        assert_eq!(
+            std::fs::read_to_string(work.join("probe.txt"))
+                .unwrap()
+                .trim(),
+            "ok"
+        );
+        let status = std::process::Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&status.stdout).contains("A  probe.txt"));
+        let ops = hub.ops(&sid);
+        assert!(
+            ops.iter().any(|o| o.contains(r#""path":"probe.txt""#)),
+            "relative diff path"
+        );
+        let state = ops
+            .iter()
+            .rev()
+            .find(|o| o.contains(r#""op":"state""#))
+            .unwrap()
+            .clone();
+        assert!(
+            state.contains(r#""model":"gpt-5.6-luna""#) && state.contains(r#""context":{"#),
+            "{state}"
+        );
+        // 3: an image
+        let red = PromptImage {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFklEQVR4nGO4IyJCEmIY1TCqYfhqAAACcQQQFwFJQgAAAABJRU5ErkJggg==".into(),
+        };
+        let ask = "What color is this image? Answer with one word.";
+        assert!(matches!(
+            rt.send(&prompt("p3", &sid, ask, vec![red])),
+            Ok(ServerMsg::Ack { ok: true, .. })
+        ));
+        assert_eq!(wait("turn 3", "p3"), "completed");
+        let reply = said(&hub.ops(&sid)).to_lowercase();
+        eprintln!(
+            "live: turn 3 image reply mentions red: {}",
+            reply.contains("red")
+        );
+        assert!(reply.contains("red"));
+        // 4: interrupted mid-turn
+        let long = "Write the numbers from 1 to 400 as words, one per line, no tools.";
+        let before = hub.ops(&sid).len();
+        assert!(matches!(
+            rt.send(&prompt("p4", &sid, long, vec![])),
+            Ok(ServerMsg::Ack { ok: true, .. })
+        ));
+        wait_until_long("streaming", || hub.ops(&sid).len() > before + 3);
+        let stop_turn = ClientMsg::Interrupt {
+            command_id: "i4".into(),
+            session_id: sid.clone(),
+        };
+        assert!(matches!(
+            rt.send(&stop_turn),
+            Ok(ServerMsg::Ack { ok: true, .. })
+        ));
+        assert_eq!(wait("turn 4", "p4"), "cancelled");
+        assert_eq!(wait("interrupt", "i4"), "completed");
+        // 5: the server exits; the next prompt resumes the thread
+        rt.dispose();
+        let text = "Reply with exactly: resumed";
+        assert!(matches!(
+            rt.send(&prompt("p5", &sid, text, vec![])),
+            Ok(ServerMsg::Ack { ok: true, .. })
+        ));
+        assert_eq!(wait("turn 5 (resumed)", "p5"), "completed");
+        assert!(said(&hub.ops(&sid)).to_lowercase().contains("resumed"));
+        let rename = ClientMsg::RenameSession {
+            command_id: "r1".into(),
+            session_id: sid.clone(),
+            title: "Live codex".into(),
+        };
+        assert!(matches!(
+            rt.send(&rename),
+            Ok(ServerMsg::Ack { ok: true, .. })
+        ));
+        assert_eq!(wait("rename", "r1"), "completed");
+        stop.store(true, Ordering::SeqCst);
+        rt.dispose();
+        // a second companion: the thread is listed (named), replayed and forked
+        let hub2 = HubHandle::default();
+        let (sink2, seen2) = recorder();
+        let rt2 = CodexRuntime::new("codex-1", cfg, hub2.clone(), sink2, no_opener());
+        rt2.refresh().unwrap();
+        wait_until_long("the listed thread", || {
+            rt2.sessions().iter().any(|s| s.id == sid)
+        });
+        let found = rt2.sessions().into_iter().find(|s| s.id == sid).unwrap();
+        eprintln!("live: listed {:?} livePc={}", found.title, found.live_pc);
+        assert_eq!(found.title, "Live codex");
+        rt2.on_subscribe(&sid);
+        wait_until_long("the replay", || said(&hub2.ops(&sid)).contains("pong"));
+        let fork = ClientMsg::SubmitPrompt {
+            command_id: "f6".into(),
+            session_id: sid.clone(),
+            text: "Reply with exactly: forked".into(),
+            images: vec![],
+            fork: true,
+        };
+        let forked = match rt2.send(&fork).unwrap() {
+            ServerMsg::Ack {
+                ok: true,
+                session_id: Some(s),
+                ..
+            } => s,
+            other => panic!("{other:?}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while !results(&seen2).contains(&("f6".into(), "completed".into())) {
+            assert!(Instant::now() < deadline, "the forked turn");
+            thread::sleep(Duration::from_millis(100));
+        }
+        let ops = hub2.ops(&forked);
+        assert!(said(&ops).contains("pong") && said(&ops).to_lowercase().contains("forked"));
+        eprintln!("live: forked into {forked}; 6 turns");
+        rt2.dispose();
+    }
+
+    /// LIVE through the companion (ignored; 1 short turn): the real server
+    /// in-process with a codex adapter from config, a WS client as the phone.
+    /// create → subscribe → streamed text → a file-change approval decided
+    /// by the phone → the item and the command complete.
+    /// `CHERNOBYL_LIVE_CODEX=1 cargo test --lib live_codex_companion --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "spawns the real Codex app-server (ChatGPT plan usage)"]
+    fn live_codex_companion_phone_round_trip() {
+        use crate::client::WsClient;
+        use crate::companion::Companion;
+        use crate::config::{AdapterEntryConfig, default_config};
+        use crate::json::{self, Json};
+        let Some((work, cfg)) = live_workspace("phone") else {
+            return;
+        };
+        let data = work.parent().unwrap().join("data");
+        let mut c = default_config();
+        c.data_dir = data;
+        c.adapters.push(AdapterEntryConfig {
+            id: "codex-1".into(),
+            kind: "codex".into(),
+            enabled: true,
+            codex: Some(cfg.clone()),
+            ..Default::default()
+        });
+        let comp = Arc::new(Companion::boot(c).unwrap());
+        let server = crate::server::start("127.0.0.1", 0, 0, None, comp.clone()).unwrap();
+        let mut phone =
+            WsClient::connect(&format!("127.0.0.1:{}", server.port), "/", None).unwrap();
+        phone.hello().unwrap();
+        phone.set_read_timeout_ms(500).unwrap();
+        let send = |phone: &mut WsClient, v: Json| phone.send_text(&json::stringify(&v)).unwrap();
+        let msg = |pairs: Vec<(&str, &str)>| {
+            json::obj(pairs.into_iter().map(|(k, v)| (k, json::s(v))).collect())
+        };
+        send(
+            &mut phone,
+            msg(vec![
+                ("type", "create_session"),
+                ("commandId", "c1"),
+                ("agentId", "codex-1"),
+                ("title", "live codex"),
+                (
+                    "prompt",
+                    "Create a file named hello.txt containing the single word hi using your file edit tool, then reply with: done",
+                ),
+                ("project", &cfg.workspaces[0].id),
+            ]),
+        );
+        let (mut appends, mut perms, mut tool_done) = (0, 0, false);
+        let mut result = None;
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while Instant::now() < deadline && result.is_none() {
+            let Some(text) = phone.next_text_timeoutable().unwrap() else {
+                continue;
+            };
+            let v = json::parse(&text).unwrap();
+            let get = |k: &str| json::get_str(&v, k).unwrap_or("").to_string();
+            match get("type").as_str() {
+                "ack" if get("commandId") == "c1" => {
+                    assert_eq!(json::get_bool(&v, "ok"), Some(true), "{text}");
+                    let sid = get("sessionId");
+                    send(
+                        &mut phone,
+                        msg(vec![
+                            ("type", "session_subscribe"),
+                            ("commandId", "s1"),
+                            ("sessionId", &sid),
+                        ]),
+                    );
+                }
+                "transcript" => {
+                    for op in json::get(&v, "ops").and_then(json::as_arr).unwrap_or(&[]) {
+                        if json::get_str(op, "op") == Some("append") {
+                            appends += 1;
+                        }
+                        let tool = json::get(op, "item").and_then(|i| json::get(i, "tool"));
+                        tool_done |= tool.is_some_and(|t| {
+                            json::get_str(t, "name") == Some("apply_patch")
+                                && json::get_str(t, "status") == Some("completed")
+                        });
+                    }
+                }
+                "permission_requested" => {
+                    let p = json::get(&v, "permission").unwrap();
+                    perms += 1;
+                    eprintln!(
+                        "live: phone sees {:?} {:?}",
+                        json::get_str(p, "title"),
+                        json::get_str(p, "command")
+                    );
+                    let mut d = msg(vec![
+                        ("type", "permission_decision"),
+                        ("commandId", &format!("d{perms}")),
+                        ("permissionId", json::get_str(p, "id").unwrap()),
+                        ("decision", "approve-once"),
+                        ("optionId", "accept"),
+                    ]);
+                    if let Json::Obj(f) = &mut d {
+                        f.push((
+                            "revision".into(),
+                            Json::Int(json::get_i64(p, "revision").unwrap_or(1)),
+                        ));
+                    }
+                    send(&mut phone, d);
+                }
+                "command_result" if get("commandId") == "c1" => result = Some(get("status")),
+                _ => {}
+            }
+        }
+        eprintln!(
+            "live: phone appends={appends} approvals={perms} tool_done={tool_done} result={result:?}; 1 turn"
+        );
+        assert_eq!(result.as_deref(), Some("completed"));
+        assert!(perms >= 1 && tool_done && appends >= 1);
+        assert_eq!(
+            std::fs::read_to_string(work.join("hello.txt"))
+                .unwrap()
+                .trim(),
+            "hi"
+        );
+        comp.shutdown(true);
+    }
+
+    fn wait_until_long(what: &str, mut f: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]

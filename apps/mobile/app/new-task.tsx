@@ -72,8 +72,9 @@ export default function NewTaskScreen() {
   // ADR-015: a spawning runtime starts only in a workspace allow-listed on the PC;
   // create_session.project then carries the workspace id
   const workspaces = selectedAgent?.live?.workspaces ?? [];
-  const pickModel = selectedAgent?.live?.composer?.includes('model') ?? false;
-  // ADR-021: OpenCode sends its own list; Claude Code takes the aliases
+  // ADR-021/022: OpenCode and Antigravity send their own lists, Claude Code takes its aliases;
+  // Codex picks its model inside the session
+  const pickModel = selectedAgent?.kind !== 'codex' && (selectedAgent?.live?.composer?.includes('model') ?? false);
   const modelList = newTaskModels(selectedAgent?.live?.models);
 
   // Auto-navigate when reconciled on reconnect

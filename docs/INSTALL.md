@@ -153,6 +153,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 -Workspaces '
 | Flag | Effect |
 |---|---|
 | `-TunnelUrl wss://host` / `-NgrokDomain <name>.ngrok-free.dev` | second endpoint for away from home; turns on `requireE2e` |
+| `-Codex` | adds `{"id":"codex-1","type":"codex","enabled":true,"workspaces":[…]}` for the same folders; no `binary`: the companion finds `codex.exe` at every start (see Codex below) |
 | `-OpenCode [-OpenCodeUrl http://127.0.0.1:4096]` | adds `{"id":"opencode-1","type":"opencode","endpoint":…,"basicAuthEnv":"OPENCODE_SERVER_PASSWORD"}` (attach-only) |
 | `-StartOpenCode` | also runs `opencode serve --port <port> --hostname 127.0.0.1` hidden in the first workspace folder, now and at login (HKCU Run `CHERNOBYL OpenCode`); implies `-OpenCode`, loopback URLs only |
 | `-EnableTerminal` | writes `"terminal": {"enabled": true}`: the paired phone can run shell commands in the workspaces **without approval prompts** (ADR-020). Off otherwise |
@@ -173,6 +174,14 @@ when the server has a password). A plain `opencode run "..."` starts its own pri
 same data folder: its session shows up on the phone only at the companion's next probe (within
 15 s), with its history, and is not streamed while it runs. The OpenCode TUI attached to the
 server (`opencode attach http://127.0.0.1:4096`) streams the same way.
+**Codex.** Install the Codex desktop app (or the CLI) and sign in there once (`codex login status`
+should say "Logged in"); the companion never reads or copies the credentials. It finds `codex.exe`
+on `PATH`, else the newest `%LOCALAPPDATA%\OpenAI\Codex\bin\<version>\codex.exe` the app
+installed, at every start, so app updates need no config change (`"binary"` in the codex entry
+overrides it). Verified with codex-cli 0.167.0-alpha.4.1. The companion starts one `codex
+app-server` at boot to list your Codex threads in the workspaces; Codex asks the phone before every
+file change and every command it does not know as read-only, runs without its sandbox, and marks
+each workspace trusted in `%USERPROFILE%\.codex\config.toml`. Turns use your ChatGPT plan's limits.
 
 `scripts\test-setup-windows.ps1` checks the script without touching your real config, Run key
 or variables (AST parse, then `-ConfigOnly` runs in a temp `APPDATA`, each file loaded by a debug
