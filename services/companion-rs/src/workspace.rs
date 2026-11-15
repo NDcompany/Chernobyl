@@ -427,8 +427,18 @@ impl Workspace {
     /// config says. Diverged history, or local changes the incoming commits
     /// would overwrite, are refused by git and change nothing.
     pub fn pull(&self) -> Result<String, String> {
+        self.pull_report().map(|(message, _)| message)
+    }
+
+    /// [`pull`](Self::pull) plus the changed paths that are agent
+    /// configuration ([`is_agent_config`]): a pull can rewrite what the
+    /// workspace's agents trust (hooks, MCP servers, instructions), and the
+    /// phone is told which paths so the person can look before the next turn
+    /// (security pass 2026-11-15, E1).
+    pub fn pull_report(&self) -> Result<(String, Vec<String>), String> {
         self.repo()?;
         let (head, remote, merge) = self.upstream()?;
+        let before = self.git_text(&["rev-parse", "HEAD"]);
         let out = self.git_change(
             &[
                 "pull",
@@ -442,11 +452,30 @@ impl Workspace {
             PULL_TIMEOUT,
         )?;
         let from = format!("{remote}/{}", merge.trim_start_matches("refs/heads/"));
-        Ok(if out.contains("Already up to date") {
+        let changed = before
+            .and_then(|b| {
+                self.git(
+                    &["diff", "--name-only", "--no-renames", &b, "HEAD"],
+                    READ_TIMEOUT,
+                    GIT_OUT_MAX,
+                )
+                .ok()
+                .filter(|o| o.ok)
+            })
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter(|p| is_agent_config(p))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let message = if out.contains("Already up to date") {
             format!("{head} is up to date with {from}")
         } else {
             format!("{from} -> {head}")
-        })
+        };
+        Ok((message, changed))
     }
 
     /// The canonical workspace folder (ADR-020: the terminal's cwd).
@@ -540,6 +569,27 @@ fn decode_text(buf: Vec<u8>, truncated: bool) -> Option<String> {
         }
         Err(_) => None,
     }
+}
+
+/// A repository path (as git prints it) that configures an agent: anything
+/// under a `.claude`, `.codex`, `.gemini` or `.opencode` folder, and the
+/// `.mcp.json`, `CLAUDE.md`, `AGENTS.md`, `GEMINI.md` and `opencode.json`
+/// files, at the top or in a subfolder. Repo settings stay trusted by design
+/// (T11); this only lets a pull say which ones it changed.
+pub fn is_agent_config(path: &str) -> bool {
+    let parts: Vec<String> = path
+        .split(['/', '\\'])
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let Some((file, dirs)) = parts.split_last() else {
+        return false;
+    };
+    dirs.iter()
+        .any(|d| matches!(d.as_str(), ".claude" | ".codex" | ".gemini" | ".opencode"))
+        || matches!(
+            file.as_str(),
+            ".mcp.json" | "claude.md" | "agents.md" | "gemini.md" | "opencode.json"
+        )
 }
 
 /// `.env`, `.env.local`, `prod.env`: dotenv files hold secrets by design.
@@ -1334,6 +1384,77 @@ pub(crate) mod tests {
         std::fs::write(dir.join(name), text).unwrap();
         git(dir, &["add", name]);
         git(dir, &["commit", "-q", "-m", name]);
+    }
+
+    #[test]
+    fn agent_config_paths_are_recognised() {
+        for yes in [
+            ".claude/settings.json",
+            ".claude/commands/x.md",
+            ".codex/config.toml",
+            ".gemini/settings.json",
+            ".opencode/plugin/a.js",
+            ".mcp.json",
+            "CLAUDE.md",
+            "AGENTS.md",
+            "GEMINI.md",
+            "opencode.json",
+            "pkg/sub/CLAUDE.md",
+            "pkg/.claude/settings.local.json",
+            ".Claude/Settings.json",
+        ] {
+            assert!(is_agent_config(yes), "{yes}");
+        }
+        for no in [
+            "README.md",
+            "src/claude.rs",
+            "docs/CLAUDE.md.bak",
+            "claude/notes.md",
+            ".claudex/x",
+            "opencode.jsonc",
+            "",
+        ] {
+            assert!(!is_agent_config(no), "{no}");
+        }
+    }
+
+    /// Security pass 2026-11-15 (E1): a pull reports which of the paths it
+    /// changed are agent configuration, and nothing else.
+    #[test]
+    fn pull_reports_the_agent_config_it_changed() {
+        let remote = temp("pull-cfg-remote");
+        git(
+            &remote,
+            &["-c", "init.defaultBranch=main", "init", "-q", "--bare"],
+        );
+        let root = repo("pull-cfg");
+        let (ws, _) = open(&root);
+        git(
+            &root,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        git(&root, &["push", "-q", "-u", "origin", "main"]);
+        let (_, changed) = ws.pull_report().unwrap();
+        assert!(changed.is_empty(), "nothing pulled: {changed:?}");
+
+        let other = clone_of(&remote, "pull-cfg-other");
+        std::fs::create_dir_all(other.join(".claude")).unwrap();
+        std::fs::create_dir_all(other.join("src")).unwrap();
+        std::fs::write(other.join(".claude/settings.json"), "{}\n").unwrap();
+        std::fs::write(other.join("CLAUDE.md"), "be nice\n").unwrap();
+        std::fs::write(other.join("src/main.rs"), "fn main() {}\n").unwrap();
+        git(&other, &["add", "-A"]);
+        git(&other, &["commit", "-q", "-m", "config and code"]);
+        git(&other, &["push", "-q"]);
+        let (message, changed) = ws.pull_report().unwrap();
+        assert_eq!(message, "origin/main -> main");
+        assert_eq!(changed, [".claude/settings.json", "CLAUDE.md"]);
+
+        // a pull that only brings code reports none
+        commit_file(&other, "b.txt", "b\n");
+        git(&other, &["push", "-q"]);
+        let (_, changed) = ws.pull_report().unwrap();
+        assert!(changed.is_empty(), "{changed:?}");
     }
 
     #[test]

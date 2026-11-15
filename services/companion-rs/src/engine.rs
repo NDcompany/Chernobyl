@@ -349,6 +349,7 @@ impl Engine {
         permission_id: Option<&str>,
     ) {
         self.broadcast(EventKind::CommandResult {
+            agent_config_changed: Vec::new(),
             command_id: command_id.to_string(),
             status: status.to_string(),
             error: error.map(str::to_string),

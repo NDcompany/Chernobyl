@@ -942,11 +942,15 @@ impl Companion {
         let started = std::thread::Builder::new()
             .name("workspace-git".into())
             .spawn(move || {
+                let mut config_changed = Vec::new();
                 let outcome = match &job {
                     WorkspaceOp::GitStage { paths } => ws.stage(paths),
                     WorkspaceOp::GitUnstage { paths } => ws.unstage(paths),
                     WorkspaceOp::GitCommit { message } => ws.commit(message),
-                    WorkspaceOp::GitPull => ws.pull(),
+                    WorkspaceOp::GitPull => ws.pull_report().map(|(message, changed)| {
+                        config_changed = changed;
+                        message
+                    }),
                     _ => ws.push(),
                 };
                 busy.lock().unwrap().remove(&wid);
@@ -967,6 +971,9 @@ impl Companion {
                 };
                 if let Some((kind, what)) = audit {
                     let verdict = match &outcome {
+                        Ok(done) if !config_changed.is_empty() => {
+                            format!("ok: {done}; agent config changed: {}", config_changed.len())
+                        }
                         Ok(done) => format!("ok: {done}"),
                         Err(e) => format!("failed: {e}"),
                     };
@@ -983,6 +990,7 @@ impl Companion {
                     error: outcome.err(),
                     session_id: None,
                     permission_id: None,
+                    agent_config_changed: config_changed,
                 });
             });
         match started {
@@ -1071,6 +1079,7 @@ impl Companion {
                 });
                 let error = end.error(timeout);
                 sink(EventKind::CommandResult {
+                    agent_config_changed: Vec::new(),
                     command_id: cmd,
                     status: if error.is_some() {
                         "failed"

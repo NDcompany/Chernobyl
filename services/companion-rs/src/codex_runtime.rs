@@ -675,6 +675,7 @@ impl Inner {
     /// Done at once: the command has nothing to act on.
     fn noop(&self, command_id: &str, session_id: &str) -> ServerMsg {
         (self.sink)(EventKind::CommandResult {
+            agent_config_changed: Vec::new(),
             command_id: command_id.into(),
             status: "completed".into(),
             error: None,
@@ -926,6 +927,7 @@ impl Inner {
                         continue;
                     }
                     (self.sink)(EventKind::CommandResult {
+                        agent_config_changed: Vec::new(),
                         session_id: st.tags.remove(&tag),
                         command_id: tag,
                         status: status.into(),
@@ -938,6 +940,7 @@ impl Inner {
                     if let Err(e) = (self.opener)(&url) {
                         st.dropped.insert(tag.clone());
                         (self.sink)(EventKind::CommandResult {
+                            agent_config_changed: Vec::new(),
                             session_id: st.tags.remove(&tag),
                             command_id: tag,
                             status: "failed".into(),

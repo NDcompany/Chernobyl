@@ -2136,6 +2136,7 @@ fn result(
     session_id: Option<String>,
 ) -> EventKind {
     EventKind::CommandResult {
+        agent_config_changed: Vec::new(),
         command_id: command_id.to_string(),
         status: status.to_string(),
         error,
@@ -4235,6 +4236,7 @@ pub(crate) mod tests {
                 error,
                 session_id,
                 permission_id,
+                ..
             } => {
                 assert_eq!(command_id, "cmd-7");
                 assert_eq!(status, "failed");

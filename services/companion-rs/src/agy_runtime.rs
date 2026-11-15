@@ -548,6 +548,7 @@ impl Inner {
         let s = s.clone();
         (self.sink)(EventKind::SessionUpdated(s));
         (self.sink)(EventKind::CommandResult {
+            agent_config_changed: Vec::new(),
             session_id: Some(session_id.into()),
             command_id: command_id.into(),
             status: "completed".into(),
@@ -580,6 +581,7 @@ impl Inner {
         };
         self.op(&mut st, session_id, Op::State(ended));
         (self.sink)(EventKind::CommandResult {
+            agent_config_changed: Vec::new(),
             session_id: Some(session_id.into()),
             command_id: command_id.into(),
             status: "completed".into(),
@@ -754,6 +756,7 @@ impl Inner {
                         continue;
                     }
                     (self.sink)(EventKind::CommandResult {
+                        agent_config_changed: Vec::new(),
                         session_id: st.tags.remove(&tag),
                         command_id: tag,
                         status: status.into(),

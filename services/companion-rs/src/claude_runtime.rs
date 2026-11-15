@@ -866,6 +866,7 @@ impl Inner {
                 ClientMsg::Interrupt { .. } | ClientMsg::SessionEnd { .. }
             ) {
                 out.push(EventKind::CommandResult {
+                    agent_config_changed: Vec::new(),
                     command_id: command_id.clone(),
                     status: "completed".into(),
                     error: None,
@@ -1974,6 +1975,7 @@ impl Inner {
             live.create = None;
         }
         out.push(EventKind::CommandResult {
+            agent_config_changed: Vec::new(),
             command_id: cmd.to_string(),
             status: status.to_string(),
             error,
