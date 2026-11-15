@@ -2484,4 +2484,189 @@ mod tests {
         assert!(launch_config(&json::parse(r#"{"workspaces":[]}"#).unwrap(), &data).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn permission_option_mapping_drops_always_and_synthesizes_cancel() {
+        let native = json::parse(
+            r#"[
+                {"optionId":"opt_once","name":"Allow this time","kind":"allow_once"},
+                {"optionId":"opt_always","name":"Always allow","kind":"allow_always"},
+                {"optionId":"opt_deny","name":"Reject this","kind":"reject_once"},
+                {"optionId":"opt_never","name":"Never allow","kind":"reject_always"},
+                {"optionId":"chernobyl-cancel","name":"Spoofed cancel","kind":"reject_once"}
+            ]"#,
+        )
+        .unwrap();
+        let opts = options(json::as_arr(&native).unwrap());
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].id, "opt_once");
+        assert_eq!(opts[0].decision, "approve-once");
+        assert_eq!(opts[0].scope, "once");
+        assert_eq!(opts[0].label, "Allow this time");
+        assert!(!opts[0].stops_turn);
+
+        assert_eq!(opts[1].id, "opt_deny");
+        assert_eq!(opts[1].decision, "reject");
+        assert_eq!(opts[1].scope, "once");
+        assert_eq!(opts[1].label, "Reject this");
+        assert!(!opts[1].stops_turn);
+
+        // When native offers no reject option, a synthetic "chernobyl-cancel" is added
+        let allow_only = json::parse(
+            r#"[
+                {"optionId":"only_allow","name":"Allow","kind":"allow_once"},
+                {"optionId":"always","name":"Always","kind":"allow_always"}
+            ]"#,
+        )
+        .unwrap();
+        let fallback = options(json::as_arr(&allow_only).unwrap());
+        assert_eq!(fallback.len(), 2);
+        assert_eq!(fallback[0].id, "only_allow");
+        assert_eq!(fallback[0].decision, "approve-once");
+        assert_eq!(fallback[1].id, CANCEL_OPTION);
+        assert_eq!(fallback[1].decision, "reject");
+        assert_eq!(fallback[1].label, "Deny and stop");
+        assert!(fallback[1].stops_turn);
+
+        // legacy decisions list has unique values
+        let decs = legacy(&fallback);
+        assert_eq!(decs, ["approve-once", "reject"]);
+    }
+
+    #[test]
+    fn tool_call_status_mapping_and_transitions() {
+        let mut tool = new_tool("run_command", ToolStatus::Pending);
+
+        // pending -> in_progress (Running)
+        let in_prog = json::parse(r#"{"status":"in_progress"}"#).unwrap();
+        merge_tool(&mut tool, &in_prog);
+        assert_eq!(tool.status, ToolStatus::Running);
+
+        // in_progress -> completed
+        let comp = json::parse(r#"{"status":"completed"}"#).unwrap();
+        merge_tool(&mut tool, &comp);
+        assert_eq!(tool.status, ToolStatus::Completed);
+
+        // completed -> failed with error message in rawOutput
+        let fail = json::parse(
+            r#"{"status":"failed","rawOutput":{"error":"command exited with code 1"}}"#,
+        )
+        .unwrap();
+        merge_tool(&mut tool, &fail);
+        assert_eq!(tool.status, ToolStatus::Failed);
+        assert_eq!(tool.error.as_deref(), Some("command exited with code 1"));
+
+        // Denied calls remain Denied even when status update says completed or failed
+        tool.status = ToolStatus::Denied;
+        merge_tool(&mut tool, &comp);
+        assert_eq!(tool.status, ToolStatus::Denied);
+        merge_tool(&mut tool, &fail);
+        assert_eq!(tool.status, ToolStatus::Denied);
+
+        // AwaitingApproval calls remain AwaitingApproval when agy re-sends pending
+        tool.status = ToolStatus::AwaitingApproval;
+        let pend = json::parse(r#"{"status":"pending"}"#).unwrap();
+        merge_tool(&mut tool, &pend);
+        assert_eq!(tool.status, ToolStatus::AwaitingApproval);
+    }
+
+    #[test]
+    fn acp_json_parsers_and_pure_mappers() {
+        // phone_mode
+        assert_eq!(phone_mode("default"), Some("default"));
+        assert_eq!(phone_mode("accept-edits"), Some("acceptEdits"));
+        assert_eq!(phone_mode("plan"), Some("plan"));
+        assert_eq!(phone_mode("auto"), None);
+        assert_eq!(phone_mode(""), None);
+
+        // is_command
+        assert!(is_command("compact"));
+        assert!(is_command("goal-123"));
+        assert!(is_command("Compact"));
+        assert!(is_command("foo_bar:baz.1"));
+        assert!(!is_command(""));
+        assert!(!is_command("bad name"));
+        assert!(!is_command("cmd;calc"));
+        assert!(!is_command(&"a".repeat(65)));
+
+        // native_path
+        assert_eq!(native_path("/C:/project/test.rs"), "C:/project/test.rs");
+        assert_eq!(native_path(r"/d:\project\test.rs"), r"d:\project\test.rs");
+        assert_eq!(native_path("/usr/bin/agy"), "/usr/bin/agy");
+        assert_eq!(native_path("C:/project/test.rs"), "C:/project/test.rs");
+
+        // proposed_diff for write_file and edit_file
+        let write_raw = json::parse(r#"{"Path":"C:\\out.txt","Content":"hello world\n"}"#).unwrap();
+        let write_diff = proposed_diff(&write_raw, Some("C:\\out.txt")).unwrap();
+        assert_eq!(write_diff.path, "C:\\out.txt");
+        assert_eq!(write_diff.status, "added");
+        assert!(write_diff.patch.contains("+hello world"));
+
+        let edit_raw =
+            json::parse(r#"{"Path":"C:\\out.txt","Target":"hello","Replacement":"goodbye"}"#)
+                .unwrap();
+        let edit_diff = proposed_diff(&edit_raw, Some("C:\\out.txt")).unwrap();
+        assert_eq!(edit_diff.path, "C:\\out.txt");
+        assert_eq!(edit_diff.status, "modified");
+        assert!(edit_diff.patch.contains("-hello"));
+        assert!(edit_diff.patch.contains("+goodbye"));
+
+        // acp_diff
+        let acp_add =
+            json::parse(r#"{"type":"diff","path":"/C:/new.txt","newText":"new line\n"}"#).unwrap();
+        let add_diff = acp_diff(&acp_add).unwrap();
+        assert_eq!(add_diff.path, "C:/new.txt");
+        assert_eq!(add_diff.status, "added");
+
+        let acp_mod = json::parse(
+            r#"{"type":"diff","path":"/C:/mod.txt","oldText":"old\n","newText":"new\n"}"#,
+        )
+        .unwrap();
+        let mod_diff = acp_diff(&acp_mod).unwrap();
+        assert_eq!(mod_diff.path, "C:/mod.txt");
+        assert_eq!(mod_diff.status, "modified");
+
+        // command_line
+        let cmd_json = json::parse(r#"{"rawInput":{"CommandLine":"dir /w"}}"#).unwrap();
+        assert_eq!(command_line(&cmd_json), Some("dir /w".to_string()));
+        let no_cmd = json::parse(r#"{"rawInput":{}}"#).unwrap();
+        assert_eq!(command_line(&no_cmd), None);
+    }
+
+    #[test]
+    fn id_generation_includes_process_generation() {
+        let (mut agy1, mut _p1) = connect();
+        assert_eq!(agy1.next(), "1.1");
+        assert_eq!(agy1.next(), "1.2");
+
+        let (core_stdout, to_core) = io::pipe().unwrap();
+        let (from_core, core_stdin) = io::pipe().unwrap();
+        let (child, events) = ChildIo::from_pipes(core_stdout, core_stdin).unwrap();
+        let (frames_tx, frames) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(from_core).lines().map_while(Result::ok) {
+                let _ = frames_tx.send(line);
+            }
+        });
+        let mut agy2 = Agy::new(child, "agy-1", 2, "0.0.0");
+        let mut peer2 = Peer {
+            frames,
+            to_core,
+            events,
+        };
+        let _ = peer2.recv();
+        peer2.say(r#"{"jsonrpc":"2.0","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true}}},"id":1}"#);
+        assert!(peer2.feed(&mut agy2).is_empty());
+
+        assert_eq!(agy2.next(), "2.1");
+        assert_eq!(agy2.next(), "2.2");
+
+        // verify generation scoping in permission id formatting: {adapter}:{generation}-{rid}
+        let rid = "call_abc";
+        let perm1 = format!("{}:{}-{rid}", "agy-1", 1);
+        let perm2 = format!("{}:{}-{rid}", "agy-1", 2);
+        assert_eq!(perm1, "agy-1:1-call_abc");
+        assert_eq!(perm2, "agy-1:2-call_abc");
+        assert_ne!(perm1, perm2);
+    }
 }

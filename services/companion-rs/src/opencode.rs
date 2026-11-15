@@ -6272,4 +6272,190 @@ pub(crate) mod tests {
         assert_eq!(models[0].0, "opencode/big-pickle");
         assert_eq!(models.len(), 3);
     }
+
+    #[test]
+    fn build_plan_mode_mapping_pure_helpers_and_accept_edits_refused() {
+        // pure mode_agent and agent_mode mappings
+        assert_eq!(mode_agent("default"), Some("build"));
+        assert_eq!(mode_agent("plan"), Some("plan"));
+        assert_eq!(mode_agent("acceptEdits"), None); // refused: OpenCode has no acceptEdits mode
+        assert_eq!(mode_agent("yolo"), None);
+        assert_eq!(mode_agent(""), None);
+
+        assert_eq!(agent_mode("build"), Some("default"));
+        assert_eq!(agent_mode("plan"), Some("plan"));
+        assert_eq!(agent_mode("explore"), None);
+        assert_eq!(agent_mode("compaction"), None);
+
+        // filtering agents: hidden ones are dropped, non-build/plan are dropped
+        let agents_raw = json::parse(
+            r#"[
+                {"id":"build","name":"Builder","hidden":false},
+                {"id":"plan","name":"Planner","hidden":true},
+                {"id":"summary","name":"Summary","hidden":true},
+                {"id":"explore","name":"Explorer","hidden":false}
+            ]"#,
+        )
+        .unwrap();
+        let agents = json::as_arr(&agents_raw).unwrap();
+        let offered: Vec<&'static str> = ["build", "plan"]
+            .iter()
+            .filter(|m| {
+                agents.iter().any(|a| {
+                    json::get_str(a, "id") == Some(**m) && json::get_bool(a, "hidden") != Some(true)
+                })
+            })
+            .filter_map(|a| agent_mode(a))
+            .collect();
+        assert_eq!(offered, ["default"]); // plan was hidden so dropped; explore is not build/plan
+
+        // Fake-server test: verify acceptEdits is explicitly refused by set_mode
+        let d = dirs();
+        let r = rig_in(
+            parity_opts(&d.work.to_string_lossy()),
+            "ses_test1",
+            Some(&d.data),
+        );
+        let res =
+            r.ad.send(&ClientMsg::SetPermissionMode {
+                command_id: "cmd_mode".into(),
+                session_id: "ses_test1".into(),
+                mode: "acceptEdits".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            res,
+            ServerMsg::Ack {
+                ok: false,
+                error: Some(err),
+                ..
+            } if err.contains("acceptEdits")
+        ));
+    }
+
+    #[test]
+    fn end_behaviour_helpers_refusal() {
+        let d = dirs();
+        let r = rig_in(
+            parity_opts(&d.work.to_string_lossy()),
+            "ses_test1",
+            Some(&d.data),
+        );
+
+        // End the session
+        let end =
+            r.ad.send(&ClientMsg::SessionEnd {
+                command_id: "cmd_end".into(),
+                session_id: "ses_test1".into(),
+            })
+            .unwrap();
+        assert!(matches!(end, ServerMsg::Ack { ok: true, .. }));
+
+        // Now prompt to ended session is refused with ENDED message
+        let prompt_res =
+            r.ad.send(&ClientMsg::SubmitPrompt {
+                command_id: "cmd_p".into(),
+                session_id: "ses_test1".into(),
+                text: "next turn".into(),
+                images: vec![],
+                fork: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            prompt_res,
+            ServerMsg::Ack {
+                ok: false,
+                error: Some(err),
+                ..
+            } if err == ENDED
+        ));
+
+        // SetPermissionMode is refused on ended session
+        let mode_res =
+            r.ad.send(&ClientMsg::SetPermissionMode {
+                command_id: "cmd_m".into(),
+                session_id: "ses_test1".into(),
+                mode: "plan".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            mode_res,
+            ServerMsg::Ack {
+                ok: false,
+                error: Some(err),
+                ..
+            } if err == ENDED
+        ));
+
+        // SetModel is refused on ended session
+        let model_res =
+            r.ad.send(&ClientMsg::SetModel {
+                command_id: "cmd_mod".into(),
+                session_id: "ses_test1".into(),
+                model: "ollama/qwen3.5:4b".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            model_res,
+            ServerMsg::Ack {
+                ok: false,
+                error: Some(err),
+                ..
+            } if err == ENDED
+        ));
+    }
+
+    #[test]
+    fn provider_model_list_ordering_default_first_and_filtering() {
+        let providers_raw = json::parse(
+            r#"{
+                "providers": [
+                    {
+                        "id": "provider_a",
+                        "models": {
+                            "m1": {"id": "m1", "name": "Model 1", "limit": {"context": 8192}},
+                            "m_dep": {"id": "m_dep", "name": "Deprecated", "status": "deprecated"},
+                            "bad id": {"id": "bad id", "name": "Invalid"}
+                        }
+                    },
+                    {
+                        "id": "provider_b",
+                        "models": {
+                            "m2": {"id": "m2", "name": "Model 2", "limit": {"context": 32768}}
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        // When default is "provider_b/m2", it is sorted to index 0
+        let models_def = catalog_models(&providers_raw, Some("provider_b/m2"));
+        assert_eq!(models_def.len(), 2);
+        assert_eq!(models_def[0].0, "provider_b/m2");
+        assert_eq!(models_def[0].1, "Model 2");
+        assert_eq!(models_def[0].2, 32768);
+        assert_eq!(models_def[1].0, "provider_a/m1");
+
+        // When default is None, standard order
+        let models_no_def = catalog_models(&providers_raw, None);
+        assert_eq!(models_no_def.len(), 2);
+        assert!(!models_no_def.iter().any(|m| m.0.contains("dep")));
+        assert!(!models_no_def.iter().any(|m| m.0.contains("bad")));
+
+        // Truncation at MODELS_MAX (30)
+        let mut many = Vec::new();
+        for i in 0..40 {
+            many.push(format!(
+                r#""m_{i}": {{"id": "m_{i}", "name": "Model {i}"}}"#
+            ));
+        }
+        let many_json = json::parse(&format!(
+            r#"{{"providers": [{{"id": "p", "models": {{{}}} }}]}}"#,
+            many.join(",")
+        ))
+        .unwrap();
+        let capped = catalog_models(&many_json, None);
+        assert_eq!(capped.len(), MODELS_MAX);
+    }
 }

@@ -10,12 +10,74 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  kitkat-apk:
+    name: Build KitKat APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK Packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Build KitKat Release APK
+        run: |
+          chmod +x android-kitkat/gradlew
+          cd android-kitkat && ./gradlew assembleRelease --console=plain
+
+      - name: Sign KitKat APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+        run: |
+          mkdir -p release
+          UNSIGNED_APK="android-kitkat/build/outputs/apk/release/android-kitkat-release.apk"
+          VERSION=$(grep "versionName" android-kitkat/build.gradle | head -n 1 | sed "s/.*'\(.*\)'.*/\1/")
+          OUT_APK="release/chernobyl-kitkat-${VERSION}.apk"
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASS" ]; then
+            SIGNING_DIR="$RUNNER_TEMP/keystore"
+            mkdir -p "$SIGNING_DIR"
+            JKS_PATH="$SIGNING_DIR/chernobyl-release.jks"
+            PASS_PATH="$SIGNING_DIR/chernobyl-release.pass"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$JKS_PATH"
+            printf "%s" "$KEYSTORE_PASS" > "$PASS_PATH"
+            APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+            "$APKSIGNER" sign --ks "$JKS_PATH" --ks-pass "file:$PASS_PATH" --ks-key-alias chernobyl \
+              --min-sdk-version 19 --v1-signing-enabled true --v2-signing-enabled true --v4-signing-enabled false \
+              --out "$OUT_APK" "$UNSIGNED_APK"
+            "$APKSIGNER" verify --min-sdk-version 19 --verbose "$OUT_APK"
+            echo "KitKat APK signed successfully with release key"
+          else
+            echo "ANDROID_KEYSTORE_BASE64 and/or ANDROID_KEYSTORE_PASS not provided: KitKat APK remains unsigned/debug-signed"
+            cp "$UNSIGNED_APK" "$OUT_APK"
+          fi
+
+      - name: Upload KitKat APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chernobyl-kitkat-apk
+          path: release/*.apk
+          if-no-files-found: error
+
   release:
     name: Build Companion and Draft Release
+    needs: [kitkat-apk]
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,21 +105,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Download KitKat APK
+        uses: actions/download-artifact@v4
+        with:
+          name: chernobyl-kitkat-apk
+          path: release
+
       - name: Build Companion (Release)
         run: cargo build --release --manifest-path services/companion-rs/Cargo.toml
 
       - name: Package Release
         run: node scripts/package-release.mjs
 
-      # Note: Android APK builds separately on Ubuntu runners via android.yml.
-      # Because GitHub Actions runs workflow runs concurrently on the same tag,
-      # the release draft is initialized here with the companion binary and
-      # SHA256SUMS.txt, and the signed APK artifact can be attached to the draft
-      # release manually before publication.
       - name: Create Draft Release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
           files: |
             services/companion-rs/target/release/chernobyl-companion.exe
+            release/*.apk
             release/SHA256SUMS.txt

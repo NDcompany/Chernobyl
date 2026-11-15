@@ -3114,4 +3114,321 @@ mod tests {
             r#""models":[{"value":"gemini-3.8-flash-low","label":"Gemini 3.8 Flash (Low)"}]"#
         ));
     }
+
+    #[test]
+    fn model_name_rules_table() {
+        struct ModelCase {
+            name: String,
+            claude: bool,
+            provider: bool,
+            runtime: bool,
+            model: bool,
+        }
+        let cases = vec![
+            // 64 / 65 char boundary
+            ModelCase {
+                name: "a".repeat(64),
+                claude: false,
+                provider: false,
+                runtime: true,
+                model: true,
+            },
+            ModelCase {
+                name: "a".repeat(65),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: format!("claude-{}", "a".repeat(57)),
+                claude: true,
+                provider: false,
+                runtime: true,
+                model: true,
+            },
+            ModelCase {
+                name: format!("claude-{}", "a".repeat(58)),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: format!("provider/{}", "a".repeat(55)),
+                claude: false,
+                provider: true,
+                runtime: false,
+                model: true,
+            },
+            ModelCase {
+                name: format!("provider/{}", "a".repeat(56)),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            // Leading / trailing punctuation
+            ModelCase {
+                name: ".dot".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "dot.".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "-dash".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "dash-".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "_under".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "under_".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "/slash".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "slash/".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: ":colon".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "colon:".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "@at".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "at@".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            // Casing and charset
+            ModelCase {
+                name: "GPT-4".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "Opus".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "gemini-🦀".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "--flag".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "a;b".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "a b".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            // Specific prompt requirements
+            ModelCase {
+                name: "claude-".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "best".into(),
+                claude: false,
+                provider: false,
+                runtime: true,
+                model: true,
+            },
+            ModelCase {
+                name: "ollama/qwen3.5:4b".into(),
+                claude: false,
+                provider: true,
+                runtime: false,
+                model: true,
+            },
+            ModelCase {
+                name: "gpt-6-luna".into(),
+                claude: false,
+                provider: false,
+                runtime: true,
+                model: true,
+            },
+            ModelCase {
+                name: "gemini-3.8-flash-low".into(),
+                claude: false,
+                provider: false,
+                runtime: true,
+                model: true,
+            },
+            ModelCase {
+                name: "codex_mini".into(),
+                claude: false,
+                provider: false,
+                runtime: true,
+                model: true,
+            },
+            // Aliases and standard Claude / Provider models
+            ModelCase {
+                name: "default".into(),
+                claude: true,
+                provider: false,
+                runtime: true,
+                model: true,
+            },
+            ModelCase {
+                name: "sonnet".into(),
+                claude: true,
+                provider: false,
+                runtime: true,
+                model: true,
+            },
+            ModelCase {
+                name: "claude-3-5-sonnet".into(),
+                claude: true,
+                provider: false,
+                runtime: true,
+                model: true,
+            },
+            ModelCase {
+                name: "cloudflare/@cf/meta/llama-3".into(),
+                claude: false,
+                provider: true,
+                runtime: false,
+                model: true,
+            },
+            ModelCase {
+                name: "provider/-model".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "-provider/model".into(),
+                claude: false,
+                provider: false,
+                runtime: false,
+                model: false,
+            },
+            ModelCase {
+                name: "openrouter/anthropic/claude-3.5-sonnet".into(),
+                claude: false,
+                provider: true,
+                runtime: false,
+                model: true,
+            },
+        ];
+
+        for c in cases {
+            assert_eq!(
+                is_claude_model(&c.name),
+                c.claude,
+                "is_claude_model mismatch for {:?}",
+                c.name
+            );
+            assert_eq!(
+                is_provider_model(&c.name),
+                c.provider,
+                "is_provider_model mismatch for {:?}",
+                c.name
+            );
+            assert_eq!(
+                is_runtime_model(&c.name),
+                c.runtime,
+                "is_runtime_model mismatch for {:?}",
+                c.name
+            );
+            assert_eq!(
+                is_model(&c.name),
+                c.model,
+                "is_model mismatch for {:?}",
+                c.name
+            );
+            assert_eq!(
+                is_model_name(&c.name),
+                c.model,
+                "is_model_name mismatch for {:?}",
+                c.name
+            );
+        }
+    }
 }

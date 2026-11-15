@@ -113,3 +113,59 @@ jobs:
 
       - name: Run E2E Interop
         run: npm run verify:e2e
+
+  kitkat:
+    name: KitKat Client Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK Packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Run KitKat Unit Tests
+        run: |
+          chmod +x android-kitkat/gradlew
+          cd android-kitkat && ./gradlew testDebugUnitTest --console=plain
+
+  setup-script:
+    name: Windows Setup Script Test
+    needs: [rust]
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            services/companion-rs/target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('services/companion-rs/Cargo.lock', 'services/companion-rs/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Build Companion (Release)
+        run: cargo build --release --manifest-path services/companion-rs/Cargo.toml
+
+      - name: Run Windows Setup Test
+        run: |
+          New-Item -ItemType Directory -Force services/companion-rs/target/debug | Out-Null
+          Copy-Item services/companion-rs/target/release/chernobyl-companion.exe services/companion-rs/target/debug/chernobyl-companion.exe
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-setup-windows.ps1 -Exe services/companion-rs/target/release/chernobyl-companion.exe
