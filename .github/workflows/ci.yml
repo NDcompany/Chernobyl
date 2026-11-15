@@ -165,7 +165,4 @@ jobs:
         run: cargo build --release --manifest-path services/companion-rs/Cargo.toml
 
       - name: Run Windows Setup Test
-        run: |
-          New-Item -ItemType Directory -Force services/companion-rs/target/debug | Out-Null
-          Copy-Item services/companion-rs/target/release/chernobyl-companion.exe services/companion-rs/target/debug/chernobyl-companion.exe
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-setup-windows.ps1 -Exe services/companion-rs/target/release/chernobyl-companion.exe
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-setup-windows.ps1 -Exe services/companion-rs/target/release/chernobyl-companion.exe

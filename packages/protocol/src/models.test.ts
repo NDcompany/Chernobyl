@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isClaudeModelName, isModelName } from './index.ts';
+import { isClaudeModelName, isModelName } from './index';
 
 interface ModelTestCase {
   name: string;
