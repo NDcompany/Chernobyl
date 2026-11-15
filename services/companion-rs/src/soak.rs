@@ -77,7 +77,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TOKEN: &str = "soak-secret";
+const TOKEN: &str = "soak-secret-0123456789abcdef0123456789abcdef";
 
 // PROPOSED limits (see the header for their reasoning)
 const RSS_GROWTH_LIMIT_BYTES: i64 = 64 * 1024 * 1024;

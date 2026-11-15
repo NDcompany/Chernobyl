@@ -106,7 +106,7 @@ const INJECT = flag('inject', '');
 const PROGRESS_S = Number(flag('progress-secs', LONG ? 60 : 10));
 const RUN_STAMP = new Date().toISOString().replace(/[:.]/g, '-');
 const OUT = flag('out', join(REPO, 'services', 'companion-rs', 'target', 'soak', `${RUN_STAMP}-${MODE}`));
-const TOKEN = 'soak-secret';
+const TOKEN = 'soak-secret-0123456789abcdef0123456789abcdef';
 const PROTOCOL_VERSION = 2; // confirmed from /health at boot
 
 const LIMITS = {

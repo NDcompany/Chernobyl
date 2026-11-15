@@ -31,6 +31,22 @@ pub const CLOSE_DEVICE_REVOKED: u16 = 4003;
 pub const APP_ORIGIN: &str = "chernobyl://app";
 
 pub const AUTH_FAILURE_LIMIT: u32 = 5;
+/// Security pass 2026-11-15 (N5): the shortest access token the daemon will
+/// start with (setup-windows.ps1 mints 48 hex characters). A short token is
+/// guessable even with the failure limiter.
+pub const MIN_TOKEN_LEN: usize = 32;
+
+/// Refuses an empty or short access token (`--token` / `HOST_TOKEN`).
+pub fn validate_token(token: &str) -> Result<(), String> {
+    if token.chars().count() < MIN_TOKEN_LEN {
+        return Err(format!(
+            "the access token must be at least {MIN_TOKEN_LEN} characters (got {}); use 24 random bytes as hex",
+            token.chars().count()
+        ));
+    }
+    Ok(())
+}
+
 /// Security pass 2026-11-15 (N6): once the limit is hit, a wrong token is
 /// answered only after this pause, so guessing is slow even though the 429
 /// itself costs nothing.
@@ -5211,6 +5227,17 @@ mod e2e_tests {
         assert!(t.elapsed() >= AUTH_THROTTLE - Duration::from_millis(20));
         let _ok = connect_remote(&f);
         shutdown(f);
+    }
+
+    /// Security pass 2026-11-15 (N5): empty and short tokens are refused.
+    #[test]
+    fn validate_token_requires_32_characters() {
+        assert!(validate_token("").is_err());
+        assert!(validate_token("st-secret").is_err());
+        assert!(validate_token(&"a".repeat(MIN_TOKEN_LEN - 1)).is_err());
+        assert!(validate_token(&"a".repeat(MIN_TOKEN_LEN)).is_ok());
+        // what setup-windows.ps1 mints: 24 random bytes as hex
+        assert!(validate_token(&"0f".repeat(24)).is_ok());
     }
 
     /* ---- security pass 2026-11-15, N2: per-peer cap + head deadline --- */

@@ -46,6 +46,29 @@ fn health_connections_active(addr: &str) -> Option<i64> {
 // timeout. Consequently, `ServerHandle::stop()` hits its 5-second deadline and returns `false`.
 // Modifying `src/server.rs` is forbidden as another agent is editing it in parallel.
 
+/// Security pass 2026-11-15 (N5): the daemon refuses to start with an empty or
+/// short access token, before it opens a socket.
+#[test]
+fn daemon_refuses_an_empty_or_short_token() {
+    let dir = temp_dir("short-token");
+    std::fs::create_dir_all(&dir).unwrap();
+    for token in ["", "short-token"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_chernobyl-companion"))
+            .args(["--token", token, "--port", "0", "--diagnostics-port", "0"])
+            .args(["--exit-after", "1", "--config"])
+            .arg(dir.join("companion.json"))
+            .env("CHERNOBYL_HOME", &dir)
+            .env_remove("HOST_TOKEN")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{token:?}: {err}");
+        assert!(err.contains("at least 32 characters"), "{token:?}: {err}");
+        assert!(!err.contains("listening on"), "{token:?}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Mandate §8 / §10 scenario 2:
 /// Shutdown while a client is mid E2E handshake (hs_hello sent, no hs_proof): stop() returns true.
 #[test]

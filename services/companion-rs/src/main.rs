@@ -228,6 +228,14 @@ fn run(args: &[String]) -> i32 {
         return backup_main(&cfg, backup_path.as_deref(), restore_path.as_deref());
     }
 
+    // a token that is present must be strong enough to resist guessing
+    if let Some(t) = &token_override
+        && let Err(e) = server::validate_token(t)
+    {
+        eprintln!("[companion] refusing to start: {e}");
+        return 1;
+    }
+
     // Secure-by-default: exposing beyond loopback requires a token, and so does
     // remote posture on loopback: --require-e2e is the tunnel recipe, where
     // loopback is reachable from the internet (security review 2026-10-25).
