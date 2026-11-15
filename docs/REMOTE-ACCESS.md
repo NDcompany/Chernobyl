@@ -54,6 +54,8 @@ Expose a public TLS hostname forwarding to `ws://127.0.0.1:8787`.
    ```
 > [!WARNING]
 > **Always pass `--require-e2e` behind a tunnel.** The proxy connects from loopback, so without it the companion keeps loopback dev parity (threat model D2 residual (c)): anyone on the internet holding the token could run plaintext commands. With `--require-e2e` (or `"server": {"requireE2e": true}` in `companion.json`) every command and the state snapshot need the paired E2E session, exactly like a non-loopback bind.
+>
+> Since 2026-11-15 a request that carries a proxy header (`X-Forwarded-For/-Host/-Proto`, `Forwarded`, `ngrok-*`) is treated as remote for that connection even without the flag, and is refused outright when no token is set. That is a backstop for ngrok and most proxies, which add those headers; a proxy that strips them gets none of it, so keep `--require-e2e`. The token must be at least 32 characters (the companion will not start otherwise).
 
 ## 3. Multiple Endpoints & Failover (S10)
 
@@ -69,7 +71,7 @@ The `--endpoint` flag is repeatable (`main.rs`). The companion embeds them into 
 
 ## 4. Hardening Checklist
 
-- [ ] **Enforce Token:** The companion refuses to bind beyond loopback without `--token` or `HOST_TOKEN` (`main.rs`).
+- [ ] **Enforce Token:** The companion refuses to bind beyond loopback without `--token` or `HOST_TOKEN`, and refuses any token shorter than 32 characters (`main.rs`).
 - [ ] **Firewall Scope:** Restrict incoming traffic on port 8787 to your private subnet or Tailscale interface. Loopback diagnostics (port 9487) is strictly bound to `127.0.0.1` (`server.rs`).
 - [ ] **Browser Protection (D1):** WebSockets with browser `Origin` headers are rejected with HTTP 403 (`server.rs`) to prevent CSWSH attacks.
 - [ ] **Revoke Lost Devices (D4):**
