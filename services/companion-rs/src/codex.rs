@@ -1680,11 +1680,21 @@ impl Codex {
         for (tag, interrupt) in t.tags {
             out.push(done_for(tag, interrupt, &t.state));
         }
+        let mut idle = false;
         if let Some(th) = self.threads.get_mut(&thread) {
             if th.turn.as_deref() == Some(id) {
                 th.turn = None;
             }
             th.last = Some(t.state);
+            // a turn that fails before codex marks the thread active (a usage limit) gets no
+            // thread/status/changed: without this the session stays "running" with a Stop button
+            if th.turn.is_none() {
+                th.status = "idle";
+                idle = true;
+            }
+        }
+        if idle {
+            out.push(self.state_op(&thread, "idle"));
         }
     }
 
@@ -4555,6 +4565,13 @@ mod tests {
         assert_eq!(
             dones(&events),
             [("c1", "failed", Some("The model is overloaded."))]
+        );
+        // and the session leaves "running" even if codex never sent thread/status/changed
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Op(_, Op::State(st)) if st.status == "idle")),
+            "a failed turn must end the session's running state"
         );
     }
 
