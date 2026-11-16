@@ -174,6 +174,8 @@ async function typeInto(re, text) {
   const field = await until(() => a.dump().find((n) => n.pkg === PKG && n.cls.includes('EditText') && (re.test(n.desc) || re.test(n.text))), 10_000);
   if (!field) throw new Error(`no field ${re}`);
   await a.tap(field);
+  // keys typed while the 4.4 keyboard is still opening are dropped
+  await a.sleep(1500);
   typeSafe(text);
   await a.sleep(500);
   // the keyboard covers the lower fields of the dialog (a tap there hits a key)
@@ -191,6 +193,8 @@ async function ensureApp() {
   a.adb(['install', '-r', join(process.cwd(), 'release/chernobyl-kitkat-0.2.0.apk')], { timeout: 180_000 });
   a.shell(`am force-stop ${PKG}`);
   a.shell(`pm clear ${PKG}`);
+  // 4.4 uiautomator only dumps an idle screen: animated agent marks would block every dump (restored in finally)
+  a.shell('settings put global animator_duration_scale 0');
   a.shell(`am start -n ${PKG}/.MainActivity`);
   await waitApp(/^Home$/, 60_000);
 }
@@ -245,14 +249,24 @@ async function agentRun(S) {
   const sid = await newSession(S.name, title, S.prompt);
   notes.sid = sid;
   const limitNotice = () => [...view(sid).items.values()].find((i) => i.kind === 'notice' && i.level === 'error' && /usage limit|quota|exhausted|rate limit/i.test(i.text));
-  const first = await until(async () => (limitNotice() ? 'limit' : ((await snapshot())?.permissions?.find((p) => p.sessionId === sid && p.status === 'pending') ?? null)), S.wait ?? 240_000, 1500);
+  const ask = () => until(async () => (limitNotice() ? 'limit' : ((await snapshot())?.permissions?.find((p) => p.sessionId === sid && p.status === 'pending') ?? (turnsEnded(sid) > 0 && !running(sid) ? 'ended' : null))), S.wait ?? 240_000, 1500);
+  let first = await ask();
+  for (let nudge = 0; first === 'ended' && nudge < 2; nudge++) {
+    // a small local model sometimes answers with the command as text: one nudge, recorded
+    notes.nudged = nudge + 1;
+    await typeInto(/^Message /, 'Call the bash tool now to run that command.');
+    await hideKeyboard();
+    await tapApp(/^Send$/);
+    await until(() => running(sid), 30_000, 1000);
+    first = await ask();
+  }
   if (first === 'limit') {
     notes.limit = limitNotice().text;
     shot(`${S.kind}-limit`);
     notes.limitOnTablet = !!(await waitApp(/usage limit/i, 20_000));
     return notes;
   }
-  if (!first) {
+  if (!first || first === 'ended') {
     shot(`${S.kind}-no-approval`);
     notes.error = `no approval request (${a.screenText().slice(0, 200)})`;
     return notes;
@@ -260,12 +274,21 @@ async function agentRun(S) {
   notes.approval = `${first.title}: ${first.command}`;
   notes.options = (first.options ?? []).map((o) => o.label);
   // the conversation is open on the tablet: Allow is the card's first button
-  const allow = await waitApp(/^Allow( once)?$/, 20_000);
+  const allow = await waitApp(/^Allow( once)?$/, 120_000);
   shot(`${S.kind}-approval`);
   notes.cardShown = !!allow;
-  if (allow) await a.tap(allow);
+  // Stop sits at a fixed spot in the composer; 4.4 uiautomator cannot dump while text streams, so keep where it is now
+  const stopAt = allow ? a.dump().find((n) => n.pkg === PKG && n.text === 'Stop') : null;
+  // the slow 4.4 emulator can drop a tap while the list re-lays out: re-dump and tap again, counted in the evidence
+  const pending = async () => (await snapshot())?.permissions?.some((p) => p.id === first.id && p.status === 'pending');
+  notes.allowTaps = 0;
+  for (let b = allow; b && notes.allowTaps < 3; b = (await pending()) ? await waitApp(/^Allow( once)?$/, 5_000) : null) {
+    await a.tap(b);
+    notes.allowTaps++;
+    await until(async () => !(await pending()), 10_000, 1000);
+  }
   // the Stop button is in the composer for as long as a turn runs
-  let stop = S.combined ? await waitApp(/^Stop$/, 15_000) : null;
+  let stop = S.combined ? ((await waitApp(/^Stop$/, 15_000)) ?? stopAt) : null;
   notes.toolDone = !!(await until(() => [...view(sid).items.values()].find((i) => i.kind === 'tool' && i.tool.status === 'completed'), 240_000, 1500));
   const n1 = S.combined ? 0 : 1;
   if (!S.combined) {
@@ -275,16 +298,16 @@ async function agentRun(S) {
     shot(`${S.kind}-done`);
     const text = [...view(sid).items.values()].find((i) => i.kind === 'text');
     notes.reply = (text?.text ?? '').slice(0, 60);
-    await typeInto(/^Message /, 'Write a 16-line poem about the sea.');
+    await typeInto(/^Message /, S.long ?? 'Write a 16-line poem about the sea.');
     await hideKeyboard();
     await tapApp(/^Send$/);
-    stop = await waitApp(/^Stop$/, 30_000);
+    stop = (await waitApp(/^Stop$/, 30_000)) ?? stopAt;
   }
   const streaming = await until(() => [...view(sid).items.values()].find((i) => i.kind === 'text' && !i.done && i.text.length > 80), 240_000, 400);
   notes.streamedChars = streaming?.text.length ?? 0;
   if (stop) await a.tap(stop);
   await until(() => turnsEnded(sid) > n1, 120_000, 1000);
-  notes.stopped = !!(await waitApp(/^Stopped$/, 30_000));
+  notes.stopped = !!(await waitApp(/^Stopped( · |$)/, 30_000));
   notes.turn = [...view(sid).turns.values()].at(-1)?.status;
   shot(`${S.kind}-stopped`);
   if (S.combined) {
@@ -358,6 +381,7 @@ try {
 } finally {
   appendFileSync(join(OUT, 'K-runs.json'), `${JSON.stringify({ at: new Date().toISOString(), runs })}\n`);
   obs?.close();
+  a.shell('settings put global animator_duration_scale 1');
   if (comp) c.stopCompanion(comp);
   await oc?.stop();
 }

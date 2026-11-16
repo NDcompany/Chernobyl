@@ -7,8 +7,8 @@ import { writeFileSync } from 'node:fs';
 
 const ADB = process.env.ADB ?? 'G:/Android/sdk/platform-tools/adb.exe';
 // with several devices attached, every call names one (ANDROID_SERIAL=emulator-5554)
-// Android 4.4 cannot write the dump under /sdcard: UI_DUMP=/data/local/tmp/ui.xml
-const UI = process.env.UI_DUMP ?? '/sdcard/ui.xml';
+// /data/local/tmp: Android 4.4 cannot write the dump under /sdcard (shell owns this dir on every version)
+const UI = process.env.UI_DUMP ?? '/data/local/tmp/ui.xml';
 const SERIAL = process.env.ANDROID_SERIAL ? ['-s', process.env.ANDROID_SERIAL] : [];
 
 export function adb(args, opts = {}) {

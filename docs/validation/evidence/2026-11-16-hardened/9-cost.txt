@@ -1,0 +1,1 @@
+2026-11-15T23:45:22.715Z rows 1.1 4.1 4.3 9.1: model claude-haiku-5-5, 1 turns, total_cost_usd 0.0104, claude -p on the PC 0.0000

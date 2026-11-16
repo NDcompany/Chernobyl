@@ -1,0 +1,22 @@
+{
+  "1.1": {
+    "pass": true,
+    "observed": "home: 2 hosts online; companion clients=1; device d78369be5d9541f8 registered=true",
+    "at": "2026-11-15T23:39:41.079Z"
+  },
+  "4.1": {
+    "pass": true,
+    "observed": "sessions 5 -> 6; live output on the session screen=true",
+    "at": "2026-11-15T23:40:20.518Z"
+  },
+  "4.3": {
+    "pass": true,
+    "observed": "other client rejected p_1a1e195b63c27 (rev 1): ok=true; a late approve with the same revision: ok=false (request is no longer pending); left the phone's pending list=true (badge null -> null)",
+    "at": "2026-11-15T23:42:45.027Z"
+  },
+  "9.1": {
+    "pass": true,
+    "observed": "\"Starting Claude Code…\" shown=true; phone frames while streaming at companion text lengths 487 -> 1143 -> 1783 -> 2167 -> 2663 -> 3127 -> 3607 -> 4053 -> 4439 -> 4907 -> 5307 -> 5773 (stream-1/stream-2 differ=true); final phone text is 1..1500=true; \"Jump to latest\" shown at turn end=false; footer \"Done · 12.7 s · 63.8k tokens · $0.01\"; model=claude-haiku-5-5; cost so far $0.0104",
+    "at": "2026-11-15T23:45:14.558Z"
+  }
+}
