@@ -746,13 +746,18 @@ final class ConversationView extends LinearLayout implements App.Change {
         JSONObject turn = (JSONObject) w[2];
         long elapsed = now - turn.optLong("startedAt", now);
         workingMark.setState(state);
-        workingText.setText(Composer.workingLabel(state, elapsed, turn.optString("id"), (String) w[1]));
+        setIfChanged(workingText, Composer.workingLabel(state, elapsed, turn.optString("id"), (String) w[1]));
         workingText.setTextColor("waiting".equals(state) ? Ui.TEXT : Ui.TEXT2);
-        StringBuilder meta = new StringBuilder(Composer.formatElapsed(elapsed));
+        StringBuilder meta = new StringBuilder("waiting".equals(state) ? Composer.formatWaited(elapsed) : Composer.formatElapsed(elapsed));
         JSONObject u = turn.optJSONObject("usage");
         if (u != null && u.optLong("outputTokens") > 0) meta.append(" · ").append(tokens(u.optLong("outputTokens"))).append(" tokens");
         if (turn.has("costUsd")) meta.append(String.format(java.util.Locale.US, " · $%.4f", turn.optDouble("costUsd")));
-        workingMeta.setText(meta.toString());
+        setIfChanged(workingMeta, meta.toString().replaceFirst("^ · ", ""));
+    }
+
+    /** The 1 s ticker rewrites these lines: an unchanged text must not relayout or announce (and lets 4.4 uiautomator see an idle screen). */
+    private static void setIfChanged(TextView t, String s) {
+        if (!s.contentEquals(t.getText())) t.setText(s);
     }
 
     static String tokens(long n) {

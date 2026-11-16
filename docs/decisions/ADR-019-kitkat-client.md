@@ -205,6 +205,10 @@ ADR-020, with the same messages and rules (`packages/protocol` is the source of 
 - **Identity**: the working row now follows `workingStatus` / `workingLabel` (rotating verbs every
   3 s seeded by the turn id, `Running <Tool>…`, "Waiting for you", elapsed, tokens, cost); marks
   and reply heads were already the `agentMark.tsx` sprites.
+- **Old-tablet deviations (2026-11-16)**: a waiting approval shows whole minutes (`formatWaited`,
+  blank under a minute) instead of ticking seconds, the working row rewrites its lines only when
+  the text changes, and the mark stays still when the system animator scale is 0 ("Remove
+  animations"). An unanswered approval no longer redraws the screen every frame for hours.
 - **Markdown tables**: pipe tables become one aligned monospace block (header, rule, rows).
 
 ### Parity results (emulator API 19, Nexus 7 2013 profile, 2026-11-12)

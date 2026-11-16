@@ -172,6 +172,9 @@ public class ComposerTest {
         assertEquals("Waiting for you", Composer.workingLabel("waiting", 0, "t1", null));
         assertEquals("1m 05s", Composer.formatElapsed(65_000));
         assertEquals("1h 02m", Composer.formatElapsed(3_720_000));
+        assertEquals("", Composer.formatWaited(59_999));
+        assertEquals("4m", Composer.formatWaited(4 * 60_000 + 59_000));
+        assertEquals("1h 02m", Composer.formatWaited(3_720_000));
 
         Model.View v = new Model.View();
         Model.applyTranscript(v, ModelTest.fixture("transcript-snapshot.json"));

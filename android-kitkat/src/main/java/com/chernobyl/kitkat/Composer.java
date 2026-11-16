@@ -258,6 +258,13 @@ public final class Composer {
         return (s / 3600) + "h " + String.format(Locale.US, "%02d", (s / 60) % 60) + "m";
     }
 
+    /** Time an approval has waited, whole minutes only ("" under a minute, "4m", "1h 02m"): the line redraws once a minute while it waits for hours. */
+    public static String formatWaited(long ms) {
+        long m = Math.max(0, ms) / 60_000;
+        if (m == 0) return "";
+        return m < 60 ? m + "m" : (m / 60) + "h " + String.format(Locale.US, "%02d", m % 60) + "m";
+    }
+
     /* ---------------- git (workspace.ts) ---------------- */
 
     /** {label, "1" if possible}: "origin/main → main", or why there is nothing to pull from. */

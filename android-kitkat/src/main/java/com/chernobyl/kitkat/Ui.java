@@ -11,6 +11,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.method.LinkMovementMethod;
@@ -280,6 +281,8 @@ final class Ui {
             long t = SystemClock.uptimeMillis();
             float phase = 0;
             int period = "working".equals(state) ? 800 : "thinking".equals(state) ? 1600 : "waiting".equals(state) ? 2400 : 0;
+            // "Remove animations" (animator scale 0): a still mark, no 20 fps redraw while an approval waits for hours
+            if (period > 0 && Settings.Global.getFloat(getContext().getContentResolver(), Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f) period = 0;
             if (period > 0) phase = (float) (0.5 - 0.5 * Math.cos(2 * Math.PI * (t % period) / period));
             int alpha = "error".equals(state) ? 115 : "waiting".equals(state) ? (int) (255 * (1 - 0.6f * phase)) : 255;
             paint.setAlpha(alpha);
