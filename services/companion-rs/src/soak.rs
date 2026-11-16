@@ -1,5 +1,5 @@
 //! `--soak` — the companion soak harness (repeatability over time), built into
-//! the product binary. Supersedes `tools/soak.mjs` (kept for one release).
+//! the product binary. Replaced the Node harness `tools/soak.mjs` (removed).
 //!
 //! Spawns THIS executable as the server under test (loopback, token auth, an
 //! isolated CHERNOBYL_HOME under the run dir, ephemeral ports read from the

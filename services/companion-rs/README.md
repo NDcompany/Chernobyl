@@ -306,8 +306,7 @@ cargo run --release -- --soak smoke --inject server-kill   # failure-detection d
 Long mode runs the same pass with a load loop (churn + FIFO every cycle, saturation every
 3rd, dead peer every 10th) until the duration has really elapsed, before the closing phases,
 so the quiesced RSS is measured after the load; a progress line every 30 s replaces
-per-phase output while the loop runs. `tools/soak.mjs` (the Node original, same phases and
-criteria) is superseded and kept for one release.
+per-phase output while the loop runs. The Node original (`tools/soak.mjs`, same phases and criteria) was removed 2026-11-16.
 
 Phases: token auth failure/429/recovery · pipelined-ping FIFO ordering · churn with
 registry-leak checks · reconnect recovery · stopped-consumer saturation (count- and

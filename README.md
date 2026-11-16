@@ -264,7 +264,7 @@ Two suites, both green on the current tree:
 - **Soak harness**, built into the companion binary (`chernobyl-companion --soak`, which runs
   the same exe as the server under test): `npm run soak:smoke` (~80 s, 10 predefined
   pass/fail criteria) and `npm run soak:long` (explicit 24-hour mode, `--soak 86400`; any
-  duration via `--soak <seconds>`). No Node needed; the old `tools/soak.mjs` is superseded.
+  duration via `--soak <seconds>`). No Node needed (the old Node harness `tools/soak.mjs` was removed 2026-11-16).
   Emits JSONL telemetry + a machine-readable `summary.json`; a fault-injection mode
   (`--inject server-kill`) proves the harness detects an unexpected server exit (exit 1)
   rather than passing blindly.
