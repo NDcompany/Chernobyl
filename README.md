@@ -30,6 +30,15 @@ apps/mobile         Expo (React Native) app — Expo Router, TanStack Query,
                     Zustand, React Hook Form + Zod, SQLite, SecureStore.
 ```
 
+## Install
+
+Download the signed APK from the [latest release](https://github.com/NDcompany/Chernobyl/releases/latest)
+(Android 7.0 or later; a separate APK covers Android 4.4 tablets) together with the Windows companion
+and `SHA256SUMS.txt`. The app IDs are `in.ndcompany.chernobyl` and `in.ndcompany.chernobyl.kitkat`.
+To get updates automatically, add `https://github.com/NDcompany/Chernobyl` to
+[Obtainium](https://github.com/ImranR98/Obtainium). CHERNOBYL is not on Google Play.
+Setting up the companion: [`docs/INSTALL.md`](docs/INSTALL.md).
+
 ## Quick start
 
 ```powershell
@@ -300,3 +309,8 @@ mechanism: resilience lives in the companion code, not in the harness.
 
 See `docs/decisions/PHASE5-THREAT-MODEL.md` §6 for the per-gate status and the exact
 evidence each gate is waiting on.
+
+## Licence
+
+CHERNOBYL is free software under the [GNU General Public License v3.0](LICENSE). Built by
+Nakshatra Ranjan Saha, founder of [N&D Co.](https://ndcompany.in)
