@@ -18,7 +18,9 @@ $tmp = Join-Path ([IO.Path]::GetTempPath()) ("chb-setup-" + [guid]::NewGuid().To
 $ws = Join-Path $tmp 'ws'
 New-Item -ItemType Directory -Force $ws | Out-Null
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$before = (Get-ItemProperty $runKey | Out-String)
+# the key is missing on a fresh CI image: no value is a state too
+function Get-RunValues { Get-ItemProperty $runKey -ErrorAction SilentlyContinue | Out-String }
+$before = Get-RunValues
 $envBefore = [Environment]::GetEnvironmentVariable('HOST_TOKEN', 'User')
 
 function Run-Setup([string[]]$Extra) {
@@ -82,7 +84,7 @@ try {
 } finally {
   $env:APPDATA = $saved.APPDATA; $env:LOCALAPPDATA = $saved.LOCALAPPDATA
 }
-if ((Get-ItemProperty $runKey | Out-String) -ne $before) { throw 'HKCU Run changed' }
+if ((Get-RunValues) -ne $before) { throw 'HKCU Run changed' }
 if ([Environment]::GetEnvironmentVariable('HOST_TOKEN', 'User') -ne $envBefore) { throw 'HOST_TOKEN changed' }
 Remove-Item -Recurse -Force $tmp
 Write-Host 'setup checks ok'
