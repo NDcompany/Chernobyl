@@ -1629,7 +1629,13 @@ pub(crate) mod tests {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tools")
             .join("fake-codex-app-server.mjs");
-        let mut cfg = launch(&ws.to_string_lossy());
+        // a configured workspace is canonical (`validate_workspace`): a temp
+        // dir in 8.3 short form must not make the cwd checks miss it
+        let canon = std::fs::canonicalize(ws).map_or_else(
+            |_| ws.to_string_lossy().into_owned(),
+            |c| crate::claude_live::plain(&c),
+        );
+        let mut cfg = launch(&canon);
         cfg.binary = Some(PathBuf::from("node"));
         cfg.args = vec![script.to_string_lossy().into_owned()];
         cfg.args.extend(extra.iter().map(|a| a.to_string()));
@@ -1758,7 +1764,9 @@ pub(crate) mod tests {
         let (ws, state) = (root.join("ws"), root.join("state"));
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::create_dir_all(&state).unwrap();
-        let ws_path = ws.to_string_lossy().into_owned();
+        // codex stores the cwd it was started in, and `thread/list` filters on
+        // that exact string: the canonical workspace path, as configured
+        let ws_path = crate::claude_live::plain(&std::fs::canonicalize(&ws).unwrap());
         let saved = |id: &str, title: &str, updated: i64| {
             let entry = |kind: &str, text: &str| {
                 let item = if kind == "user" {

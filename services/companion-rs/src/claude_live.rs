@@ -208,8 +208,7 @@ pub fn validate_workspace(
             "the user profile folder cannot be a workspace: {path}"
         ));
     }
-    let data = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
-    if PathBuf::from(plain(&data)).starts_with(&dir) {
+    if canonical_or_pending(data_dir).starts_with(&dir) {
         return Err(format!(
             "workspace contains the CHERNOBYL data directory: {path}"
         ));
@@ -238,6 +237,46 @@ pub fn plain(p: &Path) -> String {
     } else {
         s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
     }
+}
+
+/// `canonicalize` for a path that may not exist yet (the data folder before
+/// its first run), without the verbatim prefix: the nearest existing
+/// ancestor is canonicalized (8.3 short names, junctions and symlinks
+/// resolved, like a workspace's path) and the missing tail appended.
+/// Containment checks against a canonical workspace must use this, never the
+/// raw spelling: a short-name temp folder never `starts_with` its long name.
+pub fn canonical_or_pending(p: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut base = p;
+    loop {
+        if let Ok(c) = std::fs::canonicalize(base) {
+            return tail
+                .iter()
+                .rev()
+                .fold(PathBuf::from(plain(&c)), |acc, name| acc.join(name));
+        }
+        match (base.file_name(), base.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                base = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// Test setup only: the 8.3 short spelling of an existing folder, when the
+/// volume has short names and the folder's name is long enough to get one.
+#[cfg(test)]
+pub(crate) fn short_path(p: &Path) -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("cmd")
+        .arg("/C")
+        .raw_arg(format!("for %I in (\"{}\") do @echo %~sI", p.display()))
+        .output()
+        .ok()?;
+    let short = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    (short.exists() && short.to_string_lossy().contains('~')).then_some(short)
 }
 
 /// A random v4 UUID: new session ids (`--session-id`) and prompt uuids.
@@ -4428,6 +4467,35 @@ mod tests {
         assert_eq!(ok.label, "other");
         assert_eq!(ok.path, plain(&std::fs::canonicalize(&other).unwrap()));
         assert!(!ok.path.starts_with(r"\\?\"), "{}", ok.path);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_data_dir_not_created_yet_is_checked_by_its_canonical_path() {
+        let root = scratch();
+        let ws = root.join("a-workspace-with-a-long-name");
+        std::fs::create_dir_all(&ws).unwrap();
+        let canon = PathBuf::from(plain(&std::fs::canonicalize(&ws).unwrap()));
+        let Some(short) = short_path(&ws) else {
+            eprintln!("skipped: no 8.3 short names on this volume");
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        };
+        // the missing tail is appended to the canonical (long-name) ancestor
+        let missing = short.join("data").join("deeper");
+        assert_eq!(
+            canonical_or_pending(&missing),
+            canon.join("data").join("deeper")
+        );
+        // so a data folder inside the workspace is refused in either spelling
+        let err = validate_workspace(&ws.to_string_lossy(), &short.join("data"), None).unwrap_err();
+        assert!(
+            err.contains("contains the CHERNOBYL data directory"),
+            "{err}"
+        );
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(validate_workspace(&ws.to_string_lossy(), &other.join("data"), None).is_ok());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

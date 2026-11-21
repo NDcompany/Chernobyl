@@ -15,7 +15,7 @@
 //!   and output caps. No force, no amend, no hook bypass; pull is a
 //!   fast-forward only (ADR-016 addendum).
 
-use crate::claude_live::plain;
+use crate::claude_live::{canonical_or_pending, plain};
 use crate::json::{self, Json};
 use crate::runtime_io::{child_env, no_window, redact};
 use std::ffi::OsString;
@@ -66,12 +66,9 @@ impl Workspace {
     pub fn open(root: &str, data_dir: &Path) -> Result<Workspace, String> {
         let canon = std::fs::canonicalize(root)
             .map_err(|_| "the workspace folder no longer exists".to_string())?;
-        let data = std::fs::canonicalize(data_dir)
-            .map(|d| PathBuf::from(plain(&d)))
-            .unwrap_or_else(|_| data_dir.to_path_buf());
         Ok(Workspace {
             root: PathBuf::from(plain(&canon)),
-            data_dir: data,
+            data_dir: canonical_or_pending(data_dir),
         })
     }
 
@@ -977,6 +974,22 @@ pub(crate) mod tests {
         git(&dir, &["add", "README.md"]);
         git(&dir, &["commit", "-q", "-m", "init"]);
         dir
+    }
+
+    #[test]
+    fn a_data_dir_not_created_yet_is_kept_canonical() {
+        let root = temp("short");
+        let ws = root.join("a-workspace-with-a-long-name");
+        std::fs::create_dir_all(&ws).unwrap();
+        let canon = PathBuf::from(plain(&std::fs::canonicalize(&ws).unwrap()));
+        let Some(short) = crate::claude_live::short_path(&ws) else {
+            eprintln!("skipped: no 8.3 short names on this volume");
+            return;
+        };
+        let w = Workspace::open(&ws.to_string_lossy(), &short.join("data")).unwrap();
+        assert_eq!(w.data_dir, canon.join("data"));
+        assert!(w.contain(&canon.join("data").join("x")).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn open(root: &Path) -> (Workspace, PathBuf) {

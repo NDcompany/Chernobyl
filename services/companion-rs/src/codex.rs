@@ -2806,8 +2806,7 @@ fn workspace(raw: &str, data_dir: &Path, profile: Option<&Path>) -> Result<LiveW
         return Err(format!("'{raw}' is or contains the user profile folder"));
     }
     // an agent reads its cwd without asking: never the control key or journal
-    let data = canonical(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
-    if within(&data, &path) {
+    if within(&crate::claude_live::canonical_or_pending(data_dir), &path) {
         return Err(format!("'{raw}' contains the CHERNOBYL data folder"));
     }
     let text = path.to_string_lossy().into_owned();
@@ -4573,6 +4572,20 @@ mod tests {
                 .any(|e| matches!(e, Event::Op(_, Op::State(st)) if st.status == "idle")),
             "a failed turn must end the session's running state"
         );
+    }
+
+    #[test]
+    fn a_data_folder_not_created_yet_is_checked_by_its_canonical_path() {
+        let root = std::env::temp_dir().join(format!("chb-codex-short-{}", std::process::id()));
+        let ws = root.join("a-workspace-with-a-long-name");
+        std::fs::create_dir_all(&ws).unwrap();
+        if let Some(short) = crate::claude_live::short_path(&ws) {
+            let err = workspace(&ws.to_string_lossy(), &short.join("data"), None).unwrap_err();
+            assert!(err.contains("CHERNOBYL data folder"), "{err}");
+        } else {
+            eprintln!("skipped: no 8.3 short names on this volume");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
