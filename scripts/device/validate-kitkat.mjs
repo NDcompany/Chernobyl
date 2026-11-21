@@ -14,7 +14,7 @@ import * as c from './companion.mjs';
 import * as hc from './hostclient.mjs';
 
 const OUT = join(process.cwd(), 'docs/validation/evidence/kitkat');
-const PKG = 'com.chernobyl.kitkat';
+const PKG = 'in.ndcompany.chernobyl.kitkat';
 const TMP = process.env.TEMP ?? '.';
 const HOME = join(TMP, 'chernobyl-kitkat-run');
 const CLAUDE_WS = process.env.LIVE_WS ?? join(TMP, 'chernobyl-live-ws');
@@ -195,7 +195,7 @@ async function ensureApp() {
   a.shell(`pm clear ${PKG}`);
   // 4.4 uiautomator only dumps an idle screen: animated agent marks would block every dump (restored in finally)
   a.shell('settings put global animator_duration_scale 0');
-  a.shell(`am start -n ${PKG}/.MainActivity`);
+  a.shell(`am start -n ${PKG}/com.chernobyl.kitkat.MainActivity`);
   await waitApp(/^Home$/, 60_000);
 }
 async function pair() {

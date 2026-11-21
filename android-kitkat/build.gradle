@@ -5,7 +5,7 @@ android {
     namespace 'com.chernobyl.kitkat'
     compileSdk 36
     defaultConfig {
-        applicationId 'com.chernobyl.kitkat'
+        applicationId 'in.ndcompany.chernobyl.kitkat'
         minSdk 19
         targetSdk 36
         versionCode 2
