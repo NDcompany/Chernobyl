@@ -128,7 +128,8 @@ function signRelease(apk) {
   const latest = tools.sort(cmp).pop();
   const apksigner = join(sdk, 'build-tools', latest, process.platform === 'win32' ? 'apksigner.bat' : 'apksigner');
   const signed = `${apk}.signed`;
-  const q = (x) => `"${x}"`;
+  // Quotes only for cmd.exe (shell: true on Windows); with no shell, quotes would become part of the path.
+  const q = (x) => (process.platform === 'win32' ? `"${x}"` : x);
   run(q(apksigner), ['sign', '--v4-signing-enabled', 'false', '--ks', q(ks), '--ks-pass', q(`file:${passFile}`), '--ks-key-alias', 'chernobyl', '--out', q(signed), q(apk)], root);
   renameSync(signed, apk);
   run(q(apksigner), ['verify', '--print-certs', q(apk)], root);
