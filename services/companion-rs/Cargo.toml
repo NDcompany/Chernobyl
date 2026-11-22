@@ -1,6 +1,6 @@
 [package]
 name = "chernobyl-companion"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "CHERNOBYL local backend: protocol v2 WS server + companion foundation. Zero external crates."
 
