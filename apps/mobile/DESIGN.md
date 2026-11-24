@@ -281,7 +281,10 @@ notifications carry that route in `data.url` (a `fromPc` request is titled "Appr
   above the host details. "This replaces your current host <host>" whenever a pairing is stored; "Opened from
   another app or link — only continue if you started this pairing" when the payload came from a
   `chernobyl://connect-host?payload=` link (editing the field or scanning clears that mark). Saving a pairing
-  also clears the stored host token, so an old token is never appended to the new endpoints.
+  keeps a stored host token only for the host it was entered for (`keepTokenOnPair`: the token's bound host id, or for an
+  unbound token the stored pairing's, must be the new host, or there must be neither), so another host's token is never
+  appended to the new endpoints. A token in the Access token field when Pair with this host is tapped is saved bound to
+  that pairing; one saved later with Connect host is bound to the stored pairing and rebuilds the transport at once.
 - **Tapjacking:** `plugins/withAndroidHardening.js` (a config plugin in `app.json`) sets
   `window.decorView.filterTouchesWhenObscured = true` in MainActivity.onCreate, so every screen, Approve
   buttons included, ignores touches while another window covers the app; it also sets an empty

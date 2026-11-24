@@ -238,7 +238,7 @@ if ($TunnelUrl) {
 $ip = (Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } | Select-Object -First 1).IPv4Address.IPAddress
 if (-not $ip) { throw 'No LAN IPv4 address with a default gateway found.' }
 Write-Host ''
-Write-Host "Phone setup: open CHERNOBYL > Pair with a host. Enter this access token in the token field, then scan the QR below."
+Write-Host "Phone setup: open CHERNOBYL > Pair with a host. Type this access token in the Access token field, scan the QR below, then tap Pair with this host."
 Write-Host "Access token: $token" -ForegroundColor Yellow
 Write-Host ''
 $endpoints = @('--endpoint', "ws://${ip}:$Port")

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pairingNotices } from './pairing.ts';
+import { keepTokenOnPair, pairingNotices } from './pairing.ts';
 
 test('a first pairing typed or scanned in the app has no warning', () => {
   assert.deepEqual(pairingNotices(null, false), []);
@@ -16,4 +16,21 @@ test('a link warns about its origin, and about the replacement when one exists',
   const both = pairingNotices('my-pc', true);
   assert.equal(both.length, 2);
   assert.match(both[0]!, /my-pc/);
+});
+
+test('a token typed before the first pairing is kept for it', () => {
+  assert.equal(keepTokenOnPair(null, null, 'pc-a'), true);
+});
+
+test('a token entered for this host survives re-pairing it', () => {
+  assert.equal(keepTokenOnPair('pc-a', 'pc-a', 'pc-a'), true);
+  assert.equal(keepTokenOnPair('pc-a', null, 'pc-a'), true);
+});
+
+test("another host's token is never carried to a new host", () => {
+  assert.equal(keepTokenOnPair('pc-a', 'pc-a', 'pc-b'), false);
+  assert.equal(keepTokenOnPair('pc-a', null, 'pc-b'), false);
+  // unbound legacy token: it belongs to the pairing stored when it was saved
+  assert.equal(keepTokenOnPair(null, 'pc-a', 'pc-b'), false);
+  assert.equal(keepTokenOnPair(null, 'pc-a', 'pc-a'), true);
 });

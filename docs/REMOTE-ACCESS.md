@@ -23,7 +23,9 @@ Direct connection over your local home or office network.
    .\chernobyl-companion.exe --pair --endpoint ws://192.168.1.50:8787
    ```
    *(Replace `192.168.1.50` with your desktop's LAN IP. If the companion is already running, `--pair` asks it to create the offer, so pairing works without a restart.)*
-3. On the phone, open **Connect a host**: enter the token in the manual form's token field (it goes to the keystore), then scan or paste the pairing QR.
+3. On the phone, open **Connect a host**: type the token in the **Access token** field (it goes to the keystore), scan or paste the pairing QR, then tap **Pair with this host**. The token is saved with that pairing.
+   Paired without it? Type the token in the same field with a name and address and tap **Connect host**: the app reconnects with it straight away. A token stays with the host it was entered for: pairing a different host drops it.
+   *(App 0.1.0, the APK in releases v0.1.0 and v0.1.1, deletes a token typed before pairing. There, pair first, then save the token with **Connect host**, then force-stop and reopen the app. Fixed in the next app release.)*
 
 ### Recipe B: Tailscale (Recommended Mesh VPN)
 Secure remote access across networks without opening router firewall ports.

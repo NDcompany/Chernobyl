@@ -6,39 +6,60 @@ import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 
 const TOKEN_KEY = 'chernobyl_host_token';
-/** web has no secure store; keep it in memory for the dev session only */
-let webToken: string | null = null;
+const TOKEN_HOST_KEY = 'chernobyl_host_token_host';
+/** web has no secure store (and a failed keystore write): memory, for the session only */
+const webSecrets = new Map<string, string>();
 
-export async function saveHostToken(token: string): Promise<void> {
-  if (Platform.OS === 'web') {
-    webToken = token;
-    return;
-  }
-  try {
-    await SecureStore.setItemAsync(TOKEN_KEY, token, {
-      keychainAccessible: SecureStore.WHEN_UNLOCKED,
-    });
-  } catch {
-    webToken = token;
-  }
+/**
+ * `host` is the pairing host id the token was entered for (null: no pairing yet);
+ * saving a pairing for another host drops the token (`keepTokenOnPair`).
+ */
+export async function saveHostToken(token: string, host: string | null): Promise<void> {
+  await saveSecret(TOKEN_KEY, token);
+  if (host) await saveSecret(TOKEN_HOST_KEY, host);
+  else await deleteSecret(TOKEN_HOST_KEY);
+}
+
+/** The host id a stored token is bound to; null when unbound. */
+export async function readHostTokenHost(): Promise<string | null> {
+  return readSecret(TOKEN_HOST_KEY);
 }
 
 export async function readHostToken(): Promise<string | null> {
-  if (Platform.OS === 'web') return webToken;
+  return readSecret(TOKEN_KEY);
+}
+
+export async function clearHostToken(): Promise<void> {
+  await deleteSecret(TOKEN_KEY);
+  await deleteSecret(TOKEN_HOST_KEY);
+}
+
+async function saveSecret(key: string, value: string): Promise<void> {
+  if (Platform.OS !== 'web') {
+    try {
+      await SecureStore.setItemAsync(key, value, { keychainAccessible: SecureStore.WHEN_UNLOCKED });
+      return;
+    } catch {
+      /* fall back to memory */
+    }
+  }
+  webSecrets.set(key, value);
+}
+
+async function readSecret(key: string): Promise<string | null> {
+  if (Platform.OS === 'web') return webSecrets.get(key) ?? null;
   try {
-    return await SecureStore.getItemAsync(TOKEN_KEY);
+    return (await SecureStore.getItemAsync(key)) ?? webSecrets.get(key) ?? null;
   } catch {
     return null;
   }
 }
 
-export async function clearHostToken(): Promise<void> {
-  if (Platform.OS === 'web') {
-    webToken = null;
-    return;
-  }
+async function deleteSecret(key: string): Promise<void> {
+  webSecrets.delete(key);
+  if (Platform.OS === 'web') return;
   try {
-    await SecureStore.deleteItemAsync(TOKEN_KEY);
+    await SecureStore.deleteItemAsync(key);
   } catch {
     /* nothing to clear */
   }

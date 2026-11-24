@@ -22,8 +22,15 @@ import { colors, radii, spacing, typography } from '@/theme/tokens';
 import { useAppStore } from '@/store/appStore';
 import { applyMessage } from '@/data/state';
 import { zodHandler } from '@/forms/zodBridge';
-import { clearHostToken, readPairing, saveHostToken, savePairing } from '@/platform/secure';
-import { pairingNotices } from '@/utils/pairing';
+import {
+  clearHostToken,
+  readHostToken,
+  readHostTokenHost,
+  readPairing,
+  saveHostToken,
+  savePairing,
+} from '@/platform/secure';
+import { keepTokenOnPair, pairingNotices } from '@/utils/pairing';
 import { Button, Chip, Text, TextField } from '@/ui/primitives';
 import { Screen, PageHeader, Card } from '@/ui/surface';
 import { Icon } from '@/ui/icons';
@@ -155,9 +162,27 @@ export default function ConnectHostScreen() {
 
   const savePairingNow = async () => {
     if (!pairing) return;
+    // a token in the token field is entered for THIS pairing (the documented
+    // order: token first, then scan)
+    const typed = form.getValues('token').trim();
+    const tokenCheck = hostSchema.shape.token.safeParse(typed);
+    if (!tokenCheck.success) {
+      setPairErr(tokenCheck.error.issues[0]?.message ?? 'Invalid token');
+      return;
+    }
     setPairBusy(true);
-    // the old host token must never ride along to the new pairing's endpoints
-    await clearHostToken();
+    if (typed) {
+      await saveHostToken(typed, pairing.host);
+    } else {
+      // a stored token is kept only for the host it was entered for: another
+      // host's token must never ride along to this pairing's endpoints
+      const stored = await readHostToken();
+      if (stored && keepTokenOnPair(await readHostTokenHost(), currentHost, pairing.host)) {
+        await saveHostToken(stored, pairing.host);
+      } else {
+        await clearHostToken();
+      }
+    }
     await savePairing(qrText.trim());
     // credential changed → the provider tears the transport down and
     // rebuilds it through the real handshake
@@ -182,7 +207,13 @@ export default function ConnectHostScreen() {
       // ADR-009: added by the simulated handshake below, never a live host
       simulated: true,
     };
-    if (data.token) void saveHostToken(data.token);
+    if (data.token) {
+      // bound to the stored pairing (if any); a live transport, possibly
+      // 'denied' for the old token, is rebuilt so the new token is used now
+      void saveHostToken(data.token, currentHost).then(() => {
+        if (currentHost) useAppStore.getState().bumpTransport();
+      });
+    }
     applyMessage(localEvent({ type: 'host_updated', host }));
     // simulated handshake — a real build waits for the host's hello_ack
     setTimeout(() => {
@@ -399,7 +430,7 @@ export default function ConnectHostScreen() {
         name="token"
         label="Access token (optional)"
         placeholder="Paste the host token"
-        hint="Stored in the device keystore — never in the database"
+        hint="Stored in the device keystore — never in the database. Pair with this host also saves it for that pairing."
         secureTextEntry
         autoCapitalize="none"
       />
