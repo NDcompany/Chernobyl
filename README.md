@@ -11,6 +11,8 @@ One interface. Every agent. A mobile-first control app for AI agents: monitor ho
 agents, watch live session output, and approve or reject permission requests from your
 phone — with the companion backend enforcing every decision.
 
+**[Project page](https://ndcompany.in/open-source/chernobyl)** · **[User guide](https://github.com/NDcompany/Chernobyl/wiki)** · **[Download](https://github.com/NDcompany/Chernobyl/releases/latest)**
+
 Monorepo layout:
 
 ```
